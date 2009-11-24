@@ -127,7 +127,7 @@ net-obj-y += $(addprefix net/, $(net-nested-y))
 obj-y = $(block-obj-y)
 obj-y += $(net-obj-y)
 obj-y += $(qobject-obj-y)
-obj-y += readline.o console.o
+obj-y += readline.o console.o event.o
 
 obj-y += tcg-runtime.o host-utils.o
 obj-y += irq.o ioport.o
