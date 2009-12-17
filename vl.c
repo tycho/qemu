@@ -894,8 +894,23 @@ static void icount_adjust_vm(void * opaque)
     icount_adjust();
 }
 
-static void init_icount_adjust(void)
+static void configure_icount(const char *option)
 {
+    if (!option)
+        return;
+
+    if (strcmp(option, "auto") != 0) {
+        icount_time_shift = strtol(option, NULL, 0);
+        use_icount = 1;
+        return;
+    }
+
+    use_icount = 2;
+
+    /* 125MIPS seems a reasonable initial guess at the guest speed.
+       It will be corrected fairly quickly anyway.  */
+    icount_time_shift = 3;
+
     /* Have both realtime and virtual time triggers for speed adjustment.
        The realtime trigger catches emulated time passing too slowly,
        the virtual time trigger catches emulated time passing too fast.
@@ -4851,6 +4866,7 @@ int main(int argc, char **argv, char **envp)
     uint32_t boot_devices_bitmap = 0;
     int i;
     int snapshot, linux_boot, net_boot;
+    const char *icount_option = NULL;
     const char *initrd_filename;
     const char *kernel_filename, *kernel_cmdline;
     char boot_devices[33] = "cad"; /* default to HD->floppy->CD-ROM */
@@ -5571,12 +5587,7 @@ int main(int argc, char **argv, char **envp)
                     tb_size = 0;
                 break;
             case QEMU_OPTION_icount:
-                use_icount = 1;
-                if (strcmp(optarg, "auto") == 0) {
-                    icount_time_shift = -1;
-                } else {
-                    icount_time_shift = strtol(optarg, NULL, 0);
-                }
+                icount_option = optarg;
                 break;
             case QEMU_OPTION_incoming:
                 incoming = optarg;
@@ -5820,13 +5831,7 @@ int main(int argc, char **argv, char **envp)
         fprintf(stderr, "could not initialize alarm timer\n");
         exit(1);
     }
-    if (use_icount && icount_time_shift < 0) {
-        use_icount = 2;
-        /* 125MIPS seems a reasonable initial guess at the guest speed.
-           It will be corrected fairly quickly anyway.  */
-        icount_time_shift = 3;
-        init_icount_adjust();
-    }
+    configure_icount(icount_option);
 
 #ifdef _WIN32
     socket_init();
