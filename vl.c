@@ -3428,7 +3428,6 @@ static QemuCond qemu_pause_cond;
 
 static void block_io_signals(void);
 static void unblock_io_signals(void);
-static int tcg_has_work(void);
 
 static int qemu_init_main_loop(void)
 {
@@ -3451,7 +3450,7 @@ static int qemu_init_main_loop(void)
 
 static void qemu_wait_io_event(CPUState *env)
 {
-    while (!tcg_has_work())
+    while (!qemu_cpus_have_work())
         qemu_cond_timedwait(env->halt_cond, &qemu_global_mutex, 1000);
 
     qemu_mutex_unlock(&qemu_global_mutex);
@@ -3915,29 +3914,6 @@ static void tcg_cpu_exec(void)
     }
 }
 
-static int cpu_has_work(CPUState *env)
-{
-    if (env->stop)
-        return 1;
-    if (env->stopped)
-        return 0;
-    if (!env->halted)
-        return 1;
-    if (qemu_cpu_has_work(env))
-        return 1;
-    return 0;
-}
-
-static int tcg_has_work(void)
-{
-    CPUState *env;
-
-    for (env = first_cpu; env != NULL; env = env->next_cpu)
-        if (cpu_has_work(env))
-            return 1;
-    return 0;
-}
-
 static int qemu_calculate_timeout(void)
 {
 #ifndef CONFIG_IOTHREAD
@@ -3945,7 +3921,7 @@ static int qemu_calculate_timeout(void)
 
     if (!vm_running)
         timeout = 5000;
-    else if (tcg_has_work())
+    else if (qemu_cpus_have_work())
         timeout = 0;
     else {
      /* XXX: use timeout computed from timers */

@@ -49,9 +49,21 @@ int tb_invalidated_flag;
 //#define CONFIG_DEBUG_EXEC
 //#define DEBUG_SIGNAL
 
-int qemu_cpu_has_work(CPUState *env)
+int qemu_cpus_have_work(void)
 {
-    return cpu_has_work(env);
+    CPUState *env;
+
+    for (env = first_cpu; env != NULL; env = env->next_cpu) {
+        if (env->stop)
+            return 1;
+        if (env->stopped)
+            return 0;
+        if (!env->halted)
+            return 1;
+        if (cpu_has_work(env))
+            return 1;
+    }
+    return 0;
 }
 
 void cpu_loop_exit(void)
