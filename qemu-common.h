@@ -16,6 +16,7 @@
 
 /* we put basic includes here to avoid repeating them in device drivers */
 #include <stdlib.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -106,6 +107,7 @@ void qemu_bh_schedule(QEMUBH *bh);
  * iteration.
  */
 void qemu_bh_schedule_idle(QEMUBH *bh);
+bool qemu_bh_scheduled(QEMUBH *bh);
 void qemu_bh_cancel(QEMUBH *bh);
 void qemu_bh_delete(QEMUBH *bh);
 int qemu_bh_poll(void);

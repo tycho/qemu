@@ -188,6 +188,11 @@ void qemu_bh_cancel(QEMUBH *bh)
     bh->scheduled = 0;
 }
 
+bool qemu_bh_scheduled(QEMUBH *bh)
+{
+    return bh->scheduled && !bh->deleted;
+}
+
 void qemu_bh_delete(QEMUBH *bh)
 {
     bh->scheduled = 0;
