@@ -1023,8 +1023,6 @@ static const VMStateDescription vmstate_timers = {
     }
 };
 
-static void qemu_event_increment(void);
-
 static void qemu_timer_bh(void *opaque)
 {
     struct qemu_alarm_timer *t = opaque;
@@ -1099,7 +1097,7 @@ static void host_alarm_handler(int host_signum)
                            qemu_get_clock(rt_clock)) ||
         qemu_timer_expired(active_timers[QEMU_CLOCK_HOST],
                            qemu_get_clock(host_clock))) {
-        qemu_event_increment();
+        qemu_notify_event();
         t->expired = alarm_has_dynticks(t);
 
 #ifndef CONFIG_IOTHREAD
@@ -3258,13 +3256,21 @@ void qemu_system_powerdown_request(void)
     qemu_notify_event();
 }
 
+static int cpu_can_run(CPUState *env)
+{
+    if (env->stop)
+        return 0;
+    if (env->stopped)
+        return 0;
+    return 1;
+}
+
 #ifdef CONFIG_IOTHREAD
 static void qemu_system_vmstop_request(int reason)
 {
     vmstop_requested = reason;
     qemu_notify_event();
 }
-#endif
 
 #ifndef _WIN32
 static int io_thread_fd = -1;
@@ -3346,69 +3352,6 @@ static void qemu_event_increment(void)
     }
 }
 #endif
-
-static int cpu_can_run(CPUState *env)
-{
-    if (env->stop)
-        return 0;
-    if (env->stopped)
-        return 0;
-    return 1;
-}
-
-#ifndef CONFIG_IOTHREAD
-static int qemu_init_main_loop(void)
-{
-    return qemu_event_init();
-}
-
-void qemu_init_vcpu(void *_env)
-{
-    CPUState *env = _env;
-
-    if (kvm_enabled())
-        kvm_init_vcpu(env);
-    env->nr_cores = smp_cores;
-    env->nr_threads = smp_threads;
-    return;
-}
-
-int qemu_cpu_self(void *env)
-{
-    return 1;
-}
-
-static void resume_all_vcpus(void)
-{
-}
-
-static void pause_all_vcpus(void)
-{
-}
-
-void qemu_cpu_kick(void *env)
-{
-    return;
-}
-
-void qemu_notify_event(void)
-{
-    CPUState *env = cpu_single_env;
-
-    if (env) {
-        cpu_exit(env);
-    }
-}
-
-void qemu_mutex_lock_iothread(void) {}
-void qemu_mutex_unlock_iothread(void) {}
-
-void vm_stop(int reason)
-{
-    do_vm_stop(reason);
-}
-
-#else /* CONFIG_IOTHREAD */
 
 #include "qemu-thread.h"
 
@@ -3724,6 +3667,59 @@ void vm_stop(int reason)
         }
         return;
     }
+    do_vm_stop(reason);
+}
+
+#else /* CONFIG_IOTHREAD */
+
+static int qemu_init_main_loop(void)
+{
+    return 0;
+}
+
+void qemu_init_vcpu(void *_env)
+{
+    CPUState *env = _env;
+
+    if (kvm_enabled())
+        kvm_init_vcpu(env);
+    env->nr_cores = smp_cores;
+    env->nr_threads = smp_threads;
+    return;
+}
+
+int qemu_cpu_self(void *env)
+{
+    return 1;
+}
+
+static void resume_all_vcpus(void)
+{
+}
+
+static void pause_all_vcpus(void)
+{
+}
+
+void qemu_cpu_kick(void *env)
+{
+    return;
+}
+
+void qemu_notify_event(void)
+{
+    CPUState *env = cpu_single_env;
+
+    if (env) {
+        cpu_exit(env);
+    }
+}
+
+void qemu_mutex_lock_iothread(void) {}
+void qemu_mutex_unlock_iothread(void) {}
+
+void vm_stop(int reason)
+{
     do_vm_stop(reason);
 }
 
