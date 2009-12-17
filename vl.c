@@ -1099,13 +1099,6 @@ static void host_alarm_handler(int host_signum)
                            qemu_get_clock(host_clock))) {
         qemu_notify_event();
         t->expired = alarm_has_dynticks(t);
-
-#ifndef CONFIG_IOTHREAD
-        if (next_cpu) {
-            /* stop the currently executing cpu because a timer occured */
-            cpu_exit(next_cpu);
-        }
-#endif
         qemu_bh_schedule(t->bh);
     }
 }
@@ -3712,6 +3705,9 @@ void qemu_notify_event(void)
 
     if (env) {
         cpu_exit(env);
+    } else if (next_cpu) {
+        /* stop the currently executing cpu because a timer occured */
+        cpu_exit(next_cpu);
     }
 }
 
