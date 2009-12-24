@@ -573,6 +573,7 @@ void cpu_disable_ticks(void)
 
 struct QEMUClock {
     int type;
+    int enabled;
     /* XXX: add frequency */
 };
 
@@ -803,7 +804,13 @@ static QEMUClock *qemu_new_clock(int type)
     QEMUClock *clock;
     clock = qemu_mallocz(sizeof(QEMUClock));
     clock->type = type;
+    clock->enabled = 1;
     return clock;
+}
+
+static void qemu_clock_enable(QEMUClock *clock, int enabled)
+{
+    clock->enabled = enabled;
 }
 
 QEMUTimer *qemu_new_timer(QEMUClock *clock, QEMUTimerCB *cb, void *opaque)
@@ -898,6 +905,9 @@ static void qemu_run_timers(QEMUClock *clock)
 {
     QEMUTimer **ptimer_head, *ts;
     int64_t current_time;
+   
+    if (!clock->enabled)
+        return;
 
     current_time = qemu_get_clock (clock);
     ptimer_head = &active_timers[clock->type];
@@ -1039,8 +1049,7 @@ static void qemu_timer_bh(void *opaque)
 
     /* vm time timers */
     if (vm_running) {
-        if (!cur_cpu || likely(!(cur_cpu->singlestep_enabled & SSTEP_NOTIMER)))
-            qemu_run_timers(vm_clock);
+        qemu_run_timers(vm_clock);
     }
 
     qemu_run_timers(rt_clock);
@@ -3897,6 +3906,9 @@ static bool tcg_cpu_exec(void)
         next_cpu = first_cpu;
     for (; next_cpu != NULL; next_cpu = next_cpu->next_cpu) {
         CPUState *env = cur_cpu = next_cpu;
+
+        qemu_clock_enable(vm_clock, 
+                          (cur_cpu->singlestep_enabled & SSTEP_NOTIMER) == 0);
 
         if (!vm_running)
             return false;
