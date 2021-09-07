@@ -78,7 +78,6 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
     virtio_gpu_ss.add(files('virtio-gpu-udmabuf-stubs.c'))
   endif
   virtio_gpu_ss.add(when: 'CONFIG_VHOST_USER_GPU', if_true: files('vhost-user-gpu.c'))
-  virtio_gpu_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('virtio-ramfb.c'))
   hw_display_modules += {'virtio-gpu': virtio_gpu_ss}
 
   if virgl.found() and opengl.found()
@@ -94,6 +93,16 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
                                if_true: [files('virtio-gpu-rutabaga.c'), pixman])
     hw_display_modules += {'virtio-gpu-rutabaga': virtio_gpu_rutabaga_ss}
   endif
+endif
+
+if config_all_devices.has_key('CONFIG_FW_CFG_DMA')
+  virtio_ramfb_ss = ss.source_set()
+  virtio_ramfb_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('virtio-ramfb.c'))
+  hw_display_modules += {'virtio-ramfb': virtio_ramfb_ss}
+  virtio_ramfb_gl_ss = ss.source_set()
+  virtio_ramfb_gl_ss.add(when: ['CONFIG_FW_CFG_DMA', virgl, opengl],
+                       if_true: files('virtio-ramfb-gl.c'))
+  hw_display_modules += {'virtio-ramfb-gl': virtio_ramfb_gl_ss}
 endif
 
 if config_all_devices.has_key('CONFIG_VIRTIO_PCI')
