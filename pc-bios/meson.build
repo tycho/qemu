@@ -79,6 +79,8 @@ blobs = [
   'npcm8xx_bootrom.bin',
   'vof.bin',
   'vof-nvram.bin',
+  'm68k-declrom',
+  'ppc-ndrvloader',
 ]
 
 if get_option('install_blobs')
