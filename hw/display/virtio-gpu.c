@@ -1785,6 +1785,19 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
 #endif
     }
 
+    if (virtio_gpu_neptune_enabled(g->parent_obj.conf)) {
+#ifdef HAVE_VIRGL_RENDERER_NEPTUNE
+        if (!virtio_gpu_blob_enabled(g->parent_obj.conf) ||
+            !virtio_gpu_hostmem_enabled(g->parent_obj.conf)) {
+            error_setg(errp, "neptune requires enabled blob and hostmem options");
+            return;
+        }
+#else
+        error_setg(errp, "virglrenderer does not support neptune");
+        return;
+#endif
+    }
+
     if (!virtio_gpu_base_device_realize(qdev,
                                         virtio_gpu_handle_ctrl_cb,
                                         virtio_gpu_handle_cursor_cb,
