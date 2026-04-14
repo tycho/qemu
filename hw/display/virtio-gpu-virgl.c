@@ -1542,6 +1542,14 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
         }
     }
 #endif
+#ifdef VIRGL_RENDERER_NEPTUNE
+    if (virtio_gpu_neptune_enabled(g->parent_obj.conf)) {
+        flags |= VIRGL_RENDERER_NEPTUNE;
+#ifndef CONFIG_METAL
+        flags |= VIRGL_RENDERER_RENDER_SERVER;
+#endif
+    }
+#endif
 
     ret = virgl_renderer_init(g, flags, &virtio_gpu_3d_cbs);
     if (ret != 0) {
@@ -1641,6 +1649,17 @@ GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g)
             virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_DRM);
         }
     }
+
+#ifdef VIRGL_RENDERER_NEPTUNE
+    if (virtio_gpu_neptune_enabled(g->parent_obj.conf)) {
+        virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_NEPTUNE,
+                                   &capset_max_ver,
+                                   &capset_max_size);
+        if (capset_max_size) {
+            virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_NEPTUNE);
+        }
+    }
+#endif
 
     return capset_ids;
 }
