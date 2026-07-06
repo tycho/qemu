@@ -1547,9 +1547,7 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
 #ifdef VIRGL_RENDERER_NEPTUNE
     if (virtio_gpu_neptune_enabled(g->parent_obj.conf)) {
         flags |= VIRGL_RENDERER_NEPTUNE;
-#ifndef CONFIG_METAL
         flags |= VIRGL_RENDERER_RENDER_SERVER;
-#endif
     }
 #endif
 
