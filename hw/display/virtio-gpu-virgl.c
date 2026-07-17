@@ -1196,9 +1196,21 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
                                                   cmd->cmd_hdr.ring_idx,
                                                   cmd->cmd_hdr.fence_id);
         if (ret) {
+            /*
+             * The renderer context is gone (e.g. its render-server
+             * worker died mid-teardown): this fence can never retire
+             * through the timeline.  Complete it now: the cmd is not
+             * yet on fenceq, so responding here both signals the fence
+             * to the guest and keeps it off the queue.  Leaving it
+             * pending wedges the guest's GPU scheduler (VIDEO_TDR_FAILURE
+             * bugcheck on Windows).
+             */
             qemu_log_mask(LOG_GUEST_ERROR,
-                          "%s: virgl_renderer_context_create_fence error: %s",
-                          __func__, strerror(-ret));
+                          "%s: virgl_renderer_context_create_fence error: %s,"
+                          " retiring fence %" PRIu64 " immediately\n",
+                          __func__, strerror(-ret),
+                          (uint64_t)cmd->cmd_hdr.fence_id);
+            virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
         }
         return;
     }
