@@ -271,6 +271,8 @@ struct VirtIOGPUGL {
 
     MemoryRegion hostmem_background;
     void *hostmem_mmap;
+    /* fences retire via async_fence_bh; fence_poll is only a watchdog */
+    bool async_fence_enabled;
 };
 
 struct VhostUserGPU {
