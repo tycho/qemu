@@ -19,6 +19,13 @@ extern int64_t max_advance;
 
 extern bool one_insn_per_tb;
 
+/*
+ * x-tlb-grow: grow a softmmu TLB between flushes once it has had this
+ * many times its size in fills within 100 ms while over 70% used (0: only
+ * resize at flushes).
+ */
+extern unsigned tcg_tlb_grow;
+
 extern bool icount_align_option;
 
 /*

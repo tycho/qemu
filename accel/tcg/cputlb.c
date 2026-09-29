@@ -202,6 +202,9 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
  * high), since otherwise we are likely to have a significant amount of
  * conflict misses.
  */
+static void tlb_mmu_realloc_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
+                                   size_t new_size, int64_t now);
+
 static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
                                   int64_t now)
 {
@@ -245,7 +248,16 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
         }
         return;
     }
+    tlb_mmu_realloc_locked(desc, fast, new_size, now);
+}
 
+/*
+ * Replace the TLB's storage with @new_size entries (or fewer, if that
+ * can't be allocated); the caller flushes it.  Called with tlb_lock_held.
+ */
+static void tlb_mmu_realloc_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
+                                   size_t new_size, int64_t now)
+{
     g_free(fast->table);
     g_free(desc->fulltlb);
 
@@ -280,6 +292,7 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
 static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
 {
     desc->n_used_entries = 0;
+    desc->n_fills = 0;
     desc->large_page_addr = -1;
     desc->large_page_mask = -1;
     desc->vindex = 0;
@@ -295,6 +308,9 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
 
     tlb_mmu_resize_locked(desc, fast, now);
     tlb_mmu_flush_locked(desc, fast);
+    /* A growth asked for before the flush is stale: the flush resized. */
+    desc->grow_pending = false;
+    desc->fill_window_ns = now;
 }
 
 static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
@@ -303,6 +319,8 @@ static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
 
     tlb_window_reset(desc, now, 0);
     desc->n_used_entries = 0;
+    desc->fill_window_ns = now;
+    desc->grow_pending = false;
     fast->mask = (n_entries - 1) << CPU_TLB_ENTRY_BITS;
     fast->table = g_new(CPUTLBEntry, n_entries);
     desc->fulltlb = g_new(CPUTLBEntryFull, n_entries);
@@ -1022,6 +1040,75 @@ static inline void tlb_set_compare(CPUTLBEntryFull *full, CPUTLBEntry *ent,
  * Called from TCG-generated code, which is under an RCU read-side
  * critical section.
  */
+/*
+ * x-tlb-grow: the TLB is otherwise resized only when it is flushed
+ * (tlb_mmu_resize_locked), and a guest that runs one process may not flush
+ * a TLB for a long time: it then stays at its size from the last flush
+ * however much it misses.  Double it here instead, as a flush would.
+ *
+ * This runs as work on the vCPU, between TBs: callers of tlb_fill may hold
+ * pointers into the TLB (e.g. mmu_lookup, for the first page of an access
+ * that crosses two), so the storage can't be replaced during a fill.  Only
+ * this TLB is flushed: no mapping changed, so the TB jump cache stays.
+ */
+static void tlb_grow_async_work(CPUState *cpu, run_on_cpu_data data)
+{
+    int mmu_idx = data.host_int;
+    CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
+    CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
+    size_t size;
+
+    assert_cpu_is_self(cpu);
+
+    qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    size = tlb_n_entries(fast);
+    /* Not if a flush came first (or another request's work grew it). */
+    if (desc->grow_pending && size < (1 << CPU_TLB_DYN_MAX_BITS)) {
+        int64_t now = get_clock_realtime();
+
+        tlb_mmu_realloc_locked(desc, fast, size << 1, now);
+        tlb_mmu_flush_locked(desc, fast);
+        desc->fill_window_ns = now;
+        cpu->neg.tlb.c.dirty &= ~(1 << mmu_idx);
+    }
+    desc->grow_pending = false;
+    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+}
+
+/*
+ * Count a fill; true if the TLB should grow: it has had tcg_tlb_grow times
+ * its size in fills within 100 ms (the resize window) and is over 70% used,
+ * the rate at which a flush would grow it.  The clock is only read each
+ * time that many fills have happened.  Called with tlb_lock_held.
+ */
+static bool tlb_note_fill_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
+{
+    size_t size = tlb_n_entries(fast);
+    int64_t now;
+    bool grow;
+
+    if (++desc->n_fills < (size_t)tcg_tlb_grow * size) {
+        return false;
+    }
+    /*
+     * The use rate rounds down as at a flush (tlb_mmu_resize_locked), so
+     * that both grow at the same use.  A count above the size isn't one
+     * (n_used_entries isn't exact), and a clock that went back gives no
+     * window.
+     */
+    now = get_clock_realtime();
+    grow = !desc->grow_pending
+           && now >= desc->fill_window_ns
+           && now - desc->fill_window_ns < 100 * SCALE_MS
+           && desc->n_used_entries <= size
+           && desc->n_used_entries * 100 / size > 70
+           && size < (1 << CPU_TLB_DYN_MAX_BITS);
+    desc->grow_pending |= grow;
+    desc->n_fills = 0;
+    desc->fill_window_ns = now;
+    return grow;
+}
+
 void tlb_set_page_full(CPUState *cpu, int mmu_idx,
                        vaddr addr, CPUTLBEntryFull *full)
 {
@@ -1034,7 +1121,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     hwaddr iotlb, xlat, sz, paddr_page;
     vaddr addr_page;
     int asidx, wp_flags, prot;
-    bool is_ram, is_romd;
+    bool is_ram, is_romd, grow = false;
 
     assert_cpu_is_self(cpu);
 
@@ -1181,7 +1268,15 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
 
     copy_tlb_helper_locked(te, &tn);
     tlb_n_used_entries_inc(cpu, mmu_idx);
+    if (tcg_tlb_grow) {
+        grow = tlb_note_fill_locked(desc, cpu_tlb_fast(cpu, mmu_idx));
+    }
     qemu_spin_unlock(&tlb->c.lock);
+
+    if (grow) {
+        async_run_on_cpu(cpu, tlb_grow_async_work,
+                         RUN_ON_CPU_HOST_INT(mmu_idx));
+    }
 }
 
 void tlb_set_page_with_attrs(CPUState *cpu, vaddr addr,
