@@ -33,6 +33,7 @@
 #include "system/tcg.h"
 #include "tcg/tcg.h"
 #include "tcg/tcg-ldst.h"
+#include "accel/tcg/probe.h"
 #include "tcg/startup.h"
 #include "tb-hash.h"
 #include "tb-context.h"
@@ -1236,11 +1237,28 @@ void tb_invalidate_phys_range_fast(CPUState *cpu, ram_addr_t start,
  * tcg_gen_ldst_order).  The TB may finish its current execution: its code
  * stays valid, and invalidation unlinks jumps into it.
  */
+/*
+ * In user mode, fault on the first page before touching the second: the
+ * helpers below may read or write the page-crossing access's second page
+ * first.  (System mode's softmmu lookup already goes in order.)
+ */
+static void tso_cross_probe(CPUArchState *env, uint64_t addr, MemOpIdx oi,
+                            MMUAccessType access_type, uintptr_t retaddr)
+{
+#ifdef CONFIG_USER_ONLY
+    int size = memop_size(get_memop(oi));
+
+    if ((addr & ~TARGET_PAGE_MASK) + size > TARGET_PAGE_SIZE) {
+        probe_access(env, addr, 1, access_type, get_mmuidx(oi), retaddr);
+    }
+#endif
+}
+
 static void tso_cross_note(uintptr_t retaddr, uint64_t site)
 {
     TranslationBlock *tb;
 
-    if (!tcg_tso_cross_count(site)) {
+    if (!tcg_tso_promote || !tcg_tso_cross_count(site)) {
         return;
     }
     tb = tcg_tb_lookup(retaddr);
@@ -1256,6 +1274,7 @@ tcg_target_ulong helper_tso_cross_ld(CPUArchState *env, uint64_t addr,
                                      uint64_t site)
 {
     tso_cross_note(retaddr, site);
+    tso_cross_probe(env, addr, oi, MMU_DATA_LOAD, retaddr);
     switch (get_memop(oi) & MO_SIZE) {
     case MO_16:
         return helper_lduw_mmu(env, addr, oi, retaddr);
@@ -1272,6 +1291,7 @@ void helper_tso_cross_st(CPUArchState *env, uint64_t addr, uint64_t val,
                          MemOpIdx oi, uintptr_t retaddr, uint64_t site)
 {
     tso_cross_note(retaddr, site);
+    tso_cross_probe(env, addr, oi, MMU_DATA_STORE, retaddr);
     switch (get_memop(oi) & MO_SIZE) {
     case MO_16:
         helper_stw_mmu(env, addr, val, oi, retaddr);
