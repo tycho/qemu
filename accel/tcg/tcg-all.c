@@ -35,6 +35,7 @@
 #include "qapi/qapi-types-common.h"
 #include "qapi/qapi-builtin-visit.h"
 #include "qemu/units.h"
+#include "qemu/cutils.h"
 #include "qemu/target-info.h"
 #ifndef CONFIG_USER_ONLY
 #include "hw/core/boards.h"
@@ -282,6 +283,22 @@ static void tcg_set_tso(Object *obj, const char *value, Error **errp)
     error_setg(errp, "Invalid 'x-tso' value: %s", value);
 }
 
+static char *tcg_get_tso_exp(Object *obj, Error **errp)
+{
+    return g_strdup_printf("%u", tcg_tso_exp);
+}
+
+static void tcg_set_tso_exp(Object *obj, const char *value, Error **errp)
+{
+    unsigned v;
+
+    if (qemu_strtoui(value, NULL, 0, &v) < 0) {
+        error_setg(errp, "Invalid 'x-tso-exp' value: %s", value);
+        return;
+    }
+    tcg_tso_exp = v;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -318,6 +335,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Guest memory ordering: barrier (default), "
         "acqrel (load-acquire/store-release accesses), "
         "none (no barriers: unsafe, for measurement)");
+
+    object_class_property_add_str(oc, "x-tso-exp", tcg_get_tso_exp,
+                                  tcg_set_tso_exp);
+    object_class_property_set_description(oc, "x-tso-exp",
+        "[EXP] unsafe x-tso=acqrel attribution bits: 1 = plain 128-bit, "
+        "2 = plain crossing fallback, 4 = LDR/STR with the check, "
+        "8 = with 4, no check");
 }
 
 static const TypeInfo tcg_accel_type = {

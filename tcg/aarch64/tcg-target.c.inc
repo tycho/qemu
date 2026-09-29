@@ -1678,7 +1678,14 @@ static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
     if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
         return false;
     }
-    if (lb->is_ld) {
+    if (tcg_tso_exp & TCG_TSO_EXP_CROSS_PLAIN) {
+        /* [EXP] unsafe: plain access, no barrier */
+        if (lb->is_ld) {
+            tcg_out_qemu_ld_direct(s, memop, lb->type, lb->datalo_reg, h);
+        } else {
+            tcg_out_qemu_st_direct(s, memop, lb->datalo_reg, h);
+        }
+    } else if (lb->is_ld) {
         TCGReg d = lb->datalo_reg, a = lb->addr_reg;
         MemOp s_bits = memop & MO_SIZE;
 
@@ -1889,6 +1896,11 @@ static TCGLabelQemuLdst *tcg_out_acqrel_check(TCGContext *s, MemOp memop,
     if (s_bits == MO_8 || a_bits >= s_bits) {
         return NULL;
     }
+    if ((tcg_tso_exp & (TCG_TSO_EXP_PLAIN | TCG_TSO_EXP_NOCHECK))
+        == (TCG_TSO_EXP_PLAIN | TCG_TSO_EXP_NOCHECK)) {
+        /* [EXP] plain accesses can't fault: drop the check */
+        return NULL;
+    }
     tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I32, TCG_REG_TMP0,
                      addr_reg, 15);
     tcg_out_cmp(s, TCG_TYPE_I32, TCG_COND_GTU, TCG_REG_TMP0,
@@ -1925,6 +1937,14 @@ static void tcg_out_qemu_ld_acquire(TCGContext *s, MemOp memop, TCGType ext,
 {
     uint32_t insn;
 
+    if (tcg_tso_exp & TCG_TSO_EXP_PLAIN) {
+        /* [EXP] unsafe: plain load, keeping the crossing check */
+        HostAddress h = {
+            .base = base, .index = TCG_REG_XZR, .index_ext = TCG_TYPE_I64
+        };
+        tcg_out_qemu_ld_direct(s, memop, ext, data_r, h);
+        return;
+    }
     switch (memop & MO_SSIZE) {
     case MO_UB:
         insn = Ildapr_B;
@@ -1973,6 +1993,14 @@ static void tcg_out_qemu_st_release(TCGContext *s, MemOp memop,
 {
     static const uint32_t insn[4] = { Istlr_B, Istlr_H, Istlr_W, Istlr_X };
 
+    if (tcg_tso_exp & TCG_TSO_EXP_PLAIN) {
+        /* [EXP] unsafe: plain store, keeping the crossing check */
+        HostAddress h = {
+            .base = base, .index = TCG_REG_XZR, .index_ext = TCG_TYPE_I64
+        };
+        tcg_out_qemu_st_direct(s, memop, data_r, h);
+        return;
+    }
     tcg_out32(s, insn[memop & MO_SIZE] | base << 5 | data_r);
 }
 
