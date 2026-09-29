@@ -231,6 +231,27 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
     s->tb_size = value;
 }
 
+unsigned tcg_tlb_grow;
+
+static void tcg_get_tlb_grow(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    uint32_t value = tcg_tlb_grow;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void tcg_set_tlb_grow(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    tcg_tlb_grow = value;
+}
+
 static void tcg_get_tso_promote(Object *obj, Visitor *v,
                                 const char *name, void *opaque,
                                 Error **errp)
@@ -373,6 +394,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                    tcg_set_xtcg_stats);
     object_class_property_set_description(oc, "x-stats",
         "xtcg: count TCG events and print them to stderr at exit");
+
+    object_class_property_add(oc, "x-tlb-grow", "uint32",
+        tcg_get_tlb_grow, tcg_set_tlb_grow, NULL, NULL);
+    object_class_property_set_description(oc, "x-tlb-grow",
+        "Grow a softmmu TLB between flushes once it has had this many "
+        "times its size in fills within 100 ms while over 70% used "
+        "(0: resize only at flushes, the default)");
 
     object_class_property_add_bool(oc, "x-pferr-hw",
                                    tcg_get_pferr_hw, tcg_set_pferr_hw);
