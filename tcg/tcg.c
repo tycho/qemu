@@ -106,6 +106,7 @@ struct TCGLabelQemuLdst {
     TCGReg datahi_reg;      /* reg index for high word to be loaded or stored */
     const tcg_insn_unit *raddr;   /* addr of the next IR of qemu_ld/st IR */
     tcg_insn_unit *label_ptr[2]; /* label pointers to be updated */
+    bool fallback;          /* backend-specific out-of-line code, no helper */
     QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 };
 
