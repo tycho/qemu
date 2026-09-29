@@ -71,6 +71,14 @@ G_NORETURN void raise_interrupt(CPUX86State *nenv, int intno, int next_eip_adden
 G_NORETURN void handle_unaligned_access(CPUX86State *env, vaddr vaddr,
                                         MMUAccessType access_type,
                                         uintptr_t retaddr);
+/*
+ * Flags in the third insn_start word (see i386_tr_insn_start):
+ * X86_INSN_RMW: the insn reads and writes its memory operand, so a fault
+ * on the read is reported as a write, as hardware does (x-pferr-hw).
+ */
+#define X86_INSN_RMW 1
+bool x86_insn_is_rmw(CPUState *cs, uintptr_t retaddr);
+
 #ifdef CONFIG_USER_ONLY
 void x86_cpu_record_sigsegv(CPUState *cs, vaddr addr,
                             MMUAccessType access_type,
