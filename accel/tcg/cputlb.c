@@ -293,8 +293,13 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
 {
     CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
     CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
+    size_t old_size = tlb_n_entries(fast);
 
+    xtcg_stat_inc(XS_TLB_FLUSH_IDX);
     tlb_mmu_resize_locked(desc, fast, now);
+    if (tlb_n_entries(fast) != old_size) {
+        xtcg_stat_inc(XS_TLB_RESIZE);
+    }
     tlb_mmu_flush_locked(desc, fast);
 }
 
@@ -1245,6 +1250,9 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
     CPUTLBEntryFull full;
 
     xtcg_stat_inc(XS_TLB_FILL);
+    xtcg_hist_inc(XH_TLB_FILL_BITS,
+                  ctz64(tlb_n_entries(cpu_tlb_fast(cpu, mmu_idx))));
+    xtcg_hist_inc(XH_TLB_FILL_MMUIDX, mmu_idx);
     if (ops->tlb_fill_align) {
         if (ops->tlb_fill_align(cpu, &full, addr, type, mmu_idx,
                                 memop, size, probe, ra)) {

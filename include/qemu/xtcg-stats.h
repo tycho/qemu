@@ -41,6 +41,8 @@ typedef enum XtcgStat {
     /* softmmu TLB and SMC (system mode, CH-06) */
     XS_TLB_VICTIM_HIT,
     XS_TLB_FILL,            /* tlb_fill_align calls (page walks) */
+    XS_TLB_FLUSH_IDX,       /* flushes of one mmu_idx's TLB */
+    XS_TLB_RESIZE,          /* ... that changed its size */
     XS_NOTDIRTY_WRITE,      /* stores taking the TLB_NOTDIRTY slow path */
     XS_NOTDIRTY_CODE,       /* ... whose range still held code */
     /* user-mode SMC (CH-06) */
@@ -65,6 +67,8 @@ typedef enum XtcgHist {
     XH_CC_C_OP,
     XH_CC_NZ_OP,
     XH_EXCP,                /* exception_index, see xtcg_excp_bucket() */
+    XH_TLB_FILL_BITS,       /* log2(TLB entries) of the mmu_idx at a fill */
+    XH_TLB_FILL_MMUIDX,     /* mmu_idx of each fill */
     XH__COUNT
 } XtcgHist;
 
