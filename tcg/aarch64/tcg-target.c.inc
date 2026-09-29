@@ -2081,17 +2081,20 @@ static void tcg_out_qemu_ld_split(TCGContext *s, MemOp memop, TCGType ext,
                                   TCGReg d, TCGReg host)
 {
     MemOp s_bits = memop & MO_SIZE;
+    /* [EXP] unsafe: LDR instead of LDAPR */
+    uint32_t ld = tcg_tso_exp & TCG_TSO_EXP_SPLIT_PLAIN
+                  ? 0xf9400000 /* ldr xt, [xn] */ : Ildapr_X;
 
     tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_TMP1, host,
                  (1 << s_bits) - 1);
     tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I64, TCG_REG_TMP1,
                      TCG_REG_TMP1, ~(uint64_t)7);
-    tcg_out32(s, Ildapr_X | TCG_REG_TMP1 << 5 | TCG_REG_TMP1);
+    tcg_out32(s, ld | TCG_REG_TMP1 << 5 | TCG_REG_TMP1);
     /* tmp0 = (host & 7) * 8 */
     tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_TMP0, host, 64 - 3, 3 - 1);
     /* d may be host: host is not used after this */
     tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I64, d, host, ~(uint64_t)7);
-    tcg_out32(s, Ildapr_X | d << 5 | d);
+    tcg_out32(s, ld | d << 5 | d);
     tcg_out_insn(s, rrr, LSRV, TCG_TYPE_I64, d, d, TCG_REG_TMP0);
     /* lsl tmp1, tmp1, #1 */
     tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_TMP1, TCG_REG_TMP1, 63, 62);

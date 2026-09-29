@@ -48,6 +48,7 @@ extern TCGTsoMode tcg_tso_mode;
 #define TCG_TSO_EXP_ORACLE_ONLY 16  /* no check except x-split-pcs sites:
                                        an unlisted crossing faults */
 #define TCG_TSO_EXP_SPLIT_HALF  32  /* x-split-pcs loads: LDR; DMB ISHLD */
+#define TCG_TSO_EXP_SPLIT_PLAIN 64  /* x-split-pcs split loads with LDR */
 extern unsigned tcg_tso_exp;
 
 /*

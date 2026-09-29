@@ -353,7 +353,8 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "[EXP] unsafe x-tso=acqrel attribution bits: 1 = plain 128-bit, "
         "2 = plain crossing fallback, 4 = LDR/STR with the check, "
         "8 = with 4, no check, 16 = no check outside x-split-pcs, "
-        "32 = x-split-pcs loads as LDR + DMB ISHLD");
+        "32 = x-split-pcs loads as LDR + DMB ISHLD, "
+        "64 = x-split-pcs split loads with LDR (unsafe)");
 
     object_class_property_add_str(oc, "x-split-pcs", tcg_get_split_pcs,
                                   tcg_set_split_pcs);
