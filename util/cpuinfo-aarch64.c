@@ -19,6 +19,12 @@
 # ifndef HWCAP2_CSSC
 #  define HWCAP2_CSSC 0  /* added in glibc 2.38 */
 # endif
+# ifndef HWCAP_LRCPC
+#  define HWCAP_LRCPC 0
+# endif
+# ifndef HWCAP_ILRCPC
+#  define HWCAP_ILRCPC 0
+# endif
 #endif
 #ifdef CONFIG_ELF_AUX_INFO
 #include <sys/auxv.h>
@@ -72,6 +78,8 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= (hwcap & HWCAP_USCAT ? CPUINFO_LSE2 : 0);
     info |= (hwcap & HWCAP_AES ? CPUINFO_AES : 0);
     info |= (hwcap & HWCAP_PMULL ? CPUINFO_PMULL : 0);
+    info |= (hwcap & HWCAP_LRCPC ? CPUINFO_LRCPC : 0);
+    info |= (hwcap & HWCAP_ILRCPC ? CPUINFO_LRCPC2 : 0);
 
     unsigned long hwcap2 = qemu_getauxval(AT_HWCAP2);
     info |= (hwcap2 & HWCAP2_BTI ? CPUINFO_BTI : 0);
@@ -84,6 +92,8 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= sysctl_for_bool("hw.optional.arm.FEAT_PMULL") * CPUINFO_PMULL;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_BTI") * CPUINFO_BTI;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_CSSC") * CPUINFO_CSSC;
+    info |= sysctl_for_bool("hw.optional.arm.FEAT_LRCPC") * CPUINFO_LRCPC;
+    info |= sysctl_for_bool("hw.optional.arm.FEAT_LRCPC2") * CPUINFO_LRCPC2;
 #endif
 #if defined(__OpenBSD__) && !defined(CONFIG_ELF_AUX_INFO)
     int mib[2];
