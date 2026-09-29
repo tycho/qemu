@@ -230,6 +230,27 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
     s->tb_size = value;
 }
 
+static void tcg_get_tso_promote(Object *obj, Visitor *v,
+                                const char *name, void *opaque,
+                                Error **errp)
+{
+    uint32_t value = tcg_tso_promote;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void tcg_set_tso_promote(Object *obj, Visitor *v,
+                                const char *name, void *opaque,
+                                Error **errp)
+{
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    tcg_tso_promote = value;
+}
+
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
@@ -318,6 +339,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Guest memory ordering: barrier (default), "
         "acqrel (load-acquire/store-release accesses), "
         "none (no barriers: unsafe, for measurement)");
+
+    object_class_property_add(oc, "x-tso-promote", "uint32",
+        tcg_get_tso_promote, tcg_set_tso_promote, NULL, NULL);
+    object_class_property_set_description(oc, "x-tso-promote",
+        "With x-tso=acqrel: retranslate a guest insn whose access crossed "
+        "a 16-byte boundary this many times with a branch-free form "
+        "(0: never; default 1)");
 }
 
 static const TypeInfo tcg_accel_type = {
