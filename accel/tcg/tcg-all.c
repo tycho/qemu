@@ -45,6 +45,7 @@
 #include "accel/accel-cpu-ops.h"
 #include "accel/tcg/cpu-ops.h"
 #include "internal-common.h"
+#include "qemu/xtcg-stats.h"
 
 
 struct TCGState {
@@ -303,6 +304,16 @@ static void tcg_set_tso(Object *obj, const char *value, Error **errp)
     error_setg(errp, "Invalid 'x-tso' value: %s", value);
 }
 
+static bool tcg_get_xtcg_stats(Object *obj, Error **errp)
+{
+    return xtcg_stats;
+}
+
+static void tcg_set_xtcg_stats(Object *obj, bool value, Error **errp)
+{
+    xtcg_stats_enable(value);
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -346,6 +357,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "With x-tso=acqrel: retranslate a guest insn whose access crossed "
         "a 16-byte boundary this many times with a branch-free form "
         "(0: never; default 1)");
+
+    object_class_property_add_bool(oc, "x-stats",
+                                   tcg_get_xtcg_stats,
+                                   tcg_set_xtcg_stats);
+    object_class_property_set_description(oc, "x-stats",
+        "xtcg: count TCG events and print them to stderr at exit");
 }
 
 static const TypeInfo tcg_accel_type = {
