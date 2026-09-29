@@ -1666,9 +1666,13 @@ static const TCGLdstHelperParam ldst_helper_param = {
  *   - Both words are touched by the access, so nothing outside the
  *     page(s) it touches is read.  lo is read first, so an access
  *     crossing into a second page faults on the first page first, as
- *     x86 does.  In user mode a fault reports the address of the word,
- *     A & ~7 or (A + size - 1) & ~7, not A: the right page, but not the
- *     exact address.
+ *     x86 does.
+ *   - In user mode a fault is reported at the host address that faulted,
+ *     which for lo would be A & ~7 rather than A.  So first load the
+ *     byte at A (into xzr): if A's page is inaccessible that faults, at
+ *     A.  hi then faults, if at all, at the start of the second page,
+ *     which is where x86 reports it.  (In system mode the softmmu lookup
+ *     already checked the access at A.)
  *   - If the access is within one word, hi is lo: the bits of hi << (64 - s)
  *     are above the access and the extension drops them.  If s is 0 the
  *     access is 8-aligned, and d = lo | lo.
@@ -1684,6 +1688,10 @@ static void tcg_out_qemu_ld_acquire_any(TCGContext *s, MemOp memop,
 {
     MemOp s_bits = memop & MO_SIZE;
 
+    if (!tcg_use_softmmu) {
+        /* ldrb wzr, [host]: fault at the access's address */
+        tcg_out_insn_ldst_uimm(s, Ildst_imm_LDRB, TCG_REG_XZR, host, 0);
+    }
     tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_TMP1, host,
                  (1 << s_bits) - 1);
     tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I64, TCG_REG_TMP1,
