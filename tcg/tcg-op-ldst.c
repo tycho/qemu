@@ -595,7 +595,10 @@ static void tcg_gen_qemu_ld_i128_int(TCGv_i128 val, TCGTemp *addr,
     TCGBar after = 0;
 
     check_max_alignment(memop_alignment_bits(memop));
-    if (tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD)) {
+    if (tcg_tso_exp & TCG_TSO_EXP_SSE_PLAIN
+        && tcg_tso_mode == TCG_TSO_ACQREL) {
+        /* [EXP] unsafe: no ordering for 128-bit loads */
+    } else if (tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD)) {
         /*
          * x-tso=acqrel: this load is not a load-acquire, so order it
          * before later accesses with a barrier after it.  Nothing is
@@ -719,7 +722,10 @@ static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
     TCGTemp *addr_new;
 
     check_max_alignment(memop_alignment_bits(memop));
-    tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
+    if (!(tcg_tso_exp & TCG_TSO_EXP_SSE_PLAIN
+          && tcg_tso_mode == TCG_TSO_ACQREL)) {
+        tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
+    }
 
     /* In serial mode, reduce atomicity. */
     if (!(tcg_ctx->gen_tb->cflags & CF_PARALLEL)) {

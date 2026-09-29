@@ -37,6 +37,15 @@ typedef enum TCGTsoMode {
 
 extern TCGTsoMode tcg_tso_mode;
 
+/*
+ * [EXP] x-tso-exp: UNSAFE attribution experiments for x-tso=acqrel.
+ * Each bit removes one cost; not for merging.
+ */
+#define TCG_TSO_EXP_SSE_PLAIN   1   /* no barriers around 128-bit accesses */
+#define TCG_TSO_EXP_CROSS_PLAIN 2   /* 16-byte-crossing fallback: plain op */
+#define TCG_TSO_EXP_PLAIN       4   /* LDR/STR instead of LDAPR/STLR */
+extern unsigned tcg_tso_exp;
+
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);
 
