@@ -251,6 +251,16 @@ static void tcg_set_tso_promote(Object *obj, Visitor *v,
     tcg_tso_promote = value;
 }
 
+static bool tcg_get_pferr_hw(Object *obj, Error **errp)
+{
+    return tcg_pferr_hw;
+}
+
+static void tcg_set_pferr_hw(Object *obj, bool value, Error **errp)
+{
+    tcg_pferr_hw = value;
+}
+
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
@@ -346,6 +356,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "With x-tso=acqrel: retranslate a guest insn whose access crossed "
         "a 16-byte boundary this many times with a branch-free form "
         "(0: never; default 1)");
+
+    object_class_property_add_bool(oc, "x-pferr-hw",
+                                   tcg_get_pferr_hw, tcg_set_pferr_hw);
+    object_class_property_set_description(oc, "x-pferr-hw",
+        "Report page-fault error codes as hardware does (x86: a "
+        "read-modify-write faults as a write)");
 }
 
 static const TypeInfo tcg_accel_type = {

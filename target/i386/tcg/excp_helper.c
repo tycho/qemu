@@ -24,6 +24,8 @@
 #include "system/runstate.h"
 #include "exec/helper-proto.h"
 #include "helper-tcg.h"
+#include "tcg/startup.h"
+#include "tcg/insn-start-words.h"
 #include "qemu/plugin.h"
 
 G_NORETURN void helper_raise_interrupt(CPUX86State *env, int intno,
@@ -175,3 +177,17 @@ G_NORETURN void handle_unaligned_access(CPUX86State *env, vaddr vaddr,
      */
     raise_exception_ra(env, EXCP0D_GPF, retaddr);
 }
+
+/*
+ * True if the guest insn at host @retaddr reads and writes its memory
+ * operand (X86_INSN_RMW, recorded only with x-pferr-hw).
+ */
+bool x86_insn_is_rmw(CPUState *cs, uintptr_t retaddr)
+{
+    uint64_t data[INSN_START_WORDS];
+
+    return tcg_pferr_hw && retaddr
+           && cpu_unwind_state_data(cs, retaddr, data)
+           && (data[2] & X86_INSN_RMW);
+}
+

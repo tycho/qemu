@@ -242,6 +242,7 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 TCGContext tcg_init_ctx;
 TCGTsoMode tcg_tso_mode;
 unsigned tcg_tso_promote = 1;
+bool tcg_pferr_hw;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
 static QemuMutex tso_cross_lock;
