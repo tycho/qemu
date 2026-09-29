@@ -2122,7 +2122,12 @@ static void tgen_qemu_ld(TCGContext *s, TCGType data_type, TCGReg data_reg,
     HostAddress h;
 
     ldst = prepare_host_addr(s, &h, addr_reg, oi, true);
-    if (acqrel_split(get_memop(oi))) {
+    if (acqrel_split(get_memop(oi))
+        && (tcg_tso_exp & TCG_TSO_EXP_SPLIT_HALF)) {
+        /* [EXP] half barrier: plain load, then order it before later ones */
+        tcg_out_qemu_ld_direct(s, get_memop(oi), data_type, data_reg, h);
+        tcg_out_mb(s, TCG_MO_LD_LD | TCG_MO_LD_ST);
+    } else if (acqrel_split(get_memop(oi))) {
         tcg_out_qemu_ld_split(s, get_memop(oi), data_type, data_reg,
                               tcg_out_host_addr_reg(s, h));
     } else if (get_memop(oi) & MO_ACQ_REL) {
