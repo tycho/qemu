@@ -45,6 +45,8 @@ extern TCGTsoMode tcg_tso_mode;
 #define TCG_TSO_EXP_CROSS_PLAIN 2   /* 16-byte-crossing fallback: plain op */
 #define TCG_TSO_EXP_PLAIN       4   /* LDR/STR instead of LDAPR/STLR */
 #define TCG_TSO_EXP_NOCHECK     8   /* with PLAIN: no crossing check */
+#define TCG_TSO_EXP_ORACLE_ONLY 16  /* no check except x-split-pcs sites:
+                                       an unlisted crossing faults */
 extern unsigned tcg_tso_exp;
 
 /*

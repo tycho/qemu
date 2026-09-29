@@ -1901,6 +1901,10 @@ static TCGLabelQemuLdst *tcg_out_acqrel_check(TCGContext *s, MemOp memop,
         /* [EXP] plain accesses can't fault: drop the check */
         return NULL;
     }
+    if (tcg_tso_exp & TCG_TSO_EXP_ORACLE_ONLY) {
+        /* [EXP] trust x-split-pcs to list every crossing site */
+        return NULL;
+    }
     tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I32, TCG_REG_TMP0,
                      addr_reg, 15);
     tcg_out_cmp(s, TCG_TYPE_I32, TCG_COND_GTU, TCG_REG_TMP0,
