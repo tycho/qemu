@@ -238,6 +238,11 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 
 TCGContext tcg_init_ctx;
 TCGTsoMode tcg_tso_mode;
+
+bool tcg_can_ldst_acqrel(void)
+{
+    return TCG_TARGET_HAS_qemu_ldst_acqrel;
+}
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;

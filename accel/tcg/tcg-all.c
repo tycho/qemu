@@ -258,6 +258,7 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
 
 static const char * const tcg_tso_names[] = {
     [TCG_TSO_BARRIER] = "barrier",
+    [TCG_TSO_ACQREL] = "acqrel",
     [TCG_TSO_NONE] = "none",
 };
 
@@ -270,6 +271,10 @@ static void tcg_set_tso(Object *obj, const char *value, Error **errp)
 {
     for (int i = 0; i < ARRAY_SIZE(tcg_tso_names); i++) {
         if (tcg_tso_names[i] && !strcmp(value, tcg_tso_names[i])) {
+            if (i == TCG_TSO_ACQREL && !tcg_can_ldst_acqrel()) {
+                error_setg(errp, "x-tso=acqrel is not supported on this host");
+                return;
+            }
             tcg_tso_mode = i;
             return;
         }
@@ -311,6 +316,7 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "x-tso", tcg_get_tso, tcg_set_tso);
     object_class_property_set_description(oc, "x-tso",
         "Guest memory ordering: barrier (default), "
+        "acqrel (load-acquire/store-release accesses), "
         "none (no barriers: unsafe, for measurement)");
 }
 
