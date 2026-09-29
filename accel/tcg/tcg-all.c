@@ -230,6 +230,27 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
     s->tb_size = value;
 }
 
+static void tcg_get_tso_promote(Object *obj, Visitor *v,
+                                const char *name, void *opaque,
+                                Error **errp)
+{
+    uint32_t value = tcg_tso_promote;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void tcg_set_tso_promote(Object *obj, Visitor *v,
+                                const char *name, void *opaque,
+                                Error **errp)
+{
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    tcg_tso_promote = value;
+}
+
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
@@ -254,6 +275,32 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
     s->one_insn_per_tb = value;
     /* Set the global also: this changes the behaviour */
     qatomic_set(&one_insn_per_tb, value);
+}
+
+static const char * const tcg_tso_names[] = {
+    [TCG_TSO_BARRIER] = "barrier",
+    [TCG_TSO_ACQREL] = "acqrel",
+    [TCG_TSO_NONE] = "none",
+};
+
+static char *tcg_get_tso(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_tso_names[tcg_tso_mode]);
+}
+
+static void tcg_set_tso(Object *obj, const char *value, Error **errp)
+{
+    for (int i = 0; i < ARRAY_SIZE(tcg_tso_names); i++) {
+        if (tcg_tso_names[i] && !strcmp(value, tcg_tso_names[i])) {
+            if (i == TCG_TSO_ACQREL && !tcg_can_ldst_acqrel()) {
+                error_setg(errp, "x-tso=acqrel is not supported on this host");
+                return;
+            }
+            tcg_tso_mode = i;
+            return;
+        }
+    }
+    error_setg(errp, "Invalid 'x-tso' value: %s", value);
 }
 
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
@@ -286,6 +333,19 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                    tcg_set_one_insn_per_tb);
     object_class_property_set_description(oc, "one-insn-per-tb",
         "Only put one guest insn in each translation block");
+
+    object_class_property_add_str(oc, "x-tso", tcg_get_tso, tcg_set_tso);
+    object_class_property_set_description(oc, "x-tso",
+        "Guest memory ordering: barrier (default), "
+        "acqrel (load-acquire/store-release accesses), "
+        "none (no barriers: unsafe, for measurement)");
+
+    object_class_property_add(oc, "x-tso-promote", "uint32",
+        tcg_get_tso_promote, tcg_set_tso_promote, NULL, NULL);
+    object_class_property_set_description(oc, "x-tso-promote",
+        "With x-tso=acqrel: retranslate a guest insn whose access crossed "
+        "a 16-byte boundary this many times with a branch-free form "
+        "(0: never; default 1)");
 }
 
 static const TypeInfo tcg_accel_type = {

@@ -125,6 +125,20 @@ typedef enum MemOp {
     MO_ATOM_NONE          = 5 << MO_ATOM_SHIFT,
     MO_ATOM_MASK          = 7 << MO_ATOM_SHIFT,
 
+    /*
+     * MO_ACQ_REL: the access itself provides the ordering the guest memory
+     * model requires, instead of a separate barrier: a load is a
+     * load-acquire (RCpc), a store a store-release.  Set by tcg-op-ldst.c
+     * for x-tso=acqrel, only if TCG_TARGET_HAS_qemu_ldst_acqrel.
+     */
+    MO_ACQ_REL = 1 << 12,
+    /*
+     * MO_ACQ_REL_CROSS: with MO_ACQ_REL, this guest instruction has been
+     * seen to cross a 16-byte boundary (x-tso-promote): use a form that
+     * handles any alignment without a data-dependent branch.
+     */
+    MO_ACQ_REL_CROSS = 1 << 13,
+
     /* Combinations of the above, for ease of use.  */
     MO_UB    = MO_8,
     MO_UW    = MO_16,

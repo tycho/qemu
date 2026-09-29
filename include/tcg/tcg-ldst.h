@@ -60,4 +60,16 @@ void helper_stq_mmu(CPUArchState *env, uint64_t addr, uint64_t val,
 void helper_st16_mmu(CPUArchState *env, uint64_t addr, Int128 val,
                      MemOpIdx oi, uintptr_t retaddr);
 
+/*
+ * An MO_ACQ_REL access of guest insn @site crossed a 16-byte boundary
+ * (x-tso-promote): count it, maybe retranslate its TB with the insn
+ * promoted, and perform the access.  Loads return the value
+ * zero-extended, like helper_ld*_mmu above.
+ */
+tcg_target_ulong helper_tso_cross_ld(CPUArchState *env, uint64_t addr,
+                                     MemOpIdx oi, uintptr_t retaddr,
+                                     uint64_t site);
+void helper_tso_cross_st(CPUArchState *env, uint64_t addr, uint64_t val,
+                         MemOpIdx oi, uintptr_t retaddr, uint64_t site);
+
 #endif /* TCG_LDST_H */

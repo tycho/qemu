@@ -25,6 +25,33 @@
 #ifndef TCG_STARTUP_H
 #define TCG_STARTUP_H
 
+/*
+ * How guest memory ordering is implemented for ordinary guest loads and
+ * stores (accel property x-tso).
+ */
+typedef enum TCGTsoMode {
+    TCG_TSO_BARRIER,    /* a barrier before each access (default) */
+    TCG_TSO_ACQREL,     /* load-acquire / store-release accesses */
+    TCG_TSO_NONE,       /* no barriers at all: UNSAFE, for measurement */
+} TCGTsoMode;
+
+extern TCGTsoMode tcg_tso_mode;
+
+/*
+ * x-tso-promote: with x-tso=acqrel, a guest insn whose access has crossed
+ * a 16-byte boundary this many times is retranslated with a branch-free
+ * form (MO_ACQ_REL_CROSS); 0 disables it.
+ */
+extern unsigned tcg_tso_promote;
+
+/* Count one crossing at guest insn @pc; true once it is promoted. */
+bool tcg_tso_cross_count(uint64_t pc);
+/* True if guest insn @pc has been promoted. */
+bool tcg_tso_cross_promoted(uint64_t pc);
+
+/* True if the host backend can emit MO_ACQ_REL accesses. */
+bool tcg_can_ldst_acqrel(void);
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size
