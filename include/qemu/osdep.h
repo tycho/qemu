@@ -845,13 +845,23 @@ size_t qemu_get_host_physmem(void);
  * for the current thread.
  */
 #ifdef __APPLE__
+/* xtcg Phase-1 counters, see qemu/xtcg-stats.h */
+extern bool xtcg_stats;
+void xtcg_stats_jit(bool execute);
+
 static inline void qemu_thread_jit_execute(void)
 {
+    if (unlikely(xtcg_stats)) {
+        xtcg_stats_jit(true);
+    }
     pthread_jit_write_protect_np(true);
 }
 
 static inline void qemu_thread_jit_write(void)
 {
+    if (unlikely(xtcg_stats)) {
+        xtcg_stats_jit(false);
+    }
     pthread_jit_write_protect_np(false);
 }
 #else
