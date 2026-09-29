@@ -2112,6 +2112,53 @@ static void tcg_out_qemu_ld_split(TCGContext *s, MemOp memop, TCGType ext,
     }
 }
 
+/*
+ * [EXP] One-acquire split: a plain LDR of the high word, then an LDAPR of
+ * the low word whose address depends on it (EOR of hi with itself), so
+ * hi is ordered before lo and, through lo's acquire, before every later
+ * access (Armv8 ordered-before is transitive; litmus.py model
+ * acqrel-split1).  Only lo is an acquire.
+ */
+static void tcg_out_qemu_ld_split1(TCGContext *s, MemOp memop, TCGType ext,
+                                   TCGReg d, TCGReg host)
+{
+    MemOp s_bits = memop & MO_SIZE;
+
+    tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_TMP1, host,
+                 (1 << s_bits) - 1);
+    tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I64, TCG_REG_TMP1,
+                     TCG_REG_TMP1, ~(uint64_t)7);
+    tcg_out32(s, 0xf9400000 | TCG_REG_TMP1 << 5 | TCG_REG_TMP1); /* ldr */
+    /* tmp0 = host + (hi ^ hi): host, address-dependent on hi */
+    tcg_out_insn(s, logic_shift, EOR, TCG_TYPE_I64, TCG_REG_TMP0,
+                 TCG_REG_TMP1, TCG_REG_TMP1);
+    tcg_out_insn(s, addsub_shift, ADD, TCG_TYPE_I64, TCG_REG_TMP0,
+                 TCG_REG_TMP0, host);
+    /* d may be host: host is not used after this */
+    tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I64, d, TCG_REG_TMP0,
+                     ~(uint64_t)7);
+    /* tmp0 = (host & 7) * 8 */
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_REG_TMP0, 64 - 3, 3 - 1);
+    tcg_out32(s, Ildapr_X | d << 5 | d);
+    /*
+     * d = lo >> s | hi << (64 - s).  s == 0 only for an 8-aligned access,
+     * whose hi is lo: lo | lo.
+     */
+    tcg_out_insn(s, rrr, LSRV, TCG_TYPE_I64, d, d, TCG_REG_TMP0);
+    tcg_out_insn(s, addsub_shift, SUB, TCG_TYPE_I64,
+                 TCG_REG_TMP0, TCG_REG_XZR, TCG_REG_TMP0);
+    tcg_out_insn(s, rrr, LSLV, TCG_TYPE_I64, TCG_REG_TMP1, TCG_REG_TMP1,
+                 TCG_REG_TMP0);
+    tcg_out_insn(s, logic_shift, ORR, TCG_TYPE_I64, d, d, TCG_REG_TMP1);
+    if (s_bits < MO_64) {
+        if (memop & MO_SIGN) {
+            tcg_out_sxt(s, ext, s_bits, d, d);
+        } else {
+            tcg_out_uxt(s, s_bits, d, d);
+        }
+    }
+}
+
 static bool acqrel_split(MemOp memop)
 {
     return (memop & MO_ACQ_REL_SPLIT) && (memop & MO_SIZE) != MO_8
@@ -2130,6 +2177,10 @@ static void tgen_qemu_ld(TCGContext *s, TCGType data_type, TCGReg data_reg,
         /* [EXP] half barrier: plain load, then order it before later ones */
         tcg_out_qemu_ld_direct(s, get_memop(oi), data_type, data_reg, h);
         tcg_out_mb(s, TCG_MO_LD_LD | TCG_MO_LD_ST);
+    } else if (acqrel_split(get_memop(oi))
+               && (tcg_tso_exp & TCG_TSO_EXP_SPLIT_ONEACQ)) {
+        tcg_out_qemu_ld_split1(s, get_memop(oi), data_type, data_reg,
+                               tcg_out_host_addr_reg(s, h));
     } else if (acqrel_split(get_memop(oi))) {
         tcg_out_qemu_ld_split(s, get_memop(oi), data_type, data_reg,
                               tcg_out_host_addr_reg(s, h));

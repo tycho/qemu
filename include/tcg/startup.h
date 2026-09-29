@@ -49,6 +49,7 @@ extern TCGTsoMode tcg_tso_mode;
                                        an unlisted crossing faults */
 #define TCG_TSO_EXP_SPLIT_HALF  32  /* x-split-pcs loads: LDR; DMB ISHLD */
 #define TCG_TSO_EXP_SPLIT_PLAIN 64  /* x-split-pcs split loads with LDR */
+#define TCG_TSO_EXP_SPLIT_ONEACQ 128 /* split: LDR hi, LDAPR lo dep. on hi */
 extern unsigned tcg_tso_exp;
 
 /*
