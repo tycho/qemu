@@ -11,6 +11,14 @@
 
 #define have_lse    (cpuinfo & CPUINFO_LSE)
 #define have_lse2   (cpuinfo & CPUINFO_LSE2)
+#define have_lrcpc  (cpuinfo & CPUINFO_LRCPC)
+#define have_lrcpc2 (cpuinfo & CPUINFO_LRCPC2)
+
+/*
+ * MO_ACQ_REL guest accesses: LDAPR/STLR.  Unaligned ones rely on FEAT_LSE2
+ * (they must not cross 16 bytes; the backend checks).
+ */
+#define TCG_TARGET_HAS_qemu_ldst_acqrel (have_lrcpc && have_lse2)
 
 /* optional instructions */
 #define TCG_TARGET_HAS_extr_i64_i32     0
