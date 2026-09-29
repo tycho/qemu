@@ -21,6 +21,9 @@
 #include "accel/tcg/cpu-loop.h"
 #include "cpu.h"
 #include "tcg/helper-tcg.h"
+#include "tcg/startup.h"
+#include "exec/page-protection.h"
+#include "user/page-protection.h"
 
 void x86_cpu_record_sigsegv(CPUState *cs, vaddr addr,
                             MMUAccessType access_type,
@@ -36,12 +39,18 @@ void x86_cpu_record_sigsegv(CPUState *cs, vaddr addr,
      * by cpu_loop(), since cpu_exec() clears exception_index before
      * the signal frame is built.
      */
-    if (access_type == MMU_DATA_LOAD && x86_insn_is_rmw(cs, ra)) {
-        access_type = MMU_DATA_STORE;
+    bool present = !maperr;
+
+    if (tcg_pferr_hw) {
+        /* Linux maps a PROT_NONE page not-present. */
+        present = present && (page_get_flags(addr) & PAGE_READ);
+        if (access_type == MMU_DATA_LOAD && x86_insn_is_rmw(cs, ra)) {
+            access_type = MMU_DATA_STORE;
+        }
     }
 
     env->cr[2] = addr;
-    env->error_code = (maperr ? 0 : PG_ERROR_P_MASK)
+    env->error_code = (present ? PG_ERROR_P_MASK : 0)
                     | ((access_type == MMU_DATA_STORE) << PG_ERROR_W_BIT)
                     | PG_ERROR_U_MASK
                     | ((access_type == MMU_INST_FETCH) ? PG_ERROR_I_D_MASK : 0);
