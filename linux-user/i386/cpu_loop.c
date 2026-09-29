@@ -24,6 +24,8 @@
 #include "user/cpu_loop.h"
 #include "signal-common.h"
 #include "user-mmap.h"
+#include "user/page-protection.h"
+#include "tcg/startup.h"
 
 /***********************************************************/
 /* CPUX86 core interface */
@@ -284,6 +286,17 @@ void cpu_loop(CPUX86State *env)
             force_sig(TARGET_SIGSEGV);
             break;
         case EXCP0E_PAGE:
+            if (tcg_pferr_hw) {
+                /*
+                 * P is clear for a PROT_NONE page (x86_cpu_record_sigsegv),
+                 * which is still mapped: SEGV_ACCERR, as on Linux.
+                 */
+                force_sig_fault(TARGET_SIGSEGV,
+                                (page_get_flags(env->cr[2]) & PAGE_VALID ?
+                                 TARGET_SEGV_ACCERR : TARGET_SEGV_MAPERR),
+                                env->cr[2]);
+                break;
+            }
             force_sig_fault(TARGET_SIGSEGV,
                             (env->error_code & PG_ERROR_P_MASK ?
                              TARGET_SEGV_ACCERR : TARGET_SEGV_MAPERR),

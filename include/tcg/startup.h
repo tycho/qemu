@@ -49,6 +49,13 @@ bool tcg_tso_cross_count(uint64_t pc);
 /* True if guest insn @pc has been promoted. */
 bool tcg_tso_cross_promoted(uint64_t pc);
 
+/*
+ * x-pferr-hw: targets report page-fault error codes as hardware does where
+ * TCG's access pattern would differ (x86: the load of a read-modify-write
+ * insn faults as a write; qemu-user: a PROT_NONE page is not present).
+ */
+extern bool tcg_pferr_hw;
+
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);
 
