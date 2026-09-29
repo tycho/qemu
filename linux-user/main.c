@@ -422,6 +422,33 @@ static void handle_arg_tb_size(const char *arg)
     }
 }
 
+/*
+ * Development aid, not for upstream: QEMU_XTCG="k=v,k2=v2" sets the
+ * experimental accelerator properties x-k=v and x-k2=v2 ("k" alone means
+ * "k=on"), so the same binary can run with and without an experimental
+ * TCG change.
+ */
+static void xtcg_set_accel_props(Object *accel)
+{
+    const char *opts = getenv("QEMU_XTCG");
+    g_auto(GStrv) kvs = NULL;
+
+    if (!opts) {
+        return;
+    }
+    kvs = g_strsplit(opts, ",", -1);
+    for (char **kv = kvs; *kv; kv++) {
+        g_auto(GStrv) p = g_strsplit(*kv, "=", 2);
+        g_autofree char *name = NULL;
+
+        if (!p[0] || !*p[0]) {
+            continue;
+        }
+        name = g_strconcat("x-", p[0], NULL);
+        object_property_parse(accel, name, p[1] ? p[1] : "on", &error_fatal);
+    }
+}
+
 static void handle_arg_strace(const char *arg)
 {
     enable_strace = true;
@@ -805,6 +832,7 @@ int main(int argc, char **argv, char **envp)
                                  opt_one_insn_per_tb, &error_abort);
         object_property_set_int(OBJECT(accel), "tb-size",
                                 opt_tb_size, &error_abort);
+        xtcg_set_accel_props(OBJECT(accel));
         ac->init_machine(accel, NULL);
     }
 
