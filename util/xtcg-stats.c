@@ -33,6 +33,8 @@ static const char * const stat_names[XS__COUNT] = {
     [XS_LONGJMP] = "longjmp",
     [XS_TLB_VICTIM_HIT] = "tlb_victim_hit",
     [XS_TLB_FILL] = "tlb_fill",
+    [XS_TLB_FLUSH_IDX] = "tlb_flush_idx",
+    [XS_TLB_RESIZE] = "tlb_resize",
     [XS_NOTDIRTY_WRITE] = "notdirty_write",
     [XS_NOTDIRTY_CODE] = "notdirty_code",
     [XS_PAGE_UNPROTECT] = "page_unprotect",
@@ -52,6 +54,8 @@ static const char * const hist_names[XH__COUNT] = {
     [XH_CC_C_OP] = "cc_compute_c.op",
     [XH_CC_NZ_OP] = "cc_compute_nz.op",
     [XH_EXCP] = "exception_index",
+    [XH_TLB_FILL_BITS] = "tlb_fill.size_bits",
+    [XH_TLB_FILL_MMUIDX] = "tlb_fill.mmu_idx",
 };
 
 static bool dumped;
