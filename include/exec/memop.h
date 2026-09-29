@@ -132,6 +132,8 @@ typedef enum MemOp {
      * for x-tso=acqrel, only if TCG_TARGET_HAS_qemu_ldst_acqrel.
      */
     MO_ACQ_REL = 1 << 12,
+    /* [EXP] with MO_ACQ_REL: branch-free form for a crossing site */
+    MO_ACQ_REL_SPLIT = 1 << 13,
 
     /* Combinations of the above, for ease of use.  */
     MO_UB    = MO_8,

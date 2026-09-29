@@ -299,6 +299,17 @@ static void tcg_set_tso_exp(Object *obj, const char *value, Error **errp)
     tcg_tso_exp = v;
 }
 
+static char *tcg_get_split_pcs(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_split_pcs_path ?: "");
+}
+
+static void tcg_set_split_pcs(Object *obj, const char *value, Error **errp)
+{
+    g_free(tcg_split_pcs_path);
+    tcg_split_pcs_path = g_strdup(value);
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -342,6 +353,11 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "[EXP] unsafe x-tso=acqrel attribution bits: 1 = plain 128-bit, "
         "2 = plain crossing fallback, 4 = LDR/STR with the check, "
         "8 = with 4, no check");
+
+    object_class_property_add_str(oc, "x-split-pcs", tcg_get_split_pcs,
+                                  tcg_set_split_pcs);
+    object_class_property_set_description(oc, "x-split-pcs",
+        "[EXP] file of guest pcs that get the branch-free acqrel form");
 }
 
 static const TypeInfo tcg_accel_type = {

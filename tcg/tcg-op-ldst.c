@@ -159,7 +159,11 @@ static MemOp tcg_gen_ldst_order(TCGBar type)
     }
     if (tcg_tso_mode == TCG_TSO_ACQREL && !(type & TCG_MO_ST_LD)
         && TCG_TARGET_HAS_qemu_ldst_acqrel) {
-        return tcg_mb_emitted() ? MO_ACQ_REL : 0;
+        if (!tcg_mb_emitted()) {
+            return 0;
+        }
+        return MO_ACQ_REL | (tcg_tso_split_pc(tcg_xtcg_insn_pc)
+                             ? MO_ACQ_REL_SPLIT : 0);
     }
     tcg_gen_mb(type | TCG_BAR_SC);
     return 0;

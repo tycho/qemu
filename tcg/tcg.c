@@ -240,6 +240,41 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 TCGContext tcg_init_ctx;
 TCGTsoMode tcg_tso_mode;
 unsigned tcg_tso_exp;
+__thread uint64_t tcg_xtcg_insn_pc;
+
+static GHashTable *tcg_split_pcs;
+char *tcg_split_pcs_path;
+
+static gpointer tcg_split_pcs_load(gpointer unused)
+{
+    const char *path = tcg_split_pcs_path ?: getenv("XTCG_SPLIT_PCS");
+    g_autofree char *text = NULL;
+    GHashTable *h;
+
+    if (!path || !g_file_get_contents(path, &text, NULL, NULL)) {
+        return NULL;
+    }
+    h = g_hash_table_new(g_int64_hash, g_int64_equal);
+    for (char *line = strtok(text, "\n"); line; line = strtok(NULL, "\n")) {
+        uint64_t *pc = g_new(uint64_t, 1);
+
+        if (!strncmp(line, "SITE ", 5)) {
+            line += 5;
+        }
+        *pc = strtoull(line, NULL, 16);
+        g_hash_table_add(h, pc);
+    }
+    fprintf(stderr, "XTCG split pcs: %u\n", g_hash_table_size(h));
+    return h;
+}
+
+bool tcg_tso_split_pc(uint64_t pc)
+{
+    static GOnce once = G_ONCE_INIT;
+
+    tcg_split_pcs = g_once(&once, tcg_split_pcs_load, NULL);
+    return tcg_split_pcs && g_hash_table_contains(tcg_split_pcs, &pc);
+}
 
 bool tcg_can_ldst_acqrel(void)
 {

@@ -47,6 +47,16 @@ extern TCGTsoMode tcg_tso_mode;
 #define TCG_TSO_EXP_NOCHECK     8   /* with PLAIN: no crossing check */
 extern unsigned tcg_tso_exp;
 
+/*
+ * [EXP] crossing-site oracle: guest pcs listed (hex, one per line, an
+ * optional "SITE " prefix) in the file named by x-split-pcs (or the
+ * XTCG_SPLIT_PCS env var) get the branch-free acqrel form.  tcg_xtcg_insn_pc is the pc of the guest insn
+ * being translated.
+ */
+extern __thread uint64_t tcg_xtcg_insn_pc;
+bool tcg_tso_split_pc(uint64_t pc);
+extern char *tcg_split_pcs_path;
+
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);
 

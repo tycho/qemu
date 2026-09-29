@@ -20,6 +20,7 @@
 #endif
 #include "exec/plugin-gen.h"
 #include "tcg/tcg-op-common.h"
+#include "tcg/startup.h"
 #include "internal-common.h"
 #include "disas/disas.h"
 #include "tb-internal.h"
@@ -213,6 +214,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
          * done next -- either exiting this loop or locate the start of
          * the next instruction.
          */
+        tcg_xtcg_insn_pc = db->pc_next;   /* [EXP] crossing-site oracle */
         ops->translate_insn(db, cpu);
 
         /*
