@@ -244,6 +244,7 @@ unsigned tcg_tso_promote = 1;
 bool tcg_pferr_hw;
 bool tcg_ssefp_vec;
 bool tcg_ssefp_native;
+bool tcg_vecld;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
 static QemuMutex tso_cross_lock;
@@ -2513,6 +2514,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return has_type && TCG_TARGET_HAS_bitsel_vec;
     case INDEX_op_cmpsel_vec:
         return has_type && TCG_TARGET_HAS_cmpsel_vec;
+    case INDEX_op_concat_i64_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_concat_vec;
     case INDEX_op_fadd_vec:
     case INDEX_op_fsub_vec:
     case INDEX_op_fmul_vec:
