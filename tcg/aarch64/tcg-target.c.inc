@@ -591,6 +591,9 @@ typedef enum {
     Isimd_copy_INS     = 0x4e001c00,
     Isimd_copy_UMOV    = 0x0e003c00,
 
+    /* FMOV (general), X to D: writes the whole vector register. */
+    Ifmov_DX          = 0x9e670000,
+
     /* AdvSIMD modified immediate */
     Isimd_imm_MOVI     = 0x0f000400,
     Isimd_imm_MVNI     = 0x2f000400,
@@ -923,6 +926,12 @@ static void tcg_out_insn_simd_copy(TCGContext *s, AArch64Insn insn, bool q,
        we can handle both register sets with one function.  */
     tcg_out32(s, insn | q << 30 | (dst_idx << 16) | (src_idx << 11)
               | (rd & 0x1f) | (~rn & 0x20) << 6 | (rn & 0x1f) << 5);
+}
+
+static void tcg_out_insn_fmov(TCGContext *s, AArch64Insn insn,
+                              TCGReg rd, TCGReg rn)
+{
+    tcg_out32(s, insn | (rn & 0x1f) << 5 | (rd & 0x1f));
 }
 
 static void tcg_out_insn_simd_imm(TCGContext *s, AArch64Insn insn, bool q,
@@ -3478,6 +3487,15 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_dupm_vec:
         tcg_out_dupm_vec(s, type, vece, a0, a1, a2);
         break;
+    case INDEX_op_concat_i64_vec:
+        /*
+         * FMOV into element 0, which writes the whole register and so
+         * doesn't depend on its old value, then INS (general) into
+         * element 1 (imm5 = index << 4 | 8).
+         */
+        tcg_out_insn(s, fmov, DX, a0, a1);
+        tcg_out_insn(s, simd_copy, INS, 0, a0, a2, 24, 0);
+        break;
     case INDEX_op_add_vec:
         if (is_scalar) {
             tcg_out_insn(s, rrr_e, ADD, vece, a0, a1, a2);
@@ -3923,6 +3941,9 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_umin_vec:
         return vece < MO_64;
 
+    case INDEX_op_concat_i64_vec:
+        return type == TCG_TYPE_V128 && vece == MO_64;
+
     case INDEX_op_fadd_vec:
     case INDEX_op_fsub_vec:
     case INDEX_op_fmul_vec:
@@ -4098,6 +4119,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I1(w, r);
     case INDEX_op_st_vec:
         return C_O0_I2(w, r);
+    case INDEX_op_concat_i64_vec:
+        return C_O1_I2(w, r, r);
     case INDEX_op_dup_vec:
         return C_O1_I1(w, wr);
     case INDEX_op_or_vec:
