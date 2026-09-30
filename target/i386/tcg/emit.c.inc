@@ -4631,6 +4631,57 @@ static void gen_fcmpord_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
     tcg_gen_orc_vec(vece, d, eq, d);
 }
 
+/* What gen_fp_isnan2_vec uses. */
+static const TCGOpcode fcmp_int_list[] = {
+    INDEX_op_cmp_vec, INDEX_op_shli_vec, 0
+};
+
+/*
+ * The scalar forms.  The negated and the unordered predicates compute
+ * whole vectors (the integer operations raise nothing) and move element 0
+ * into the first operand.
+ */
+static bool gen_fcmp_native_s(DisasContext *s, X86DecodedInsn *decode,
+                              int index)
+{
+    static const TCGCond cond[8] = {
+        TCG_COND_EQ, TCG_COND_LT, TCG_COND_LE, TCG_COND_EQ,
+        TCG_COND_EQ, TCG_COND_LT, TCG_COND_LE, TCG_COND_EQ,
+    };
+    unsigned vece = s->prefix & PREFIX_REPZ ? MO_32 : MO_64;
+    TCGv_vec a, b, d, t;
+
+    if (index >= ARRAY_SIZE(cond) ||
+        !fp_native_s(INDEX_op_fcmps_vec, vece) ||
+        !fp_native_s(INDEX_op_movs_vec, vece) ||
+        !fp_native(fcmp_int_list, vece)) {
+        return false;
+    }
+    a = fp_scalar_operand(decode, 1, vece);
+    b = fp_scalar_operand(decode, 2, vece);
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_fcmps_vec(cond[index], vece, d, a, b);
+    if (index >= 3) {
+        t = tcg_temp_new_vec(TCG_TYPE_V128);
+        switch (index) {
+        case 3: /* unord */
+            gen_fp_isnan2_vec(vece, t, a, b);
+            tcg_gen_andc_vec(vece, t, t, d);
+            break;
+        case 7: /* ord */
+            gen_fp_isnan2_vec(vece, t, a, b);
+            tcg_gen_orc_vec(vece, t, d, t);
+            break;
+        default:
+            tcg_gen_not_vec(vece, t, d);
+            break;
+        }
+        tcg_gen_movs_vec(vece, d, a, t);
+    }
+    fp_scalar_store(decode, d);
+    return true;
+}
+
 /* The SSE predicates; AVX's other 24 go to the helpers. */
 static bool gen_fcmp_native(DisasContext *s, X86DecodedInsn *decode, int index)
 {
@@ -4662,7 +4713,8 @@ static void gen_VCMP(DisasContext *s, X86DecodedInsn *decode)
         s->prefix & PREFIX_REPNZ ? 3 /* sd */ :
         !!(s->prefix & PREFIX_DATA) /* pd */ + (s->vex_l << 2);
 
-    if (gen_fcmp_native(s, decode, index)) {
+    if (fp_scalar(s) ? gen_fcmp_native_s(s, decode, index)
+                     : gen_fcmp_native(s, decode, index)) {
         return;
     }
     gen_helper_cmp_funcs[index][b](tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
