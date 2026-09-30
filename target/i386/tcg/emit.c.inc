@@ -815,6 +815,56 @@ static bool gen_fma_native(DisasContext *s, X86DecodedInsn *decode,
     return true;
 }
 
+/*
+ * The scalar forms.  The host keeps the other elements of the addend, x86
+ * those of the destination (operand 0).
+ */
+static bool gen_fma_native_s(DisasContext *s, X86DecodedInsn *decode,
+                             int a, int b, int c, int flags)
+{
+    unsigned vece = s->vex_w ? MO_64 : MO_32;
+    void (*fn)(unsigned, TCGv_vec, TCGv_vec, TCGv_vec, TCGv_vec);
+    TCGOpcode opc;
+    TCGv_vec v[3], d;
+
+    switch (flags) {
+    case 0:
+        fn = tcg_gen_fmadds_vec;
+        opc = INDEX_op_fmadds_vec;
+        break;
+    case float_muladd_negate_c:
+        fn = tcg_gen_fnmsubs_vec;
+        opc = INDEX_op_fnmsubs_vec;
+        break;
+    case float_muladd_negate_product:
+        fn = tcg_gen_fmsubs_vec;
+        opc = INDEX_op_fmsubs_vec;
+        break;
+    case float_muladd_negate_c | float_muladd_negate_product:
+        fn = tcg_gen_fnmadds_vec;
+        opc = INDEX_op_fnmadds_vec;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    if (!fp_native_s(opc, vece) || !fp_native_s(INDEX_op_movs_vec, vece)) {
+        return false;
+    }
+    for (int i = 0; i < 3; i++) {
+        v[i] = fp_scalar_operand(decode, i, vece);
+    }
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    fn(vece, d, v[c], v[a], v[b]);
+    if (c != 0) {
+        TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_movs_vec(vece, t, v[0], d);
+        d = t;
+    }
+    fp_scalar_store(decode, d);
+    return true;
+}
+
 /* a, b and c are the numbers of the operands of a * b + c. */
 #define FMA_SSE_PACKED(uname, a, b, c, even, odd)                             \
 static void gen_##uname##Px(DisasContext *s, X86DecodedInsn *decode)          \
@@ -840,6 +890,9 @@ static void gen_##uname##Sx(DisasContext *s, X86DecodedInsn *decode)          \
 {                                                                             \
     SSEFunc_0_eppppi fn = s->vex_w ? gen_helper_fma4sd : gen_helper_fma4ss;   \
                                                                               \
+    if (gen_fma_native_s(s, decode, a, b, c, flags)) {                        \
+        return;                                                               \
+    }                                                                         \
     fn(tcg_env, OP_PTR0, op_ptr(decode, a), op_ptr(decode, b),                \
        op_ptr(decode, c),                                                     \
        tcg_constant_i32(flags));                                              \
