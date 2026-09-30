@@ -5036,11 +5036,65 @@ static void gen_VMOVLHPS(DisasContext *s, X86DecodedInsn *decode)
  * Use a gvec move to move everything above the bottom 64 bits.
  */
 
+/*
+ * Scalar moves with x-ssefp=native: write the whole register, as the
+ * scalar operations do.  A later vector load of the register then reads
+ * what one store wrote, or within a TB the host register.
+ * Operand 0 = operand 1 with element 0 replaced by operand 2's.
+ */
+static bool gen_movs_native(DisasContext *s, X86DecodedInsn *decode,
+                            unsigned vece)
+{
+    TCGv_vec a, b, d;
+
+    if (!fp_native_s(INDEX_op_movs_vec, vece)) {
+        return false;
+    }
+    a = fp_scalar_operand(decode, 1, vece);
+    b = fp_scalar_operand(decode, 2, vece);
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_movs_vec(vece, d, a, b);
+    fp_scalar_store(decode, d);
+    return true;
+}
+
+/* The same from memory; without merge, the other elements are zero. */
+static bool gen_movs_native_ld(DisasContext *s, X86DecodedInsn *decode,
+                               unsigned vece, bool merge)
+{
+    TCGv_vec a, b, d;
+
+    if (!fp_native_s(INDEX_op_movs_vec, vece)) {
+        return false;
+    }
+    b = tcg_temp_new_vec(TCG_TYPE_V128);
+    if (vece == MO_32) {
+        TCGv_i32 t = tcg_temp_new_i32();
+
+        tcg_gen_qemu_ld_i32(t, s->A0, s->mem_index, MO_LEUL);
+        tcg_gen_dup_i32_vec(MO_32, b, t);
+    } else {
+        TCGv_i64 t = tcg_temp_new_i64();
+
+        tcg_gen_qemu_ld_i64(t, s->A0, s->mem_index, MO_LEUQ);
+        tcg_gen_dup_i64_vec(MO_64, b, t);
+    }
+    a = merge ? fp_scalar_operand(decode, 1, vece)
+              : tcg_constant_vec(TCG_TYPE_V128, MO_64, 0);
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_movs_vec(vece, d, a, b);
+    fp_scalar_store(decode, d);
+    return true;
+}
+
 static void gen_VMOVLPx(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
     TCGv_i64 t = tcg_temp_new_i64();
 
+    if (gen_movs_native(s, decode, MO_64)) {
+        return;
+    }
     tcg_gen_ld_i64(t, tcg_env, decode->op[2].offset + offsetof(XMMReg, XMM_Q(0)));
     tcg_gen_gvec_mov(MO_64, decode->op[0].offset, decode->op[1].offset, vec_len, vec_len);
     tcg_gen_st_i64(t, tcg_env, decode->op[0].offset + offsetof(XMMReg, XMM_Q(0)));
@@ -5051,6 +5105,9 @@ static void gen_VMOVLPx_ld(DisasContext *s, X86DecodedInsn *decode)
     int vec_len = vector_len(s, decode);
     TCGv_i64 t = tcg_temp_new_i64();
 
+    if (gen_movs_native_ld(s, decode, MO_64, true)) {
+        return;
+    }
     tcg_gen_qemu_ld_i64(t, s->A0, s->mem_index, MO_LEUQ);
     tcg_gen_gvec_mov(MO_64, decode->op[0].offset, decode->op[1].offset, vec_len, vec_len);
     tcg_gen_st_i64(t, OP_PTR0, offsetof(ZMMReg, ZMM_Q(0)));
@@ -5069,6 +5126,9 @@ static void gen_VMOVSD_ld(DisasContext *s, X86DecodedInsn *decode)
     TCGv_i64 zero = tcg_constant_i64(0);
     TCGv_i64 t = tcg_temp_new_i64();
 
+    if (gen_movs_native_ld(s, decode, MO_64, false)) {
+        return;
+    }
     tcg_gen_qemu_ld_i64(t, s->A0, s->mem_index, MO_LEUQ);
     tcg_gen_st_i64(zero, OP_PTR0, offsetof(ZMMReg, ZMM_Q(1)));
     tcg_gen_st_i64(t, OP_PTR0, offsetof(ZMMReg, ZMM_Q(0)));
@@ -5079,6 +5139,9 @@ static void gen_VMOVSS(DisasContext *s, X86DecodedInsn *decode)
     int vec_len = vector_len(s, decode);
     TCGv_i32 tmp = tcg_temp_new_i32();
 
+    if (gen_movs_native(s, decode, MO_32)) {
+        return;
+    }
     tcg_gen_ld_i32(tmp, OP_PTR2, offsetof(ZMMReg, ZMM_L(0)));
     tcg_gen_gvec_mov(MO_64, decode->op[0].offset, decode->op[1].offset, vec_len, vec_len);
     tcg_gen_st_i32(tmp, OP_PTR0, offsetof(ZMMReg, ZMM_L(0)));
@@ -5089,6 +5152,9 @@ static void gen_VMOVSS_ld(DisasContext *s, X86DecodedInsn *decode)
     int vec_len = vector_len(s, decode);
     TCGv_i32 tmp = tcg_temp_new_i32();
 
+    if (gen_movs_native_ld(s, decode, MO_32, false)) {
+        return;
+    }
     tcg_gen_qemu_ld_i32(tmp, s->A0, s->mem_index, MO_LEUL);
     tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset, vec_len, vec_len, 0);
     tcg_gen_st_i32(tmp, OP_PTR0, offsetof(ZMMReg, ZMM_L(0)));
