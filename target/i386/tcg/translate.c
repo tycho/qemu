@@ -32,6 +32,7 @@
 #include "exec/helper-gen.h"
 #include "helper-tcg.h"
 #include "decode-new.h"
+#include "tcg/startup.h"
 
 #include "exec/log.h"
 
