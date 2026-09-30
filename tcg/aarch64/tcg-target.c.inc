@@ -682,6 +682,8 @@ typedef enum {
 
     /* AdvSIMD two-reg misc, floating point: as for three same. */
     Iqrr_e_FSQRT      = 0x2ea1f800,
+    Iqrr_e_FRECPE     = 0x0ea1d800,
+    Iqrr_e_FRSQRTE    = 0x2ea1d800,
     Iqrr_e_FNEG       = 0x2ea0f800,
     Iqrr_e_SCVTF      = 0x0e21d800,
     Iqrr_e_FCVTZS     = 0x0ea1b800,
@@ -700,6 +702,9 @@ typedef enum {
     Ifp_rr_FSQRT      = 0x1e21c000,
     Ifp_rr_FCVT_SD    = 0x1e22c000,     /* single to double */
     Ifp_rr_FCVT_DS    = 0x1e624000,     /* double to single */
+    /* Advanced SIMD scalar, with the size in the same bit as the type. */
+    Ifp_rr_FRECPE     = 0x5ea1d800,
+    Ifp_rr_FRSQRTE    = 0x7ea1d800,
     Ifp_rrrr_FMADD    = 0x1f000000,
     Ifp_rrrr_FMSUB    = 0x1f008000,
     Ifp_rrrr_FNMADD   = 0x1f200000,
@@ -3523,6 +3528,12 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_fsqrt_vec:
         tcg_out_insn(s, qrr_e, FSQRT, is_q, fsz, a0, a1);
         break;
+    case INDEX_op_frecpe_vec:
+        tcg_out_insn(s, qrr_e, FRECPE, is_q, fsz, a0, a1);
+        break;
+    case INDEX_op_frsqrte_vec:
+        tcg_out_insn(s, qrr_e, FRSQRTE, is_q, fsz, a0, a1);
+        break;
     case INDEX_op_fneg_vec:
         tcg_out_insn(s, qrr_e, FNEG, is_q, fsz, a0, a1);
         break;
@@ -3590,6 +3601,12 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         break;
     case INDEX_op_fsqrts_vec:
         tcg_out_insn(s, fp_rr, FSQRT, fsz, a0, a2);
+        break;
+    case INDEX_op_frecpes_vec:
+        tcg_out_insn(s, fp_rr, FRECPE, fsz, a0, a2);
+        break;
+    case INDEX_op_frsqrtes_vec:
+        tcg_out_insn(s, fp_rr, FRSQRTE, fsz, a0, a2);
         break;
     case INDEX_op_fcvts_vec:
         if (vece == MO_64) {
@@ -3738,6 +3755,17 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return type == TCG_TYPE_V128 && vece >= MO_32
                && (cpuinfo & CPUINFO_AFP);
 
+    case INDEX_op_frecpe_vec:
+    case INDEX_op_frsqrte_vec:
+    case INDEX_op_frecpes_vec:
+    case INDEX_op_frsqrtes_vec:
+        /*
+         * With FPCR.AH, FEAT_RPRES gives single precision a 12-bit
+         * estimate (relative error below 2^-11.5); without it, 8 bits.
+         */
+        return type == TCG_TYPE_V128 && vece == MO_32
+               && (cpuinfo & CPUINFO_AFP) && (cpuinfo & CPUINFO_RPRES);
+
     default:
         return 0;
     }
@@ -3858,6 +3886,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fnmsubs_vec:
         return C_O1_I3(w, w, w, w);
     case INDEX_op_fsqrts_vec:
+    case INDEX_op_frecpes_vec:
+    case INDEX_op_frsqrtes_vec:
     case INDEX_op_fcvts_vec:
     case INDEX_op_movs_vec:
         return C_O1_I2(w, 0, w);
@@ -3868,6 +3898,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fcvtzsi_vec:
         return C_O1_I1(r, w);
     case INDEX_op_fsqrt_vec:
+    case INDEX_op_frecpe_vec:
+    case INDEX_op_frsqrte_vec:
     case INDEX_op_fneg_vec:
     case INDEX_op_scvtf_vec:
     case INDEX_op_fcvtzs_vec:
