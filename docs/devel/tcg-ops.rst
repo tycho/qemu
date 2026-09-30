@@ -996,6 +996,57 @@ result of each operation must be used.
      - | Round to an integral value in floating-point format, in the
          current rounding mode, signaling inexact.
 
+The scalar operations work on element 0 of a 128-bit vector.  The other
+elements of *v0* are those of *v1*.
+
+.. list-table::
+
+   * - fadds_vec *v0*, *v1*, *v2*
+
+       fsubs_vec *v0*, *v1*, *v2*
+
+       fmuls_vec *v0*, *v1*, *v2*
+
+       fdivs_vec *v0*, *v1*, *v2*
+
+       fmins_vec *v0*, *v1*, *v2*
+
+       fmaxs_vec *v0*, *v1*, *v2*
+
+     - | *v0*\ [0] = *v1*\ [0] op *v2*\ [0].
+
+   * - fsqrts_vec *v0*, *v1*, *v2*
+
+     - | *v0*\ [0] = sqrt(*v2*\ [0]).
+
+   * - fmadds_vec *v0*, *v1*, *v2*, *v3*
+
+       fmsubs_vec *v0*, *v1*, *v2*, *v3*
+
+       fnmadds_vec *v0*, *v1*, *v2*, *v3*
+
+       fnmsubs_vec *v0*, *v1*, *v2*, *v3*
+
+     - | Fused: *v0*\ [0] = *v1*\ [0] + *v2*\ [0] * *v3*\ [0];
+         *v1*\ [0] - *v2*\ [0] * *v3*\ [0];
+         -*v1*\ [0] - *v2*\ [0] * *v3*\ [0];
+         -*v1*\ [0] + *v2*\ [0] * *v3*\ [0].
+
+   * - fcmps_vec *v0*, *v1*, *v2*, *cond*
+
+     - | *v0*\ [0] = *v1*\ [0] *cond* *v2*\ [0] ? -1 : 0, for EQ (quiet),
+         LT or LE (signaling).
+
+   * - fcvts_vec *v0*, *v1*, *v2*
+
+     - | Convert between single and double precision: *v0*\ [0], of the
+         size ``TCGOP_VECE``, is *v2*\ [0] of the other size.  Only the
+         bits of *v0* above the result are those of *v1*.
+
+   * - movs_vec *v0*, *v1*, *v2*
+
+     - | *v0*\ [0] = *v2*\ [0], with no floating-point processing.
+
 **Note 1**: Some shortcuts are defined when the last operand is known to be
 a constant (e.g. addi for add, movi for mov).
 
