@@ -2020,6 +2020,7 @@ float64_muladd_scalbn(float64 a, float64 b, float64 c,
 }
 
 bool float_force_soft_fma;
+bool float_force_soft;
 
 float32 QEMU_FLATTEN
 float32_muladd(float32 xa, float32 xb, float32 xc, int flags, float_status *s)
@@ -4181,7 +4182,7 @@ float32_hs_compare(float32 xa, float32 xb, float_status *s, bool is_quiet)
     ua.s = xa;
     ub.s = xb;
 
-    if (QEMU_NO_HARDFLOAT) {
+    if (QEMU_NO_HARDFLOAT || float_force_soft) {
         goto soft;
     }
 
@@ -4234,7 +4235,7 @@ float64_hs_compare(float64 xa, float64 xb, float_status *s, bool is_quiet)
     ua.s = xa;
     ub.s = xb;
 
-    if (QEMU_NO_HARDFLOAT) {
+    if (QEMU_NO_HARDFLOAT || float_force_soft) {
         goto soft;
     }
 

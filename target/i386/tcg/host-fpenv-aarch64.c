@@ -22,6 +22,8 @@
 #include "host/fpenv.h"
 #include "host-fpenv.h"
 
+extern bool float_force_soft;
+
 static uint64_t guest_fpcr(uint32_t mxcsr)
 {
     /* x86 RC: nearest, down, up, zero; FPCR.RMode: nearest, up, down, zero. */
@@ -34,6 +36,10 @@ static uint64_t guest_fpcr(uint32_t mxcsr)
     }
     if (mxcsr & 0x0040) {
         fpcr |= HOST_FPCR_FIZ;
+    }
+    if (float_force_soft) {
+        /* [DEV] Trap every host FP exception: none is the guest's. */
+        fpcr |= 0x9f00;
     }
     return fpcr;
 }

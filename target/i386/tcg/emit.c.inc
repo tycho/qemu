@@ -537,9 +537,12 @@ static void gen_3dnow(DisasContext *s, X86DecodedInsn *decode)
  * x86's result and raises x86's flags.  Each function returns false, with
  * nothing emitted, when the instruction has to go to its helper.
  */
+extern bool float_force_soft;
+
 static bool fp_native(const TCGOpcode *list, unsigned vece)
 {
-    return tcg_ssefp_native &&
+    /* [DEV] x-ssefp=audit: keep the helpers, which then use softfloat only. */
+    return tcg_ssefp_native && !float_force_soft &&
            tcg_can_emit_vecop_list(list, TCG_TYPE_V128, vece);
 }
 
@@ -580,7 +583,7 @@ static bool gen_fp_native_3(DisasContext *s, X86DecodedInsn *decode,
  */
 static bool fp_native_s(TCGOpcode opc, unsigned vece)
 {
-    return tcg_ssefp_native &&
+    return tcg_ssefp_native && !float_force_soft &&
            tcg_can_emit_vec_op(opc, TCG_TYPE_V128, vece) > 0;
 }
 

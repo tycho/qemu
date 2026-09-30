@@ -28,11 +28,17 @@
  * nearest even, which is what the host uses.  -ffast-math breaks the exact
  * IEEE behaviour it needs.
  */
+/* [DEV] x-ssefp=audit: never use the host FPU. */
+extern bool float_force_soft;
+
 static inline bool float_inexact_set(const float_status *s)
 {
 #if defined(__FAST_MATH__)
     return false;
 #else
+    if (unlikely(float_force_soft)) {
+        return false;
+    }
     return s->float_exception_flags & float_flag_inexact;
 #endif
 }

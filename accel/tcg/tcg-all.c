@@ -29,6 +29,7 @@
 #include "exec/icount.h"
 #include "tcg/startup.h"
 #include "host/fpenv.h"
+extern bool float_force_soft;
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/accel.h"
@@ -309,10 +310,12 @@ static char *tcg_get_ssefp(Object *obj, Error **errp)
 
 static void tcg_set_ssefp(Object *obj, const char *value, Error **errp)
 {
-    if (!strcmp(value, "native")) {
+    if (!strcmp(value, "native") || !strcmp(value, "audit")) {
         /* Hosts that can't take the guest's FP mode get "vec". */
         tcg_ssefp_native = host_fpenv_native();
         tcg_ssefp_vec = !tcg_ssefp_native;
+        /* [DEV] audit: native, but no guest FP on the host FPU, and traps. */
+        float_force_soft = !strcmp(value, "audit");
     } else if (!strcmp(value, "vec")) {
         tcg_ssefp_vec = true;
         tcg_ssefp_native = false;
