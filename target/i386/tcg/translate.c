@@ -2121,6 +2121,29 @@ static inline void gen_stq_env_A0(DisasContext *s, int offset)
     tcg_gen_qemu_st_i64(t, s->A0, s->mem_index, MO_LEUQ);
 }
 
+/*
+ * Store a 128-bit value loaded from guest memory to CPU state.  With
+ * x-vecld, put it together in a host vector register and store it in one
+ * piece: a following vector load of the same bytes then finds one store
+ * to forward from (in the TB, TCG uses the register directly), where two
+ * 64-bit stores would make some hosts wait.
+ */
+static void gen_st_i128_env(TCGv_i128 t, int offset)
+{
+    if (tcg_vecld &&
+        tcg_can_emit_vec_op(INDEX_op_concat_i64_vec, TCG_TYPE_V128, MO_64)) {
+        TCGv_i64 lo = tcg_temp_new_i64();
+        TCGv_i64 hi = tcg_temp_new_i64();
+        TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_extr_i128_i64(lo, hi, t);
+        tcg_gen_concat_i64_vec(v, lo, hi);
+        tcg_gen_st_vec(v, tcg_env, offset);
+    } else {
+        tcg_gen_st_i128(t, tcg_env, offset);
+    }
+}
+
 static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align)
 {
     MemOp atom = (s->cpuid_ext_features & CPUID_EXT_AVX
@@ -2130,7 +2153,7 @@ static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align)
     TCGv_i128 t = tcg_temp_new_i128();
 
     tcg_gen_qemu_ld_i128(t, s->A0, mem_index, mop);
-    tcg_gen_st_i128(t, tcg_env, offset);
+    gen_st_i128_env(t, offset);
 }
 
 static inline void gen_sto_env_A0(DisasContext *s, int offset, bool align)
@@ -2157,8 +2180,8 @@ static void gen_ldy_env_A0(DisasContext *s, int offset, bool align)
     tcg_gen_addi_tl(a0_hi, s->A0, 16);
     tcg_gen_qemu_ld_i128(t1, a0_hi, mem_index, mop);
 
-    tcg_gen_st_i128(t0, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));
-    tcg_gen_st_i128(t1, tcg_env, offset + offsetof(YMMReg, YMM_X(1)));
+    gen_st_i128_env(t0, offset + offsetof(YMMReg, YMM_X(0)));
+    gen_st_i128_env(t1, offset + offsetof(YMMReg, YMM_X(1)));
 }
 
 static void gen_sty_env_A0(DisasContext *s, int offset, bool align)

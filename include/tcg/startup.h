@@ -71,6 +71,13 @@ extern bool tcg_ssefp_vec;
  */
 extern bool tcg_ssefp_native;
 
+/*
+ * x-vecld: a guest vector load puts the loaded value in a host vector
+ * register (when the backend can build one from general registers), so
+ * that it is stored to CPU state in one piece.
+ */
+extern bool tcg_vecld;
+
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);
 

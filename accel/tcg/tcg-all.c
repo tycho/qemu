@@ -302,6 +302,16 @@ static void tcg_set_pferr_hw(Object *obj, bool value, Error **errp)
     tcg_pferr_hw = value;
 }
 
+static bool tcg_get_vecld(Object *obj, Error **errp)
+{
+    return tcg_vecld;
+}
+
+static void tcg_set_vecld(Object *obj, bool value, Error **errp)
+{
+    tcg_vecld = value;
+}
+
 static char *tcg_get_ssefp(Object *obj, Error **errp)
 {
     return g_strdup(tcg_ssefp_native ? "native" :
@@ -484,6 +494,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "macOS MAP_JIT write/execute toggles: always (default) or lazy "
         "(skip the calls that wouldn't change the thread's mode); "
         "no effect on other hosts");
+
+    object_class_property_add_bool(oc, "x-vecld",
+                                   tcg_get_vecld, tcg_set_vecld);
+    object_class_property_set_description(oc, "x-vecld",
+        "Build guest vector loads in a host vector register instead of "
+        "storing them to CPU state in pieces");
 
     object_class_property_add_bool(oc, "x-pferr-hw",
                                    tcg_get_pferr_hw, tcg_set_pferr_hw);
