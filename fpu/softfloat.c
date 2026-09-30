@@ -84,6 +84,7 @@ this code that are retained.
 #include "qemu/bitops.h"
 #include "fpu/softfloat.h"
 #include "fpu/softfloat-vec.h"
+#include "qemu/xtcg-stats.h"
 #include "fpu/softfloat-parts.h"
 
 /* We only need stdlib for abort() */
@@ -234,6 +235,12 @@ static inline bool can_use_fpu(const float_status *s)
     return float_hardfloat_ok(s);
 }
 
+/* [DEV] x-stats: why a scalar op is about to take the soft path. */
+static inline void sf_stat_nofpu(const float_status *s)
+{
+    xtcg_stat_inc(float_inexact_set(s) ? XS_SF_SOFT_RC : XS_SF_SOFT_PE);
+}
+
 /*
  * Hardfloat generation functions. Each operation can have two flavors:
  * either using softfloat primitives (e.g. float32_is_zero_or_normal) for
@@ -343,11 +350,13 @@ float32_gen2(float32 xa, float32 xb, float_status *s,
     ub.s = xb;
 
     if (unlikely(!can_use_fpu(s))) {
+        sf_stat_nofpu(s);
         goto soft;
     }
 
     float32_input_flush2(&ua.s, &ub.s, s);
     if (unlikely(!pre(ua, ub))) {
+        xtcg_stat_inc(XS_SF_SOFT_INPUT);
         goto soft;
     }
 
@@ -355,8 +364,10 @@ float32_gen2(float32 xa, float32 xb, float_status *s,
     if (unlikely(f32_is_inf(ur))) {
         float_raise(float_flag_overflow, s);
     } else if (unlikely(fabsf(ur.h) <= FLT_MIN) && post(ua, ub)) {
+        xtcg_stat_inc(XS_SF_SOFT_RESULT);
         goto soft;
     }
+    xtcg_stat_inc(XS_SF_HARD);
     return ur.s;
 
  soft:
@@ -374,11 +385,13 @@ float64_gen2(float64 xa, float64 xb, float_status *s,
     ub.s = xb;
 
     if (unlikely(!can_use_fpu(s))) {
+        sf_stat_nofpu(s);
         goto soft;
     }
 
     float64_input_flush2(&ua.s, &ub.s, s);
     if (unlikely(!pre(ua, ub))) {
+        xtcg_stat_inc(XS_SF_SOFT_INPUT);
         goto soft;
     }
 
@@ -386,8 +399,10 @@ float64_gen2(float64 xa, float64 xb, float_status *s,
     if (unlikely(f64_is_inf(ur))) {
         float_raise(float_flag_overflow, s);
     } else if (unlikely(fabs(ur.h) <= DBL_MIN) && post(ua, ub)) {
+        xtcg_stat_inc(XS_SF_SOFT_RESULT);
         goto soft;
     }
+    xtcg_stat_inc(XS_SF_HARD);
     return ur.s;
 
  soft:
