@@ -244,6 +244,7 @@ unsigned tcg_tso_promote = 1;
 bool tcg_pferr_hw;
 bool tcg_ssefp_vec;
 bool tcg_ssefp_native;
+bool tcg_vecld;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
 static QemuMutex tso_cross_lock;
