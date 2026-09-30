@@ -2544,6 +2544,9 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fcmps_vec:
     case INDEX_op_fcvts_vec:
     case INDEX_op_movs_vec:
+    case INDEX_op_fcmp3_vec:
+    case INDEX_op_scvtfs_vec:
+    case INDEX_op_fcvtzsi_vec:
         return has_type && TCG_TARGET_HAS_fp_vec;
 
     default:
