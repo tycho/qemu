@@ -2470,6 +2470,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_qemu_ld_vec:
     case INDEX_op_qemu_st_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_qemu_ldst_vec;
+    case INDEX_op_perm_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_perm_vec;
 
     default:
         if (op < INDEX_op_last_generic) {
