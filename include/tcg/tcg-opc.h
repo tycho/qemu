@@ -186,6 +186,22 @@ DEF(cmp_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(bitsel_vec, 1, 3, 0, TCG_OPF_VECTOR)
 DEF(cmpsel_vec, 1, 4, 1, TCG_OPF_VECTOR)
 
+/* Host floating point, in the host's FP environment. */
+DEF(fadd_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fsub_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fmul_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fdiv_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fmin_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fmax_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fsqrt_vec, 1, 1, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fneg_vec, 1, 1, 0, TCG_OPF_VECTOR)
+DEF(fmla_vec, 1, 3, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fmls_vec, 1, 3, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fcmp_vec, 1, 2, 1, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(scvtf_vec, 1, 1, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fcvtzs_vec, 1, 1, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(frintx_vec, 1, 1, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 
 #include "tcg-target-opc.h.inc"
