@@ -4936,8 +4936,64 @@ static void gen_VCVTSx2SI(DisasContext *s, X86DecodedInsn *decode)
                    gen_helper_cvtsd2si, gen_helper_cvtsd2sq);
 }
 
+/*
+ * CVTTSS2SI/CVTTSD2SI with x-ssefp=native: the host's conversion rounds
+ * toward zero too.  x86 returns the "integer indefinite" (the most
+ * negative value) where the input is a NaN or out of range; the host gives
+ * 0 or saturates.  So take the indefinite value wherever the input's
+ * magnitude, tested as an integer, is at least 2^31 (2^63): that is every
+ * NaN, infinity and overflow, and -2^31 (-2^63), whose result is the same
+ * value anyway.
+ */
+static bool gen_cvttsx2si_native(DisasContext *s, X86DecodedInsn *decode)
+{
+    unsigned vece = s->prefix & PREFIX_REPNZ ? MO_64 : MO_32;
+    X86DecodedOp *op = &decode->op[2];
+    bool is64 = false;
+    TCGv_vec a;
+    TCGv_i64 bits, r;
+    uint64_t limit;
+    int ofs;
+
+#ifdef TARGET_X86_64
+    is64 = decode->op[0].ot == MO_64;
+#endif
+    if (!fp_native_s(INDEX_op_fcvtzsi_vec, vece)) {
+        return false;
+    }
+    a = fp_scalar_operand(decode, 2, vece);
+    bits = tcg_temp_new_i64();
+    r = tcg_temp_new_i64();
+    if (is64) {
+        tcg_gen_fcvtzsi_i64_vec(vece, r, a);
+    } else {
+        TCGv_i32 t = tcg_temp_new_i32();
+
+        tcg_gen_fcvtzsi_i32_vec(vece, t, a);
+        tcg_gen_extu_i32_i64(r, t);
+    }
+
+    ofs = op->has_ea ? op->offset : ZMM_OFFSET(op->n) + xmm_offset(vece);
+    if (vece == MO_64) {
+        tcg_gen_ld_i64(bits, tcg_env, ofs);
+        tcg_gen_andi_i64(bits, bits, INT64_MAX);
+        limit = is64 ? 0x43e0000000000000ull : 0x41e0000000000000ull;
+    } else {
+        tcg_gen_ld32u_i64(bits, tcg_env, ofs);
+        tcg_gen_andi_i64(bits, bits, INT32_MAX);
+        limit = is64 ? 0x5f000000 : 0x4f000000;
+    }
+    tcg_gen_movcond_i64(TCG_COND_GEU, r, bits, tcg_constant_i64(limit),
+                        tcg_constant_i64(is64 ? INT64_MIN : 0x80000000u), r);
+    tcg_gen_trunc_i64_tl(s->T0, r);
+    return true;
+}
+
 static void gen_VCVTTSx2SI(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (gen_cvttsx2si_native(s, decode)) {
+        return;
+    }
     gen_VCVTtSx2SI(s, decode,
                    gen_helper_cvttss2si, gen_helper_cvttss2sq,
                    gen_helper_cvttsd2si, gen_helper_cvttsd2sq);
