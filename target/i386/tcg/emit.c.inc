@@ -4392,6 +4392,102 @@ static const SSEFunc_0_eppp gen_helper_cmp_funcs[32][6] = {
 };
 #undef SSE_CMP
 
+/* d = a or b is a NaN, by integer tests, which raise no exception. */
+static void gen_fp_isnan2_vec(unsigned vece, TCGv_vec d,
+                              TCGv_vec a, TCGv_vec b)
+{
+    TCGv_vec t = tcg_temp_new_vec_matching(d);
+    TCGv_vec inf2 = tcg_constant_vec_matching(d, vece,
+                                              vece == MO_32 ? 0xff000000u
+                                              : 0xffe0000000000000ull);
+
+    tcg_gen_shli_vec(vece, t, a, 1);
+    tcg_gen_cmp_vec(TCG_COND_GTU, vece, t, t, inf2);
+    tcg_gen_shli_vec(vece, d, b, 1);
+    tcg_gen_cmp_vec(TCG_COND_GTU, vece, d, d, inf2);
+    tcg_gen_or_vec(vece, d, d, t);
+}
+
+static void gen_fcmpeq_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_fcmp_vec(TCG_COND_EQ, vece, d, a, b);
+}
+
+static void gen_fcmplt_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_fcmp_vec(TCG_COND_LT, vece, d, a, b);
+}
+
+static void gen_fcmple_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_fcmp_vec(TCG_COND_LE, vece, d, a, b);
+}
+
+static void gen_fcmpneq_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_fcmp_vec(TCG_COND_EQ, vece, d, a, b);
+    tcg_gen_not_vec(vece, d, d);
+}
+
+static void gen_fcmpnlt_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_fcmp_vec(TCG_COND_LT, vece, d, a, b);
+    tcg_gen_not_vec(vece, d, d);
+}
+
+static void gen_fcmpnle_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_fcmp_vec(TCG_COND_LE, vece, d, a, b);
+    tcg_gen_not_vec(vece, d, d);
+}
+
+/*
+ * Unordered and ordered: the quiet compare raises the exceptions, and is
+ * false when the operands are unordered, so folding its result in doesn't
+ * change the answer of the integer test but keeps the compare alive.
+ */
+static void gen_fcmpunord_vec(unsigned vece, TCGv_vec d,
+                              TCGv_vec a, TCGv_vec b)
+{
+    TCGv_vec eq = tcg_temp_new_vec_matching(d);
+
+    tcg_gen_fcmp_vec(TCG_COND_EQ, vece, eq, a, b);
+    gen_fp_isnan2_vec(vece, d, a, b);
+    tcg_gen_andc_vec(vece, d, d, eq);
+}
+
+static void gen_fcmpord_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    TCGv_vec eq = tcg_temp_new_vec_matching(d);
+
+    tcg_gen_fcmp_vec(TCG_COND_EQ, vece, eq, a, b);
+    gen_fp_isnan2_vec(vece, d, a, b);
+    tcg_gen_orc_vec(vece, d, eq, d);
+}
+
+/* The SSE predicates; AVX's other 24 go to the helpers. */
+static bool gen_fcmp_native(DisasContext *s, X86DecodedInsn *decode, int index)
+{
+    FP_NATIVE_GVEC(GVecGen3, eq, gen_fcmpeq_vec, INDEX_op_fcmp_vec);
+    FP_NATIVE_GVEC(GVecGen3, lt, gen_fcmplt_vec, INDEX_op_fcmp_vec);
+    FP_NATIVE_GVEC(GVecGen3, le, gen_fcmple_vec, INDEX_op_fcmp_vec);
+    FP_NATIVE_GVEC(GVecGen3, unord, gen_fcmpunord_vec, INDEX_op_fcmp_vec,
+                   INDEX_op_cmp_vec, INDEX_op_shli_vec);
+    FP_NATIVE_GVEC(GVecGen3, neq, gen_fcmpneq_vec, INDEX_op_fcmp_vec);
+    FP_NATIVE_GVEC(GVecGen3, nlt, gen_fcmpnlt_vec, INDEX_op_fcmp_vec);
+    FP_NATIVE_GVEC(GVecGen3, nle, gen_fcmpnle_vec, INDEX_op_fcmp_vec);
+    FP_NATIVE_GVEC(GVecGen3, ord, gen_fcmpord_vec, INDEX_op_fcmp_vec,
+                   INDEX_op_cmp_vec, INDEX_op_shli_vec);
+    static const GVecGen3 * const g[8] = {
+        eq, lt, le, unord, neq, nlt, nle, ord
+    };
+
+    if (index >= ARRAY_SIZE(g) || fp_scalar(s)) {
+        return false;
+    }
+    return gen_fp_native_3(s, decode, &g[index][!!(s->prefix & PREFIX_DATA)]);
+}
+
 static void gen_VCMP(DisasContext *s, X86DecodedInsn *decode)
 {
     int index = decode->immediate & (s->prefix & PREFIX_VEX ? 31 : 7);
@@ -4400,6 +4496,9 @@ static void gen_VCMP(DisasContext *s, X86DecodedInsn *decode)
         s->prefix & PREFIX_REPNZ ? 3 /* sd */ :
         !!(s->prefix & PREFIX_DATA) /* pd */ + (s->vex_l << 2);
 
+    if (gen_fcmp_native(s, decode, index)) {
+        return;
+    }
     gen_helper_cmp_funcs[index][b](tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
