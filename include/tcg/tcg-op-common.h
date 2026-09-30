@@ -495,6 +495,28 @@ void tcg_gen_rotrv_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec s);
 void tcg_gen_cmp_vec(TCGCond cond, unsigned vece, TCGv_vec r,
                      TCGv_vec a, TCGv_vec b);
 
+/*
+ * Host floating point on MO_32 or MO_64 elements, in the host's FP
+ * environment.  There are no fallbacks: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_fadd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fsub_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fmul_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fdiv_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fmin_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fmax_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fsqrt_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+void tcg_gen_fneg_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+void tcg_gen_fmla_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                      TCGv_vec b, TCGv_vec c);
+void tcg_gen_fmls_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                      TCGv_vec b, TCGv_vec c);
+void tcg_gen_fcmp_vec(TCGCond cond, unsigned vece, TCGv_vec r,
+                      TCGv_vec a, TCGv_vec b);
+void tcg_gen_scvtf_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+void tcg_gen_fcvtzs_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+void tcg_gen_frintx_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+
 void tcg_gen_bitsel_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
                         TCGv_vec b, TCGv_vec c);
 void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,

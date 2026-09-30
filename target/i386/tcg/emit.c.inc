@@ -531,6 +531,58 @@ static void gen_3dnow(DisasContext *s, X86DecodedInsn *decode)
 }
 
 /*
+ * x-ssefp=native: packed SSE/AVX floating point as host vector operations.
+ * While generated code runs, the host FP registers hold MXCSR's mode and
+ * exception flags (tcg/host-fpenv.h), so the host instruction computes
+ * x86's result and raises x86's flags.  Each function returns false, with
+ * nothing emitted, when the instruction has to go to its helper.
+ */
+static bool fp_native(const TCGOpcode *list, unsigned vece)
+{
+    return tcg_ssefp_native &&
+           tcg_can_emit_vecop_list(list, TCG_TYPE_V128, vece);
+}
+
+static bool fp_scalar(DisasContext *s)
+{
+    return s->prefix & (PREFIX_REPZ | PREFIX_REPNZ);
+}
+
+static bool gen_fp_native_2(DisasContext *s, X86DecodedInsn *decode,
+                            const GVecGen2 *g)
+{
+    int vec_len = vector_len(s, decode);
+
+    if (!fp_native(g->opt_opc, g->vece)) {
+        return false;
+    }
+    tcg_gen_gvec_2(decode->op[0].offset, decode->op[2].offset,
+                   vec_len, vec_len, g);
+    return true;
+}
+
+static bool gen_fp_native_3(DisasContext *s, X86DecodedInsn *decode,
+                            const GVecGen3 *g)
+{
+    int vec_len = vector_len(s, decode);
+
+    if (!fp_native(g->opt_opc, g->vece)) {
+        return false;
+    }
+    tcg_gen_gvec_3(decode->op[0].offset, decode->op[1].offset,
+                   decode->op[2].offset, vec_len, vec_len, g);
+    return true;
+}
+
+/* A pair of expanders for the ps and pd forms of one instruction. */
+#define FP_NATIVE_GVEC(T, name, fn, ...)                                      \
+    static const TCGOpcode name##_list[] = { __VA_ARGS__, 0 };                \
+    static const T name[2] = {                                                \
+        { .fniv = fn, .opt_opc = name##_list, .vece = MO_32 },                \
+        { .fniv = fn, .opt_opc = name##_list, .vece = MO_64 },                \
+    }
+
+/*
  * 00 = v*ps Vps, Hps, Wpd
  * 66 = v*pd Vpd, Hpd, Wps
  * f3 = v*ss Vss, Hss, Wps
@@ -560,18 +612,24 @@ static inline void gen_unary_fp_sse(DisasContext *s, X86DecodedInsn *decode,
         fn(tcg_env, OP_PTR0, OP_PTR2);
     }
 }
-#define UNARY_FP_SSE(uname, lname)                                                 \
-static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
-{                                                                                  \
-    gen_unary_fp_sse(s, decode,                                                    \
-                     gen_helper_##lname##pd_xmm,                                   \
-                     gen_helper_##lname##ps_xmm,                                   \
-                     gen_helper_##lname##pd_ymm,                                   \
-                     gen_helper_##lname##ps_ymm,                                   \
-                     gen_helper_##lname##sd,                                       \
-                     gen_helper_##lname##ss);                                      \
+#define UNARY_FP_SSE(uname, lname, vecop)                                     \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    FP_NATIVE_GVEC(GVecGen2, g, tcg_gen_##vecop, INDEX_op_##vecop);           \
+                                                                              \
+    if (!fp_scalar(s) &&                                                      \
+        gen_fp_native_2(s, decode, &g[!!(s->prefix & PREFIX_DATA)])) {        \
+        return;                                                               \
+    }                                                                         \
+    gen_unary_fp_sse(s, decode,                                               \
+                     gen_helper_##lname##pd_xmm,                              \
+                     gen_helper_##lname##ps_xmm,                              \
+                     gen_helper_##lname##pd_ymm,                              \
+                     gen_helper_##lname##ps_ymm,                              \
+                     gen_helper_##lname##sd,                                  \
+                     gen_helper_##lname##ss);                                 \
 }
-UNARY_FP_SSE(VSQRT, sqrt)
+UNARY_FP_SSE(VSQRT, sqrt, fsqrt_vec)
 
 /*
  * 00 = v*ps Vps, Hps, Wpd
@@ -599,69 +657,159 @@ static inline void gen_fp_sse(DisasContext *s, X86DecodedInsn *decode,
     }
 }
 
-#define FP_SSE(uname, lname)                                                       \
-static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
-{                                                                                  \
-    gen_fp_sse(s, decode,                                                          \
-               gen_helper_##lname##pd_xmm,                                         \
-               gen_helper_##lname##ps_xmm,                                         \
-               gen_helper_##lname##pd_ymm,                                         \
-               gen_helper_##lname##ps_ymm,                                         \
-               gen_helper_##lname##sd,                                             \
-               gen_helper_##lname##ss);                                            \
+#define FP_SSE(uname, lname, vecop)                                           \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    FP_NATIVE_GVEC(GVecGen3, g, tcg_gen_##vecop, INDEX_op_##vecop);           \
+                                                                              \
+    if (!fp_scalar(s) &&                                                      \
+        gen_fp_native_3(s, decode, &g[!!(s->prefix & PREFIX_DATA)])) {        \
+        return;                                                               \
+    }                                                                         \
+    gen_fp_sse(s, decode,                                                     \
+               gen_helper_##lname##pd_xmm,                                    \
+               gen_helper_##lname##ps_xmm,                                    \
+               gen_helper_##lname##pd_ymm,                                    \
+               gen_helper_##lname##ps_ymm,                                    \
+               gen_helper_##lname##sd,                                        \
+               gen_helper_##lname##ss);                                       \
 }
-FP_SSE(VADD, add)
-FP_SSE(VMUL, mul)
-FP_SSE(VSUB, sub)
-FP_SSE(VMIN, min)
-FP_SSE(VDIV, div)
-FP_SSE(VMAX, max)
+FP_SSE(VADD, add, fadd_vec)
+FP_SSE(VMUL, mul, fmul_vec)
+FP_SSE(VSUB, sub, fsub_vec)
+FP_SSE(VMIN, min, fmin_vec)
+FP_SSE(VDIV, div, fdiv_vec)
+FP_SSE(VMAX, max, fmax_vec)
 
-#define FMA_SSE_PACKED(uname, ptr0, ptr1, ptr2, even, odd)                         \
-static void gen_##uname##Px(DisasContext *s, X86DecodedInsn *decode)               \
-{                                                                                  \
-    SSEFunc_0_eppppii xmm = s->vex_w ? gen_helper_fma4pd_xmm : gen_helper_fma4ps_xmm; \
-    SSEFunc_0_eppppii ymm = s->vex_w ? gen_helper_fma4pd_ymm : gen_helper_fma4ps_ymm; \
-    SSEFunc_0_eppppii fn = s->vex_l ? ymm : xmm;                                   \
-                                                                                   \
-    fn(tcg_env, OP_PTR0, ptr0, ptr1, ptr2,                                         \
-       tcg_constant_i32(even),                                                     \
-       tcg_constant_i32((even) ^ (odd)));                                          \
+/*
+ * x86's a * b + c as the host's accumulating forms.  The host's negation
+ * leaves a NaN alone, as x86's negated forms do.
+ */
+static void gen_fmadd_vec(unsigned vece, TCGv_vec d, TCGv_vec a,
+                          TCGv_vec b, TCGv_vec c)
+{
+    tcg_gen_fmla_vec(vece, d, c, a, b);
 }
 
-#define FMA_SSE(uname, ptr0, ptr1, ptr2, flags)                                    \
-FMA_SSE_PACKED(uname, ptr0, ptr1, ptr2, flags, flags)                              \
-static void gen_##uname##Sx(DisasContext *s, X86DecodedInsn *decode)               \
-{                                                                                  \
-    SSEFunc_0_eppppi fn = s->vex_w ? gen_helper_fma4sd : gen_helper_fma4ss;        \
-                                                                                   \
-    fn(tcg_env, OP_PTR0, ptr0, ptr1, ptr2,                                         \
-       tcg_constant_i32(flags));                                                   \
-}                                                                                  \
+static void gen_fmsub_vec(unsigned vece, TCGv_vec d, TCGv_vec a,
+                          TCGv_vec b, TCGv_vec c)
+{
+    TCGv_vec t = tcg_temp_new_vec_matching(d);
 
-FMA_SSE(VFMADD231,  OP_PTR1, OP_PTR2, OP_PTR0, 0)
-FMA_SSE(VFMADD213,  OP_PTR1, OP_PTR0, OP_PTR2, 0)
-FMA_SSE(VFMADD132,  OP_PTR0, OP_PTR2, OP_PTR1, 0)
+    tcg_gen_fneg_vec(vece, t, c);
+    tcg_gen_fmla_vec(vece, d, t, a, b);
+}
 
-FMA_SSE(VFNMADD231, OP_PTR1, OP_PTR2, OP_PTR0, float_muladd_negate_product)
-FMA_SSE(VFNMADD213, OP_PTR1, OP_PTR0, OP_PTR2, float_muladd_negate_product)
-FMA_SSE(VFNMADD132, OP_PTR0, OP_PTR2, OP_PTR1, float_muladd_negate_product)
+static void gen_fnmadd_vec(unsigned vece, TCGv_vec d, TCGv_vec a,
+                           TCGv_vec b, TCGv_vec c)
+{
+    tcg_gen_fmls_vec(vece, d, c, a, b);
+}
 
-FMA_SSE(VFMSUB231,  OP_PTR1, OP_PTR2, OP_PTR0, float_muladd_negate_c)
-FMA_SSE(VFMSUB213,  OP_PTR1, OP_PTR0, OP_PTR2, float_muladd_negate_c)
-FMA_SSE(VFMSUB132,  OP_PTR0, OP_PTR2, OP_PTR1, float_muladd_negate_c)
+static void gen_fnmsub_vec(unsigned vece, TCGv_vec d, TCGv_vec a,
+                           TCGv_vec b, TCGv_vec c)
+{
+    TCGv_vec t = tcg_temp_new_vec_matching(d);
 
-FMA_SSE(VFNMSUB231, OP_PTR1, OP_PTR2, OP_PTR0, float_muladd_negate_c|float_muladd_negate_product)
-FMA_SSE(VFNMSUB213, OP_PTR1, OP_PTR0, OP_PTR2, float_muladd_negate_c|float_muladd_negate_product)
-FMA_SSE(VFNMSUB132, OP_PTR0, OP_PTR2, OP_PTR1, float_muladd_negate_c|float_muladd_negate_product)
+    tcg_gen_fneg_vec(vece, t, c);
+    tcg_gen_fmls_vec(vece, d, t, a, b);
+}
 
-FMA_SSE_PACKED(VFMADDSUB231, OP_PTR1, OP_PTR2, OP_PTR0, float_muladd_negate_c, 0)
-FMA_SSE_PACKED(VFMADDSUB213, OP_PTR1, OP_PTR0, OP_PTR2, float_muladd_negate_c, 0)
-FMA_SSE_PACKED(VFMADDSUB132, OP_PTR0, OP_PTR2, OP_PTR1, float_muladd_negate_c, 0)
+/* a, b and c are the numbers of the operands of a * b + c. */
+static bool gen_fma_native(DisasContext *s, X86DecodedInsn *decode,
+                           int a, int b, int c, int flags)
+{
+    FP_NATIVE_GVEC(GVecGen4, madd, gen_fmadd_vec, INDEX_op_fmla_vec);
+    FP_NATIVE_GVEC(GVecGen4, msub, gen_fmsub_vec,
+                   INDEX_op_fmla_vec, INDEX_op_fneg_vec);
+    FP_NATIVE_GVEC(GVecGen4, nmadd, gen_fnmadd_vec, INDEX_op_fmls_vec);
+    FP_NATIVE_GVEC(GVecGen4, nmsub, gen_fnmsub_vec,
+                   INDEX_op_fmls_vec, INDEX_op_fneg_vec);
+    const GVecGen4 *g;
+    int vec_len = vector_len(s, decode);
 
-FMA_SSE_PACKED(VFMSUBADD231, OP_PTR1, OP_PTR2, OP_PTR0, 0, float_muladd_negate_c)
-FMA_SSE_PACKED(VFMSUBADD213, OP_PTR1, OP_PTR0, OP_PTR2, 0, float_muladd_negate_c)
-FMA_SSE_PACKED(VFMSUBADD132, OP_PTR0, OP_PTR2, OP_PTR1, 0, float_muladd_negate_c)
+    switch (flags) {
+    case 0:
+        g = madd;
+        break;
+    case float_muladd_negate_c:
+        g = msub;
+        break;
+    case float_muladd_negate_product:
+        g = nmadd;
+        break;
+    case float_muladd_negate_c | float_muladd_negate_product:
+        g = nmsub;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    g += s->vex_w;
+    if (!fp_native(g->opt_opc, g->vece)) {
+        return false;
+    }
+    tcg_gen_gvec_4(decode->op[0].offset, decode->op[a].offset,
+                   decode->op[b].offset, decode->op[c].offset,
+                   vec_len, vec_len, g);
+    return true;
+}
+
+/* a, b and c are the numbers of the operands of a * b + c. */
+#define FMA_SSE_PACKED(uname, a, b, c, even, odd)                             \
+static void gen_##uname##Px(DisasContext *s, X86DecodedInsn *decode)          \
+{                                                                             \
+    SSEFunc_0_eppppii xmm = s->vex_w ? gen_helper_fma4pd_xmm                  \
+                                     : gen_helper_fma4ps_xmm;                 \
+    SSEFunc_0_eppppii ymm = s->vex_w ? gen_helper_fma4pd_ymm                  \
+                                     : gen_helper_fma4ps_ymm;                 \
+    SSEFunc_0_eppppii fn = s->vex_l ? ymm : xmm;                              \
+                                                                              \
+    if ((even) == (odd) && gen_fma_native(s, decode, a, b, c, even)) {        \
+        return;                                                               \
+    }                                                                         \
+    fn(tcg_env, OP_PTR0, op_ptr(decode, a), op_ptr(decode, b),                \
+       op_ptr(decode, c),                                                     \
+       tcg_constant_i32(even),                                                \
+       tcg_constant_i32((even) ^ (odd)));                                     \
+}
+
+#define FMA_SSE(uname, a, b, c, flags)                                        \
+FMA_SSE_PACKED(uname, a, b, c, flags, flags)                                  \
+static void gen_##uname##Sx(DisasContext *s, X86DecodedInsn *decode)          \
+{                                                                             \
+    SSEFunc_0_eppppi fn = s->vex_w ? gen_helper_fma4sd : gen_helper_fma4ss;   \
+                                                                              \
+    fn(tcg_env, OP_PTR0, op_ptr(decode, a), op_ptr(decode, b),                \
+       op_ptr(decode, c),                                                     \
+       tcg_constant_i32(flags));                                              \
+}
+
+FMA_SSE(VFMADD231,  1, 2, 0, 0)
+FMA_SSE(VFMADD213,  1, 0, 2, 0)
+FMA_SSE(VFMADD132,  0, 2, 1, 0)
+
+FMA_SSE(VFNMADD231, 1, 2, 0, float_muladd_negate_product)
+FMA_SSE(VFNMADD213, 1, 0, 2, float_muladd_negate_product)
+FMA_SSE(VFNMADD132, 0, 2, 1, float_muladd_negate_product)
+
+FMA_SSE(VFMSUB231,  1, 2, 0, float_muladd_negate_c)
+FMA_SSE(VFMSUB213,  1, 0, 2, float_muladd_negate_c)
+FMA_SSE(VFMSUB132,  0, 2, 1, float_muladd_negate_c)
+
+FMA_SSE(VFNMSUB231, 1, 2, 0,
+        float_muladd_negate_c | float_muladd_negate_product)
+FMA_SSE(VFNMSUB213, 1, 0, 2,
+        float_muladd_negate_c | float_muladd_negate_product)
+FMA_SSE(VFNMSUB132, 0, 2, 1,
+        float_muladd_negate_c | float_muladd_negate_product)
+
+FMA_SSE_PACKED(VFMADDSUB231, 1, 2, 0, float_muladd_negate_c, 0)
+FMA_SSE_PACKED(VFMADDSUB213, 1, 0, 2, float_muladd_negate_c, 0)
+FMA_SSE_PACKED(VFMADDSUB132, 0, 2, 1, float_muladd_negate_c, 0)
+
+FMA_SSE_PACKED(VFMSUBADD231, 1, 2, 0, 0, float_muladd_negate_c)
+FMA_SSE_PACKED(VFMSUBADD213, 1, 0, 2, 0, float_muladd_negate_c)
+FMA_SSE_PACKED(VFMSUBADD132, 0, 2, 1, 0, float_muladd_negate_c)
 
 #define FP_UNPACK_SSE(uname, lname)                                                \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
@@ -1020,9 +1168,61 @@ UNARY_INT_SSE(VMOVDDUP,     pmovdldup)
 UNARY_INT_SSE(VCVTDQ2PD, cvtdq2pd)
 UNARY_INT_SSE(VCVTPD2DQ, cvtpd2dq)
 UNARY_INT_SSE(VCVTTPD2DQ, cvttpd2dq)
-UNARY_INT_SSE(VCVTDQ2PS, cvtdq2ps)
-UNARY_INT_SSE(VCVTPS2DQ, cvtps2dq)
-UNARY_INT_SSE(VCVTTPS2DQ, cvttps2dq)
+
+/*
+ * r is the host's conversion of a to int32.  Where a is a NaN or too
+ * large, x86 gives the "integer indefinite" 0x80000000; the host gives 0
+ * for a NaN and saturates, which differs for a positive value.  No float
+ * converts to INT32_MAX exactly.
+ */
+static void gen_fp_int32_indefinite_vec(TCGv_vec r, TCGv_vec a)
+{
+    TCGv_vec t = tcg_temp_new_vec_matching(r);
+
+    tcg_gen_cmp_vec(TCG_COND_EQ, MO_32, t, r,
+                    tcg_constant_vec_matching(r, MO_32, INT32_MAX));
+    tcg_gen_xor_vec(MO_32, r, r, t);
+    tcg_gen_shli_vec(MO_32, t, a, 1);
+    tcg_gen_cmp_vec(TCG_COND_GTU, MO_32, t, t,
+                    tcg_constant_vec_matching(r, MO_32, 0xff000000u));
+    tcg_gen_shli_vec(MO_32, t, t, 31);
+    tcg_gen_or_vec(MO_32, r, r, t);
+}
+
+static void gen_cvttps2dq_vec(unsigned vece, TCGv_vec d, TCGv_vec a)
+{
+    tcg_gen_fcvtzs_vec(vece, d, a);
+    gen_fp_int32_indefinite_vec(d, a);
+}
+
+static void gen_cvtps2dq_vec(unsigned vece, TCGv_vec d, TCGv_vec a)
+{
+    tcg_gen_frintx_vec(vece, d, a);
+    tcg_gen_fcvtzs_vec(vece, d, d);
+    gen_fp_int32_indefinite_vec(d, a);
+}
+
+#define UNARY_FP_INT_SSE(uname, lname, fn, ...)                               \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    static const TCGOpcode list[] = { __VA_ARGS__, 0 };                       \
+    static const GVecGen2 g = {                                               \
+        .fniv = fn, .opt_opc = list, .vece = MO_32                            \
+    };                                                                        \
+                                                                              \
+    if (gen_fp_native_2(s, decode, &g)) {                                     \
+        return;                                                               \
+    }                                                                         \
+    gen_unary_int_sse(s, decode,                                              \
+                      gen_helper_##lname##_xmm,                               \
+                      gen_helper_##lname##_ymm);                              \
+}
+
+UNARY_FP_INT_SSE(VCVTDQ2PS, cvtdq2ps, tcg_gen_scvtf_vec, INDEX_op_scvtf_vec)
+UNARY_FP_INT_SSE(VCVTPS2DQ, cvtps2dq, gen_cvtps2dq_vec, INDEX_op_frintx_vec,
+                 INDEX_op_fcvtzs_vec, INDEX_op_cmp_vec, INDEX_op_shli_vec)
+UNARY_FP_INT_SSE(VCVTTPS2DQ, cvttps2dq, gen_cvttps2dq_vec,
+                 INDEX_op_fcvtzs_vec, INDEX_op_cmp_vec, INDEX_op_shli_vec)
 UNARY_INT_SSE(VCVTPH2PS, cvtph2ps)
 
 
@@ -4244,6 +4444,102 @@ static const SSEFunc_0_eppp gen_helper_cmp_funcs[32][6] = {
 };
 #undef SSE_CMP
 
+/* d = a or b is a NaN, by integer tests, which raise no exception. */
+static void gen_fp_isnan2_vec(unsigned vece, TCGv_vec d,
+                              TCGv_vec a, TCGv_vec b)
+{
+    TCGv_vec t = tcg_temp_new_vec_matching(d);
+    TCGv_vec inf2 = tcg_constant_vec_matching(d, vece,
+                                              vece == MO_32 ? 0xff000000u
+                                              : 0xffe0000000000000ull);
+
+    tcg_gen_shli_vec(vece, t, a, 1);
+    tcg_gen_cmp_vec(TCG_COND_GTU, vece, t, t, inf2);
+    tcg_gen_shli_vec(vece, d, b, 1);
+    tcg_gen_cmp_vec(TCG_COND_GTU, vece, d, d, inf2);
+    tcg_gen_or_vec(vece, d, d, t);
+}
+
+static void gen_fcmpeq_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_fcmp_vec(TCG_COND_EQ, vece, d, a, b);
+}
+
+static void gen_fcmplt_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_fcmp_vec(TCG_COND_LT, vece, d, a, b);
+}
+
+static void gen_fcmple_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_fcmp_vec(TCG_COND_LE, vece, d, a, b);
+}
+
+static void gen_fcmpneq_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_fcmp_vec(TCG_COND_EQ, vece, d, a, b);
+    tcg_gen_not_vec(vece, d, d);
+}
+
+static void gen_fcmpnlt_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_fcmp_vec(TCG_COND_LT, vece, d, a, b);
+    tcg_gen_not_vec(vece, d, d);
+}
+
+static void gen_fcmpnle_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_fcmp_vec(TCG_COND_LE, vece, d, a, b);
+    tcg_gen_not_vec(vece, d, d);
+}
+
+/*
+ * Unordered and ordered: the quiet compare raises the exceptions, and is
+ * false when the operands are unordered, so folding its result in doesn't
+ * change the answer of the integer test but keeps the compare alive.
+ */
+static void gen_fcmpunord_vec(unsigned vece, TCGv_vec d,
+                              TCGv_vec a, TCGv_vec b)
+{
+    TCGv_vec eq = tcg_temp_new_vec_matching(d);
+
+    tcg_gen_fcmp_vec(TCG_COND_EQ, vece, eq, a, b);
+    gen_fp_isnan2_vec(vece, d, a, b);
+    tcg_gen_andc_vec(vece, d, d, eq);
+}
+
+static void gen_fcmpord_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
+{
+    TCGv_vec eq = tcg_temp_new_vec_matching(d);
+
+    tcg_gen_fcmp_vec(TCG_COND_EQ, vece, eq, a, b);
+    gen_fp_isnan2_vec(vece, d, a, b);
+    tcg_gen_orc_vec(vece, d, eq, d);
+}
+
+/* The SSE predicates; AVX's other 24 go to the helpers. */
+static bool gen_fcmp_native(DisasContext *s, X86DecodedInsn *decode, int index)
+{
+    FP_NATIVE_GVEC(GVecGen3, eq, gen_fcmpeq_vec, INDEX_op_fcmp_vec);
+    FP_NATIVE_GVEC(GVecGen3, lt, gen_fcmplt_vec, INDEX_op_fcmp_vec);
+    FP_NATIVE_GVEC(GVecGen3, le, gen_fcmple_vec, INDEX_op_fcmp_vec);
+    FP_NATIVE_GVEC(GVecGen3, unord, gen_fcmpunord_vec, INDEX_op_fcmp_vec,
+                   INDEX_op_cmp_vec, INDEX_op_shli_vec);
+    FP_NATIVE_GVEC(GVecGen3, neq, gen_fcmpneq_vec, INDEX_op_fcmp_vec);
+    FP_NATIVE_GVEC(GVecGen3, nlt, gen_fcmpnlt_vec, INDEX_op_fcmp_vec);
+    FP_NATIVE_GVEC(GVecGen3, nle, gen_fcmpnle_vec, INDEX_op_fcmp_vec);
+    FP_NATIVE_GVEC(GVecGen3, ord, gen_fcmpord_vec, INDEX_op_fcmp_vec,
+                   INDEX_op_cmp_vec, INDEX_op_shli_vec);
+    static const GVecGen3 * const g[8] = {
+        eq, lt, le, unord, neq, nlt, nle, ord
+    };
+
+    if (index >= ARRAY_SIZE(g) || fp_scalar(s)) {
+        return false;
+    }
+    return gen_fp_native_3(s, decode, &g[index][!!(s->prefix & PREFIX_DATA)]);
+}
+
 static void gen_VCMP(DisasContext *s, X86DecodedInsn *decode)
 {
     int index = decode->immediate & (s->prefix & PREFIX_VEX ? 31 : 7);
@@ -4252,6 +4548,9 @@ static void gen_VCMP(DisasContext *s, X86DecodedInsn *decode)
         s->prefix & PREFIX_REPNZ ? 3 /* sd */ :
         !!(s->prefix & PREFIX_DATA) /* pd */ + (s->vex_l << 2);
 
+    if (gen_fcmp_native(s, decode, index)) {
+        return;
+    }
     gen_helper_cmp_funcs[index][b](tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
 }
 

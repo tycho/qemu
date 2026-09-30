@@ -62,6 +62,15 @@ extern bool tcg_pferr_hw;
  */
 extern bool tcg_ssefp_vec;
 
+/*
+ * x-ssefp=native: on hosts whose FPU can take the guest's FP mode
+ * (host_fpenv_native()), the vCPU thread runs with it while in cpu_exec,
+ * so generated code can use host FP instructions for guest FP.  Other
+ * hosts get tcg_ssefp_vec instead; the two are never both set, as the
+ * vector fast paths run host FP on unvalidated values.
+ */
+extern bool tcg_ssefp_native;
+
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);
 
