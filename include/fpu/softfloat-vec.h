@@ -11,6 +11,13 @@
  * function returns true.  Otherwise it returns false, having written and
  * raised nothing, and the caller applies the scalar function lane by lane.
  *
+ * No host floating-point instruction runs on a lane until integer tests
+ * have shown every input to be zero or normal, and the results are checked
+ * with integer tests too.  So the only host exception flags these functions
+ * can raise are the ones the operation itself raises on such inputs
+ * (inexact, overflow, underflow), which matters where the host's flags are
+ * the guest's (host/fpenv.h).
+ *
  * The lanes are processed 16 bytes at a time with the compiler's generic
  * vector types.  n must be a compile-time constant that fills whole 16-byte
  * chunks, at most four, so that the functions, which are inline, keep every
@@ -176,11 +183,17 @@ static inline bool float32_binop_vec(float32 *r, const float32 *a,
         return false;
     }
     for (i = 0; i < c; i++) {
+        bad |= fv32_not_zon(fv32_load(a, i)) |
+               (op == FLOAT_VEC_DIV ? fv32_not_normal(fv32_load(b, i))
+                                    : fv32_not_zon(fv32_load(b, i)));
+    }
+    if (fv32_any(bad)) {
+        return false;
+    }
+    for (i = 0; i < c; i++) {
         FloatVecU32 ua = fv32_load(a, i), ub = fv32_load(b, i), tiny_ok;
         FloatVecF32 fa = (FloatVecF32)ua, fb = (FloatVecF32)ub, fr;
 
-        bad |= fv32_not_zon(ua) |
-               (op == FLOAT_VEC_DIV ? fv32_not_normal(ub) : fv32_not_zon(ub));
         switch (op) {
         case FLOAT_VEC_ADD:
             fr = fa + fb;
@@ -221,11 +234,17 @@ static inline bool float64_binop_vec(float64 *r, const float64 *a,
         return false;
     }
     for (i = 0; i < c; i++) {
+        bad |= fv64_not_zon(fv64_load(a, i)) |
+               (op == FLOAT_VEC_DIV ? fv64_not_normal(fv64_load(b, i))
+                                    : fv64_not_zon(fv64_load(b, i)));
+    }
+    if (fv64_any(bad)) {
+        return false;
+    }
+    for (i = 0; i < c; i++) {
         FloatVecU64 ua = fv64_load(a, i), ub = fv64_load(b, i), tiny_ok;
         FloatVecF64 fa = (FloatVecF64)ua, fb = (FloatVecF64)ub, fr;
 
-        bad |= fv64_not_zon(ua) |
-               (op == FLOAT_VEC_DIV ? fv64_not_normal(ub) : fv64_not_zon(ub));
         switch (op) {
         case FLOAT_VEC_ADD:
             fr = fa + fb;
@@ -282,12 +301,19 @@ static inline bool float32_muladd_vec(float32 *r, const float32 *a,
         return false;
     }
     for (i = 0; i < k; i++) {
+        bad |= fv32_not_zon(fv32_load(a, i)) |
+               fv32_not_zon(fv32_load(b, i)) |
+               fv32_not_zon(fv32_load(c, i));
+    }
+    if (fv32_any(bad)) {
+        return false;
+    }
+    for (i = 0; i < k; i++) {
         FloatVecU32 ua = fv32_load(a, i), ub = fv32_load(b, i);
         FloatVecU32 uc = fv32_load(c, i);
         FloatVecF32 fa = (FloatVecF32)(ua ^ neg_a), fb = (FloatVecF32)ub;
         FloatVecF32 fc = (FloatVecF32)(uc ^ neg_c), fr;
 
-        bad |= fv32_not_zon(ua) | fv32_not_zon(ub) | fv32_not_zon(uc);
         for (j = 0; j < 4; j++) {
             fr[j] = fmaf(fa[j], fb[j], fc[j]);
         }
@@ -320,12 +346,19 @@ static inline bool float64_muladd_vec(float64 *r, const float64 *a,
         return false;
     }
     for (i = 0; i < k; i++) {
+        bad |= fv64_not_zon(fv64_load(a, i)) |
+               fv64_not_zon(fv64_load(b, i)) |
+               fv64_not_zon(fv64_load(c, i));
+    }
+    if (fv64_any(bad)) {
+        return false;
+    }
+    for (i = 0; i < k; i++) {
         FloatVecU64 ua = fv64_load(a, i), ub = fv64_load(b, i);
         FloatVecU64 uc = fv64_load(c, i);
         FloatVecF64 fa = (FloatVecF64)(ua ^ neg_a), fb = (FloatVecF64)ub;
         FloatVecF64 fc = (FloatVecF64)(uc ^ neg_c), fr;
 
-        bad |= fv64_not_zon(ua) | fv64_not_zon(ub) | fv64_not_zon(uc);
         for (j = 0; j < 2; j++) {
             fr[j] = fma(fa[j], fb[j], fc[j]);
         }
@@ -356,16 +389,19 @@ static inline bool float32_sqrt_vec(float32 *r, const float32 *a, unsigned n,
     }
     for (i = 0; i < c; i++) {
         FloatVecU32 ua = fv32_load(a, i);
-        FloatVecF32 f = (FloatVecF32)ua;
 
         bad |= fv32_not_zon(ua) | (ua >> 31);
+    }
+    if (fv32_any(bad)) {
+        return false;
+    }
+    for (i = 0; i < c; i++) {
+        FloatVecF32 f = (FloatVecF32)fv32_load(a, i);
+
         for (j = 0; j < 4; j++) {
             f[j] = sqrtf(f[j]);
         }
         res[i] = (FloatVecU32)f;
-    }
-    if (fv32_any(bad)) {
-        return false;
     }
     for (i = 0; i < c; i++) {
         fv_store(r, i, &res[i]);
@@ -385,16 +421,19 @@ static inline bool float64_sqrt_vec(float64 *r, const float64 *a, unsigned n,
     }
     for (i = 0; i < c; i++) {
         FloatVecU64 ua = fv64_load(a, i);
-        FloatVecF64 f = (FloatVecF64)ua;
 
         bad |= fv64_not_zon(ua) | (ua >> 63);
+    }
+    if (fv64_any(bad)) {
+        return false;
+    }
+    for (i = 0; i < c; i++) {
+        FloatVecF64 f = (FloatVecF64)fv64_load(a, i);
+
         for (j = 0; j < 2; j++) {
             f[j] = sqrt(f[j]);
         }
         res[i] = (FloatVecU64)f;
-    }
-    if (fv64_any(bad)) {
-        return false;
     }
     for (i = 0; i < c; i++) {
         fv_store(r, i, &res[i]);
@@ -419,15 +458,18 @@ static inline bool float32_select_vec(float32 *r, const float32 *a,
     unsigned i, c = n / 4;
 
     for (i = 0; i < c; i++) {
-        FloatVecU32 ua = fv32_load(a, i), ub = fv32_load(b, i), m;
-
-        bad |= fv32_not_zon(ua) | fv32_not_zon(ub);
-        m = lt ? (FloatVecU32)((FloatVecF32)ua < (FloatVecF32)ub)
-               : (FloatVecU32)((FloatVecF32)ua > (FloatVecF32)ub);
-        res[i] = (ua & m) | (ub & ~m);
+        bad |= fv32_not_zon(fv32_load(a, i)) |
+               fv32_not_zon(fv32_load(b, i));
     }
     if (fv32_any(bad)) {
         return false;
+    }
+    for (i = 0; i < c; i++) {
+        FloatVecU32 ua = fv32_load(a, i), ub = fv32_load(b, i), m;
+
+        m = lt ? (FloatVecU32)((FloatVecF32)ua < (FloatVecF32)ub)
+               : (FloatVecU32)((FloatVecF32)ua > (FloatVecF32)ub);
+        res[i] = (ua & m) | (ub & ~m);
     }
     for (i = 0; i < c; i++) {
         fv_store(r, i, &res[i]);
@@ -444,15 +486,18 @@ static inline bool float64_select_vec(float64 *r, const float64 *a,
     unsigned i, c = n / 2;
 
     for (i = 0; i < c; i++) {
-        FloatVecU64 ua = fv64_load(a, i), ub = fv64_load(b, i), m;
-
-        bad |= fv64_not_zon(ua) | fv64_not_zon(ub);
-        m = lt ? (FloatVecU64)((FloatVecF64)ua < (FloatVecF64)ub)
-               : (FloatVecU64)((FloatVecF64)ua > (FloatVecF64)ub);
-        res[i] = (ua & m) | (ub & ~m);
+        bad |= fv64_not_zon(fv64_load(a, i)) |
+               fv64_not_zon(fv64_load(b, i));
     }
     if (fv64_any(bad)) {
         return false;
+    }
+    for (i = 0; i < c; i++) {
+        FloatVecU64 ua = fv64_load(a, i), ub = fv64_load(b, i), m;
+
+        m = lt ? (FloatVecU64)((FloatVecF64)ua < (FloatVecF64)ub)
+               : (FloatVecU64)((FloatVecF64)ua > (FloatVecF64)ub);
+        res[i] = (ua & m) | (ub & ~m);
     }
     for (i = 0; i < c; i++) {
         fv_store(r, i, &res[i]);
@@ -469,14 +514,17 @@ static inline bool float32_compare_vec(uint32_t *lt, uint32_t *eq,
     unsigned i, c = n / 4;
 
     for (i = 0; i < c; i++) {
-        FloatVecU32 ua = fv32_load(a, i), ub = fv32_load(b, i);
-
-        bad |= fv32_not_zon(ua) | fv32_not_zon(ub);
-        rlt[i] = (FloatVecU32)((FloatVecF32)ua < (FloatVecF32)ub);
-        req[i] = (FloatVecU32)((FloatVecF32)ua == (FloatVecF32)ub);
+        bad |= fv32_not_zon(fv32_load(a, i)) |
+               fv32_not_zon(fv32_load(b, i));
     }
     if (fv32_any(bad)) {
         return false;
+    }
+    for (i = 0; i < c; i++) {
+        FloatVecU32 ua = fv32_load(a, i), ub = fv32_load(b, i);
+
+        rlt[i] = (FloatVecU32)((FloatVecF32)ua < (FloatVecF32)ub);
+        req[i] = (FloatVecU32)((FloatVecF32)ua == (FloatVecF32)ub);
     }
     for (i = 0; i < c; i++) {
         fv_store(lt, i, &rlt[i]);
@@ -494,14 +542,17 @@ static inline bool float64_compare_vec(uint64_t *lt, uint64_t *eq,
     unsigned i, c = n / 2;
 
     for (i = 0; i < c; i++) {
-        FloatVecU64 ua = fv64_load(a, i), ub = fv64_load(b, i);
-
-        bad |= fv64_not_zon(ua) | fv64_not_zon(ub);
-        rlt[i] = (FloatVecU64)((FloatVecF64)ua < (FloatVecF64)ub);
-        req[i] = (FloatVecU64)((FloatVecF64)ua == (FloatVecF64)ub);
+        bad |= fv64_not_zon(fv64_load(a, i)) |
+               fv64_not_zon(fv64_load(b, i));
     }
     if (fv64_any(bad)) {
         return false;
+    }
+    for (i = 0; i < c; i++) {
+        FloatVecU64 ua = fv64_load(a, i), ub = fv64_load(b, i);
+
+        rlt[i] = (FloatVecU64)((FloatVecF64)ua < (FloatVecF64)ub);
+        req[i] = (FloatVecU64)((FloatVecF64)ua == (FloatVecF64)ub);
     }
     for (i = 0; i < c; i++) {
         fv_store(lt, i, &rlt[i]);
@@ -523,14 +574,14 @@ static inline bool int32_to_float32_vec(float32 *r, const int32_t *a,
     unsigned i, c = n / 4;
 
     for (i = 0; i < c; i++) {
-        FloatVecU32 ux = fv32_load(a, i);
-
-        big |= (FloatVecU32)(ux + (1u << 24) > (2u << 24));
-        res[i] = (FloatVecU32)__builtin_convertvector((FloatVecS32)ux,
-                                                      FloatVecF32);
+        big |= (FloatVecU32)(fv32_load(a, i) + (1u << 24) > (2u << 24));
     }
     if (fv32_any(big) && !float_hardfloat_ok(s)) {
         return false;
+    }
+    for (i = 0; i < c; i++) {
+        res[i] = (FloatVecU32)__builtin_convertvector(
+                     (FloatVecS32)fv32_load(a, i), FloatVecF32);
     }
     for (i = 0; i < c; i++) {
         fv_store(r, i, &res[i]);
@@ -558,20 +609,30 @@ static inline bool float32_to_int32_vec_common(int32_t *r, const float32 *a,
         return false;
     }
     for (i = 0; i < c; i++) {
-        FloatVecU32 ua = fv32_load(a, i);
-        FloatVecF32 f = (FloatVecF32)ua;
+        bad |= fv32_not_zon(fv32_load(a, i));
+    }
+    if (fv32_any(bad)) {
+        return false;
+    }
+    /* Comparing zero or normal values raises nothing. */
+    for (i = 0; i < c; i++) {
+        FloatVecF32 f = (FloatVecF32)fv32_load(a, i);
 
-        bad |= fv32_not_zon(ua) | (FloatVecU32)(f < -2147483648.0f) |
+        bad |= (FloatVecU32)(f < -2147483648.0f) |
                (FloatVecU32)(f > 2147483520.0f);
+    }
+    if (fv32_any(bad)) {
+        return false;
+    }
+    for (i = 0; i < c; i++) {
+        FloatVecF32 f = (FloatVecF32)fv32_load(a, i);
+
         if (!rtz) {
             for (j = 0; j < 4; j++) {
                 f[j] = rintf(f[j]);
             }
         }
         res[i] = __builtin_convertvector(f, FloatVecS32);
-    }
-    if (fv32_any(bad)) {
-        return false;
     }
     for (i = 0; i < c; i++) {
         fv_store(r, i, &res[i]);
