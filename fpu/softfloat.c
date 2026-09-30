@@ -83,6 +83,7 @@ this code that are retained.
 #include <math.h>
 #include "qemu/bitops.h"
 #include "fpu/softfloat.h"
+#include "fpu/softfloat-vec.h"
 #include "fpu/softfloat-parts.h"
 
 /* We only need stdlib for abort() */
@@ -230,11 +231,7 @@ GEN_INPUT_FLUSH3(float64_input_flush3, float64)
 
 static inline bool can_use_fpu(const float_status *s)
 {
-    if (QEMU_NO_HARDFLOAT) {
-        return false;
-    }
-    return likely(s->float_exception_flags & float_flag_inexact &&
-                  get_float_rounding_mode(s) == float_round_nearest_even);
+    return float_hardfloat_ok(s);
 }
 
 /*
@@ -1984,7 +1981,7 @@ float64_muladd_scalbn(float64 a, float64 b, float64 c,
     return pack_raw64(&pr, &float64_params);
 }
 
-static bool force_soft_fma;
+bool float_force_soft_fma;
 
 float32 QEMU_FLATTEN
 float32_muladd(float32 xa, float32 xb, float32 xc, int flags, float_status *s)
@@ -2007,7 +2004,7 @@ float32_muladd(float32 xa, float32 xb, float32 xc, int flags, float_status *s)
         goto soft;
     }
 
-    if (unlikely(force_soft_fma)) {
+    if (unlikely(float_force_soft_fma)) {
         goto soft;
     }
 
@@ -2075,7 +2072,7 @@ float64_muladd(float64 xa, float64 xb, float64 xc, int flags, float_status *s)
         goto soft;
     }
 
-    if (unlikely(force_soft_fma)) {
+    if (unlikely(float_force_soft_fma)) {
         goto soft;
     }
 
@@ -5159,6 +5156,6 @@ static void __attribute__((constructor)) softfloat_init(void)
     uc.s = 0x0020000000000000ULL;
     ur.h = fma(ua.h, ub.h, uc.h);
     if (ur.s != 0x0020000000000001ULL) {
-        force_soft_fma = true;
+        float_force_soft_fma = true;
     }
 }
