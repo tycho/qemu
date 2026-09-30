@@ -843,16 +843,36 @@ size_t qemu_get_host_physmem(void);
 /*
  * Toggle write/execute on the pages marked MAP_JIT
  * for the current thread.
+ *
+ * pthread_jit_write_protect_np() costs the same whether or not it changes
+ * the mode, and most calls don't.  With qemu_thread_jit_lazy, remember the
+ * mode each thread is in and skip the calls that wouldn't change it.  Only
+ * these two functions change the mode, and a thread starts with it unknown.
  */
 #ifdef __APPLE__
 /* xtcg Phase-1 counters, see qemu/xtcg-stats.h */
 extern bool xtcg_stats;
 void xtcg_stats_jit(bool execute);
 
+typedef enum {
+    QEMU_THREAD_JIT_UNKNOWN,
+    QEMU_THREAD_JIT_WRITE,
+    QEMU_THREAD_JIT_EXECUTE,
+} QemuThreadJitMode;
+
+extern bool qemu_thread_jit_lazy;
+extern __thread QemuThreadJitMode qemu_thread_jit_mode;
+
 static inline void qemu_thread_jit_execute(void)
 {
     if (unlikely(xtcg_stats)) {
         xtcg_stats_jit(true);
+    }
+    if (qemu_thread_jit_lazy) {
+        if (qemu_thread_jit_mode == QEMU_THREAD_JIT_EXECUTE) {
+            return;
+        }
+        qemu_thread_jit_mode = QEMU_THREAD_JIT_EXECUTE;
     }
     pthread_jit_write_protect_np(true);
 }
@@ -861,6 +881,12 @@ static inline void qemu_thread_jit_write(void)
 {
     if (unlikely(xtcg_stats)) {
         xtcg_stats_jit(false);
+    }
+    if (qemu_thread_jit_lazy) {
+        if (qemu_thread_jit_mode == QEMU_THREAD_JIT_WRITE) {
+            return;
+        }
+        qemu_thread_jit_mode = QEMU_THREAD_JIT_WRITE;
     }
     pthread_jit_write_protect_np(false);
 }
