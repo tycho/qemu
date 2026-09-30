@@ -724,6 +724,12 @@ typedef enum {
     Ifp_rrrr_FNMADD   = 0x1f200000,
     Ifp_rrrr_FNMSUB   = 0x1f208000,
 
+    /* Floating-point compare; conversion between FP and integer. */
+    Ifp_cmp_FCMP      = 0x1e202000,
+    Ifp_cmp_FCMPE     = 0x1e202010,
+    Ifp_cvt_SCVTF     = 0x1e220000,
+    Ifp_cvt_FCVTZS    = 0x1e380000,
+
     /* AdvSIMD copy: insert element 0 from element 0. */
     Isimd_ins_S       = 0x6e040400,
     Isimd_ins_D       = 0x6e080400,
@@ -1007,6 +1013,20 @@ static void tcg_out_insn_simd_ins(TCGContext *s, AArch64Insn insn,
                                   TCGReg rd, TCGReg rn)
 {
     tcg_out32(s, insn | (rn & 0x1f) << 5 | (rd & 0x1f));
+}
+
+static void tcg_out_insn_fp_cmp(TCGContext *s, AArch64Insn insn,
+                                unsigned type, TCGReg rn, TCGReg rm)
+{
+    tcg_out32(s, insn | type << 22 | (rm & 0x1f) << 16 | (rn & 0x1f) << 5);
+}
+
+/* sf: a 64-bit general register; type: double precision. */
+static void tcg_out_insn_fp_cvt(TCGContext *s, AArch64Insn insn, bool sf,
+                                unsigned type, TCGReg rd, TCGReg rn)
+{
+    tcg_out32(s, insn | sf << 31 | type << 22 | (rn & 0x1f) << 5
+              | (rd & 0x1f));
 }
 
 static void tcg_out_insn_ldst_reg(TCGContext *s, AArch64Insn insn,
@@ -3881,6 +3901,29 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_fnmsubs_vec:
         tcg_out_insn(s, fp_rrrr, FNMSUB, fsz, a0, a2, args[3], a1);
         break;
+    case INDEX_op_fcmp3_vec:
+        if (args[3]) {
+            tcg_out_insn(s, fp_cmp, FCMPE, fsz, a1, a2);
+        } else {
+            tcg_out_insn(s, fp_cmp, FCMP, fsz, a1, a2);
+        }
+        /*
+         * NZCV after FCMP: less 1000, equal 0110, greater 0010,
+         * unordered 0011.  CSET PL gives 0 for less and 1 for the rest;
+         * then +1 for HI (greater, unordered) and +1 for VS (unordered).
+         */
+        tcg_out32(s, Icsel_CSINC | TCG_REG_XZR << 16 | COND_MI << 12
+                  | TCG_REG_XZR << 5 | a0);
+        tcg_out32(s, Icsel_CSINC | a0 << 16 | COND_LS << 12 | a0 << 5 | a0);
+        tcg_out32(s, Icsel_CSINC | a0 << 16 | COND_VC << 12 | a0 << 5 | a0);
+        break;
+    case INDEX_op_scvtfs_vec:
+        /* The destination is tied to the first input (FPCR.NEP). */
+        tcg_out_insn(s, fp_cvt, SCVTF, args[3], fsz, a0, a2);
+        break;
+    case INDEX_op_fcvtzsi_vec:
+        tcg_out_insn(s, fp_cvt, FCVTZS, a2, fsz, a0, a1);
+        break;
     case INDEX_op_fcmps_vec:
         switch (args[3]) {
         case TCG_COND_EQ:
@@ -3972,6 +4015,9 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_fcmps_vec:
     case INDEX_op_fcvts_vec:
     case INDEX_op_movs_vec:
+    case INDEX_op_fcmp3_vec:
+    case INDEX_op_scvtfs_vec:
+    case INDEX_op_fcvtzsi_vec:
         /*
          * These are for running guest FP in the guest's FP environment,
          * which takes FEAT_AFP (host_fpenv_native).
@@ -4102,6 +4148,12 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fcvts_vec:
     case INDEX_op_movs_vec:
         return C_O1_I2(w, 0, w);
+    case INDEX_op_fcmp3_vec:
+        return C_O1_I2(r, w, w);
+    case INDEX_op_scvtfs_vec:
+        return C_O1_I2(w, 0, r);
+    case INDEX_op_fcvtzsi_vec:
+        return C_O1_I1(r, w);
     case INDEX_op_fsqrt_vec:
     case INDEX_op_fneg_vec:
     case INDEX_op_scvtf_vec:

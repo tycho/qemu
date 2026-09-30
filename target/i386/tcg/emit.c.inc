@@ -4720,9 +4720,40 @@ static void gen_VCMP(DisasContext *s, X86DecodedInsn *decode)
     gen_helper_cmp_funcs[index][b](tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
+/*
+ * COMISS/SD (signaling) and UCOMISS/SD (quiet) with x-ssefp=native: the
+ * host compare gives less, equal, greater or unordered, and a table packed
+ * in a constant gives ZF, PF and CF (0x01, 0x40, 0, 0x45).
+ */
+static bool gen_fcomi_native(DisasContext *s, X86DecodedInsn *decode,
+                             bool signaling)
+{
+    unsigned vece = s->prefix & PREFIX_DATA ? MO_64 : MO_32;
+    TCGv_vec a, b;
+    TCGv_i32 t;
+
+    if (!fp_native_s(INDEX_op_fcmp3_vec, vece)) {
+        return false;
+    }
+    a = fp_scalar_operand(decode, 1, vece);
+    b = fp_scalar_operand(decode, 2, vece);
+    t = tcg_temp_new_i32();
+    tcg_gen_fcmp3_vec(vece, t, a, b, signaling);
+    tcg_gen_shli_i32(t, t, 3);
+    tcg_gen_shr_i32(t, tcg_constant_i32(0x45004001), t);
+    tcg_gen_ext8u_i32(t, t);
+    tcg_gen_extu_i32_tl(cpu_cc_src, t);
+    set_cc_op(s, CC_OP_EFLAGS);
+    return true;
+}
+
 static void gen_VCOMI(DisasContext *s, X86DecodedInsn *decode)
 {
     SSEFunc_0_epp fn;
+
+    if (gen_fcomi_native(s, decode, true)) {
+        return;
+    }
     fn = s->prefix & PREFIX_DATA ? gen_helper_comisd : gen_helper_comiss;
     fn(tcg_env, OP_PTR1, OP_PTR2);
     assume_cc_op(s, CC_OP_EFLAGS);
@@ -4796,11 +4827,45 @@ static void gen_VCVTSS2SD(DisasContext *s, X86DecodedInsn *decode)
     gen_helper_cvtss2sd(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
+/*
+ * CVTSI2SS/SD with x-ssefp=native: one host conversion from the general
+ * register, which leaves the other elements of the first operand in place,
+ * and a store of the whole register.
+ */
+static bool gen_cvtsi2sx_native(DisasContext *s, X86DecodedInsn *decode)
+{
+    unsigned vece = s->prefix & PREFIX_REPNZ ? MO_64 : MO_32;
+    TCGv_vec a, d;
+
+    if (!fp_native_s(INDEX_op_scvtfs_vec, vece)) {
+        return false;
+    }
+    a = fp_scalar_operand(decode, 1, vece);
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+#ifdef TARGET_X86_64
+    if (decode->op[2].ot == MO_64) {
+        tcg_gen_scvtfs_i64_vec(vece, d, a, s->T1);
+    } else {
+        TCGv_i32 in = tcg_temp_new_i32();
+
+        tcg_gen_extrl_i64_i32(in, s->T1);
+        tcg_gen_scvtfs_i32_vec(vece, d, a, in);
+    }
+#else
+    tcg_gen_scvtfs_i32_vec(vece, d, a, s->T1);
+#endif
+    fp_scalar_store(decode, d);
+    return true;
+}
+
 static void gen_VCVTSI2Sx(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
     TCGv_i32 in;
 
+    if (gen_cvtsi2sx_native(s, decode)) {
+        return;
+    }
     tcg_gen_gvec_mov(MO_64, decode->op[0].offset, decode->op[1].offset, vec_len, vec_len);
 
 #ifdef TARGET_X86_64
@@ -4871,8 +4936,64 @@ static void gen_VCVTSx2SI(DisasContext *s, X86DecodedInsn *decode)
                    gen_helper_cvtsd2si, gen_helper_cvtsd2sq);
 }
 
+/*
+ * CVTTSS2SI/CVTTSD2SI with x-ssefp=native: the host's conversion rounds
+ * toward zero too.  x86 returns the "integer indefinite" (the most
+ * negative value) where the input is a NaN or out of range; the host gives
+ * 0 or saturates.  So take the indefinite value wherever the input's
+ * magnitude, tested as an integer, is at least 2^31 (2^63): that is every
+ * NaN, infinity and overflow, and -2^31 (-2^63), whose result is the same
+ * value anyway.
+ */
+static bool gen_cvttsx2si_native(DisasContext *s, X86DecodedInsn *decode)
+{
+    unsigned vece = s->prefix & PREFIX_REPNZ ? MO_64 : MO_32;
+    X86DecodedOp *op = &decode->op[2];
+    bool is64 = false;
+    TCGv_vec a;
+    TCGv_i64 bits, r;
+    uint64_t limit;
+    int ofs;
+
+#ifdef TARGET_X86_64
+    is64 = decode->op[0].ot == MO_64;
+#endif
+    if (!fp_native_s(INDEX_op_fcvtzsi_vec, vece)) {
+        return false;
+    }
+    a = fp_scalar_operand(decode, 2, vece);
+    bits = tcg_temp_new_i64();
+    r = tcg_temp_new_i64();
+    if (is64) {
+        tcg_gen_fcvtzsi_i64_vec(vece, r, a);
+    } else {
+        TCGv_i32 t = tcg_temp_new_i32();
+
+        tcg_gen_fcvtzsi_i32_vec(vece, t, a);
+        tcg_gen_extu_i32_i64(r, t);
+    }
+
+    ofs = op->has_ea ? op->offset : ZMM_OFFSET(op->n) + xmm_offset(vece);
+    if (vece == MO_64) {
+        tcg_gen_ld_i64(bits, tcg_env, ofs);
+        tcg_gen_andi_i64(bits, bits, INT64_MAX);
+        limit = is64 ? 0x43e0000000000000ull : 0x41e0000000000000ull;
+    } else {
+        tcg_gen_ld32u_i64(bits, tcg_env, ofs);
+        tcg_gen_andi_i64(bits, bits, INT32_MAX);
+        limit = is64 ? 0x5f000000 : 0x4f000000;
+    }
+    tcg_gen_movcond_i64(TCG_COND_GEU, r, bits, tcg_constant_i64(limit),
+                        tcg_constant_i64(is64 ? INT64_MIN : 0x80000000u), r);
+    tcg_gen_trunc_i64_tl(s->T0, r);
+    return true;
+}
+
 static void gen_VCVTTSx2SI(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (gen_cvttsx2si_native(s, decode)) {
+        return;
+    }
     gen_VCVTtSx2SI(s, decode,
                    gen_helper_cvttss2si, gen_helper_cvttss2sq,
                    gen_helper_cvttsd2si, gen_helper_cvttsd2sq);
@@ -5223,6 +5344,10 @@ static void gen_VSHUF(DisasContext *s, X86DecodedInsn *decode)
 static void gen_VUCOMI(DisasContext *s, X86DecodedInsn *decode)
 {
     SSEFunc_0_epp fn;
+
+    if (gen_fcomi_native(s, decode, false)) {
+        return;
+    }
     fn = s->prefix & PREFIX_DATA ? gen_helper_ucomisd : gen_helper_ucomiss;
     fn(tcg_env, OP_PTR1, OP_PTR2);
     assume_cc_op(s, CC_OP_EFLAGS);
