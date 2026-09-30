@@ -1032,3 +1032,23 @@ void tcg_gen_fcvtzsi_i64_vec(unsigned vece, TCGv_i64 r, TCGv_vec a)
     vec_gen_3(INDEX_op_fcvtzsi_vec, TCG_TYPE_V128, vece, tcgv_i64_arg(r),
               tcgv_vec_arg(a), 1);
 }
+
+void tcg_gen_frecpe_vec(unsigned vece, TCGv_vec r, TCGv_vec a)
+{
+    do_op2_nofail(vece, r, a, INDEX_op_frecpe_vec);
+}
+
+void tcg_gen_frsqrte_vec(unsigned vece, TCGv_vec r, TCGv_vec a)
+{
+    do_op2_nofail(vece, r, a, INDEX_op_frsqrte_vec);
+}
+
+void tcg_gen_frecpes_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_frecpes_vec);
+}
+
+void tcg_gen_frsqrtes_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_frsqrtes_vec);
+}
