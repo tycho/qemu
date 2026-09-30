@@ -681,51 +681,135 @@ FP_SSE(VMIN, min, fmin_vec)
 FP_SSE(VDIV, div, fdiv_vec)
 FP_SSE(VMAX, max, fmax_vec)
 
-#define FMA_SSE_PACKED(uname, ptr0, ptr1, ptr2, even, odd)                         \
-static void gen_##uname##Px(DisasContext *s, X86DecodedInsn *decode)               \
-{                                                                                  \
-    SSEFunc_0_eppppii xmm = s->vex_w ? gen_helper_fma4pd_xmm : gen_helper_fma4ps_xmm; \
-    SSEFunc_0_eppppii ymm = s->vex_w ? gen_helper_fma4pd_ymm : gen_helper_fma4ps_ymm; \
-    SSEFunc_0_eppppii fn = s->vex_l ? ymm : xmm;                                   \
-                                                                                   \
-    fn(tcg_env, OP_PTR0, ptr0, ptr1, ptr2,                                         \
-       tcg_constant_i32(even),                                                     \
-       tcg_constant_i32((even) ^ (odd)));                                          \
+/*
+ * x86's a * b + c as the host's accumulating forms.  The host's negation
+ * leaves a NaN alone, as x86's negated forms do.
+ */
+static void gen_fmadd_vec(unsigned vece, TCGv_vec d, TCGv_vec a,
+                          TCGv_vec b, TCGv_vec c)
+{
+    tcg_gen_fmla_vec(vece, d, c, a, b);
 }
 
-#define FMA_SSE(uname, ptr0, ptr1, ptr2, flags)                                    \
-FMA_SSE_PACKED(uname, ptr0, ptr1, ptr2, flags, flags)                              \
-static void gen_##uname##Sx(DisasContext *s, X86DecodedInsn *decode)               \
-{                                                                                  \
-    SSEFunc_0_eppppi fn = s->vex_w ? gen_helper_fma4sd : gen_helper_fma4ss;        \
-                                                                                   \
-    fn(tcg_env, OP_PTR0, ptr0, ptr1, ptr2,                                         \
-       tcg_constant_i32(flags));                                                   \
-}                                                                                  \
+static void gen_fmsub_vec(unsigned vece, TCGv_vec d, TCGv_vec a,
+                          TCGv_vec b, TCGv_vec c)
+{
+    TCGv_vec t = tcg_temp_new_vec_matching(d);
 
-FMA_SSE(VFMADD231,  OP_PTR1, OP_PTR2, OP_PTR0, 0)
-FMA_SSE(VFMADD213,  OP_PTR1, OP_PTR0, OP_PTR2, 0)
-FMA_SSE(VFMADD132,  OP_PTR0, OP_PTR2, OP_PTR1, 0)
+    tcg_gen_fneg_vec(vece, t, c);
+    tcg_gen_fmla_vec(vece, d, t, a, b);
+}
 
-FMA_SSE(VFNMADD231, OP_PTR1, OP_PTR2, OP_PTR0, float_muladd_negate_product)
-FMA_SSE(VFNMADD213, OP_PTR1, OP_PTR0, OP_PTR2, float_muladd_negate_product)
-FMA_SSE(VFNMADD132, OP_PTR0, OP_PTR2, OP_PTR1, float_muladd_negate_product)
+static void gen_fnmadd_vec(unsigned vece, TCGv_vec d, TCGv_vec a,
+                           TCGv_vec b, TCGv_vec c)
+{
+    tcg_gen_fmls_vec(vece, d, c, a, b);
+}
 
-FMA_SSE(VFMSUB231,  OP_PTR1, OP_PTR2, OP_PTR0, float_muladd_negate_c)
-FMA_SSE(VFMSUB213,  OP_PTR1, OP_PTR0, OP_PTR2, float_muladd_negate_c)
-FMA_SSE(VFMSUB132,  OP_PTR0, OP_PTR2, OP_PTR1, float_muladd_negate_c)
+static void gen_fnmsub_vec(unsigned vece, TCGv_vec d, TCGv_vec a,
+                           TCGv_vec b, TCGv_vec c)
+{
+    TCGv_vec t = tcg_temp_new_vec_matching(d);
 
-FMA_SSE(VFNMSUB231, OP_PTR1, OP_PTR2, OP_PTR0, float_muladd_negate_c|float_muladd_negate_product)
-FMA_SSE(VFNMSUB213, OP_PTR1, OP_PTR0, OP_PTR2, float_muladd_negate_c|float_muladd_negate_product)
-FMA_SSE(VFNMSUB132, OP_PTR0, OP_PTR2, OP_PTR1, float_muladd_negate_c|float_muladd_negate_product)
+    tcg_gen_fneg_vec(vece, t, c);
+    tcg_gen_fmls_vec(vece, d, t, a, b);
+}
 
-FMA_SSE_PACKED(VFMADDSUB231, OP_PTR1, OP_PTR2, OP_PTR0, float_muladd_negate_c, 0)
-FMA_SSE_PACKED(VFMADDSUB213, OP_PTR1, OP_PTR0, OP_PTR2, float_muladd_negate_c, 0)
-FMA_SSE_PACKED(VFMADDSUB132, OP_PTR0, OP_PTR2, OP_PTR1, float_muladd_negate_c, 0)
+/* a, b and c are the numbers of the operands of a * b + c. */
+static bool gen_fma_native(DisasContext *s, X86DecodedInsn *decode,
+                           int a, int b, int c, int flags)
+{
+    FP_NATIVE_GVEC(GVecGen4, madd, gen_fmadd_vec, INDEX_op_fmla_vec);
+    FP_NATIVE_GVEC(GVecGen4, msub, gen_fmsub_vec,
+                   INDEX_op_fmla_vec, INDEX_op_fneg_vec);
+    FP_NATIVE_GVEC(GVecGen4, nmadd, gen_fnmadd_vec, INDEX_op_fmls_vec);
+    FP_NATIVE_GVEC(GVecGen4, nmsub, gen_fnmsub_vec,
+                   INDEX_op_fmls_vec, INDEX_op_fneg_vec);
+    const GVecGen4 *g;
+    int vec_len = vector_len(s, decode);
 
-FMA_SSE_PACKED(VFMSUBADD231, OP_PTR1, OP_PTR2, OP_PTR0, 0, float_muladd_negate_c)
-FMA_SSE_PACKED(VFMSUBADD213, OP_PTR1, OP_PTR0, OP_PTR2, 0, float_muladd_negate_c)
-FMA_SSE_PACKED(VFMSUBADD132, OP_PTR0, OP_PTR2, OP_PTR1, 0, float_muladd_negate_c)
+    switch (flags) {
+    case 0:
+        g = madd;
+        break;
+    case float_muladd_negate_c:
+        g = msub;
+        break;
+    case float_muladd_negate_product:
+        g = nmadd;
+        break;
+    case float_muladd_negate_c | float_muladd_negate_product:
+        g = nmsub;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    g += s->vex_w;
+    if (!fp_native(g->opt_opc, g->vece)) {
+        return false;
+    }
+    tcg_gen_gvec_4(decode->op[0].offset, decode->op[a].offset,
+                   decode->op[b].offset, decode->op[c].offset,
+                   vec_len, vec_len, g);
+    return true;
+}
+
+/* a, b and c are the numbers of the operands of a * b + c. */
+#define FMA_SSE_PACKED(uname, a, b, c, even, odd)                             \
+static void gen_##uname##Px(DisasContext *s, X86DecodedInsn *decode)          \
+{                                                                             \
+    SSEFunc_0_eppppii xmm = s->vex_w ? gen_helper_fma4pd_xmm                  \
+                                     : gen_helper_fma4ps_xmm;                 \
+    SSEFunc_0_eppppii ymm = s->vex_w ? gen_helper_fma4pd_ymm                  \
+                                     : gen_helper_fma4ps_ymm;                 \
+    SSEFunc_0_eppppii fn = s->vex_l ? ymm : xmm;                              \
+                                                                              \
+    if ((even) == (odd) && gen_fma_native(s, decode, a, b, c, even)) {        \
+        return;                                                               \
+    }                                                                         \
+    fn(tcg_env, OP_PTR0, op_ptr(decode, a), op_ptr(decode, b),                \
+       op_ptr(decode, c),                                                     \
+       tcg_constant_i32(even),                                                \
+       tcg_constant_i32((even) ^ (odd)));                                     \
+}
+
+#define FMA_SSE(uname, a, b, c, flags)                                        \
+FMA_SSE_PACKED(uname, a, b, c, flags, flags)                                  \
+static void gen_##uname##Sx(DisasContext *s, X86DecodedInsn *decode)          \
+{                                                                             \
+    SSEFunc_0_eppppi fn = s->vex_w ? gen_helper_fma4sd : gen_helper_fma4ss;   \
+                                                                              \
+    fn(tcg_env, OP_PTR0, op_ptr(decode, a), op_ptr(decode, b),                \
+       op_ptr(decode, c),                                                     \
+       tcg_constant_i32(flags));                                              \
+}
+
+FMA_SSE(VFMADD231,  1, 2, 0, 0)
+FMA_SSE(VFMADD213,  1, 0, 2, 0)
+FMA_SSE(VFMADD132,  0, 2, 1, 0)
+
+FMA_SSE(VFNMADD231, 1, 2, 0, float_muladd_negate_product)
+FMA_SSE(VFNMADD213, 1, 0, 2, float_muladd_negate_product)
+FMA_SSE(VFNMADD132, 0, 2, 1, float_muladd_negate_product)
+
+FMA_SSE(VFMSUB231,  1, 2, 0, float_muladd_negate_c)
+FMA_SSE(VFMSUB213,  1, 0, 2, float_muladd_negate_c)
+FMA_SSE(VFMSUB132,  0, 2, 1, float_muladd_negate_c)
+
+FMA_SSE(VFNMSUB231, 1, 2, 0,
+        float_muladd_negate_c | float_muladd_negate_product)
+FMA_SSE(VFNMSUB213, 1, 0, 2,
+        float_muladd_negate_c | float_muladd_negate_product)
+FMA_SSE(VFNMSUB132, 0, 2, 1,
+        float_muladd_negate_c | float_muladd_negate_product)
+
+FMA_SSE_PACKED(VFMADDSUB231, 1, 2, 0, float_muladd_negate_c, 0)
+FMA_SSE_PACKED(VFMADDSUB213, 1, 0, 2, float_muladd_negate_c, 0)
+FMA_SSE_PACKED(VFMADDSUB132, 0, 2, 1, float_muladd_negate_c, 0)
+
+FMA_SSE_PACKED(VFMSUBADD231, 1, 2, 0, 0, float_muladd_negate_c)
+FMA_SSE_PACKED(VFMSUBADD213, 1, 0, 2, 0, float_muladd_negate_c)
+FMA_SSE_PACKED(VFMSUBADD132, 0, 2, 1, 0, float_muladd_negate_c)
 
 #define FP_UNPACK_SSE(uname, lname)                                                \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
