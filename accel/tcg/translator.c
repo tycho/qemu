@@ -23,6 +23,8 @@
 #include "internal-common.h"
 #include "disas/disas.h"
 #include "tb-internal.h"
+#include "tb-hash.h"
+#include "tcg/tcg-temp-internal.h"
 
 #ifndef CONFIG_USER_ONLY
 static void set_can_do_io(DisasContextBase *db, bool val)
@@ -150,6 +152,121 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
 
     /* Check for the dest on the same page as the start of the TB.  */
     return use_cross_page_goto_tb() || translator_is_same_page(db, dest);
+}
+
+bool translator_use_inline_lookup(DisasContextBase *db)
+{
+    return tcg_ijmp_inline &&
+           !(tb_cflags(db->tb) & (CF_NO_GOTO_PTR | CF_USE_ICOUNT)) &&
+           !qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC);
+}
+
+/*
+ * Byte offset of @pc's entry in CPUJumpCache.array, computed as
+ * tb_jmp_cache_hash_func() does.
+ */
+static void gen_jmp_cache_offset(TCGv_i64 off, TCGv_i64 pc)
+{
+#define JC_ENTRY_SIZE sizeof_field(CPUJumpCache, array[0])
+    const unsigned e = ctz32(JC_ENTRY_SIZE);
+    TCGv_i64 tmp = tcg_temp_ebb_new_i64();
+
+    QEMU_BUILD_BUG_ON(JC_ENTRY_SIZE & (JC_ENTRY_SIZE - 1));
+#undef JC_ENTRY_SIZE
+#ifdef CONFIG_SOFTMMU
+    TCGv_i64 hi = tcg_temp_ebb_new_i64();
+    const unsigned sh = TARGET_PAGE_BITS - TB_JMP_PAGE_BITS;
+
+    tcg_gen_shri_i64(tmp, pc, sh);
+    tcg_gen_xor_i64(tmp, tmp, pc);
+    tcg_gen_shri_i64(hi, tmp, sh + TB_JMP_PAGE_BITS);
+    tcg_gen_deposit_z_i64(hi, hi, e + TB_JMP_PAGE_BITS,
+                          TB_JMP_CACHE_BITS - TB_JMP_PAGE_BITS);
+    tcg_gen_deposit_z_i64(off, tmp, e, TB_JMP_PAGE_BITS);
+    tcg_gen_or_i64(off, off, hi);
+    tcg_temp_free_i64(hi);
+#else
+    tcg_gen_shri_i64(tmp, pc, TB_JMP_CACHE_BITS);
+    tcg_gen_xor_i64(tmp, tmp, pc);
+    tcg_gen_deposit_z_i64(off, tmp, e, TB_JMP_CACHE_BITS);
+#endif
+    tcg_temp_free_i64(tmp);
+}
+
+/*
+ * Whether a breakpoint can be inserted while generated code runs, and so
+ * whether the inline lookup must defer to the helper, which checks them.
+ */
+static bool inline_lookup_checks_breakpoints(void)
+{
+#ifdef CONFIG_USER_ONLY
+    return gdb_may_set_breakpoints();
+#else
+    return true;
+#endif
+}
+
+void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
+                                    uint64_t cs_base, uint32_t flags)
+{
+    TCGLabel *miss = gen_new_label();
+    TCGv_ptr jc = tcg_temp_ebb_new_ptr();
+    TCGv_ptr tb = tcg_temp_ebb_new_ptr();
+    TCGv_i64 t64 = tcg_temp_ebb_new_i64();
+    TCGv_i32 t32 = tcg_temp_ebb_new_i32();
+    TCGv_i32 cf = tcg_temp_ebb_new_i32();
+
+    assert(translator_use_inline_lookup(db));
+    plugin_gen_disable_mem_helpers();
+
+    /*
+     * The same checks as tb_lookup(), against the jump cache only.  The
+     * cache holds only TBs that are valid for the vCPU's current mappings:
+     * TLB flushes clear it, and TB invalidation removes the TB from it.
+     * The pc is compared before the first branch, so it needn't stay live
+     * across them.
+     */
+    tcg_gen_ld_ptr(jc, tcg_env,
+                   offsetof(CPUState, tb_jmp_cache) - sizeof(CPUState));
+    gen_jmp_cache_offset(t64, pc);
+    tcg_gen_trunc_i64_ptr(tb, t64);
+    tcg_gen_add_ptr(jc, jc, tb);
+    QEMU_BUILD_BUG_ON(sizeof(vaddr) != sizeof(uint64_t));
+    tcg_gen_ld_i64(t64, jc, offsetof(CPUJumpCache, array[0].pc));
+    tcg_gen_ld_ptr(tb, jc, offsetof(CPUJumpCache, array[0].tb));
+    tcg_gen_brcond_i64(TCG_COND_NE, t64, pc, miss);
+    tcg_gen_brcondi_ptr(TCG_COND_EQ, tb, 0, miss);
+
+    /* check_for_breakpoints() runs only in the helper. */
+    if (inline_lookup_checks_breakpoints()) {
+        tcg_gen_ld_ptr(jc, tcg_env,
+                       offsetof(CPUState, breakpoints.tqh_first) -
+                       sizeof(CPUState));
+        tcg_gen_brcondi_ptr(TCG_COND_NE, jc, 0, miss);
+    }
+
+    tcg_gen_ld_i64(t64, tb, offsetof(TranslationBlock, cs_base));
+    tcg_gen_brcondi_i64(TCG_COND_NE, t64, cs_base, miss);
+    tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, flags));
+    tcg_gen_brcondi_i32(TCG_COND_NE, t32, flags, miss);
+
+    /* curr_cflags(); a stale TB has CF_INVALID set and never matches. */
+    tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, cflags));
+    tcg_gen_ld_i32(cf, tcg_env,
+                   offsetof(CPUState, tcg_cflags) - sizeof(CPUState));
+    tcg_gen_brcond_i32(TCG_COND_NE, t32, cf, miss);
+
+    tcg_gen_ld_ptr(tb, tb, offsetof(TranslationBlock, tc.ptr));
+    tcg_gen_goto_ptr(tb);
+
+    gen_set_label(miss);
+    tcg_gen_lookup_and_goto_ptr();
+
+    tcg_temp_free_i32(cf);
+    tcg_temp_free_i32(t32);
+    tcg_temp_free_i64(t64);
+    tcg_temp_free_ptr(tb);
+    tcg_temp_free_ptr(jc);
 }
 
 void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
