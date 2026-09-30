@@ -85,6 +85,15 @@ void tcg_gen_goto_tb(unsigned idx);
  */
 void tcg_gen_lookup_and_goto_ptr(void);
 
+/**
+ * tcg_gen_goto_ptr() - jump to a TB's host code
+ * @ptr: host address of the TB's code, as helper_lookup_tb_ptr returns
+ *
+ * The caller must have established that the TB is valid for the current
+ * CPU state, as tcg_gen_lookup_and_goto_ptr() does.
+ */
+void tcg_gen_goto_ptr(TCGv_ptr ptr);
+
 void tcg_gen_plugin_cb(unsigned from);
 void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo);
 
