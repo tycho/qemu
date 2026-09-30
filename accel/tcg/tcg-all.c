@@ -301,6 +301,22 @@ static void tcg_set_pferr_hw(Object *obj, bool value, Error **errp)
     tcg_pferr_hw = value;
 }
 
+static char *tcg_get_ssefp(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_ssefp_vec ? "vec" : "soft");
+}
+
+static void tcg_set_ssefp(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "vec")) {
+        tcg_ssefp_vec = true;
+    } else if (!strcmp(value, "soft")) {
+        tcg_ssefp_vec = false;
+    } else {
+        error_setg(errp, "Invalid 'x-ssefp' value: %s", value);
+    }
+}
+
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
@@ -425,6 +441,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Look up the next TB at an indirect or cross-page jump: helper "
         "(default) or inline (probe the jump cache in generated code, "
         "call the helper on a miss)");
+
+    object_class_property_add_str(oc, "x-ssefp", tcg_get_ssefp, tcg_set_ssefp);
+    object_class_property_set_description(oc, "x-ssefp",
+        "SIMD floating point: soft (default, lane by lane) or vec (compute "
+        "whole vectors on the host FPU when that gives the same results "
+        "and flags)");
 
     object_class_property_add_bool(oc, "x-pferr-hw",
                                    tcg_get_pferr_hw, tcg_set_pferr_hw);

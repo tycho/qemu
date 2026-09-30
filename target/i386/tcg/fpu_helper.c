@@ -26,8 +26,10 @@
 #include "exec/helper-proto.h"
 #include "fpu/softfloat.h"
 #include "fpu/softfloat-macros.h"
+#include "fpu/softfloat-vec.h"
 #include "helper-tcg.h"
 #include "access.h"
+#include "tcg/startup.h"
 
 /* float macros */
 #define FT0    (env->ft0)
@@ -3331,6 +3333,152 @@ void helper_emms(CPUX86State *env)
     /* set to empty state */
     *(uint32_t *)(env->fptags) = 0x01010101;
     *(uint32_t *)(env->fptags + 4) = 0x01010101;
+}
+
+/*
+ * Packed SSE/AVX floating point through the softfloat vector fast paths
+ * (x-ssefp=vec).  Each wrapper returns true if the vector function computed
+ * the destination; otherwise the helper computes lane by lane as before.
+ *
+ * The operations are elementwise, so they work on the first n lanes of each
+ * register as an array: that big-endian hosts store the lanes in reverse
+ * order doesn't matter, since every register does.
+ */
+#if HOST_BIG_ENDIAN
+#define SSE_LANES(r, fld, n) (&(r)->fld[ARRAY_SIZE((r)->fld) - (n)])
+#else
+#define SSE_LANES(r, fld, n) (&(r)->fld[0])
+#endif
+
+#define SSE_VEC_BINOP(N, op, OP, fld)                                       \
+static inline bool sse_vec_##op##N(CPUX86State *env, ZMMReg *d,            \
+                                   ZMMReg *v, ZMMReg *s, unsigned n)       \
+{                                                                           \
+    return tcg_ssefp_vec &&                                                 \
+           float##N##_binop_vec(SSE_LANES(d, fld, n), SSE_LANES(v, fld, n), \
+                                SSE_LANES(s, fld, n), n, &env->sse_status,  \
+                                OP);                                        \
+}
+
+SSE_VEC_BINOP(32, add, FLOAT_VEC_ADD, _s_ZMMReg)
+SSE_VEC_BINOP(32, sub, FLOAT_VEC_SUB, _s_ZMMReg)
+SSE_VEC_BINOP(32, mul, FLOAT_VEC_MUL, _s_ZMMReg)
+SSE_VEC_BINOP(32, div, FLOAT_VEC_DIV, _s_ZMMReg)
+SSE_VEC_BINOP(64, add, FLOAT_VEC_ADD, _d_ZMMReg)
+SSE_VEC_BINOP(64, sub, FLOAT_VEC_SUB, _d_ZMMReg)
+SSE_VEC_BINOP(64, mul, FLOAT_VEC_MUL, _d_ZMMReg)
+SSE_VEC_BINOP(64, div, FLOAT_VEC_DIV, _d_ZMMReg)
+
+/*
+ * MIN returns the first operand if it compares less, MAX if it compares
+ * greater, and otherwise the second (see FPU_MIN and FPU_MAX in ops_sse.h).
+ */
+#define SSE_VEC_MINMAX(N, op, LT, fld)                                      \
+static inline bool sse_vec_##op##N(CPUX86State *env, ZMMReg *d,            \
+                                   ZMMReg *v, ZMMReg *s, unsigned n)       \
+{                                                                           \
+    return tcg_ssefp_vec &&                                                 \
+           float##N##_select_vec(SSE_LANES(d, fld, n), SSE_LANES(v, fld, n), \
+                                 SSE_LANES(s, fld, n), n, LT,              \
+                                 &env->sse_status);                         \
+}
+
+SSE_VEC_MINMAX(32, min, true, _s_ZMMReg)
+SSE_VEC_MINMAX(32, max, false, _s_ZMMReg)
+SSE_VEC_MINMAX(64, min, true, _d_ZMMReg)
+SSE_VEC_MINMAX(64, max, false, _d_ZMMReg)
+
+/*
+ * CMPPS/CMPPD: the relation of each pair of lanes, in the array order of
+ * SSE_LANES, for the helper to turn into a mask with its predicate.
+ */
+#define SSE_VEC_COMPARE(N, UT, fld)                                         \
+static inline bool sse_vec_compare##N(CPUX86State *env, FloatRelation *rel, \
+                                      ZMMReg *v, ZMMReg *s, unsigned n)    \
+{                                                                           \
+    UT lt[8], eq[8];                                                        \
+    unsigned i;                                                             \
+                                                                            \
+    if (!tcg_ssefp_vec ||                                                   \
+        !float##N##_compare_vec(lt, eq, SSE_LANES(v, fld, n),              \
+                                SSE_LANES(s, fld, n), n, &env->sse_status)) { \
+        return false;                                                       \
+    }                                                                       \
+    for (i = 0; i < n; i++) {                                               \
+        rel[i] = lt[i] ? float_relation_less                                \
+                 : eq[i] ? float_relation_equal : float_relation_greater;   \
+    }                                                                       \
+    return true;                                                            \
+}
+
+SSE_VEC_COMPARE(32, uint32_t, _s_ZMMReg)
+SSE_VEC_COMPARE(64, uint64_t, _d_ZMMReg)
+
+static inline bool sse_vec_sqrt32(CPUX86State *env, ZMMReg *d, ZMMReg *s,
+                                  unsigned n)
+{
+    return tcg_ssefp_vec &&
+           float32_sqrt_vec(SSE_LANES(d, _s_ZMMReg, n),
+                            SSE_LANES(s, _s_ZMMReg, n), n, &env->sse_status);
+}
+
+static inline bool sse_vec_sqrt64(CPUX86State *env, ZMMReg *d, ZMMReg *s,
+                                  unsigned n)
+{
+    return tcg_ssefp_vec &&
+           float64_sqrt_vec(SSE_LANES(d, _d_ZMMReg, n),
+                            SSE_LANES(s, _d_ZMMReg, n), n, &env->sse_status);
+}
+
+static inline bool sse_vec_muladd32(CPUX86State *env, ZMMReg *d, ZMMReg *a,
+                                    ZMMReg *b, ZMMReg *c, unsigned n,
+                                    int flags)
+{
+    return tcg_ssefp_vec &&
+           float32_muladd_vec(SSE_LANES(d, _s_ZMMReg, n),
+                              SSE_LANES(a, _s_ZMMReg, n),
+                              SSE_LANES(b, _s_ZMMReg, n),
+                              SSE_LANES(c, _s_ZMMReg, n), n, flags,
+                              &env->sse_status);
+}
+
+static inline bool sse_vec_muladd64(CPUX86State *env, ZMMReg *d, ZMMReg *a,
+                                    ZMMReg *b, ZMMReg *c, unsigned n,
+                                    int flags)
+{
+    return tcg_ssefp_vec &&
+           float64_muladd_vec(SSE_LANES(d, _d_ZMMReg, n),
+                              SSE_LANES(a, _d_ZMMReg, n),
+                              SSE_LANES(b, _d_ZMMReg, n),
+                              SSE_LANES(c, _d_ZMMReg, n), n, flags,
+                              &env->sse_status);
+}
+
+static inline bool sse_vec_cvtdq2ps(CPUX86State *env, ZMMReg *d, ZMMReg *s,
+                                    unsigned n)
+{
+    return tcg_ssefp_vec &&
+           int32_to_float32_vec(SSE_LANES(d, _s_ZMMReg, n),
+                                (int32_t *)SSE_LANES(s, _l_ZMMReg, n), n,
+                                &env->sse_status);
+}
+
+static inline bool sse_vec_cvtps2dq(CPUX86State *env, ZMMReg *d, ZMMReg *s,
+                                    unsigned n)
+{
+    return tcg_ssefp_vec &&
+           float32_to_int32_vec((int32_t *)SSE_LANES(d, _l_ZMMReg, n),
+                                SSE_LANES(s, _s_ZMMReg, n), n,
+                                &env->sse_status);
+}
+
+static inline bool sse_vec_cvttps2dq(CPUX86State *env, ZMMReg *d, ZMMReg *s,
+                                     unsigned n)
+{
+    return tcg_ssefp_vec &&
+           float32_to_int32_round_to_zero_vec(
+               (int32_t *)SSE_LANES(d, _l_ZMMReg, n),
+               SSE_LANES(s, _s_ZMMReg, n), n, &env->sse_status);
 }
 
 #define SHIFT 0
