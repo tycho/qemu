@@ -928,6 +928,74 @@ specifies the length of the element (if applicable) in log2 8-bit units.
               v0[i] = (c1[i] cond c2[i]) ? v3[i] : v4[i].
           }
 
+Host floating-point vector operations
+-------------------------------------
+
+These compute IEEE floating point on the elements of a vector, which are
+32 or 64 bits wide (``TCGOP_VECE``), with the host's FPU in its current
+state: they round as the host's FP control register says and set the
+host's cumulative exception flags.  They are for front ends that keep
+the guest's FP environment in the host's FP registers while generated
+code runs (``accel/tcg/host-fp.h``), on hosts whose FPU can take the
+guest's semantics.  The result is what the host instruction gives,
+including which NaN it propagates.  There are no fallbacks, so check
+``tcg_can_emit_vec_op`` first.
+
+Because the exception flags are an effect that TCG doesn't track, the
+result of each operation must be used.
+
+.. list-table::
+
+   * - fadd_vec *v0*, *v1*, *v2*
+
+       fsub_vec *v0*, *v1*, *v2*
+
+       fmul_vec *v0*, *v1*, *v2*
+
+       fdiv_vec *v0*, *v1*, *v2*
+
+     - | *v0* = *v1* op *v2*.
+
+   * - fmin_vec *v0*, *v1*, *v2*
+
+       fmax_vec *v0*, *v1*, *v2*
+
+     - | Minimum and maximum.
+
+   * - fsqrt_vec *v0*, *v1*
+
+       fneg_vec *v0*, *v1*
+
+     - | Square root; negation.
+
+   * - fmla_vec *v0*, *v1*, *v2*, *v3*
+
+       fmls_vec *v0*, *v1*, *v2*, *v3*
+
+     - | Fused multiply-add: *v0* = *v1* + *v2* * *v3*, and
+         *v0* = *v1* - *v2* * *v3*.
+
+   * - fcmp_vec *v0*, *v1*, *v2*, *cond*
+
+     - | Compare, storing -1 for true and 0 for false.  *cond* is EQ, which
+         is quiet (invalid for a signaling NaN only), or GE, GT, LE or LT,
+         which signal invalid for any NaN.  Unordered is false.
+
+   * - scvtf_vec *v0*, *v1*
+
+     - | Convert signed integers to floating point of the same width.
+
+   * - fcvtzs_vec *v0*, *v1*
+
+     - | Convert floating point to signed integers of the same width,
+         rounding toward zero.  What an out-of-range value or a NaN gives
+         is the host's choice.
+
+   * - frintx_vec *v0*, *v1*
+
+     - | Round to an integral value in floating-point format, in the
+         current rounding mode, signaling inexact.
+
 **Note 1**: Some shortcuts are defined when the last operand is known to be
 a constant (e.g. addi for add, movi for mov).
 
