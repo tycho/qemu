@@ -574,6 +574,61 @@ static bool gen_fp_native_3(DisasContext *s, X86DecodedInsn *decode,
     return true;
 }
 
+/*
+ * The scalar forms work on element 0 of 128-bit vectors, and the host
+ * operation leaves the other elements as x86 wants them (FPCR.NEP).
+ */
+static bool fp_native_s(TCGOpcode opc, unsigned vece)
+{
+    return tcg_ssefp_native &&
+           tcg_can_emit_vec_op(opc, TCG_TYPE_V128, vece) > 0;
+}
+
+/*
+ * Operand n of a scalar operation: all 128 bits of a register, or a scalar
+ * that the decoder loaded from memory, which is duplicated so that the
+ * host's load is no wider than the store it follows.
+ */
+static TCGv_vec fp_scalar_operand(X86DecodedInsn *decode, int n,
+                                  unsigned vece)
+{
+    X86DecodedOp *op = &decode->op[n];
+    TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    if (op->has_ea) {
+        tcg_gen_dup_mem_vec(vece, v, tcg_env, op->offset);
+    } else {
+        tcg_gen_ld_vec(v, tcg_env, ZMM_OFFSET(op->n) + xmm_offset(MO_128));
+    }
+    return v;
+}
+
+static void fp_scalar_store(X86DecodedInsn *decode, TCGv_vec v)
+{
+    tcg_gen_st_vec(v, tcg_env,
+                   ZMM_OFFSET(decode->op[0].n) + xmm_offset(MO_128));
+}
+
+typedef void FPScalarFn3(unsigned, TCGv_vec, TCGv_vec, TCGv_vec);
+
+/* Operand 0 = operand 1 with element 0 = fn(operand 1, operand 2). */
+static bool gen_fp_native_s3(DisasContext *s, X86DecodedInsn *decode,
+                             FPScalarFn3 *fn, TCGOpcode opc)
+{
+    unsigned vece = s->prefix & PREFIX_REPZ ? MO_32 : MO_64;
+    TCGv_vec a, b, d;
+
+    if (!fp_native_s(opc, vece)) {
+        return false;
+    }
+    a = fp_scalar_operand(decode, 1, vece);
+    b = fp_scalar_operand(decode, 2, vece);
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    fn(vece, d, a, b);
+    fp_scalar_store(decode, d);
+    return true;
+}
+
 /* A pair of expanders for the ps and pd forms of one instruction. */
 #define FP_NATIVE_GVEC(T, name, fn, ...)                                      \
     static const TCGOpcode name##_list[] = { __VA_ARGS__, 0 };                \
@@ -615,10 +670,13 @@ static inline void gen_unary_fp_sse(DisasContext *s, X86DecodedInsn *decode,
 #define UNARY_FP_SSE(uname, lname, vecop)                                     \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
 {                                                                             \
-    FP_NATIVE_GVEC(GVecGen2, g, tcg_gen_##vecop, INDEX_op_##vecop);           \
+    FP_NATIVE_GVEC(GVecGen2, g, tcg_gen_##vecop##_vec,                        \
+                   INDEX_op_##vecop##_vec);                                   \
                                                                               \
-    if (!fp_scalar(s) &&                                                      \
-        gen_fp_native_2(s, decode, &g[!!(s->prefix & PREFIX_DATA)])) {        \
+    if (fp_scalar(s)                                                          \
+        ? gen_fp_native_s3(s, decode, tcg_gen_##vecop##s_vec,                 \
+                           INDEX_op_##vecop##s_vec)                           \
+        : gen_fp_native_2(s, decode, &g[!!(s->prefix & PREFIX_DATA)])) {      \
         return;                                                               \
     }                                                                         \
     gen_unary_fp_sse(s, decode,                                               \
@@ -629,7 +687,7 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
                      gen_helper_##lname##sd,                                  \
                      gen_helper_##lname##ss);                                 \
 }
-UNARY_FP_SSE(VSQRT, sqrt, fsqrt_vec)
+UNARY_FP_SSE(VSQRT, sqrt, fsqrt)
 
 /*
  * 00 = v*ps Vps, Hps, Wpd
@@ -660,10 +718,13 @@ static inline void gen_fp_sse(DisasContext *s, X86DecodedInsn *decode,
 #define FP_SSE(uname, lname, vecop)                                           \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
 {                                                                             \
-    FP_NATIVE_GVEC(GVecGen3, g, tcg_gen_##vecop, INDEX_op_##vecop);           \
+    FP_NATIVE_GVEC(GVecGen3, g, tcg_gen_##vecop##_vec,                        \
+                   INDEX_op_##vecop##_vec);                                   \
                                                                               \
-    if (!fp_scalar(s) &&                                                      \
-        gen_fp_native_3(s, decode, &g[!!(s->prefix & PREFIX_DATA)])) {        \
+    if (fp_scalar(s)                                                          \
+        ? gen_fp_native_s3(s, decode, tcg_gen_##vecop##s_vec,                 \
+                           INDEX_op_##vecop##s_vec)                           \
+        : gen_fp_native_3(s, decode, &g[!!(s->prefix & PREFIX_DATA)])) {      \
         return;                                                               \
     }                                                                         \
     gen_fp_sse(s, decode,                                                     \
@@ -674,12 +735,12 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
                gen_helper_##lname##sd,                                        \
                gen_helper_##lname##ss);                                       \
 }
-FP_SSE(VADD, add, fadd_vec)
-FP_SSE(VMUL, mul, fmul_vec)
-FP_SSE(VSUB, sub, fsub_vec)
-FP_SSE(VMIN, min, fmin_vec)
-FP_SSE(VDIV, div, fdiv_vec)
-FP_SSE(VMAX, max, fmax_vec)
+FP_SSE(VADD, add, fadd)
+FP_SSE(VMUL, mul, fmul)
+FP_SSE(VSUB, sub, fsub)
+FP_SSE(VMIN, min, fmin)
+FP_SSE(VDIV, div, fdiv)
+FP_SSE(VMAX, max, fmax)
 
 /*
  * x86's a * b + c as the host's accumulating forms.  The host's negation
@@ -754,6 +815,56 @@ static bool gen_fma_native(DisasContext *s, X86DecodedInsn *decode,
     return true;
 }
 
+/*
+ * The scalar forms.  The host keeps the other elements of the addend, x86
+ * those of the destination (operand 0).
+ */
+static bool gen_fma_native_s(DisasContext *s, X86DecodedInsn *decode,
+                             int a, int b, int c, int flags)
+{
+    unsigned vece = s->vex_w ? MO_64 : MO_32;
+    void (*fn)(unsigned, TCGv_vec, TCGv_vec, TCGv_vec, TCGv_vec);
+    TCGOpcode opc;
+    TCGv_vec v[3], d;
+
+    switch (flags) {
+    case 0:
+        fn = tcg_gen_fmadds_vec;
+        opc = INDEX_op_fmadds_vec;
+        break;
+    case float_muladd_negate_c:
+        fn = tcg_gen_fnmsubs_vec;
+        opc = INDEX_op_fnmsubs_vec;
+        break;
+    case float_muladd_negate_product:
+        fn = tcg_gen_fmsubs_vec;
+        opc = INDEX_op_fmsubs_vec;
+        break;
+    case float_muladd_negate_c | float_muladd_negate_product:
+        fn = tcg_gen_fnmadds_vec;
+        opc = INDEX_op_fnmadds_vec;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    if (!fp_native_s(opc, vece) || !fp_native_s(INDEX_op_movs_vec, vece)) {
+        return false;
+    }
+    for (int i = 0; i < 3; i++) {
+        v[i] = fp_scalar_operand(decode, i, vece);
+    }
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    fn(vece, d, v[c], v[a], v[b]);
+    if (c != 0) {
+        TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_movs_vec(vece, t, v[0], d);
+        d = t;
+    }
+    fp_scalar_store(decode, d);
+    return true;
+}
+
 /* a, b and c are the numbers of the operands of a * b + c. */
 #define FMA_SSE_PACKED(uname, a, b, c, even, odd)                             \
 static void gen_##uname##Px(DisasContext *s, X86DecodedInsn *decode)          \
@@ -779,6 +890,9 @@ static void gen_##uname##Sx(DisasContext *s, X86DecodedInsn *decode)          \
 {                                                                             \
     SSEFunc_0_eppppi fn = s->vex_w ? gen_helper_fma4sd : gen_helper_fma4ss;   \
                                                                               \
+    if (gen_fma_native_s(s, decode, a, b, c, flags)) {                        \
+        return;                                                               \
+    }                                                                         \
     fn(tcg_env, OP_PTR0, op_ptr(decode, a), op_ptr(decode, b),                \
        op_ptr(decode, c),                                                     \
        tcg_constant_i32(flags));                                              \
@@ -4517,6 +4631,57 @@ static void gen_fcmpord_vec(unsigned vece, TCGv_vec d, TCGv_vec a, TCGv_vec b)
     tcg_gen_orc_vec(vece, d, eq, d);
 }
 
+/* What gen_fp_isnan2_vec uses. */
+static const TCGOpcode fcmp_int_list[] = {
+    INDEX_op_cmp_vec, INDEX_op_shli_vec, 0
+};
+
+/*
+ * The scalar forms.  The negated and the unordered predicates compute
+ * whole vectors (the integer operations raise nothing) and move element 0
+ * into the first operand.
+ */
+static bool gen_fcmp_native_s(DisasContext *s, X86DecodedInsn *decode,
+                              int index)
+{
+    static const TCGCond cond[8] = {
+        TCG_COND_EQ, TCG_COND_LT, TCG_COND_LE, TCG_COND_EQ,
+        TCG_COND_EQ, TCG_COND_LT, TCG_COND_LE, TCG_COND_EQ,
+    };
+    unsigned vece = s->prefix & PREFIX_REPZ ? MO_32 : MO_64;
+    TCGv_vec a, b, d, t;
+
+    if (index >= ARRAY_SIZE(cond) ||
+        !fp_native_s(INDEX_op_fcmps_vec, vece) ||
+        !fp_native_s(INDEX_op_movs_vec, vece) ||
+        !fp_native(fcmp_int_list, vece)) {
+        return false;
+    }
+    a = fp_scalar_operand(decode, 1, vece);
+    b = fp_scalar_operand(decode, 2, vece);
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_fcmps_vec(cond[index], vece, d, a, b);
+    if (index >= 3) {
+        t = tcg_temp_new_vec(TCG_TYPE_V128);
+        switch (index) {
+        case 3: /* unord */
+            gen_fp_isnan2_vec(vece, t, a, b);
+            tcg_gen_andc_vec(vece, t, t, d);
+            break;
+        case 7: /* ord */
+            gen_fp_isnan2_vec(vece, t, a, b);
+            tcg_gen_orc_vec(vece, t, d, t);
+            break;
+        default:
+            tcg_gen_not_vec(vece, t, d);
+            break;
+        }
+        tcg_gen_movs_vec(vece, d, a, t);
+    }
+    fp_scalar_store(decode, d);
+    return true;
+}
+
 /* The SSE predicates; AVX's other 24 go to the helpers. */
 static bool gen_fcmp_native(DisasContext *s, X86DecodedInsn *decode, int index)
 {
@@ -4548,7 +4713,8 @@ static void gen_VCMP(DisasContext *s, X86DecodedInsn *decode)
         s->prefix & PREFIX_REPNZ ? 3 /* sd */ :
         !!(s->prefix & PREFIX_DATA) /* pd */ + (s->vex_l << 2);
 
-    if (gen_fcmp_native(s, decode, index)) {
+    if (fp_scalar(s) ? gen_fcmp_native_s(s, decode, index)
+                     : gen_fcmp_native(s, decode, index)) {
         return;
     }
     gen_helper_cmp_funcs[index][b](tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
@@ -4594,13 +4760,39 @@ static void gen_VCVTPS2PH(DisasContext *s, X86DecodedInsn *decode)
     }
 }
 
+/*
+ * Operand 0 = operand 1 with element 0, of size vece, = operand 2's
+ * element 0 converted from the other precision.
+ */
+static bool gen_fcvt_native_s(DisasContext *s, X86DecodedInsn *decode,
+                              unsigned vece)
+{
+    TCGv_vec a, b, d;
+
+    if (!fp_native_s(INDEX_op_fcvts_vec, vece)) {
+        return false;
+    }
+    a = fp_scalar_operand(decode, 1, vece);
+    b = fp_scalar_operand(decode, 2, vece ^ MO_32 ^ MO_64);
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_fcvts_vec(vece, d, a, b);
+    fp_scalar_store(decode, d);
+    return true;
+}
+
 static void gen_VCVTSD2SS(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (gen_fcvt_native_s(s, decode, MO_32)) {
+        return;
+    }
     gen_helper_cvtsd2ss(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
 static void gen_VCVTSS2SD(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (gen_fcvt_native_s(s, decode, MO_64)) {
+        return;
+    }
     gen_helper_cvtss2sd(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
@@ -4844,11 +5036,65 @@ static void gen_VMOVLHPS(DisasContext *s, X86DecodedInsn *decode)
  * Use a gvec move to move everything above the bottom 64 bits.
  */
 
+/*
+ * Scalar moves with x-ssefp=native: write the whole register, as the
+ * scalar operations do.  A later vector load of the register then reads
+ * what one store wrote, or within a TB the host register.
+ * Operand 0 = operand 1 with element 0 replaced by operand 2's.
+ */
+static bool gen_movs_native(DisasContext *s, X86DecodedInsn *decode,
+                            unsigned vece)
+{
+    TCGv_vec a, b, d;
+
+    if (!fp_native_s(INDEX_op_movs_vec, vece)) {
+        return false;
+    }
+    a = fp_scalar_operand(decode, 1, vece);
+    b = fp_scalar_operand(decode, 2, vece);
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_movs_vec(vece, d, a, b);
+    fp_scalar_store(decode, d);
+    return true;
+}
+
+/* The same from memory; without merge, the other elements are zero. */
+static bool gen_movs_native_ld(DisasContext *s, X86DecodedInsn *decode,
+                               unsigned vece, bool merge)
+{
+    TCGv_vec a, b, d;
+
+    if (!fp_native_s(INDEX_op_movs_vec, vece)) {
+        return false;
+    }
+    b = tcg_temp_new_vec(TCG_TYPE_V128);
+    if (vece == MO_32) {
+        TCGv_i32 t = tcg_temp_new_i32();
+
+        tcg_gen_qemu_ld_i32(t, s->A0, s->mem_index, MO_LEUL);
+        tcg_gen_dup_i32_vec(MO_32, b, t);
+    } else {
+        TCGv_i64 t = tcg_temp_new_i64();
+
+        tcg_gen_qemu_ld_i64(t, s->A0, s->mem_index, MO_LEUQ);
+        tcg_gen_dup_i64_vec(MO_64, b, t);
+    }
+    a = merge ? fp_scalar_operand(decode, 1, vece)
+              : tcg_constant_vec(TCG_TYPE_V128, MO_64, 0);
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_movs_vec(vece, d, a, b);
+    fp_scalar_store(decode, d);
+    return true;
+}
+
 static void gen_VMOVLPx(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
     TCGv_i64 t = tcg_temp_new_i64();
 
+    if (gen_movs_native(s, decode, MO_64)) {
+        return;
+    }
     tcg_gen_ld_i64(t, tcg_env, decode->op[2].offset + offsetof(XMMReg, XMM_Q(0)));
     tcg_gen_gvec_mov(MO_64, decode->op[0].offset, decode->op[1].offset, vec_len, vec_len);
     tcg_gen_st_i64(t, tcg_env, decode->op[0].offset + offsetof(XMMReg, XMM_Q(0)));
@@ -4859,6 +5105,9 @@ static void gen_VMOVLPx_ld(DisasContext *s, X86DecodedInsn *decode)
     int vec_len = vector_len(s, decode);
     TCGv_i64 t = tcg_temp_new_i64();
 
+    if (gen_movs_native_ld(s, decode, MO_64, true)) {
+        return;
+    }
     tcg_gen_qemu_ld_i64(t, s->A0, s->mem_index, MO_LEUQ);
     tcg_gen_gvec_mov(MO_64, decode->op[0].offset, decode->op[1].offset, vec_len, vec_len);
     tcg_gen_st_i64(t, OP_PTR0, offsetof(ZMMReg, ZMM_Q(0)));
@@ -4877,6 +5126,9 @@ static void gen_VMOVSD_ld(DisasContext *s, X86DecodedInsn *decode)
     TCGv_i64 zero = tcg_constant_i64(0);
     TCGv_i64 t = tcg_temp_new_i64();
 
+    if (gen_movs_native_ld(s, decode, MO_64, false)) {
+        return;
+    }
     tcg_gen_qemu_ld_i64(t, s->A0, s->mem_index, MO_LEUQ);
     tcg_gen_st_i64(zero, OP_PTR0, offsetof(ZMMReg, ZMM_Q(1)));
     tcg_gen_st_i64(t, OP_PTR0, offsetof(ZMMReg, ZMM_Q(0)));
@@ -4887,6 +5139,9 @@ static void gen_VMOVSS(DisasContext *s, X86DecodedInsn *decode)
     int vec_len = vector_len(s, decode);
     TCGv_i32 tmp = tcg_temp_new_i32();
 
+    if (gen_movs_native(s, decode, MO_32)) {
+        return;
+    }
     tcg_gen_ld_i32(tmp, OP_PTR2, offsetof(ZMMReg, ZMM_L(0)));
     tcg_gen_gvec_mov(MO_64, decode->op[0].offset, decode->op[1].offset, vec_len, vec_len);
     tcg_gen_st_i32(tmp, OP_PTR0, offsetof(ZMMReg, ZMM_L(0)));
@@ -4897,6 +5152,9 @@ static void gen_VMOVSS_ld(DisasContext *s, X86DecodedInsn *decode)
     int vec_len = vector_len(s, decode);
     TCGv_i32 tmp = tcg_temp_new_i32();
 
+    if (gen_movs_native_ld(s, decode, MO_32, false)) {
+        return;
+    }
     tcg_gen_qemu_ld_i32(tmp, s->A0, s->mem_index, MO_LEUL);
     tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset, vec_len, vec_len, 0);
     tcg_gen_st_i32(tmp, OP_PTR0, offsetof(ZMMReg, ZMM_L(0)));
