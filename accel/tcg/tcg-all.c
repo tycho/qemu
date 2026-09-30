@@ -230,6 +230,8 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
     s->tb_size = value;
 }
 
+bool tcg_ijmp_inline;
+
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
