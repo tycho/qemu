@@ -230,6 +230,28 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
     s->tb_size = value;
 }
 
+static char *tcg_get_jitwx(Object *obj, Error **errp)
+{
+#ifdef CONFIG_DARWIN
+    return g_strdup(qemu_thread_jit_lazy ? "lazy" : "always");
+#else
+    return g_strdup("always");
+#endif
+}
+
+static void tcg_set_jitwx(Object *obj, const char *value, Error **errp)
+{
+    bool lazy = !strcmp(value, "lazy");
+
+    if (!lazy && strcmp(value, "always")) {
+        error_setg(errp, "Invalid 'x-jitwx' value: %s", value);
+        return;
+    }
+#ifdef CONFIG_DARWIN
+    qemu_thread_jit_lazy = lazy;
+#endif
+}
+
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
@@ -286,6 +308,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                    tcg_set_one_insn_per_tb);
     object_class_property_set_description(oc, "one-insn-per-tb",
         "Only put one guest insn in each translation block");
+
+    object_class_property_add_str(oc, "x-jitwx", tcg_get_jitwx, tcg_set_jitwx);
+    object_class_property_set_description(oc, "x-jitwx",
+        "macOS MAP_JIT write/execute toggles: always (default) or lazy "
+        "(skip the calls that wouldn't change the thread's mode); "
+        "no effect on other hosts");
 }
 
 static const TypeInfo tcg_accel_type = {
