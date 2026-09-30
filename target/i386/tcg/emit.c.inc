@@ -1168,9 +1168,61 @@ UNARY_INT_SSE(VMOVDDUP,     pmovdldup)
 UNARY_INT_SSE(VCVTDQ2PD, cvtdq2pd)
 UNARY_INT_SSE(VCVTPD2DQ, cvtpd2dq)
 UNARY_INT_SSE(VCVTTPD2DQ, cvttpd2dq)
-UNARY_INT_SSE(VCVTDQ2PS, cvtdq2ps)
-UNARY_INT_SSE(VCVTPS2DQ, cvtps2dq)
-UNARY_INT_SSE(VCVTTPS2DQ, cvttps2dq)
+
+/*
+ * r is the host's conversion of a to int32.  Where a is a NaN or too
+ * large, x86 gives the "integer indefinite" 0x80000000; the host gives 0
+ * for a NaN and saturates, which differs for a positive value.  No float
+ * converts to INT32_MAX exactly.
+ */
+static void gen_fp_int32_indefinite_vec(TCGv_vec r, TCGv_vec a)
+{
+    TCGv_vec t = tcg_temp_new_vec_matching(r);
+
+    tcg_gen_cmp_vec(TCG_COND_EQ, MO_32, t, r,
+                    tcg_constant_vec_matching(r, MO_32, INT32_MAX));
+    tcg_gen_xor_vec(MO_32, r, r, t);
+    tcg_gen_shli_vec(MO_32, t, a, 1);
+    tcg_gen_cmp_vec(TCG_COND_GTU, MO_32, t, t,
+                    tcg_constant_vec_matching(r, MO_32, 0xff000000u));
+    tcg_gen_shli_vec(MO_32, t, t, 31);
+    tcg_gen_or_vec(MO_32, r, r, t);
+}
+
+static void gen_cvttps2dq_vec(unsigned vece, TCGv_vec d, TCGv_vec a)
+{
+    tcg_gen_fcvtzs_vec(vece, d, a);
+    gen_fp_int32_indefinite_vec(d, a);
+}
+
+static void gen_cvtps2dq_vec(unsigned vece, TCGv_vec d, TCGv_vec a)
+{
+    tcg_gen_frintx_vec(vece, d, a);
+    tcg_gen_fcvtzs_vec(vece, d, d);
+    gen_fp_int32_indefinite_vec(d, a);
+}
+
+#define UNARY_FP_INT_SSE(uname, lname, fn, ...)                               \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    static const TCGOpcode list[] = { __VA_ARGS__, 0 };                       \
+    static const GVecGen2 g = {                                               \
+        .fniv = fn, .opt_opc = list, .vece = MO_32                            \
+    };                                                                        \
+                                                                              \
+    if (gen_fp_native_2(s, decode, &g)) {                                     \
+        return;                                                               \
+    }                                                                         \
+    gen_unary_int_sse(s, decode,                                              \
+                      gen_helper_##lname##_xmm,                               \
+                      gen_helper_##lname##_ymm);                              \
+}
+
+UNARY_FP_INT_SSE(VCVTDQ2PS, cvtdq2ps, tcg_gen_scvtf_vec, INDEX_op_scvtf_vec)
+UNARY_FP_INT_SSE(VCVTPS2DQ, cvtps2dq, gen_cvtps2dq_vec, INDEX_op_frintx_vec,
+                 INDEX_op_fcvtzs_vec, INDEX_op_cmp_vec, INDEX_op_shli_vec)
+UNARY_FP_INT_SSE(VCVTTPS2DQ, cvttps2dq, gen_cvttps2dq_vec,
+                 INDEX_op_fcvtzs_vec, INDEX_op_cmp_vec, INDEX_op_shli_vec)
 UNARY_INT_SSE(VCVTPH2PS, cvtph2ps)
 
 
