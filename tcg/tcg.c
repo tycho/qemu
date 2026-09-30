@@ -2527,6 +2527,20 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_scvtf_vec:
     case INDEX_op_fcvtzs_vec:
     case INDEX_op_frintx_vec:
+    case INDEX_op_fadds_vec:
+    case INDEX_op_fsubs_vec:
+    case INDEX_op_fmuls_vec:
+    case INDEX_op_fdivs_vec:
+    case INDEX_op_fmins_vec:
+    case INDEX_op_fmaxs_vec:
+    case INDEX_op_fsqrts_vec:
+    case INDEX_op_fmadds_vec:
+    case INDEX_op_fmsubs_vec:
+    case INDEX_op_fnmadds_vec:
+    case INDEX_op_fnmsubs_vec:
+    case INDEX_op_fcmps_vec:
+    case INDEX_op_fcvts_vec:
+    case INDEX_op_movs_vec:
         return has_type && TCG_TARGET_HAS_fp_vec;
 
     default:
@@ -2983,6 +2997,7 @@ void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs)
             case INDEX_op_cmp_vec:
             case INDEX_op_cmpsel_vec:
             case INDEX_op_fcmp_vec:
+            case INDEX_op_fcmps_vec:
                 if (op->args[k] < ARRAY_SIZE(cond_name)
                     && cond_name[op->args[k]]) {
                     col += ne_fprintf(f, ",%s", cond_name[op->args[k++]]);
