@@ -29,6 +29,7 @@
 #include "exec/target_page.h"
 #include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/cpu-ops.h"
+#include "accel/tcg/host-fp.h"
 #include "tb-internal.h"
 #include "system/tcg.h"
 #include "tcg/tcg.h"
@@ -1254,11 +1255,16 @@ static void tso_cross_probe(CPUArchState *env, uint64_t addr, MemOpIdx oi,
 #endif
 }
 
-static void tso_cross_note(uintptr_t retaddr, uint64_t site)
+static void tso_cross_note(CPUState *cpu, uintptr_t retaddr, uint64_t site)
 {
     TranslationBlock *tb;
 
-    if (!tcg_tso_promote || !tcg_tso_cross_count(site)) {
+    if (!tcg_tso_promote) {
+        return;
+    }
+    /* The site table is a GHashTable, which uses host floating point. */
+    TCG_HOST_FP_SUSPEND_GUARD(cpu);
+    if (!tcg_tso_cross_count(site)) {
         return;
     }
     tb = tcg_tb_lookup(retaddr);
@@ -1273,7 +1279,7 @@ tcg_target_ulong helper_tso_cross_ld(CPUArchState *env, uint64_t addr,
                                      MemOpIdx oi, uintptr_t retaddr,
                                      uint64_t site)
 {
-    tso_cross_note(retaddr, site);
+    tso_cross_note(env_cpu(env), retaddr, site);
     tso_cross_probe(env, addr, oi, MMU_DATA_LOAD, retaddr);
     switch (get_memop(oi) & MO_SIZE) {
     case MO_16:
@@ -1290,7 +1296,7 @@ tcg_target_ulong helper_tso_cross_ld(CPUArchState *env, uint64_t addr,
 void helper_tso_cross_st(CPUArchState *env, uint64_t addr, uint64_t val,
                          MemOpIdx oi, uintptr_t retaddr, uint64_t site)
 {
-    tso_cross_note(retaddr, site);
+    tso_cross_note(env_cpu(env), retaddr, site);
     tso_cross_probe(env, addr, oi, MMU_DATA_STORE, retaddr);
     switch (get_memop(oi) & MO_SIZE) {
     case MO_16:

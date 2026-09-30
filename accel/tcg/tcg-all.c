@@ -28,6 +28,7 @@
 #include "exec/replay-core.h"
 #include "exec/icount.h"
 #include "tcg/startup.h"
+#include "host/fpenv.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/accel.h"
@@ -303,15 +304,22 @@ static void tcg_set_pferr_hw(Object *obj, bool value, Error **errp)
 
 static char *tcg_get_ssefp(Object *obj, Error **errp)
 {
-    return g_strdup(tcg_ssefp_vec ? "vec" : "soft");
+    return g_strdup(tcg_ssefp_native ? "native" :
+                    tcg_ssefp_vec ? "vec" : "soft");
 }
 
 static void tcg_set_ssefp(Object *obj, const char *value, Error **errp)
 {
-    if (!strcmp(value, "vec")) {
+    if (!strcmp(value, "native")) {
+        /* Hosts that can't take the guest's FP mode get "vec". */
+        tcg_ssefp_native = host_fpenv_native();
+        tcg_ssefp_vec = !tcg_ssefp_native;
+    } else if (!strcmp(value, "vec")) {
         tcg_ssefp_vec = true;
+        tcg_ssefp_native = false;
     } else if (!strcmp(value, "soft")) {
         tcg_ssefp_vec = false;
+        tcg_ssefp_native = false;
     } else {
         error_setg(errp, "Invalid 'x-ssefp' value: %s", value);
     }
@@ -466,9 +474,10 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 
     object_class_property_add_str(oc, "x-ssefp", tcg_get_ssefp, tcg_set_ssefp);
     object_class_property_set_description(oc, "x-ssefp",
-        "SIMD floating point: soft (default, lane by lane) or vec (compute "
+        "SIMD floating point: soft (default, lane by lane), vec (compute "
         "whole vectors on the host FPU when that gives the same results "
-        "and flags)");
+        "and flags) or native (run with the guest's FP mode in the host "
+        "FPU, where the host can express it; otherwise as vec)");
 
     object_class_property_add_str(oc, "x-jitwx", tcg_get_jitwx, tcg_set_jitwx);
     object_class_property_set_description(oc, "x-jitwx",

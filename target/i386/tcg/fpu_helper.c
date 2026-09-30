@@ -29,6 +29,8 @@
 #include "fpu/softfloat-vec.h"
 #include "helper-tcg.h"
 #include "access.h"
+#include "host-fpenv.h"
+#include "accel/tcg/host-fp.h"
 #include "tcg/startup.h"
 #include "qemu/xtcg-stats.h"
 
@@ -1311,6 +1313,8 @@ void helper_f2xm1(CPUX86State *env)
 
 void helper_fptan(CPUX86State *env)
 {
+    /* Host libm: not the guest's SSE mode or flags. */
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     double fptemp = floatx80_to_double(env, ST0);
 
     if ((fptemp > MAXTAN) || (fptemp < -MAXTAN)) {
@@ -2331,6 +2335,8 @@ void helper_fsqrt(CPUX86State *env)
 
 void helper_fsincos(CPUX86State *env)
 {
+    /* Host libm: not the guest's SSE mode or flags. */
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     double fptemp = floatx80_to_double(env, ST0);
 
     if ((fptemp > MAXTAN) || (fptemp < -MAXTAN)) {
@@ -2404,6 +2410,8 @@ void helper_fscale(CPUX86State *env)
 
 void helper_fsin(CPUX86State *env)
 {
+    /* Host libm: not the guest's SSE mode or flags. */
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     double fptemp = floatx80_to_double(env, ST0);
 
     if ((fptemp > MAXTAN) || (fptemp < -MAXTAN)) {
@@ -2417,6 +2425,8 @@ void helper_fsin(CPUX86State *env)
 
 void helper_fcos(CPUX86State *env)
 {
+    /* Host libm: not the guest's SSE mode or flags. */
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     double fptemp = floatx80_to_double(env, ST0);
 
     if ((fptemp > MAXTAN) || (fptemp < -MAXTAN)) {
@@ -3297,11 +3307,16 @@ void update_mxcsr_status(CPUX86State *env)
 
     /* set flush to zero */
     set_flush_to_zero((mxcsr & SSE_FZ) ? 1 : 0, &env->sse_status);
+
+    x86_host_fp_sync(env);
 }
 
 void update_mxcsr_from_sse_status(CPUX86State *env)
 {
-    int flags = get_float_exception_flags(&env->sse_status);
+    int flags;
+
+    x86_host_fp_fold(env);
+    flags = get_float_exception_flags(&env->sse_status);
     env->mxcsr |= ((flags & float_flag_invalid ? FPUS_IE : 0) |
                    (flags & float_flag_input_denormal_used ? FPUS_DE : 0) |
                    (flags & float_flag_divbyzero ? FPUS_ZE : 0) |
