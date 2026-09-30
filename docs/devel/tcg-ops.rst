@@ -1064,6 +1064,21 @@ elements of *v0* are those of *v1*.
          *is64*, else 32, rounding toward zero.  What an out-of-range
          value or a NaN gives is the host's choice.
 
+   * - frecpe_vec *v0*, *v1*
+
+       frsqrte_vec *v0*, *v1*
+
+     - | Estimates of 1 / *v1* and 1 / sqrt(*v1*), with a relative error
+         of at most 1.5 * 2^-12 (x86's bound for RCPPS and RSQRTPS).
+         Which zero, infinity or NaN special inputs give, and which
+         flags they raise, is the host's.
+
+   * - frecpes_vec *v0*, *v1*, *v2*
+
+       frsqrtes_vec *v0*, *v1*, *v2*
+
+     - | The same on *v0*\ [0], of *v2*\ [0].
+
 **Note 1**: Some shortcuts are defined when the last operand is known to be
 a constant (e.g. addi for add, movi for mov).
 
