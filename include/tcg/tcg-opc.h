@@ -201,6 +201,22 @@ DEF(scvtf_vec, 1, 1, 0, TCG_OPF_VECTOR)
 DEF(fcvtzs_vec, 1, 1, 0, TCG_OPF_VECTOR)
 DEF(frintx_vec, 1, 1, 0, TCG_OPF_VECTOR)
 
+/* The same on element 0; the other elements come from the first input. */
+DEF(fadds_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fsubs_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fmuls_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fdivs_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fmins_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fmaxs_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fsqrts_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fmadds_vec, 1, 3, 0, TCG_OPF_VECTOR)
+DEF(fmsubs_vec, 1, 3, 0, TCG_OPF_VECTOR)
+DEF(fnmadds_vec, 1, 3, 0, TCG_OPF_VECTOR)
+DEF(fnmsubs_vec, 1, 3, 0, TCG_OPF_VECTOR)
+DEF(fcmps_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(fcvts_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(movs_vec, 1, 2, 0, TCG_OPF_VECTOR)
+
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 
 #include "tcg-target-opc.h.inc"
