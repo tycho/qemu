@@ -511,6 +511,12 @@ struct CPUState {
     uint64_t random_seed;
     sigjmp_buf jmp_env;
 
+    /* See accel/tcg/host-fp.h. */
+    bool host_fp_guest;
+    uint8_t host_fp_suspended;
+    uint64_t host_fp_control;
+    uint64_t host_fp_status;
+
     QemuMutex work_mutex;
     QSIMPLEQ_HEAD(, qemu_work_item) work_list;
 
