@@ -805,6 +805,14 @@ specifies the length of the element (if applicable) in log2 8-bit units.
          Only for accesses that need at most two single-copy atomic 64-bit
          halves, with no byte swap: check with tcg_can_qemu_ldst_vec().
 
+   * - perm_vec *v0*, *v1*, *v2*, *pattern*
+
+     - | Permute: element *i* of *v0* is element (*pattern* >> 4 * *i*) & 15
+         of the concatenation *v1*:*v2*, whose elements 0 to *n*-1 are
+         *v1*'s and *n* to 2*n*-1 *v2*'s, for *n* elements of
+         ``TCGOP_VECE`` (MO_16, MO_32 or MO_64) in 128 bits.  The pattern
+         is a constant, so a backend can pick the instructions for it.
+
    * - dupi_vec *v0*, *c*
 
      - | Similarly, for a constant.
