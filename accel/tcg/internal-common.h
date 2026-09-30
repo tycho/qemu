@@ -19,6 +19,13 @@ extern int64_t max_advance;
 
 extern bool one_insn_per_tb;
 
+/*
+ * tcg_ijmp_inline: at a TB exit that looks up the next TB, probe the
+ * vCPU's jump cache in generated code, and call helper_lookup_tb_ptr only
+ * on a miss (see translator_lookup_and_goto_ptr).
+ */
+extern bool tcg_ijmp_inline;
+
 extern bool icount_align_option;
 
 /*
