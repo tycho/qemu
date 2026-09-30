@@ -560,6 +560,14 @@ void tcg_gen_scvtfs_i64_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
                             TCGv_i64 i);
 void tcg_gen_fcvtzsi_i32_vec(unsigned vece, TCGv_i32 r, TCGv_vec a);
 void tcg_gen_fcvtzsi_i64_vec(unsigned vece, TCGv_i64 r, TCGv_vec a);
+/*
+ * Estimates of 1/x and 1/sqrt(x) with a relative error of at most
+ * 1.5 * 2^-12; the scalar forms on element 0, the other elements from a.
+ */
+void tcg_gen_frecpe_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+void tcg_gen_frsqrte_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+void tcg_gen_frecpes_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_frsqrtes_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 
 void tcg_gen_bitsel_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
                         TCGv_vec b, TCGv_vec c);
