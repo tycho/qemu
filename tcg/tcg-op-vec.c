@@ -234,6 +234,18 @@ void tcg_gen_dup_i64_vec(unsigned vece, TCGv_vec r, TCGv_i64 a)
     vec_gen_2(INDEX_op_dup_vec, type, vece, ri, ai);
 }
 
+void tcg_gen_concat_i64_vec(TCGv_vec r, TCGv_i64 lo, TCGv_i64 hi)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_assert_listed_vecop(INDEX_op_concat_i64_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_concat_i64_vec,
+                                         TCG_TYPE_V128, MO_64) > 0);
+    vec_gen_3(INDEX_op_concat_i64_vec, TCG_TYPE_V128, MO_64, temp_arg(rt),
+              tcgv_i64_arg(lo), tcgv_i64_arg(hi));
+}
+
 void tcg_gen_dup_i32_vec(unsigned vece, TCGv_vec r, TCGv_i32 a)
 {
     TCGArg ri = tcgv_vec_arg(r);

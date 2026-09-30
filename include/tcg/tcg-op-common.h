@@ -253,6 +253,11 @@ QEMU_ARG_NONNULL
 void tcg_gen_dup_i32_vec(unsigned vece, TCGv_vec, TCGv_i32);
 QEMU_ARG_NONNULL
 void tcg_gen_dup_i64_vec(unsigned vece, TCGv_vec, TCGv_i64);
+/*
+ * A 128-bit vector from two 64-bit values, element 0 from lo.  No
+ * fallback: check tcg_can_emit_vec_op(INDEX_op_concat_i64_vec) first.
+ */
+void tcg_gen_concat_i64_vec(TCGv_vec r, TCGv_i64 lo, TCGv_i64 hi);
 QEMU_ARG_NONNULL
 void tcg_gen_dup_mem_vec(unsigned vece, TCGv_vec, TCGv_ptr, tcg_target_long);
 QEMU_ARG_NONNULL
