@@ -975,3 +975,48 @@ void tcg_gen_fcmps_vec(TCGCond cond, unsigned vece, TCGv_vec r,
 {
     do_op4_nofail(vece, r, a, b, cond, INDEX_op_fcmps_vec);
 }
+
+static void check_fp_scalar_op(TCGOpcode opc, TCGTemp *vt, unsigned vece)
+{
+    tcg_debug_assert(vt->base_type >= TCG_TYPE_V128);
+    tcg_assert_listed_vecop(opc);
+    tcg_debug_assert(tcg_can_emit_vec_op(opc, TCG_TYPE_V128, vece) > 0);
+}
+
+void tcg_gen_fcmp3_vec(unsigned vece, TCGv_i32 r, TCGv_vec a, TCGv_vec b,
+                       bool signaling)
+{
+    check_fp_scalar_op(INDEX_op_fcmp3_vec, tcgv_vec_temp(a), vece);
+    vec_gen_4(INDEX_op_fcmp3_vec, TCG_TYPE_V128, vece, tcgv_i32_arg(r),
+              tcgv_vec_arg(a), tcgv_vec_arg(b), signaling);
+}
+
+void tcg_gen_scvtfs_i32_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                            TCGv_i32 i)
+{
+    check_fp_scalar_op(INDEX_op_scvtfs_vec, tcgv_vec_temp(r), vece);
+    vec_gen_4(INDEX_op_scvtfs_vec, TCG_TYPE_V128, vece, tcgv_vec_arg(r),
+              tcgv_vec_arg(a), tcgv_i32_arg(i), 0);
+}
+
+void tcg_gen_scvtfs_i64_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                            TCGv_i64 i)
+{
+    check_fp_scalar_op(INDEX_op_scvtfs_vec, tcgv_vec_temp(r), vece);
+    vec_gen_4(INDEX_op_scvtfs_vec, TCG_TYPE_V128, vece, tcgv_vec_arg(r),
+              tcgv_vec_arg(a), tcgv_i64_arg(i), 1);
+}
+
+void tcg_gen_fcvtzsi_i32_vec(unsigned vece, TCGv_i32 r, TCGv_vec a)
+{
+    check_fp_scalar_op(INDEX_op_fcvtzsi_vec, tcgv_vec_temp(a), vece);
+    vec_gen_3(INDEX_op_fcvtzsi_vec, TCG_TYPE_V128, vece, tcgv_i32_arg(r),
+              tcgv_vec_arg(a), 0);
+}
+
+void tcg_gen_fcvtzsi_i64_vec(unsigned vece, TCGv_i64 r, TCGv_vec a)
+{
+    check_fp_scalar_op(INDEX_op_fcvtzsi_vec, tcgv_vec_temp(a), vece);
+    vec_gen_3(INDEX_op_fcvtzsi_vec, TCG_TYPE_V128, vece, tcgv_i64_arg(r),
+              tcgv_vec_arg(a), 1);
+}
