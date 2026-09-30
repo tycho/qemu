@@ -1052,6 +1052,23 @@ elements of *v0* are those of *v1*.
 
      - | *v0*\ [0] = *v2*\ [0], with no floating-point processing.
 
+   * - fcmp3_vec *t0*, *v1*, *v2*, *signaling*
+
+     - | Compare *v1*\ [0] with *v2*\ [0]: *t0* (an i32) = 0 if less,
+         1 if equal, 2 if greater, 3 if unordered.  If *signaling*, any
+         NaN operand raises invalid; otherwise only a signaling NaN.
+
+   * - scvtfs_vec *v0*, *v1*, *t2*, *is64*
+
+     - | *v0*\ [0] = the signed integer *t2* (64 bits wide if *is64*,
+         else 32), converted.
+
+   * - fcvtzsi_vec *t0*, *v1*, *is64*
+
+     - | *t0* = *v1*\ [0] converted to a signed integer of 64 bits if
+         *is64*, else 32, rounding toward zero.  What an out-of-range
+         value or a NaN gives is the host's choice.
+
 **Note 1**: Some shortcuts are defined when the last operand is known to be
 a constant (e.g. addi for add, movi for mov).
 
