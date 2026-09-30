@@ -604,6 +604,9 @@ typedef enum {
     Irrr_e_USHL       = 0x7e204400,
     Irrr_e_SUB        = 0x7e208400,
     Irrr_e_CMEQ       = 0x7e208c00,
+    Irrr_e_FCMEQ      = 0x5e20e400,
+    Irrr_e_FCMGE      = 0x7e20e400,
+    Irrr_e_FCMGT      = 0x7ea0e400,
 
     /* AdvSIMD scalar two-reg misc */
     Isimd_rr_CMGT0    = 0x5e208800,
@@ -683,6 +686,28 @@ typedef enum {
     Iqrr_e_SCVTF      = 0x0e21d800,
     Iqrr_e_FCVTZS     = 0x0ea1b800,
     Iqrr_e_FRINTX     = 0x2e219800,
+
+    /*
+     * Floating-point data processing, scalar: two sources, one source,
+     * three sources.  The "type" field selects double precision.
+     */
+    Ifp_rrr_FMUL      = 0x1e200800,
+    Ifp_rrr_FDIV      = 0x1e201800,
+    Ifp_rrr_FADD      = 0x1e202800,
+    Ifp_rrr_FSUB      = 0x1e203800,
+    Ifp_rrr_FMAX      = 0x1e204800,
+    Ifp_rrr_FMIN      = 0x1e205800,
+    Ifp_rr_FSQRT      = 0x1e21c000,
+    Ifp_rr_FCVT_SD    = 0x1e22c000,     /* single to double */
+    Ifp_rr_FCVT_DS    = 0x1e624000,     /* double to single */
+    Ifp_rrrr_FMADD    = 0x1f000000,
+    Ifp_rrrr_FMSUB    = 0x1f008000,
+    Ifp_rrrr_FNMADD   = 0x1f200000,
+    Ifp_rrrr_FNMSUB   = 0x1f208000,
+
+    /* AdvSIMD copy: insert element 0 from element 0. */
+    Isimd_ins_S       = 0x6e040400,
+    Isimd_ins_D       = 0x6e080400,
 
     /* System instructions.  */
     NOP               = 0xd503201f,
@@ -929,6 +954,34 @@ static void tcg_out_insn_qrr_e(TCGContext *s, AArch64Insn insn, bool q,
 {
     tcg_out32(s, insn | q << 30 | (size << 22)
               | (rn & 0x1f) << 5 | (rd & 0x1f));
+}
+
+static void tcg_out_insn_fp_rrr(TCGContext *s, AArch64Insn insn,
+                                unsigned type, TCGReg rd, TCGReg rn,
+                                TCGReg rm)
+{
+    tcg_out32(s, insn | type << 22 | (rm & 0x1f) << 16
+              | (rn & 0x1f) << 5 | (rd & 0x1f));
+}
+
+static void tcg_out_insn_fp_rr(TCGContext *s, AArch64Insn insn,
+                               unsigned type, TCGReg rd, TCGReg rn)
+{
+    tcg_out32(s, insn | type << 22 | (rn & 0x1f) << 5 | (rd & 0x1f));
+}
+
+static void tcg_out_insn_fp_rrrr(TCGContext *s, AArch64Insn insn,
+                                 unsigned type, TCGReg rd, TCGReg rn,
+                                 TCGReg rm, TCGReg ra)
+{
+    tcg_out32(s, insn | type << 22 | (rm & 0x1f) << 16 | (ra & 0x1f) << 10
+              | (rn & 0x1f) << 5 | (rd & 0x1f));
+}
+
+static void tcg_out_insn_simd_ins(TCGContext *s, AArch64Insn insn,
+                                  TCGReg rd, TCGReg rn)
+{
+    tcg_out32(s, insn | (rn & 0x1f) << 5 | (rd & 0x1f));
 }
 
 static void tcg_out_insn_ldst_reg(TCGContext *s, AArch64Insn insn,
@@ -3491,6 +3544,75 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         }
         break;
 
+    /*
+     * The scalar operations rely on FPCR.NEP: the result's other elements
+     * are those of Rn (two sources), Ra (three), Rm (compares) or the
+     * previous contents of Rd (one source), which the constraints tie to
+     * the first input.
+     */
+    case INDEX_op_fadds_vec:
+        tcg_out_insn(s, fp_rrr, FADD, fsz, a0, a1, a2);
+        break;
+    case INDEX_op_fsubs_vec:
+        tcg_out_insn(s, fp_rrr, FSUB, fsz, a0, a1, a2);
+        break;
+    case INDEX_op_fmuls_vec:
+        tcg_out_insn(s, fp_rrr, FMUL, fsz, a0, a1, a2);
+        break;
+    case INDEX_op_fdivs_vec:
+        tcg_out_insn(s, fp_rrr, FDIV, fsz, a0, a1, a2);
+        break;
+    case INDEX_op_fmins_vec:
+        tcg_out_insn(s, fp_rrr, FMIN, fsz, a0, a1, a2);
+        break;
+    case INDEX_op_fmaxs_vec:
+        tcg_out_insn(s, fp_rrr, FMAX, fsz, a0, a1, a2);
+        break;
+    case INDEX_op_fsqrts_vec:
+        tcg_out_insn(s, fp_rr, FSQRT, fsz, a0, a2);
+        break;
+    case INDEX_op_fcvts_vec:
+        if (vece == MO_64) {
+            tcg_out_insn(s, fp_rr, FCVT_SD, 0, a0, a2);
+        } else {
+            tcg_out_insn(s, fp_rr, FCVT_DS, 0, a0, a2);
+        }
+        break;
+    case INDEX_op_movs_vec:
+        if (vece == MO_64) {
+            tcg_out_insn(s, simd_ins, D, a0, a2);
+        } else {
+            tcg_out_insn(s, simd_ins, S, a0, a2);
+        }
+        break;
+    case INDEX_op_fmadds_vec:
+        tcg_out_insn(s, fp_rrrr, FMADD, fsz, a0, a2, args[3], a1);
+        break;
+    case INDEX_op_fmsubs_vec:
+        tcg_out_insn(s, fp_rrrr, FMSUB, fsz, a0, a2, args[3], a1);
+        break;
+    case INDEX_op_fnmadds_vec:
+        tcg_out_insn(s, fp_rrrr, FNMADD, fsz, a0, a2, args[3], a1);
+        break;
+    case INDEX_op_fnmsubs_vec:
+        tcg_out_insn(s, fp_rrrr, FNMSUB, fsz, a0, a2, args[3], a1);
+        break;
+    case INDEX_op_fcmps_vec:
+        switch (args[3]) {
+        case TCG_COND_EQ:
+            tcg_out_insn(s, rrr_e, FCMEQ, fsz, a0, a2, a1);
+            break;
+        case TCG_COND_LE:
+            tcg_out_insn(s, rrr_e, FCMGE, fsz, a0, a2, a1);
+            break;
+        case TCG_COND_LT:
+            tcg_out_insn(s, rrr_e, FCMGT, fsz, a0, a2, a1);
+            break;
+        default:
+            g_assert_not_reached();
+        }
+        break;
+
     case INDEX_op_mov_vec:  /* Always emitted via tcg_out_mov.  */
     case INDEX_op_dup_vec:  /* Always emitted via tcg_out_dup_vec.  */
     default:
@@ -3549,6 +3671,20 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_scvtf_vec:
     case INDEX_op_fcvtzs_vec:
     case INDEX_op_frintx_vec:
+    case INDEX_op_fadds_vec:
+    case INDEX_op_fsubs_vec:
+    case INDEX_op_fmuls_vec:
+    case INDEX_op_fdivs_vec:
+    case INDEX_op_fmins_vec:
+    case INDEX_op_fmaxs_vec:
+    case INDEX_op_fsqrts_vec:
+    case INDEX_op_fmadds_vec:
+    case INDEX_op_fmsubs_vec:
+    case INDEX_op_fnmadds_vec:
+    case INDEX_op_fnmsubs_vec:
+    case INDEX_op_fcmps_vec:
+    case INDEX_op_fcvts_vec:
+    case INDEX_op_movs_vec:
         /*
          * These are for running guest FP in the guest's FP environment,
          * which takes FEAT_AFP (host_fpenv_native).
@@ -3659,10 +3795,26 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fmin_vec:
     case INDEX_op_fmax_vec:
     case INDEX_op_fcmp_vec:
+    case INDEX_op_fadds_vec:
+    case INDEX_op_fsubs_vec:
+    case INDEX_op_fmuls_vec:
+    case INDEX_op_fdivs_vec:
+    case INDEX_op_fmins_vec:
+    case INDEX_op_fmaxs_vec:
+    case INDEX_op_fcmps_vec:
         return C_O1_I2(w, w, w);
     case INDEX_op_fmla_vec:
     case INDEX_op_fmls_vec:
         return C_O1_I3(w, 0, w, w);
+    case INDEX_op_fmadds_vec:
+    case INDEX_op_fmsubs_vec:
+    case INDEX_op_fnmadds_vec:
+    case INDEX_op_fnmsubs_vec:
+        return C_O1_I3(w, w, w, w);
+    case INDEX_op_fsqrts_vec:
+    case INDEX_op_fcvts_vec:
+    case INDEX_op_movs_vec:
+        return C_O1_I2(w, 0, w);
     case INDEX_op_fsqrt_vec:
     case INDEX_op_fneg_vec:
     case INDEX_op_scvtf_vec:
