@@ -30,6 +30,7 @@
 #include "helper-tcg.h"
 #include "access.h"
 #include "tcg/startup.h"
+#include "qemu/xtcg-stats.h"
 
 /* float macros */
 #define FT0    (env->ft0)
@@ -3350,14 +3351,70 @@ void helper_emms(CPUX86State *env)
 #define SSE_LANES(r, fld, n) (&(r)->fld[0])
 #endif
 
+/*
+ * [DEV] x-stats: count a packed op that took the vector path, or why it
+ * fell back.  Called after the vector function, with the sources intact
+ * when it failed.  size is the lane size of the FP sources, 0 for int32.
+ */
+static bool sse_vec_stat(bool ok, int op, CPUX86State *env, const void *a,
+                         const void *b, const void *c, unsigned n, int size)
+{
+    const float_status *s = &env->sse_status;
+    const void *src[3] = { a, b, c };
+    bool naninf = false, denorm = false;
+    int out;
+
+    if (likely(!xtcg_stats)) {
+        return ok;
+    }
+    for (int k = 0; k < 3 && !ok; k++) {
+        for (unsigned i = 0; src[k] && i < n; i++) {
+            if (size == 4) {
+                uint32_t x = ((const uint32_t *)src[k])[i];
+                uint32_t e = x & 0x7f800000;
+
+                naninf |= e == 0x7f800000;
+                denorm |= e == 0 && (x & 0x007fffff);
+            } else if (size == 8) {
+                uint64_t x = ((const uint64_t *)src[k])[i];
+                uint64_t e = x & 0x7ff0000000000000ULL;
+
+                naninf |= e == 0x7ff0000000000000ULL;
+                denorm |= e == 0 && (x & 0x000fffffffffffffULL);
+            }
+        }
+    }
+    if (ok) {
+        out = XSSE_VEC;
+    } else if (op != XSSE_MIN && op != XSSE_MAX && op != XSSE_CMP &&
+               !float_inexact_set(s)) {
+        out = XSSE_FB_PE;
+    } else if (op != XSSE_MIN && op != XSSE_MAX && op != XSSE_CMP &&
+               op != XSSE_CVTTPS2DQ &&
+               get_float_rounding_mode(s) != float_round_nearest_even) {
+        out = XSSE_FB_RC;
+    } else if (naninf) {
+        out = XSSE_FB_NANINF;
+    } else if (denorm) {
+        out = XSSE_FB_DENORM;
+    } else {
+        out = XSSE_FB_RESULT;
+    }
+    xtcg_hist_inc(XH_SSEFP, op * 8 + out);
+    return ok;
+}
+
 #define SSE_VEC_BINOP(N, op, OP, fld)                                       \
 static inline bool sse_vec_##op##N(CPUX86State *env, ZMMReg *d,            \
                                    ZMMReg *v, ZMMReg *s, unsigned n)       \
 {                                                                           \
     return tcg_ssefp_vec &&                                                 \
-           float##N##_binop_vec(SSE_LANES(d, fld, n), SSE_LANES(v, fld, n), \
-                                SSE_LANES(s, fld, n), n, &env->sse_status,  \
-                                OP);                                        \
+           sse_vec_stat(float##N##_binop_vec(SSE_LANES(d, fld, n),          \
+                                             SSE_LANES(v, fld, n),          \
+                                             SSE_LANES(s, fld, n), n,       \
+                                             &env->sse_status, OP),         \
+                        XSSE_ADD + (OP), env, SSE_LANES(v, fld, n),         \
+                        SSE_LANES(s, fld, n), NULL, n, N / 8);              \
 }
 
 SSE_VEC_BINOP(32, add, FLOAT_VEC_ADD, _s_ZMMReg)
@@ -3378,9 +3435,12 @@ static inline bool sse_vec_##op##N(CPUX86State *env, ZMMReg *d,            \
                                    ZMMReg *v, ZMMReg *s, unsigned n)       \
 {                                                                           \
     return tcg_ssefp_vec &&                                                 \
-           float##N##_select_vec(SSE_LANES(d, fld, n), SSE_LANES(v, fld, n), \
-                                 SSE_LANES(s, fld, n), n, LT,              \
-                                 &env->sse_status);                         \
+           sse_vec_stat(float##N##_select_vec(SSE_LANES(d, fld, n),         \
+                                              SSE_LANES(v, fld, n),         \
+                                              SSE_LANES(s, fld, n), n, LT,  \
+                                              &env->sse_status),            \
+                        LT ? XSSE_MIN : XSSE_MAX, env, SSE_LANES(v, fld, n), \
+                        SSE_LANES(s, fld, n), NULL, n, N / 8);              \
 }
 
 SSE_VEC_MINMAX(32, min, true, _s_ZMMReg)
@@ -3400,8 +3460,11 @@ static inline bool sse_vec_compare##N(CPUX86State *env, FloatRelation *rel, \
     unsigned i;                                                             \
                                                                             \
     if (!tcg_ssefp_vec ||                                                   \
-        !float##N##_compare_vec(lt, eq, SSE_LANES(v, fld, n),              \
-                                SSE_LANES(s, fld, n), n, &env->sse_status)) { \
+        !sse_vec_stat(float##N##_compare_vec(lt, eq, SSE_LANES(v, fld, n), \
+                                             SSE_LANES(s, fld, n), n,       \
+                                             &env->sse_status),             \
+                      XSSE_CMP, env, SSE_LANES(v, fld, n),                  \
+                      SSE_LANES(s, fld, n), NULL, n, N / 8)) {              \
         return false;                                                       \
     }                                                                       \
     for (i = 0; i < n; i++) {                                               \
@@ -3418,16 +3481,22 @@ static inline bool sse_vec_sqrt32(CPUX86State *env, ZMMReg *d, ZMMReg *s,
                                   unsigned n)
 {
     return tcg_ssefp_vec &&
-           float32_sqrt_vec(SSE_LANES(d, _s_ZMMReg, n),
-                            SSE_LANES(s, _s_ZMMReg, n), n, &env->sse_status);
+           sse_vec_stat(float32_sqrt_vec(SSE_LANES(d, _s_ZMMReg, n),
+                                         SSE_LANES(s, _s_ZMMReg, n), n,
+                                         &env->sse_status),
+                        XSSE_SQRT, env, SSE_LANES(s, _s_ZMMReg, n), NULL, NULL,
+                        n, 4);
 }
 
 static inline bool sse_vec_sqrt64(CPUX86State *env, ZMMReg *d, ZMMReg *s,
                                   unsigned n)
 {
     return tcg_ssefp_vec &&
-           float64_sqrt_vec(SSE_LANES(d, _d_ZMMReg, n),
-                            SSE_LANES(s, _d_ZMMReg, n), n, &env->sse_status);
+           sse_vec_stat(float64_sqrt_vec(SSE_LANES(d, _d_ZMMReg, n),
+                                         SSE_LANES(s, _d_ZMMReg, n), n,
+                                         &env->sse_status),
+                        XSSE_SQRT, env, SSE_LANES(s, _d_ZMMReg, n), NULL, NULL,
+                        n, 8);
 }
 
 static inline bool sse_vec_muladd32(CPUX86State *env, ZMMReg *d, ZMMReg *a,
@@ -3435,11 +3504,14 @@ static inline bool sse_vec_muladd32(CPUX86State *env, ZMMReg *d, ZMMReg *a,
                                     int flags)
 {
     return tcg_ssefp_vec &&
-           float32_muladd_vec(SSE_LANES(d, _s_ZMMReg, n),
-                              SSE_LANES(a, _s_ZMMReg, n),
-                              SSE_LANES(b, _s_ZMMReg, n),
-                              SSE_LANES(c, _s_ZMMReg, n), n, flags,
-                              &env->sse_status);
+           sse_vec_stat(float32_muladd_vec(SSE_LANES(d, _s_ZMMReg, n),
+                                           SSE_LANES(a, _s_ZMMReg, n),
+                                           SSE_LANES(b, _s_ZMMReg, n),
+                                           SSE_LANES(c, _s_ZMMReg, n), n, flags,
+                                           &env->sse_status),
+                        XSSE_FMA, env, SSE_LANES(a, _s_ZMMReg, n),
+                        SSE_LANES(b, _s_ZMMReg, n), SSE_LANES(c, _s_ZMMReg, n), n,
+                        4);
 }
 
 static inline bool sse_vec_muladd64(CPUX86State *env, ZMMReg *d, ZMMReg *a,
@@ -3447,38 +3519,47 @@ static inline bool sse_vec_muladd64(CPUX86State *env, ZMMReg *d, ZMMReg *a,
                                     int flags)
 {
     return tcg_ssefp_vec &&
-           float64_muladd_vec(SSE_LANES(d, _d_ZMMReg, n),
-                              SSE_LANES(a, _d_ZMMReg, n),
-                              SSE_LANES(b, _d_ZMMReg, n),
-                              SSE_LANES(c, _d_ZMMReg, n), n, flags,
-                              &env->sse_status);
+           sse_vec_stat(float64_muladd_vec(SSE_LANES(d, _d_ZMMReg, n),
+                                           SSE_LANES(a, _d_ZMMReg, n),
+                                           SSE_LANES(b, _d_ZMMReg, n),
+                                           SSE_LANES(c, _d_ZMMReg, n), n, flags,
+                                           &env->sse_status),
+                        XSSE_FMA, env, SSE_LANES(a, _d_ZMMReg, n),
+                        SSE_LANES(b, _d_ZMMReg, n), SSE_LANES(c, _d_ZMMReg, n), n,
+                        8);
 }
 
 static inline bool sse_vec_cvtdq2ps(CPUX86State *env, ZMMReg *d, ZMMReg *s,
                                     unsigned n)
 {
     return tcg_ssefp_vec &&
-           int32_to_float32_vec(SSE_LANES(d, _s_ZMMReg, n),
-                                (int32_t *)SSE_LANES(s, _l_ZMMReg, n), n,
-                                &env->sse_status);
+           sse_vec_stat(int32_to_float32_vec(
+                            SSE_LANES(d, _s_ZMMReg, n),
+                            (int32_t *)SSE_LANES(s, _l_ZMMReg, n), n,
+                            &env->sse_status),
+                        XSSE_CVTDQ2PS, env, NULL, NULL, NULL, n, 0);
 }
 
 static inline bool sse_vec_cvtps2dq(CPUX86State *env, ZMMReg *d, ZMMReg *s,
                                     unsigned n)
 {
     return tcg_ssefp_vec &&
-           float32_to_int32_vec((int32_t *)SSE_LANES(d, _l_ZMMReg, n),
-                                SSE_LANES(s, _s_ZMMReg, n), n,
-                                &env->sse_status);
+           sse_vec_stat(float32_to_int32_vec(
+                            (int32_t *)SSE_LANES(d, _l_ZMMReg, n),
+                            SSE_LANES(s, _s_ZMMReg, n), n, &env->sse_status),
+                        XSSE_CVTPS2DQ, env, SSE_LANES(s, _s_ZMMReg, n), NULL,
+                        NULL, n, 4);
 }
 
 static inline bool sse_vec_cvttps2dq(CPUX86State *env, ZMMReg *d, ZMMReg *s,
                                      unsigned n)
 {
     return tcg_ssefp_vec &&
-           float32_to_int32_round_to_zero_vec(
-               (int32_t *)SSE_LANES(d, _l_ZMMReg, n),
-               SSE_LANES(s, _s_ZMMReg, n), n, &env->sse_status);
+           sse_vec_stat(float32_to_int32_round_to_zero_vec(
+                            (int32_t *)SSE_LANES(d, _l_ZMMReg, n),
+                            SSE_LANES(s, _s_ZMMReg, n), n, &env->sse_status),
+                        XSSE_CVTTPS2DQ, env, SSE_LANES(s, _s_ZMMReg, n),
+                        NULL, NULL, n, 4);
 }
 
 #define SHIFT 0
