@@ -187,6 +187,7 @@ F: include/exec/page-protection.h
 F: include/system/tcg.h
 F: include/accel/tcg/
 F: host/include/*/host/cpuinfo.h
+F: host/include/*/host/fpenv.h
 F: util/cpuinfo-*.c
 F: include/tcg/
 F: tests/decode/
