@@ -4760,13 +4760,39 @@ static void gen_VCVTPS2PH(DisasContext *s, X86DecodedInsn *decode)
     }
 }
 
+/*
+ * Operand 0 = operand 1 with element 0, of size vece, = operand 2's
+ * element 0 converted from the other precision.
+ */
+static bool gen_fcvt_native_s(DisasContext *s, X86DecodedInsn *decode,
+                              unsigned vece)
+{
+    TCGv_vec a, b, d;
+
+    if (!fp_native_s(INDEX_op_fcvts_vec, vece)) {
+        return false;
+    }
+    a = fp_scalar_operand(decode, 1, vece);
+    b = fp_scalar_operand(decode, 2, vece ^ MO_32 ^ MO_64);
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_fcvts_vec(vece, d, a, b);
+    fp_scalar_store(decode, d);
+    return true;
+}
+
 static void gen_VCVTSD2SS(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (gen_fcvt_native_s(s, decode, MO_32)) {
+        return;
+    }
     gen_helper_cvtsd2ss(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
 static void gen_VCVTSS2SD(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (gen_fcvt_native_s(s, decode, MO_64)) {
+        return;
+    }
     gen_helper_cvtss2sd(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
