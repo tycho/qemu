@@ -25,6 +25,7 @@
 #include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/cpu-ops.h"
 #include "accel/tcg/helper-retaddr.h"
+#include "accel/tcg/host-fp.h"
 #include "trace.h"
 #include "disas/disas.h"
 #include "exec/cpu-interrupt.h"
@@ -546,6 +547,7 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
     if (bql_locked()) {
         bql_unlock();
     }
+    tcg_host_fp_unwind(cpu);
     assert_no_pages_locked();
 }
 
@@ -801,6 +803,8 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
     assert(!cpu_test_interrupt(cpu, ~0));
 #else
     if (unlikely(cpu_test_interrupt(cpu, ~0))) {
+        TCG_HOST_FP_SUSPEND_GUARD(cpu);
+
         bql_lock();
         if (cpu_test_interrupt(cpu, CPU_INTERRUPT_DEBUG)) {
             cpu_reset_interrupt(cpu, CPU_INTERRUPT_DEBUG);
