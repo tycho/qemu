@@ -892,3 +892,86 @@ void tcg_gen_fcmp_vec(TCGCond cond, unsigned vece, TCGv_vec r,
 {
     do_op4_nofail(vece, r, a, b, cond, INDEX_op_fcmp_vec);
 }
+
+void tcg_gen_fadds_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_fadds_vec);
+}
+
+void tcg_gen_fsubs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_fsubs_vec);
+}
+
+void tcg_gen_fmuls_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_fmuls_vec);
+}
+
+void tcg_gen_fdivs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_fdivs_vec);
+}
+
+void tcg_gen_fmins_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_fmins_vec);
+}
+
+void tcg_gen_fmaxs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_fmaxs_vec);
+}
+
+void tcg_gen_fsqrts_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_fsqrts_vec);
+}
+
+void tcg_gen_fcvts_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_fcvts_vec);
+}
+
+void tcg_gen_movs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_movs_vec);
+}
+
+void tcg_gen_fmadds_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                        TCGv_vec b, TCGv_vec c)
+{
+    tcg_debug_assert(tcgv_vec_temp(c)->base_type >=
+                     tcgv_vec_temp(r)->base_type);
+    do_op4_nofail(vece, r, a, b, tcgv_vec_arg(c), INDEX_op_fmadds_vec);
+}
+
+void tcg_gen_fmsubs_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                        TCGv_vec b, TCGv_vec c)
+{
+    tcg_debug_assert(tcgv_vec_temp(c)->base_type >=
+                     tcgv_vec_temp(r)->base_type);
+    do_op4_nofail(vece, r, a, b, tcgv_vec_arg(c), INDEX_op_fmsubs_vec);
+}
+
+void tcg_gen_fnmadds_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                         TCGv_vec b, TCGv_vec c)
+{
+    tcg_debug_assert(tcgv_vec_temp(c)->base_type >=
+                     tcgv_vec_temp(r)->base_type);
+    do_op4_nofail(vece, r, a, b, tcgv_vec_arg(c), INDEX_op_fnmadds_vec);
+}
+
+void tcg_gen_fnmsubs_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                         TCGv_vec b, TCGv_vec c)
+{
+    tcg_debug_assert(tcgv_vec_temp(c)->base_type >=
+                     tcgv_vec_temp(r)->base_type);
+    do_op4_nofail(vece, r, a, b, tcgv_vec_arg(c), INDEX_op_fnmsubs_vec);
+}
+
+void tcg_gen_fcmps_vec(TCGCond cond, unsigned vece, TCGv_vec r,
+                       TCGv_vec a, TCGv_vec b)
+{
+    do_op4_nofail(vece, r, a, b, cond, INDEX_op_fcmps_vec);
+}

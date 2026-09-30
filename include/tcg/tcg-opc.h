@@ -202,6 +202,22 @@ DEF(scvtf_vec, 1, 1, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
 DEF(fcvtzs_vec, 1, 1, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
 DEF(frintx_vec, 1, 1, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
 
+/* The same on element 0; the other elements come from the first input. */
+DEF(fadds_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fsubs_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fmuls_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fdivs_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fmins_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fmaxs_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fsqrts_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fmadds_vec, 1, 3, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fmsubs_vec, 1, 3, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fnmadds_vec, 1, 3, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fnmsubs_vec, 1, 3, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fcmps_vec, 1, 2, 1, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fcvts_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(movs_vec, 1, 2, 0, TCG_OPF_VECTOR)
+
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 
 #include "tcg-target-opc.h.inc"
