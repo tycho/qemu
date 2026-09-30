@@ -651,6 +651,22 @@ typedef enum {
     Iqrrr_e_UQSUB     = 0x2e202c00,
     Iqrrr_e_USHL      = 0x2e204400,
 
+    /*
+     * AdvSIMD three same, floating point.  The size field's low bit
+     * selects double precision; its high bit is part of the opcode.
+     */
+    Iqrrr_e_FADD      = 0x0e20d400,
+    Iqrrr_e_FSUB      = 0x0ea0d400,
+    Iqrrr_e_FMUL      = 0x2e20dc00,
+    Iqrrr_e_FDIV      = 0x2e20fc00,
+    Iqrrr_e_FMAX      = 0x0e20f400,
+    Iqrrr_e_FMIN      = 0x0ea0f400,
+    Iqrrr_e_FMLA      = 0x0e20cc00,
+    Iqrrr_e_FMLS      = 0x0ea0cc00,
+    Iqrrr_e_FCMEQ     = 0x0e20e400,
+    Iqrrr_e_FCMGE     = 0x2e20e400,
+    Iqrrr_e_FCMGT     = 0x2ea0e400,
+
     /* AdvSIMD two-reg misc.  */
     Iqrr_e_CMGT0      = 0x0e208800,
     Iqrr_e_CMEQ0      = 0x0e209800,
@@ -660,6 +676,13 @@ typedef enum {
     Iqrr_e_NOT        = 0x2e205800,
     Iqrr_e_ABS        = 0x0e20b800,
     Iqrr_e_NEG        = 0x2e20b800,
+
+    /* AdvSIMD two-reg misc, floating point: as for three same. */
+    Iqrr_e_FSQRT      = 0x2ea1f800,
+    Iqrr_e_FNEG       = 0x2ea0f800,
+    Iqrr_e_SCVTF      = 0x0e21d800,
+    Iqrr_e_FCVTZS     = 0x0ea1b800,
+    Iqrr_e_FRINTX     = 0x2e219800,
 
     /* System instructions.  */
     NOP               = 0xd503201f,
@@ -3118,6 +3141,7 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     TCGType type = vecl + TCG_TYPE_V64;
     unsigned is_q = vecl;
     bool is_scalar = !is_q && vece == MO_64;
+    unsigned fsz = vece == MO_64;
     TCGArg a0, a1, a2, a3;
     int cmode, imm8;
 
@@ -3405,6 +3429,68 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         }
         break;
 
+    case INDEX_op_fadd_vec:
+        tcg_out_insn(s, qrrr_e, FADD, is_q, fsz, a0, a1, a2);
+        break;
+    case INDEX_op_fsub_vec:
+        tcg_out_insn(s, qrrr_e, FSUB, is_q, fsz, a0, a1, a2);
+        break;
+    case INDEX_op_fmul_vec:
+        tcg_out_insn(s, qrrr_e, FMUL, is_q, fsz, a0, a1, a2);
+        break;
+    case INDEX_op_fdiv_vec:
+        tcg_out_insn(s, qrrr_e, FDIV, is_q, fsz, a0, a1, a2);
+        break;
+    case INDEX_op_fmin_vec:
+        tcg_out_insn(s, qrrr_e, FMIN, is_q, fsz, a0, a1, a2);
+        break;
+    case INDEX_op_fmax_vec:
+        tcg_out_insn(s, qrrr_e, FMAX, is_q, fsz, a0, a1, a2);
+        break;
+    case INDEX_op_fsqrt_vec:
+        tcg_out_insn(s, qrr_e, FSQRT, is_q, fsz, a0, a1);
+        break;
+    case INDEX_op_fneg_vec:
+        tcg_out_insn(s, qrr_e, FNEG, is_q, fsz, a0, a1);
+        break;
+    case INDEX_op_scvtf_vec:
+        tcg_out_insn(s, qrr_e, SCVTF, is_q, fsz, a0, a1);
+        break;
+    case INDEX_op_fcvtzs_vec:
+        tcg_out_insn(s, qrr_e, FCVTZS, is_q, fsz, a0, a1);
+        break;
+    case INDEX_op_frintx_vec:
+        tcg_out_insn(s, qrr_e, FRINTX, is_q, fsz, a0, a1);
+        break;
+    case INDEX_op_fmla_vec:
+        /* The accumulator is both the first input and the output. */
+        tcg_out_insn(s, qrrr_e, FMLA, is_q, fsz, a0, a2, args[3]);
+        break;
+    case INDEX_op_fmls_vec:
+        tcg_out_insn(s, qrrr_e, FMLS, is_q, fsz, a0, a2, args[3]);
+        break;
+    case INDEX_op_fcmp_vec:
+        switch (args[3]) {
+        case TCG_COND_EQ:
+            tcg_out_insn(s, qrrr_e, FCMEQ, is_q, fsz, a0, a1, a2);
+            break;
+        case TCG_COND_GE:
+            tcg_out_insn(s, qrrr_e, FCMGE, is_q, fsz, a0, a1, a2);
+            break;
+        case TCG_COND_GT:
+            tcg_out_insn(s, qrrr_e, FCMGT, is_q, fsz, a0, a1, a2);
+            break;
+        case TCG_COND_LE:
+            tcg_out_insn(s, qrrr_e, FCMGE, is_q, fsz, a0, a2, a1);
+            break;
+        case TCG_COND_LT:
+            tcg_out_insn(s, qrrr_e, FCMGT, is_q, fsz, a0, a2, a1);
+            break;
+        default:
+            g_assert_not_reached();
+        }
+        break;
+
     case INDEX_op_mov_vec:  /* Always emitted via tcg_out_mov.  */
     case INDEX_op_dup_vec:  /* Always emitted via tcg_out_dup_vec.  */
     default:
@@ -3448,6 +3534,27 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_umax_vec:
     case INDEX_op_umin_vec:
         return vece < MO_64;
+
+    case INDEX_op_fadd_vec:
+    case INDEX_op_fsub_vec:
+    case INDEX_op_fmul_vec:
+    case INDEX_op_fdiv_vec:
+    case INDEX_op_fmin_vec:
+    case INDEX_op_fmax_vec:
+    case INDEX_op_fsqrt_vec:
+    case INDEX_op_fneg_vec:
+    case INDEX_op_fmla_vec:
+    case INDEX_op_fmls_vec:
+    case INDEX_op_fcmp_vec:
+    case INDEX_op_scvtf_vec:
+    case INDEX_op_fcvtzs_vec:
+    case INDEX_op_frintx_vec:
+        /*
+         * These are for running guest FP in the guest's FP environment,
+         * which takes FEAT_AFP (host_fpenv_native).
+         */
+        return type == TCG_TYPE_V128 && vece >= MO_32
+               && (cpuinfo & CPUINFO_AFP);
 
     default:
         return 0;
@@ -3545,7 +3652,22 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_shrv_vec:
     case INDEX_op_sarv_vec:
     case INDEX_op_aa64_sshl_vec:
+    case INDEX_op_fadd_vec:
+    case INDEX_op_fsub_vec:
+    case INDEX_op_fmul_vec:
+    case INDEX_op_fdiv_vec:
+    case INDEX_op_fmin_vec:
+    case INDEX_op_fmax_vec:
+    case INDEX_op_fcmp_vec:
         return C_O1_I2(w, w, w);
+    case INDEX_op_fmla_vec:
+    case INDEX_op_fmls_vec:
+        return C_O1_I3(w, 0, w, w);
+    case INDEX_op_fsqrt_vec:
+    case INDEX_op_fneg_vec:
+    case INDEX_op_scvtf_vec:
+    case INDEX_op_fcvtzs_vec:
+    case INDEX_op_frintx_vec:
     case INDEX_op_not_vec:
     case INDEX_op_neg_vec:
     case INDEX_op_abs_vec:
