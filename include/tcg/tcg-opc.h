@@ -218,6 +218,11 @@ DEF(fcmps_vec, 1, 2, 1, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
 DEF(fcvts_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
 DEF(movs_vec, 1, 2, 0, TCG_OPF_VECTOR)
 
+/* Scalar FP to and from general registers. */
+DEF(fcmp3_vec, 1, 2, 1, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(scvtfs_vec, 1, 2, 1, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(fcvtzsi_vec, 1, 1, 1, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 
 #include "tcg-target-opc.h.inc"
