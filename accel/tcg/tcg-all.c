@@ -252,6 +252,24 @@ static void tcg_set_tlb_grow(Object *obj, Visitor *v, const char *name,
     tcg_tlb_grow = value;
 }
 
+bool tcg_ijmp_inline;
+
+static char *tcg_get_ijmp(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_ijmp_inline ? "inline" : "helper");
+}
+
+static void tcg_set_ijmp(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "inline")) {
+        tcg_ijmp_inline = true;
+    } else if (!strcmp(value, "helper")) {
+        tcg_ijmp_inline = false;
+    } else {
+        error_setg(errp, "Invalid 'x-ijmp' value: %s", value);
+    }
+}
+
 static void tcg_get_tso_promote(Object *obj, Visitor *v,
                                 const char *name, void *opaque,
                                 Error **errp)
@@ -401,6 +419,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Grow a softmmu TLB between flushes once it has had this many "
         "times its size in fills within 100 ms while over 70% used "
         "(0: resize only at flushes, the default)");
+
+    object_class_property_add_str(oc, "x-ijmp", tcg_get_ijmp, tcg_set_ijmp);
+    object_class_property_set_description(oc, "x-ijmp",
+        "Look up the next TB at an indirect or cross-page jump: helper "
+        "(default) or inline (probe the jump cache in generated code, "
+        "call the helper on a miss)");
 
     object_class_property_add_bool(oc, "x-pferr-hw",
                                    tcg_get_pferr_hw, tcg_set_pferr_hw);
