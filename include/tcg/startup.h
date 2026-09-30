@@ -56,6 +56,12 @@ bool tcg_tso_cross_promoted(uint64_t pc);
  */
 extern bool tcg_pferr_hw;
 
+/*
+ * x-ssefp=vec: target SIMD floating-point helpers try the softfloat vector
+ * fast paths (float32_add_vec etc.) before computing lane by lane.
+ */
+extern bool tcg_ssefp_vec;
+
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);
 
