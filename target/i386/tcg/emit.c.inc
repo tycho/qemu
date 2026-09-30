@@ -967,16 +967,34 @@ static inline void gen_unary_fp32_sse(DisasContext *s, X86DecodedInsn *decode,
 illegal_op:
     gen_illegal_opcode(s);
 }
-#define UNARY_FP32_SSE(uname, lname)                                               \
-static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
-{                                                                                  \
-    gen_unary_fp32_sse(s, decode,                                                  \
-                       gen_helper_##lname##ps_xmm,                                 \
-                       gen_helper_##lname##ps_ymm,                                 \
-                       gen_helper_##lname##ss);                                    \
+/*
+ * With x-ssefp=native, RCPPS/RSQRTPS and RCPSS/RSQRTSS are the host's
+ * estimates, where the host's are as precise as x86's.
+ */
+#define UNARY_FP32_SSE(uname, lname, vecop)                                   \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    static const TCGOpcode vecop##_list[] = { INDEX_op_##vecop##_vec, 0 };    \
+    static const GVecGen2 g = {                                               \
+        .fniv = tcg_gen_##vecop##_vec,                                        \
+        .opt_opc = vecop##_list,                                              \
+        .vece = MO_32,                                                        \
+    };                                                                        \
+                                                                              \
+    if (!(s->prefix & (PREFIX_DATA | PREFIX_REPNZ))                           \
+        && (s->prefix & PREFIX_REPZ                                           \
+            ? gen_fp_native_s3(s, decode, tcg_gen_##vecop##s_vec,             \
+                               INDEX_op_##vecop##s_vec)                       \
+            : gen_fp_native_2(s, decode, &g))) {                              \
+        return;                                                               \
+    }                                                                         \
+    gen_unary_fp32_sse(s, decode,                                             \
+                       gen_helper_##lname##ps_xmm,                            \
+                       gen_helper_##lname##ps_ymm,                            \
+                       gen_helper_##lname##ss);                               \
 }
-UNARY_FP32_SSE(VRSQRT, rsqrt)
-UNARY_FP32_SSE(VRCP, rcp)
+UNARY_FP32_SSE(VRSQRT, rsqrt, frsqrte)
+UNARY_FP32_SSE(VRCP, rcp, frecpe)
 
 /*
  * 66 = v*pd Vpd, Hpd, Wpd
