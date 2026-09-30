@@ -4827,11 +4827,45 @@ static void gen_VCVTSS2SD(DisasContext *s, X86DecodedInsn *decode)
     gen_helper_cvtss2sd(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
+/*
+ * CVTSI2SS/SD with x-ssefp=native: one host conversion from the general
+ * register, which leaves the other elements of the first operand in place,
+ * and a store of the whole register.
+ */
+static bool gen_cvtsi2sx_native(DisasContext *s, X86DecodedInsn *decode)
+{
+    unsigned vece = s->prefix & PREFIX_REPNZ ? MO_64 : MO_32;
+    TCGv_vec a, d;
+
+    if (!fp_native_s(INDEX_op_scvtfs_vec, vece)) {
+        return false;
+    }
+    a = fp_scalar_operand(decode, 1, vece);
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+#ifdef TARGET_X86_64
+    if (decode->op[2].ot == MO_64) {
+        tcg_gen_scvtfs_i64_vec(vece, d, a, s->T1);
+    } else {
+        TCGv_i32 in = tcg_temp_new_i32();
+
+        tcg_gen_extrl_i64_i32(in, s->T1);
+        tcg_gen_scvtfs_i32_vec(vece, d, a, in);
+    }
+#else
+    tcg_gen_scvtfs_i32_vec(vece, d, a, s->T1);
+#endif
+    fp_scalar_store(decode, d);
+    return true;
+}
+
 static void gen_VCVTSI2Sx(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
     TCGv_i32 in;
 
+    if (gen_cvtsi2sx_native(s, decode)) {
+        return;
+    }
     tcg_gen_gvec_mov(MO_64, decode->op[0].offset, decode->op[1].offset, vec_len, vec_len);
 
 #ifdef TARGET_X86_64
