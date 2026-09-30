@@ -165,6 +165,32 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 bool translator_use_goto_tb(DisasContextBase *db, vaddr dest);
 
 /**
+ * translator_use_inline_lookup
+ * @db: Disassembly context
+ *
+ * Return true if translator_lookup_and_goto_ptr() may be used to end the
+ * current TB.
+ */
+bool translator_use_inline_lookup(DisasContextBase *db);
+
+/**
+ * translator_lookup_and_goto_ptr
+ * @db: Disassembly context
+ * @pc: virtual pc of the next TB
+ * @cs_base: cs_base of the next TB
+ * @flags: flags of the next TB
+ *
+ * Like tcg_gen_lookup_and_goto_ptr(), for a target that knows at
+ * translation time the CPU state at this TB exit: @cs_base and @flags must
+ * be what TCGCPUOps.get_tb_cpu_state() would return there, and @pc its pc.
+ * Probe the vCPU's jump cache in generated code, and call
+ * helper_lookup_tb_ptr only on a miss.  Only valid when
+ * translator_use_inline_lookup() returns true.
+ */
+void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
+                                    uint64_t cs_base, uint32_t flags);
+
+/**
  * translator_io_start
  * @db: Disassembly context
  *
