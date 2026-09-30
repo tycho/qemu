@@ -14,6 +14,7 @@
 #define CPUINFO_BTI             (1u << 5)
 #define CPUINFO_CSSC            (1u << 6)
 #define CPUINFO_AFP             (1u << 7)
+#define CPUINFO_RPRES           (1u << 8)
 
 /* Initialized with a constructor. */
 extern unsigned cpuinfo;
