@@ -246,6 +246,7 @@ bool tcg_ssefp_vec;
 bool tcg_ssefp_native;
 bool tcg_vecld;
 bool tcg_vperm;
+bool tcg_dse;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
 static QemuMutex tso_cross_lock;
@@ -3667,6 +3668,162 @@ static void move_label_uses(TCGLabel *to, TCGLabel *from)
     QSIMPLEQ_CONCAT(&to->branches, &from->branches);
 }
 
+/*
+ * x-dse: dead stores to CPUArchState.  Walking each extended basic block
+ * backward, keep the byte ranges of env that are certainly stored again
+ * before anything reads them; a store entirely within those is removed.
+ * The ranges are forgotten at anything that could read env or observe
+ * it: a helper call, a guest memory access (which may fault), a branch,
+ * label or exit, a plugin callback, and a host load or store not based on
+ * env (which may alias it).  Stores overlapping a global's memory are
+ * kept, because the register allocator reads globals implicitly.
+ */
+#define DSE_RANGES 32
+
+typedef struct DseRange {
+    intptr_t lo, hi;            /* [lo, hi) */
+} DseRange;
+
+typedef struct DseSet {
+    DseRange r[DSE_RANGES];
+    int n;
+} DseSet;
+
+static bool dse_covered(const DseSet *d, intptr_t lo, intptr_t hi)
+{
+    for (int i = 0; i < d->n; i++) {
+        if (d->r[i].lo <= lo && hi <= d->r[i].hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Remove [lo, hi) from the set (a read of those bytes). */
+static void dse_read(DseSet *d, intptr_t lo, intptr_t hi)
+{
+    for (int i = 0; i < d->n; i++) {
+        DseRange r = d->r[i];
+
+        if (r.hi <= lo || hi <= r.lo) {
+            continue;
+        }
+        if (r.lo < lo && hi < r.hi && d->n < DSE_RANGES) {
+            d->r[d->n++] = (DseRange){ hi, r.hi };
+            d->r[i].hi = lo;
+        } else if (r.lo < lo) {
+            d->r[i].hi = lo;
+        } else if (hi < r.hi) {
+            d->r[i].lo = hi;
+        } else {
+            d->r[i--] = d->r[--d->n];
+        }
+    }
+}
+
+/* Add [lo, hi) to the set (a store of those bytes). */
+static void dse_write(DseSet *d, intptr_t lo, intptr_t hi)
+{
+    for (int i = 0; i < d->n; i++) {
+        if (d->r[i].lo <= hi && lo <= d->r[i].hi) {
+            lo = MIN(lo, d->r[i].lo);
+            hi = MAX(hi, d->r[i].hi);
+            d->r[i--] = d->r[--d->n];
+        }
+    }
+    if (d->n < DSE_RANGES) {
+        d->r[d->n++] = (DseRange){ lo, hi };
+    }
+}
+
+static int dse_access_size(TCGOp *op)
+{
+    switch (op->opc) {
+    case INDEX_op_ld8u:
+    case INDEX_op_ld8s:
+    case INDEX_op_st8:
+        return 1;
+    case INDEX_op_ld16u:
+    case INDEX_op_ld16s:
+    case INDEX_op_st16:
+        return 2;
+    case INDEX_op_ld32u:
+    case INDEX_op_ld32s:
+    case INDEX_op_st32:
+        return 4;
+    case INDEX_op_ld:
+    case INDEX_op_st:
+    case INDEX_op_ld_vec:
+    case INDEX_op_st_vec:
+        return tcg_type_size(TCGOP_TYPE(op));
+    case INDEX_op_dupm_vec:
+        return 1 << TCGOP_VECE(op);
+    default:
+        return 0;
+    }
+}
+
+static void __attribute__((noinline))
+dead_env_store_pass(TCGContext *s)
+{
+    TCGTemp *env = tcgv_ptr_temp(tcg_env);
+    DseSet dead = { .n = 0 };
+    TCGOp *op, *prev;
+
+    QTAILQ_FOREACH_REVERSE_SAFE(op, &s->ops, link, prev) {
+        int size = dse_access_size(op);
+        bool store;
+        intptr_t lo;
+
+        if (size) {
+            store = tcg_op_defs[op->opc].nb_oargs == 0;
+            if (arg_temp(op->args[1]) != env) {
+                dead.n = 0;
+                continue;
+            }
+            lo = op->args[2];
+            if (!store) {
+                dse_read(&dead, lo, lo + size);
+            } else if (dse_covered(&dead, lo, lo + size)) {
+                bool global = false;
+
+                for (int i = 0; i < s->nb_globals && !global; i++) {
+                    TCGTemp *ts = &s->temps[i];
+
+                    global = ts->mem_base == env && ts->mem_offset < lo + size
+                             && lo < ts->mem_offset
+                                     + tcg_type_size(ts->base_type);
+                }
+                if (!global) {
+                    tcg_op_remove(s, op);
+                }
+            } else {
+                dse_write(&dead, lo, lo + size);
+            }
+            continue;
+        }
+        switch (op->opc) {
+        case INDEX_op_insn_start:
+        case INDEX_op_discard:
+        case INDEX_op_mb:
+            break;
+        case INDEX_op_call:
+        case INDEX_op_set_label:
+        case INDEX_op_plugin_cb:
+        case INDEX_op_plugin_mem_cb:
+            dead.n = 0;
+            break;
+        default:
+            if (tcg_op_defs[op->opc].flags
+                & (TCG_OPF_BB_END | TCG_OPF_CALL_CLOBBER
+                   | TCG_OPF_SIDE_EFFECTS)) {
+                dead.n = 0;
+            }
+            break;
+        }
+    }
+}
+
 /* Reachable analysis : remove unreachable code.  */
 static void __attribute__((noinline))
 reachable_code_pass(TCGContext *s)
@@ -6704,6 +6861,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     tcg_temp_ebb_reset_freed(s);
 
     tcg_optimize(s);
+    if (tcg_dse) {
+        dead_env_store_pass(s);
+    }
 
     reachable_code_pass(s);
     liveness_pass_0(s);

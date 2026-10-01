@@ -84,6 +84,13 @@ extern bool tcg_vecld;
  */
 extern bool tcg_vperm;
 
+/*
+ * x-dse: before liveness, remove stores to CPUArchState that are
+ * overwritten later in the same extended basic block before any
+ * operation could read them.
+ */
+extern bool tcg_dse;
+
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);
 
