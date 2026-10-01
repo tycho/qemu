@@ -22,6 +22,7 @@
 #include "trace.h"
 #include "disas/disas.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 #include "exec/mmap-lock.h"
 #include "tb-internal.h"
 #include "exec/tb-flush.h"
@@ -37,6 +38,9 @@
 #include "internal-common.h"
 #include "tcg/perf.h"
 #include "tcg/insn-start-words.h"
+#ifdef CONFIG_USER_ONLY
+#include "user/cpu_loop.h"
+#endif
 
 TBContext tb_ctx;
 
@@ -97,6 +101,9 @@ static int64_t decode_sleb128(const uint8_t **pp)
    That is, the first column is seeded with the guest pc, the last column
    with the host pc, and the middle columns with zeros.  */
 
+/* tcg_lazysync map: the register byte of a constant-valued global. */
+#define LAZY_WB_CONST 0xff
+
 static int encode_search(TranslationBlock *tb, uint8_t *block)
 {
     uint8_t *highwater = tcg_ctx->code_gen_highwater;
@@ -130,8 +137,95 @@ static int encode_search(TranslationBlock *tb, uint8_t *block)
         }
     }
 
+#ifdef CONFIG_USER_ONLY
+    /* tcg_lazysync: the dirty globals per guest access, after the rows. */
+    if (tcg_lazysync_user) {
+        TCGContext *s = tcg_ctx;
+
+        p = encode_sleb128(p, s->nb_lazy_map);
+        for (i = 0; i < s->nb_lazy_map; ++i) {
+            const TCGLazyMap *m = &s->lazy_map[i];
+
+            p = encode_sleb128(p, m->start);
+            p = encode_sleb128(p, m->end - m->start);
+            p = encode_sleb128(p, m->nb_wb);
+            for (j = 0; j < m->nb_wb; ++j) {
+                *p++ = m->wb[j].is_const ? LAZY_WB_CONST : m->wb[j].reg;
+                *p++ = m->wb[j].base;
+                *p++ = m->wb[j].type;
+                p = encode_sleb128(p, m->wb[j].offset);
+                if (m->wb[j].is_const) {
+                    p = encode_sleb128(p, m->wb[j].val);
+                }
+            }
+            if (unlikely(p > highwater)) {
+                return -1;
+            }
+        }
+    }
+#endif
+
     return p - block;
 }
+
+#ifdef CONFIG_USER_ONLY
+/*
+ * A host signal at @host_pc in generated code: if it is a guest access
+ * that left dirty globals in registers (tcg_lazysync), store them from
+ * @regs, the host's registers at the signal, numbered as TCGReg.
+ */
+void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t *regs)
+{
+    TranslationBlock *tb;
+    const uint8_t *p;
+    uintptr_t off;
+    int n;
+
+    if (!tcg_lazysync_user) {
+        return;
+    }
+    tb = tcg_tb_lookup(host_pc);
+    if (!tb || host_pc < (uintptr_t)tb->tc.ptr) {
+        return;
+    }
+    off = host_pc - (uintptr_t)tb->tc.ptr;
+    p = tb->tc.ptr + tb->tc.size;
+    for (int i = 0; i < tb->icount * (INSN_START_WORDS + 1); ++i) {
+        decode_sleb128(&p);
+    }
+    n = decode_sleb128(&p);
+    for (int i = 0; i < n; ++i) {
+        uintptr_t start = decode_sleb128(&p);
+        uintptr_t len = decode_sleb128(&p);
+        int nb_wb = decode_sleb128(&p);
+        bool hit = off >= start && off < start + len;
+
+        for (int j = 0; j < nb_wb; ++j) {
+            unsigned reg = *p++;
+            TCGReg base = *p++;
+            TCGType type = *p++;
+            intptr_t ofs = decode_sleb128(&p);
+            uint64_t val = reg == LAZY_WB_CONST ? decode_sleb128(&p) : 0;
+
+            if (hit) {
+                void *dst = (void *)(uintptr_t)(regs[base] + ofs);
+
+                if (reg != LAZY_WB_CONST) {
+                    val = regs[reg];
+                }
+                if (type == TCG_TYPE_I32) {
+                    *(uint32_t *)dst = val;
+                } else {
+                    *(uint64_t *)dst = val;
+                }
+            }
+        }
+        if (hit) {
+            return;
+        }
+    }
+}
+#endif
 
 static int cpu_unwind_data_from_tb(TranslationBlock *tb, uintptr_t host_pc,
                                    uint64_t *data)
