@@ -3422,6 +3422,26 @@ void tcg_x86_init(void)
                                      bnd_regu_names[i]);
     }
 
+    /*
+     * With tcg_vecglobal, the low 128 bits of each xmm register as a
+     * vector global; whole-register loads and stores become moves of it.
+     */
+    if (tcg_vecglobal) {
+        static const char xmm_names[CPU_NB_REGS][6] = {
+            "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+#ifdef TARGET_X86_64
+            "xmm8", "xmm9", "xmm10", "xmm11",
+            "xmm12", "xmm13", "xmm14", "xmm15",
+#endif
+        };
+
+        for (i = 0; i < CPU_NB_REGS; ++i) {
+            tcg_global_mem_new_vec(tcg_env,
+                                   offsetof(CPUX86State, xmm_regs[i].ZMM_X(0)),
+                                   TCG_TYPE_V128, xmm_names[i]);
+        }
+    }
+
     /* xmm_t0 and mmx_t0 hold an operand only within one instruction. */
     tcg_set_env_scratch(offsetof(CPUX86State, xmm_t0),
                         offsetof(CPUX86State, mmx_t0) + sizeof(MMXReg)
