@@ -107,6 +107,7 @@ struct TCGLabelQemuLdst {
     const tcg_insn_unit *raddr;   /* addr of the next IR of qemu_ld/st IR */
     tcg_insn_unit *label_ptr[2]; /* label pointers to be updated */
     bool fallback;          /* backend-specific out-of-line code, no helper */
+    TCGRegSet save_regs;    /* to save around the slow path's call */
     uint64_t site;          /* fallback: guest pc of the access's insn */
     QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 };
@@ -247,6 +248,7 @@ bool tcg_ssefp_native;
 bool tcg_vecld;
 bool tcg_vperm;
 bool tcg_dse;
+bool tcg_ldstkeep;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
 static QemuMutex tso_cross_lock;
@@ -301,6 +303,12 @@ tcg_prologue_fn *tcg_qemu_tb_exec;
 
 static TCGRegSet tcg_target_available_regs[TCG_TYPE_COUNT];
 static TCGRegSet tcg_target_call_clobber_regs;
+/*
+ * The registers a guest memory access's slow path clobbers, if the
+ * backend's slow path saves the rest of the call-clobbered registers that
+ * hold values (TCGLabelQemuLdst.save_regs); by default, all of them.
+ */
+static TCGRegSet tcg_target_ldst_clobber_regs;
 
 #if TCG_TARGET_INSN_UNIT_SIZE == 1
 static __attribute__((unused)) inline void tcg_out8(TCGContext *s, uint8_t v)
@@ -694,6 +702,7 @@ static TCGLabelQemuLdst *new_ldst_label(TCGContext *s)
     TCGLabelQemuLdst *l = tcg_malloc(sizeof(*l));
 
     memset(l, 0, sizeof(*l));
+    l->save_regs = s->ldst_save_regs;
     QSIMPLEQ_INSERT_TAIL(&s->ldst_labels, l, next);
 
     return l;
@@ -1835,6 +1844,9 @@ static void tcg_context_init(unsigned max_threads)
     init_call_layout(&info_helper_st128_mmu);
 
     tcg_target_init(s);
+    if (!tcg_target_ldst_clobber_regs) {
+        tcg_target_ldst_clobber_regs = tcg_target_call_clobber_regs;
+    }
     process_constraint_sets();
 
     /* Reverse the order of the saved registers, assuming they're all at
@@ -4078,9 +4090,24 @@ static void la_global_kill(TCGContext *s, int ng)
 }
 
 /* liveness analysis: note live globals crossing calls.  */
-static void la_cross_call(TCGContext *s, int nt)
+/* x-ldstkeep: the narrower clobber set for guest memory accesses. */
+static TCGRegSet op_clobber_regs(TCGOpcode opc)
 {
-    TCGRegSet mask = ~tcg_target_call_clobber_regs;
+    switch (opc) {
+    case INDEX_op_qemu_ld:
+    case INDEX_op_qemu_st:
+    case INDEX_op_qemu_ld2:
+    case INDEX_op_qemu_st2:
+        return tcg_ldstkeep ? tcg_target_ldst_clobber_regs
+                            : tcg_target_call_clobber_regs;
+    default:
+        return tcg_target_call_clobber_regs;
+    }
+}
+
+static void la_cross_call(TCGContext *s, int nt, TCGRegSet clobber)
+{
+    TCGRegSet mask = ~clobber;
     int i;
 
     for (i = 0; i < nt; i++) {
@@ -4262,7 +4289,7 @@ liveness_pass_1(TCGContext *s)
                 }
 
                 /* For all live registers, remove call-clobbered prefs.  */
-                la_cross_call(s, nb_temps);
+                la_cross_call(s, nb_temps, tcg_target_call_clobber_regs);
 
                 /*
                  * Input arguments are live for preceding opcodes.
@@ -4498,7 +4525,7 @@ liveness_pass_1(TCGContext *s)
                 assert_carry_dead(s);
                 la_global_sync(s, nb_globals);
                 if (def->flags & TCG_OPF_CALL_CLOBBER) {
-                    la_cross_call(s, nb_temps);
+                    la_cross_call(s, nb_temps, op_clobber_regs(opc));
                 }
             }
 
@@ -5705,11 +5732,24 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         tcg_reg_alloc_bb_end(s, i_allocated_regs);
     } else {
         if (def->flags & TCG_OPF_CALL_CLOBBER) {
+            TCGRegSet clobber = op_clobber_regs(op->opc);
+
             assert_carry_dead(s);
-            /* XXX: permit generic clobber register list ? */
             for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
-                if (tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
+                if (tcg_regset_test_reg(clobber, i)) {
                     tcg_reg_free(s, i, i_allocated_regs);
+                }
+            }
+            /*
+             * The call-clobbered registers still holding values: a guest
+             * access's slow path saves them (new_ldst_label).
+             */
+            s->ldst_save_regs = 0;
+            for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
+                if (tcg_regset_test_reg(tcg_target_call_clobber_regs, i)
+                    && !tcg_regset_test_reg(clobber, i)
+                    && s->reg_to_temp[i]) {
+                    tcg_regset_set_reg(s->ldst_save_regs, i);
                 }
             }
         }

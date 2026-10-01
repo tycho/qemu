@@ -355,6 +355,7 @@ struct TCGContext {
     TCGBar guest_mo;
 
     TCGRegSet reserved_regs;
+    TCGRegSet ldst_save_regs;   /* for the next guest access label */
     intptr_t current_frame_offset;
     intptr_t frame_start;
     intptr_t frame_end;
