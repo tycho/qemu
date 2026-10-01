@@ -562,6 +562,7 @@ static void xtcg_fork_defaults(TCGState *s)
     tcg_vecld = true;
     tcg_vperm = true;
     tcg_vpermvar = true;
+    tcg_ymmglobal = true;
     tcg_dse = true;
     tcg_ldstkeep = true;
     tcg_vecmem = true;
