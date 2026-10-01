@@ -42,10 +42,18 @@ extern bool tcg_ldstkeep;
 /*
  * Guest memory accesses leave dirty globals in registers; their slow
  * paths store them before anything can observe env, and save the
- * call-clobbered registers in use (where the backend supports it;
- * system mode only).
+ * call-clobbered registers in use, where the backend supports it.
+ * In user mode, where an access faults on its fast path, also where the
+ * host signal handler supports it (tcg_lazysync_user).
  */
 extern bool tcg_lazysync;
+
+/*
+ * User mode: the host signal handler stores the dirty globals a faulting
+ * guest access had in registers (tb_lazysync_unwind), so tcg_lazysync
+ * can apply.
+ */
+extern bool tcg_lazysync_user;
 
 /*
  * The front end's scratch area in env, [ofs, ofs + size): values there
