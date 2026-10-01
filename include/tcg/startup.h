@@ -134,6 +134,12 @@ extern bool tcg_lazysync_user;
 extern bool tcg_vecglobal;
 
 /*
+ * x-ymmglobal: with x-vecglobal, the upper 128 bits of each ymm register
+ * as vector globals too.
+ */
+extern bool tcg_ymmglobal;
+
+/*
  * x-region: a TB whose direct jump returns to its first insn branches
  * back within the TB instead of chaining to itself.
  */
