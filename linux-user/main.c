@@ -833,6 +833,7 @@ int main(int argc, char **argv, char **envp)
         object_property_set_int(OBJECT(accel), "tb-size",
                                 opt_tb_size, &error_abort);
         xtcg_set_accel_props(OBJECT(accel));
+        tcg_lazysync_user = tcg_lazysync && host_signal_lazysync_ok();
         ac->init_machine(accel, NULL);
     }
 

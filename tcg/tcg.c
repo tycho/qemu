@@ -97,6 +97,17 @@ typedef struct QEMU_PACKED {
     DebugFrameFDEHeader fde;
 } DebugFrameHeader;
 
+/*
+ * x-lazysync: the globals whose values die at a guest access, used only by
+ * its slow path, for the register allocator to release after the access.
+ * Liveness pushes one per access walking backward; the allocator pops them
+ * walking forward.
+ */
+typedef struct TCGLazyDead {
+    const TCGOp *op;
+    unsigned long *dead;    /* bitmap over the globals, or NULL */
+} TCGLazyDead;
+
 struct TCGLabelQemuLdst {
     bool is_ld;             /* qemu_ld: true, qemu_st: false */
     MemOpIdx oi;
@@ -108,6 +119,9 @@ struct TCGLabelQemuLdst {
     tcg_insn_unit *label_ptr[2]; /* label pointers to be updated */
     bool fallback;          /* backend-specific out-of-line code, no helper */
     TCGRegSet save_regs;    /* to save around the slow path's call */
+    /* x-lazysync: dirty globals the slow path stores before its call */
+    const TCGLdstWriteback *wb;
+    unsigned nb_wb;
     uint64_t site;          /* fallback: guest pc of the access's insn */
     QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 };
@@ -250,6 +264,7 @@ bool tcg_vperm;
 bool tcg_vecmem;
 bool tcg_dse;
 bool tcg_ldstkeep;
+bool tcg_lazysync;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
 static QemuMutex tso_cross_lock;
@@ -310,6 +325,12 @@ static TCGRegSet tcg_target_call_clobber_regs;
  * hold values (TCGLabelQemuLdst.save_regs); by default, all of them.
  */
 static TCGRegSet tcg_target_ldst_clobber_regs;
+/*
+ * The backend's guest access slow paths store the dirty globals listed in
+ * TCGLabelQemuLdst.wb before their call, and save every call-clobbered
+ * register in save_regs except the access's outputs (x-lazysync).
+ */
+static bool tcg_target_ldst_writeback;
 
 #if TCG_TARGET_INSN_UNIT_SIZE == 1
 static __attribute__((unused)) inline void tcg_out8(TCGContext *s, uint8_t v)
@@ -704,6 +725,8 @@ static TCGLabelQemuLdst *new_ldst_label(TCGContext *s)
 
     memset(l, 0, sizeof(*l));
     l->save_regs = s->ldst_save_regs;
+    l->wb = s->ldst_wb;
+    l->nb_wb = s->ldst_nb_wb;
     QSIMPLEQ_INSERT_TAIL(&s->ldst_labels, l, next);
 
     return l;
@@ -4054,6 +4077,41 @@ static void la_global_sync(TCGContext *s, int ng)
 }
 
 /*
+ * liveness analysis: a guest memory access with x-lazysync: its slow path
+ * reads every global, but none needs to be in memory before it.  Record
+ * the globals whose values die here (other than the op's outputs).
+ */
+static void la_global_live(TCGContext *s, int ng, TCGOp *op, int nb_oargs)
+{
+    TCGLazyDead *ld = &s->lazy_dead[s->nb_lazy_dead++];
+
+    ld->op = op;
+    ld->dead = NULL;
+    for (int i = 0; i < ng; ++i) {
+        TCGTemp *ts = &s->temps[i];
+        bool output = false;
+
+        if (!(ts->state & TS_DEAD) || ts->kind == TEMP_FIXED) {
+            continue;
+        }
+        for (int k = 0; k < nb_oargs; k++) {
+            output |= arg_temp(op->args[k]) == ts;
+        }
+        if (!output) {
+            if (!ld->dead) {
+                size_t size = BITS_TO_LONGS(ng) * sizeof(unsigned long);
+
+                ld->dead = tcg_malloc(size);
+                memset(ld->dead, 0, size);
+            }
+            set_bit(i, ld->dead);
+        }
+        ts->state &= ~TS_DEAD;
+        la_reset_pref(ts);
+    }
+}
+
+/*
  * liveness analysis: conditional branch: all temps are dead unless
  * explicitly live-across-conditional-branch, globals and local temps
  * should be synced.
@@ -4095,9 +4153,7 @@ static void la_global_kill(TCGContext *s, int ng)
     }
 }
 
-/* liveness analysis: note live globals crossing calls.  */
-/* x-ldstkeep: the narrower clobber set for guest memory accesses. */
-static TCGRegSet op_clobber_regs(TCGOpcode opc)
+static bool op_is_guest_access(TCGOpcode opc)
 {
     switch (opc) {
     case INDEX_op_qemu_ld:
@@ -4106,11 +4162,40 @@ static TCGRegSet op_clobber_regs(TCGOpcode opc)
     case INDEX_op_qemu_st2:
     case INDEX_op_qemu_ld_vec:
     case INDEX_op_qemu_st_vec:
-        return tcg_ldstkeep ? tcg_target_ldst_clobber_regs
-                            : tcg_target_call_clobber_regs;
+        return true;
     default:
+        return false;
+    }
+}
+
+/*
+ * x-lazysync: dirty globals stay in registers across guest memory
+ * accesses.  An access's slow path stores them before its call; in user
+ * mode, where a fault is a host signal on the fast path, the TB also
+ * records them per access (TCGLazyMap) for the signal handler, where the
+ * host supports it (tcg_lazysync_user).
+ */
+bool tcg_lazysync_user;
+
+static bool op_lazysync(TCGOpcode opc)
+{
+    return tcg_lazysync && tcg_target_ldst_writeback
+           && (tcg_use_softmmu || tcg_lazysync_user)
+           && op_is_guest_access(opc);
+}
+
+/* liveness analysis: note live globals crossing calls.  */
+/* x-ldstkeep, x-lazysync: the narrower clobber sets for guest accesses. */
+static TCGRegSet op_clobber_regs(TCGOpcode opc)
+{
+    if (!op_is_guest_access(opc)) {
         return tcg_target_call_clobber_regs;
     }
+    if (op_lazysync(opc)) {
+        return 0;
+    }
+    return tcg_ldstkeep ? tcg_target_ldst_clobber_regs
+                        : tcg_target_call_clobber_regs;
 }
 
 static void la_cross_call(TCGContext *s, int nt, TCGRegSet clobber)
@@ -4229,6 +4314,11 @@ liveness_pass_1(TCGContext *s)
     for (int i = 0; i < nb_temps; ++i) {
         s->temps[i].state_ptr = prefs + i;
     }
+
+    s->lazy_dead = tcg_malloc(sizeof(TCGLazyDead) * s->nb_ops);
+    s->nb_lazy_dead = 0;
+    s->lazy_map = tcg_malloc(sizeof(TCGLazyMap) * s->nb_ops);
+    s->nb_lazy_map = 0;
 
     /* ??? Should be redundant with the exit_tb that ends the TB.  */
     la_func_end(s, nb_globals, nb_temps);
@@ -4531,7 +4621,11 @@ liveness_pass_1(TCGContext *s)
                 la_bb_end(s, nb_globals, nb_temps);
             } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
                 assert_carry_dead(s);
-                la_global_sync(s, nb_globals);
+                if (op_lazysync(opc)) {
+                    la_global_live(s, nb_globals, op, nb_oargs);
+                } else {
+                    la_global_sync(s, nb_globals);
+                }
                 if (def->flags & TCG_OPF_CALL_CLOBBER) {
                     la_cross_call(s, nb_temps, op_clobber_regs(opc));
                 }
@@ -5176,6 +5270,40 @@ static void sync_globals(TCGContext *s, TCGRegSet allocated_regs)
     }
 }
 
+/*
+ * x-lazysync: list the dirty globals held in registers for the next guest
+ * access label to store on its slow path; store the others now.
+ */
+static void ldst_record_writeback(TCGContext *s, TCGRegSet allocated_regs)
+{
+    TCGLdstWriteback *wb = NULL;
+    unsigned n = 0;
+
+    for (int i = 0; i < s->nb_globals; i++) {
+        TCGTemp *ts = &s->temps[i];
+
+        if (ts->kind == TEMP_FIXED || ts->mem_coherent
+            || ts->val_type == TEMP_VAL_MEM || ts->val_type == TEMP_VAL_DEAD) {
+            continue;
+        }
+        if (ts->val_type != TEMP_VAL_REG || ts->mem_base->kind != TEMP_FIXED) {
+            temp_sync(s, ts, allocated_regs, 0, 0);
+            continue;
+        }
+        if (!wb) {
+            wb = tcg_malloc(sizeof(*wb) * s->nb_globals);
+        }
+        wb[n++] = (TCGLdstWriteback){
+            .type = ts->type,
+            .reg = ts->reg,
+            .base = ts->mem_base->reg,
+            .offset = ts->mem_offset,
+        };
+    }
+    s->ldst_wb = wb;
+    s->ldst_nb_wb = n;
+}
+
 /* at the end of a basic block, we assume all temporaries are dead and
    all globals are stored at their canonical location. */
 static void tcg_reg_alloc_bb_end(TCGContext *s, TCGRegSet allocated_regs)
@@ -5480,6 +5608,8 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
     const TCGArgConstraint *args_ct;
     const TCGArgConstraint *arg_ct;
     TCGTemp *ts;
+    TCGLazyDead *lazy = NULL;
+    size_t lazy_start = 0;
     TCGArg new_args[TCG_MAX_OP_ARGS];
     int const_args[TCG_MAX_OP_ARGS];
     TCGCond op_cond;
@@ -5761,7 +5891,12 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
                 }
             }
         }
-        if (def->flags & TCG_OPF_SIDE_EFFECTS) {
+        s->ldst_nb_wb = 0;
+        if (op_lazysync(op->opc)) {
+            lazy = &s->lazy_dead[--s->nb_lazy_dead];
+            tcg_debug_assert(lazy->op == op);
+            ldst_record_writeback(s, i_allocated_regs);
+        } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
             /* sync globals if the op has side effects and might trigger
                an exception. */
             sync_globals(s, i_allocated_regs);
@@ -5827,6 +5962,27 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             ts->mem_coherent = 0;
             new_args[i] = reg;
         }
+    }
+
+    if (lazy) {
+        /*
+         * A global whose register now holds an output was stored when
+         * the register was taken: drop it.
+         */
+        unsigned n = 0;
+
+        for (unsigned w = 0; w < s->ldst_nb_wb; w++) {
+            bool out = false;
+
+            for (k = 0; k < nb_oargs; k++) {
+                out |= s->ldst_wb[w].reg == new_args[k];
+            }
+            if (!out) {
+                s->ldst_wb[n++] = s->ldst_wb[w];
+            }
+        }
+        s->ldst_nb_wb = n;
+        lazy_start = tcg_current_code_size(s);
     }
 
     /* emit instruction */
@@ -6145,6 +6301,15 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         s->carry_live = true;
     }
 
+    if (lazy && !tcg_use_softmmu && s->ldst_nb_wb) {
+        s->lazy_map[s->nb_lazy_map++] = (TCGLazyMap){
+            .start = lazy_start,
+            .end = tcg_current_code_size(s),
+            .wb = s->ldst_wb,
+            .nb_wb = s->ldst_nb_wb,
+        };
+    }
+
     /* move the outputs in the correct register if needed */
     for(i = 0; i < nb_oargs; i++) {
         ts = arg_temp(op->args[i]);
@@ -6156,6 +6321,15 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             temp_sync(s, ts, o_allocated_regs, 0, IS_DEAD_ARG(i));
         } else if (IS_DEAD_ARG(i)) {
             temp_dead(s, ts);
+        }
+    }
+
+    /* x-lazysync: the globals only the slow path needed. */
+    if (lazy && lazy->dead) {
+        for (i = 0; i < s->nb_globals; i++) {
+            if (test_bit(i, lazy->dead)) {
+                temp_dead(s, &s->temps[i]);
+            }
         }
     }
 }
