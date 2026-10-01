@@ -134,6 +134,12 @@ extern bool tcg_vecglobal;
 extern bool tcg_region;
 
 /*
+ * x-region-hot: executions of a backward jump between TBs after which its
+ * destination becomes the head of a multi-block region (0: never).
+ */
+extern unsigned tcg_region_hot;
+
+/*
  * The front end's scratch area in env, [ofs, ofs + size): values there
  * live only within one guest instruction, so a fault or an exit never
  * observes them (x-dse may remove stores to it across guest memory

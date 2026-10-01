@@ -365,6 +365,25 @@ static void tcg_set_region(Object *obj, bool value, Error **errp)
     tcg_region = value;
 }
 
+static void tcg_get_region_hot(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    uint32_t value = tcg_region_hot;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void tcg_set_region_hot(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    tcg_region_hot = MIN(value, INT32_MAX);
+}
+
 static bool tcg_get_vecglobal(Object *obj, Error **errp)
 {
     return tcg_vecglobal;
@@ -668,6 +687,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-region",
         "Let a translation block loop back to its own start instead of "
         "chaining to itself");
+
+    object_class_property_add(oc, "x-region-hot", "uint32",
+        tcg_get_region_hot, tcg_set_region_hot, NULL, NULL);
+    object_class_property_set_description(oc, "x-region-hot",
+        "With x-region: after this many executions of a backward jump "
+        "between TBs, retranslate its destination as a multi-block region "
+        "(0: never, the default)");
 
     object_class_property_add_bool(oc, "x-vecglobal",
                                    tcg_get_vecglobal, tcg_set_vecglobal);

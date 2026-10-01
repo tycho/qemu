@@ -33,6 +33,9 @@ extern unsigned tcg_tlb_grow;
  */
 extern bool tcg_ijmp_inline;
 
+/* x-region-hot: make @pc a region head; false if it already was one. */
+bool translator_region_promote(vaddr pc);
+
 extern bool icount_align_option;
 
 /*

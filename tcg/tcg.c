@@ -267,6 +267,7 @@ bool tcg_ldstkeep;
 bool tcg_lazysync;
 bool tcg_vecglobal;
 bool tcg_region;
+unsigned tcg_region_hot;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
 static QemuMutex tso_cross_lock;

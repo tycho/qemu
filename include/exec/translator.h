@@ -85,6 +85,13 @@ struct DisasContextBase {
      * jump back to pc_first may branch to it (translator_loop_back).
      */
     struct TCGLabel *loop_label;
+    /*
+     * x-region-hot: the blocks of a multi-block region (one TB holding a
+     * hot loop's blocks), or NULL; goto_tb slots handed out so far.
+     */
+    struct TranslatorRegion *region;
+    unsigned goto_tb_used;
+    bool region_capable;
 
     /*
      * Record insn data that we cannot read directly from host memory.
@@ -129,6 +136,15 @@ typedef struct TranslatorOps {
     void (*insn_start)(DisasContextBase *db, CPUState *cpu);
     void (*translate_insn)(DisasContextBase *db, CPUState *cpu);
     void (*tb_stop)(DisasContextBase *db, CPUState *cpu);
+
+    /*
+     * x-region-hot: start translating another block of a multi-block
+     * region at db->pc_next: reset what the front end tracks across insns
+     * of a block to what any jump into the block establishes.  Front ends
+     * without it don't form regions.
+     */
+    void (*block_start)(DisasContextBase *db, CPUState *cpu);
+
     bool (*disas_log)(const DisasContextBase *db, CPUState *cpu, FILE *f);
 } TranslatorOps;
 
@@ -181,6 +197,62 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest);
  * false and emit nothing.
  */
 bool translator_loop_back(DisasContextBase *db, vaddr dest);
+
+/**
+ * translator_region_target:
+ * @db: Disassembly context
+ * @dest: the destination of a direct jump
+ * @backward: set if the jump goes back to an earlier block of the region
+ *
+ * In a multi-block region (x-region-hot), the label of @dest's block,
+ * adding the block if it may join the region; NULL if @dest is outside
+ * (the jump leaves the TB as usual).  The caller has brought the guest
+ * state up to date as for a jump between TBs.  A backward jump must
+ * check the exit request first (translator_exit_check).
+ */
+struct TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
+                                          bool *backward);
+
+/**
+ * translator_region_count:
+ * @db: Disassembly context
+ * @dest: the destination of a direct jump that goes back to an earlier pc
+ *
+ * Count executions of a backward jump to @dest that leaves the TB; past
+ * x-region-hot, @dest becomes the head of a multi-block region (its TB is
+ * retranslated as one).  Emits nothing if regions are off.
+ */
+void translator_region_count(DisasContextBase *db, vaddr dest);
+
+/**
+ * translator_exit_check:
+ * @db: Disassembly context
+ * @exit: label to branch to if an exit is requested
+ *
+ * Emit the check of the exit request that a TB entry does, as a branch to
+ * @exit; marks the TB as one that loops.
+ */
+void translator_exit_check(DisasContextBase *db, struct TCGLabel *exit);
+
+/**
+ * translator_goto_tb_slot:
+ * @db: Disassembly context
+ * @want: the goto_tb slot the front end would use (0 or 1)
+ *
+ * The goto_tb slot to use: @want, or in a multi-block region whichever
+ * slot is still free; -1 if none is (leave the TB by lookup instead).
+ */
+int translator_goto_tb_slot(DisasContextBase *db, int want);
+
+/**
+ * translator_in_tb_pages:
+ * @db: Disassembly context
+ * @addr: guest address
+ *
+ * Whether @addr is on a page the TB may translate from without ending:
+ * the first page, or in a multi-block region its second page too.
+ */
+bool translator_in_tb_pages(const DisasContextBase *db, vaddr addr);
 
 /**
  * translator_use_inline_lookup
