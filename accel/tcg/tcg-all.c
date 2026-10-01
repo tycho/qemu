@@ -375,6 +375,16 @@ static void tcg_set_vpermvar(Object *obj, bool value, Error **errp)
     tcg_vpermvar = value;
 }
 
+static bool tcg_get_ymmglobal(Object *obj, Error **errp)
+{
+    return tcg_ymmglobal;
+}
+
+static void tcg_set_ymmglobal(Object *obj, bool value, Error **errp)
+{
+    tcg_ymmglobal = value;
+}
+
 static bool tcg_get_vecglobal(Object *obj, Error **errp)
 {
     return tcg_vecglobal;
@@ -685,6 +695,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-vpermvar",
         "Permutes by indices in a register (vpermd, vpermps) as host "
         "table lookups instead of helper calls");
+
+    object_class_property_add_bool(oc, "x-ymmglobal",
+                                   tcg_get_ymmglobal, tcg_set_ymmglobal);
+    object_class_property_set_description(oc, "x-ymmglobal",
+        "With x-vecglobal: keep the upper halves of the ymm registers in "
+        "host registers too");
 
     object_class_property_add_bool(oc, "x-vecglobal",
                                    tcg_get_vecglobal, tcg_set_vecglobal);
