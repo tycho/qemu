@@ -47,6 +47,19 @@ bool handle_sigsegv_accerr_write(CPUState *cpu, sigset_t *old_set,
                                  uintptr_t host_pc, vaddr guest_addr);
 
 /**
+ * tb_lazysync_unwind:
+ * @host_pc: the host pc of a signal in generated code
+ * @regs: the host registers at the signal, indexed by TCGReg, each as
+ *        two 64-bit halves, low first
+ * @nregs: the number of entries in @regs
+ *
+ * If @host_pc is a guest memory access that left dirty globals in host
+ * registers (x-lazysync), store them to their canonical locations.
+ */
+void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t (*regs)[2],
+                        int nregs);
+
+/**
  * cpu_loop_exit_sigsegv:
  * @cpu: the cpu context
  * @addr: the guest address of the fault
@@ -57,16 +70,6 @@ bool handle_sigsegv_accerr_write(CPUState *cpu, sigset_t *old_set,
  * Use the TCGCPUOps hook to record cpu state, do guest operating system
  * specific things to raise SIGSEGV, and jump to the main cpu loop.
  */
-/**
- * tb_lazysync_unwind:
- * @host_pc: the host pc of a signal in generated code
- * @regs: the host registers at the signal, indexed by TCGReg
- *
- * If @host_pc is a guest memory access that left dirty globals in host
- * registers (x-lazysync), store them to their canonical locations.
- */
-void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t *regs);
-
 G_NORETURN void cpu_loop_exit_sigsegv(CPUState *cpu, vaddr addr,
                                       MMUAccessType access_type,
                                       bool maperr, uintptr_t ra);
