@@ -97,13 +97,6 @@ typedef struct QEMU_PACKED {
     DebugFrameFDEHeader fde;
 } DebugFrameHeader;
 
-typedef struct TCGLdstWriteback {
-    TCGType type;
-    TCGReg reg;             /* the register holding the global's value */
-    TCGReg base;            /* its canonical location: base + offset */
-    intptr_t offset;
-} TCGLdstWriteback;
-
 /*
  * x-lazysync: the globals whose values die at a guest access, used only by
  * its slow path, for the register allocator to release after the access.
@@ -4177,13 +4170,17 @@ static bool op_is_guest_access(TCGOpcode opc)
 
 /*
  * x-lazysync: dirty globals stay in registers across guest memory
- * accesses; an access's slow path, the only way it can raise an
- * exception, stores them first.  In user mode a fault is a host signal
- * on the fast path instead, so it applies to system mode only.
+ * accesses.  An access's slow path stores them before its call; in user
+ * mode, where a fault is a host signal on the fast path, the TB also
+ * records them per access (TCGLazyMap) for the signal handler, where the
+ * host supports it (tcg_lazysync_user).
  */
+bool tcg_lazysync_user;
+
 static bool op_lazysync(TCGOpcode opc)
 {
-    return tcg_lazysync && tcg_use_softmmu && tcg_target_ldst_writeback
+    return tcg_lazysync && tcg_target_ldst_writeback
+           && (tcg_use_softmmu || tcg_lazysync_user)
            && op_is_guest_access(opc);
 }
 
@@ -4320,6 +4317,8 @@ liveness_pass_1(TCGContext *s)
 
     s->lazy_dead = tcg_malloc(sizeof(TCGLazyDead) * s->nb_ops);
     s->nb_lazy_dead = 0;
+    s->lazy_map = tcg_malloc(sizeof(TCGLazyMap) * s->nb_ops);
+    s->nb_lazy_map = 0;
 
     /* ??? Should be redundant with the exit_tb that ends the TB.  */
     la_func_end(s, nb_globals, nb_temps);
@@ -5610,6 +5609,7 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
     const TCGArgConstraint *arg_ct;
     TCGTemp *ts;
     TCGLazyDead *lazy = NULL;
+    size_t lazy_start = 0;
     TCGArg new_args[TCG_MAX_OP_ARGS];
     int const_args[TCG_MAX_OP_ARGS];
     TCGCond op_cond;
@@ -5964,6 +5964,27 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         }
     }
 
+    if (lazy) {
+        /*
+         * A global whose register now holds an output was stored when
+         * the register was taken: drop it.
+         */
+        unsigned n = 0;
+
+        for (unsigned w = 0; w < s->ldst_nb_wb; w++) {
+            bool out = false;
+
+            for (k = 0; k < nb_oargs; k++) {
+                out |= s->ldst_wb[w].reg == new_args[k];
+            }
+            if (!out) {
+                s->ldst_wb[n++] = s->ldst_wb[w];
+            }
+        }
+        s->ldst_nb_wb = n;
+        lazy_start = tcg_current_code_size(s);
+    }
+
     /* emit instruction */
     TCGType type = TCGOP_TYPE(op);
     switch (op->opc) {
@@ -6278,6 +6299,15 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
     }
     if (def->flags & TCG_OPF_CARRY_OUT) {
         s->carry_live = true;
+    }
+
+    if (lazy && !tcg_use_softmmu && s->ldst_nb_wb) {
+        s->lazy_map[s->nb_lazy_map++] = (TCGLazyMap){
+            .start = lazy_start,
+            .end = tcg_current_code_size(s),
+            .wb = s->ldst_wb,
+            .nb_wb = s->ldst_nb_wb,
+        };
     }
 
     /* move the outputs in the correct register if needed */

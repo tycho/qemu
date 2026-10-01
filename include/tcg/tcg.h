@@ -343,6 +343,24 @@ static inline TCGRegSet output_pref(const TCGOp *op, unsigned i)
     return i < ARRAY_SIZE(op->output_pref) ? op->output_pref[i] : 0;
 }
 
+/* x-lazysync: a dirty global, held in a register at a guest access. */
+typedef struct TCGLdstWriteback {
+    TCGType type;
+    TCGReg reg;             /* the register holding the global's value */
+    TCGReg base;            /* its canonical location: base + offset */
+    intptr_t offset;
+} TCGLdstWriteback;
+
+/*
+ * x-lazysync in user mode: a guest access's code, [start, end) from the
+ * start of the TB, and the dirty globals a fault there must store.
+ */
+typedef struct TCGLazyMap {
+    uint32_t start, end;
+    const TCGLdstWriteback *wb;
+    unsigned nb_wb;
+} TCGLazyMap;
+
 struct TCGContext {
     uintptr_t pool_cur, pool_end;
     TCGPool *pool_first, *pool_current, *pool_first_large;
@@ -356,10 +374,12 @@ struct TCGContext {
 
     TCGRegSet reserved_regs;
     TCGRegSet ldst_save_regs;   /* for the next guest access label */
-    const struct TCGLdstWriteback *ldst_wb;    /* likewise, x-lazysync */
+    TCGLdstWriteback *ldst_wb;  /* likewise, x-lazysync */
     unsigned ldst_nb_wb;
     struct TCGLazyDead *lazy_dead;  /* x-lazysync, from liveness */
     int nb_lazy_dead;
+    TCGLazyMap *lazy_map;       /* x-lazysync, user mode: per access */
+    int nb_lazy_map;
     intptr_t current_frame_offset;
     intptr_t frame_start;
     intptr_t frame_end;
