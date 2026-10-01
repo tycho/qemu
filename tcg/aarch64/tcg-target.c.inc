@@ -4040,6 +4040,9 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_perm_vec:
         tcg_out_perm_vec(s, vece, a0, a1, a2, args[3]);
         break;
+    case INDEX_op_tbl_vec:
+        tcg_out_insn(s, qrrr_e, TBL, 1, 0, a0, a1, a2);
+        break;
     case INDEX_op_qemu_ld_vec:
         tcg_out_qemu_ldst_vec(s, a0, a1, args[2], true);
         break;
@@ -4539,6 +4542,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return type == TCG_TYPE_V128 && vece == MO_64;
     case INDEX_op_perm_vec:
         return type == TCG_TYPE_V128 && vece >= MO_16 && vece <= MO_64;
+    case INDEX_op_tbl_vec:
+        return type == TCG_TYPE_V128 && vece == MO_8;
 
     case INDEX_op_fadd_vec:
     case INDEX_op_fsub_vec:
@@ -4742,6 +4747,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_concat_i64_vec:
         return C_O1_I2(w, r, r);
     case INDEX_op_perm_vec:
+    case INDEX_op_tbl_vec:
         return C_O1_I2(w, w, w);
     case INDEX_op_qemu_ld_vec:
         return C_O1_I1(w, r);
