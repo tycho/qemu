@@ -120,6 +120,7 @@ typedef struct TCGPool {
 
 #define TCG_MAX_TEMPS 512
 #define TCG_MAX_INSNS 512
+#define TCG_MAX_ALIAS 32
 
 /* when the size of the arguments of a called function is smaller than
    this value, they are statically allocated in the TB stack frame */
@@ -279,6 +280,12 @@ typedef struct TCGTemp {
     unsigned int mem_allocated:1;
     unsigned int temp_allocated:1;
     unsigned int temp_subindex:2;
+    /*
+     * A global that the code also reaches through its memory: by loads
+     * and stores of env other than its own, and by helpers given
+     * pointers into env (tcg_global_mem_new_vec).
+     */
+    unsigned int env_alias:1;
 
     int64_t val;
     struct TCGTemp *mem_base;
@@ -372,6 +379,10 @@ struct TCGContext {
     int nb_indirects;
     uint16_t *la_globals;       /* liveness: the globals the ops use */
     int nb_la_globals;
+    int nb_alias;                         /* env_alias globals */
+    uint16_t alias_temp[TCG_MAX_ALIAS];   /* their temp indices */
+    TCGTemp *alias_base;                  /* their base, and the span */
+    intptr_t alias_lo, alias_hi;          /* of their memory */
     int nb_ops;
     TCGType addr_type;            /* TCG_TYPE_I32 or TCG_TYPE_I64 */
     TCGBar guest_mo;
