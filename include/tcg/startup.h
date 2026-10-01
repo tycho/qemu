@@ -25,6 +25,13 @@
 #ifndef TCG_STARTUP_H
 #define TCG_STARTUP_H
 
+/*
+ * Before liveness, remove stores to CPUArchState that are overwritten
+ * later in the same extended basic block before any operation could
+ * read them.
+ */
+extern bool tcg_dse;
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size
