@@ -5671,6 +5671,38 @@ static void tcg_reg_free(TCGContext *s, TCGReg reg, TCGRegSet allocated_regs)
     }
 }
 
+/*
+ * The register to spill in a loop: cheapest first, a value already in
+ * memory (dropping it costs nothing now), then one that must be stored,
+ * and a loop global in its own register last (the back edge would have
+ * to reload it).
+ */
+static TCGReg xblk_victim(TCGContext *s, TCGRegSet set, const int *order,
+                          int n)
+{
+    TCGReg best = -1;
+    int best_cost = INT_MAX;
+
+    for (int i = 0; i < n; i++) {
+        TCGReg reg = order[i];
+        TCGTemp *ts = s->reg_to_temp[reg];
+        int cost;
+
+        if (!tcg_regset_test_reg(set, reg)) {
+            continue;
+        }
+        cost = temp_readonly(ts) || ts->mem_coherent ? 0 : 1;
+        if (ts->kind == TEMP_GLOBAL && s->xblk_home[temp_idx(ts)] == reg) {
+            cost += 2;
+        }
+        if (cost < best_cost) {
+            best = reg;
+            best_cost = cost;
+        }
+    }
+    return best;
+}
+
 /**
  * tcg_reg_alloc:
  * @required_regs: Set of registers in which we must allocate.
@@ -5724,6 +5756,12 @@ static TCGReg tcg_reg_alloc(TCGContext *s, TCGRegSet required_regs,
     for (j = f; j < 2; j++) {
         TCGRegSet set = reg_ct[j];
 
+        if (s->xblk_home && !tcg_regset_single(set)) {
+            TCGReg reg = xblk_victim(s, set, order, n);
+
+            tcg_reg_free(s, reg, allocated_regs);
+            return reg;
+        }
         if (tcg_regset_single(set)) {
             /* One register in the set.  */
             TCGReg reg = tcg_regset_first(set);
@@ -7951,6 +7989,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         /* The loop's globals stay live across its back edge. */
         s->xblk_pass = 2;
         liveness_pass_1(s);
+    } else {
+        s->xblk_home = NULL;
     }
 
     if (s->nb_indirects > 0) {
