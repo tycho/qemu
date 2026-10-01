@@ -72,6 +72,8 @@ bool qemu_tcg_mttcg_enabled(void)
 }
 #endif /* !CONFIG_USER_ONLY */
 
+static void xtcg_fork_defaults(TCGState *s);
+
 static void tcg_accel_instance_init(Object *obj)
 {
     TCGState *s = TCG_STATE(obj);
@@ -83,6 +85,7 @@ static void tcg_accel_instance_init(Object *obj)
     s->splitwx_enabled = 0;
 #endif
     s->kvmvapic = true;
+    xtcg_fork_defaults(s);
 }
 
 bool one_insn_per_tb;
@@ -519,6 +522,37 @@ static void tcg_set_tso(Object *obj, const char *value, Error **errp)
         }
     }
     error_setg(errp, "Invalid 'x-tso' value: %s", value);
+}
+
+/*
+ * Fork defaults ([DEV], not for upstream): the adopted x- settings are on
+ * where they have been validated, on aarch64 hosts, each as far as the
+ * host supports it; on other hosts every setting keeps QEMU's default.
+ * Properties given on the command line or in QEMU_XTCG still override
+ * these (x-tso=barrier,x-ssefp=soft,... for QEMU's behaviour).
+ */
+static void xtcg_fork_defaults(TCGState *s)
+{
+#if defined(__aarch64__)
+    tcg_tso_mode = tcg_can_ldst_acqrel() ? TCG_TSO_ACQREL : TCG_TSO_BARRIER;
+    tcg_ssefp_native = host_fpenv_native();
+    tcg_ssefp_vec = !tcg_ssefp_native;
+    tcg_ijmp_inline = true;
+    tcg_tlb_grow = 1;
+    tcg_vecld = true;
+    tcg_vperm = true;
+    tcg_dse = true;
+    tcg_ldstkeep = true;
+    tcg_vecmem = true;
+    tcg_lazysync = true;
+    tcg_vecglobal = true;
+    tcg_region = true;
+    tcg_pferr_hw = true;
+    s->kvmvapic = false;
+#ifdef CONFIG_DARWIN
+    qemu_thread_jit_lazy = true;
+#endif
+#endif
 }
 
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
