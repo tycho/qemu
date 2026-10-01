@@ -311,6 +311,16 @@ static void tcg_set_vperm(Object *obj, bool value, Error **errp)
     tcg_vperm = value;
 }
 
+static bool tcg_get_dse(Object *obj, Error **errp)
+{
+    return tcg_dse;
+}
+
+static void tcg_set_dse(Object *obj, bool value, Error **errp)
+{
+    tcg_dse = value;
+}
+
 static bool tcg_get_vecld(Object *obj, Error **errp)
 {
     return tcg_vecld;
@@ -499,6 +509,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-vperm",
         "Generate guest vector shuffles, unpacks and blends with constant "
         "operands as host permutes instead of helper calls");
+
+    object_class_property_add_bool(oc, "x-dse",
+                                   tcg_get_dse, tcg_set_dse);
+    object_class_property_set_description(oc, "x-dse",
+        "Remove stores to CPU state that a later store in the same "
+        "extended basic block overwrites before anything can read them");
 
     object_class_property_add_bool(oc, "x-pferr-hw",
                                    tcg_get_pferr_hw, tcg_set_pferr_hw);
