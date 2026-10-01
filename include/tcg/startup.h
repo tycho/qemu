@@ -105,6 +105,14 @@ extern bool tcg_dse;
 extern bool tcg_ldstkeep;
 
 /*
+ * x-lazysync: guest memory accesses leave dirty globals in registers;
+ * their slow paths store them before anything can observe env, and save
+ * the call-clobbered registers in use (where the backend supports it;
+ * system mode only).
+ */
+extern bool tcg_lazysync;
+
+/*
  * The front end's scratch area in env, [ofs, ofs + size): values there
  * live only within one guest instruction, so a fault or an exit never
  * observes them (x-dse may remove stores to it across guest memory

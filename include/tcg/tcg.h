@@ -356,6 +356,10 @@ struct TCGContext {
 
     TCGRegSet reserved_regs;
     TCGRegSet ldst_save_regs;   /* for the next guest access label */
+    const struct TCGLdstWriteback *ldst_wb;    /* likewise, x-lazysync */
+    unsigned ldst_nb_wb;
+    struct TCGLazyDead *lazy_dead;  /* x-lazysync, from liveness */
+    int nb_lazy_dead;
     intptr_t current_frame_offset;
     intptr_t frame_start;
     intptr_t frame_end;
