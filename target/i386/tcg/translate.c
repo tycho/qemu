@@ -2038,7 +2038,14 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
         new_pc = (uint32_t)(new_eip + s->cs_base);
     }
 
-    if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)) {
+    if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)
+        && translator_loop_back(&s->base, new_pc)) {
+        /*
+         * A loop within the TB (tcg_region): the exit path takes the pc
+         * from the TB, or, with CF_PCREL, from cpu_eip, already updated.
+         */
+        s->base.is_jmp = DISAS_NORETURN;
+    } else if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)) {
         /* jump to same page: we can use a direct jump */
         tcg_gen_goto_tb(tb_num);
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
