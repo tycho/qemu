@@ -980,10 +980,10 @@ static void host_signal_lazysync(host_sigcontext *uc)
 
     if (tcg_lazysync_user
         && in_code_gen_buffer((void *)(pc - tcg_splitwx_diff))) {
-        uint64_t regs[HOST_SIGNAL_TCG_REGS];
+        uint64_t regs[HOST_SIGNAL_TCG_REGS][2];
 
         host_signal_tcg_regs(uc, regs);
-        tb_lazysync_unwind(pc, regs);
+        tb_lazysync_unwind(pc, regs, HOST_SIGNAL_TCG_REGS);
     }
 #endif
 }

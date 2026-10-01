@@ -49,12 +49,15 @@ bool handle_sigsegv_accerr_write(CPUState *cpu, sigset_t *old_set,
 /**
  * tb_lazysync_unwind:
  * @host_pc: the host pc of a signal in generated code
- * @regs: the host registers at the signal, indexed by TCGReg
+ * @regs: the host registers at the signal, indexed by TCGReg, each as
+ *        two 64-bit halves, low first
+ * @nregs: the number of entries in @regs
  *
  * If @host_pc is a guest memory access that left dirty globals in host
  * registers (tcg_lazysync), store them to their canonical locations.
  */
-void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t *regs);
+void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t (*regs)[2],
+                        int nregs);
 
 /**
  * cpu_loop_exit_sigsegv:
