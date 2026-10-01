@@ -2144,14 +2144,48 @@ static void gen_st_i128_env(TCGv_i128 t, int offset)
     }
 }
 
+/*
+ * With x-vecmem, a 128-bit guest access whose atomicity a host vector
+ * access can give goes straight between guest memory and a vector.
+ */
+static bool gen_ld_vec_env(DisasContext *s, TCGv addr, int offset, MemOp mop)
+{
+    TCGv_vec v;
+
+    if (!tcg_vecmem || !tcg_can_qemu_ldst_vec(mop)) {
+        return false;
+    }
+    v = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_qemu_ld_vec(v, addr, s->mem_index, mop);
+    tcg_gen_st_vec(v, tcg_env, offset);
+    return true;
+}
+
+static bool gen_st_vec_env(DisasContext *s, TCGv addr, int offset, MemOp mop)
+{
+    TCGv_vec v;
+
+    if (!tcg_vecmem || !tcg_can_qemu_ldst_vec(mop)) {
+        return false;
+    }
+    v = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(v, tcg_env, offset);
+    tcg_gen_qemu_st_vec(v, addr, s->mem_index, mop);
+    return true;
+}
+
 static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align)
 {
     MemOp atom = (s->cpuid_ext_features & CPUID_EXT_AVX
                   ? MO_ATOM_IFALIGN : MO_ATOM_IFALIGN_PAIR);
     MemOp mop = MO_128 | MO_LE | atom | (align ? MO_ALIGN_16 : 0);
     int mem_index = s->mem_index;
-    TCGv_i128 t = tcg_temp_new_i128();
+    TCGv_i128 t;
 
+    if (gen_ld_vec_env(s, s->A0, offset, mop)) {
+        return;
+    }
+    t = tcg_temp_new_i128();
     tcg_gen_qemu_ld_i128(t, s->A0, mem_index, mop);
     gen_st_i128_env(t, offset);
 }
@@ -2162,8 +2196,12 @@ static inline void gen_sto_env_A0(DisasContext *s, int offset, bool align)
                   ? MO_ATOM_IFALIGN : MO_ATOM_IFALIGN_PAIR);
     MemOp mop = MO_128 | MO_LE | atom | (align ? MO_ALIGN_16 : 0);
     int mem_index = s->mem_index;
-    TCGv_i128 t = tcg_temp_new_i128();
+    TCGv_i128 t;
 
+    if (gen_st_vec_env(s, s->A0, offset, mop)) {
+        return;
+    }
+    t = tcg_temp_new_i128();
     tcg_gen_ld_i128(t, tcg_env, offset);
     tcg_gen_qemu_st_i128(t, s->A0, mem_index, mop);
 }
@@ -2176,6 +2214,19 @@ static void gen_ldy_env_A0(DisasContext *s, int offset, bool align)
     TCGv_i128 t1 = tcg_temp_new_i128();
     TCGv a0_hi = tcg_temp_new();
 
+    if (tcg_vecmem && tcg_can_qemu_ldst_vec(mop)) {
+        TCGv_vec v0 = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec v1 = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        /* Both halves are loaded before either is stored, as below. */
+        tcg_gen_qemu_ld_vec(v0, s->A0, mem_index,
+                            mop | (align ? MO_ALIGN_32 : 0));
+        tcg_gen_addi_tl(a0_hi, s->A0, 16);
+        tcg_gen_qemu_ld_vec(v1, a0_hi, mem_index, mop);
+        tcg_gen_st_vec(v0, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));
+        tcg_gen_st_vec(v1, tcg_env, offset + offsetof(YMMReg, YMM_X(1)));
+        return;
+    }
     tcg_gen_qemu_ld_i128(t0, s->A0, mem_index, mop | (align ? MO_ALIGN_32 : 0));
     tcg_gen_addi_tl(a0_hi, s->A0, 16);
     tcg_gen_qemu_ld_i128(t1, a0_hi, mem_index, mop);
@@ -2191,6 +2242,12 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
     TCGv_i128 t = tcg_temp_new_i128();
     TCGv a0_hi = tcg_temp_new();
 
+    if (gen_st_vec_env(s, s->A0, offset + offsetof(YMMReg, YMM_X(0)),
+                       mop | (align ? MO_ALIGN_32 : 0))) {
+        tcg_gen_addi_tl(a0_hi, s->A0, 16);
+        gen_st_vec_env(s, a0_hi, offset + offsetof(YMMReg, YMM_X(1)), mop);
+        return;
+    }
     tcg_gen_ld_i128(t, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));
     tcg_gen_qemu_st_i128(t, s->A0, mem_index, mop | (align ? MO_ALIGN_32 : 0));
     tcg_gen_addi_tl(a0_hi, s->A0, 16);

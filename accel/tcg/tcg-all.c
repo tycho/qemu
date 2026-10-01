@@ -302,6 +302,16 @@ static void tcg_set_pferr_hw(Object *obj, bool value, Error **errp)
     tcg_pferr_hw = value;
 }
 
+static bool tcg_get_vecmem(Object *obj, Error **errp)
+{
+    return tcg_vecmem;
+}
+
+static void tcg_set_vecmem(Object *obj, bool value, Error **errp)
+{
+    tcg_vecmem = value;
+}
+
 static bool tcg_get_vperm(Object *obj, Error **errp)
 {
     return tcg_vperm;
@@ -530,6 +540,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-vecld",
         "Build guest vector loads in a host vector register instead of "
         "storing them to CPU state in pieces");
+
+    object_class_property_add_bool(oc, "x-vecmem",
+                                   tcg_get_vecmem, tcg_set_vecmem);
+    object_class_property_set_description(oc, "x-vecmem",
+        "Load and store guest vectors with host vector loads and stores "
+        "where the access needs no more than 64-bit atomicity");
 
     object_class_property_add_bool(oc, "x-vperm",
                                    tcg_get_vperm, tcg_set_vperm);

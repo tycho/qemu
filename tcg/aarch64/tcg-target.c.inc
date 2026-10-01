@@ -1922,8 +1922,15 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     tcg_out_ldst_save(s, lb->save_regs, false);
     tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
-    tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
-    tcg_out_ldst_save(s, lb->save_regs, true);
+    if (lb->type == TCG_TYPE_V128) {
+        /* The Int128 result in X0:X1 goes to the vector after the restore. */
+        tcg_out_ldst_save(s, lb->save_regs, true);
+        tcg_out_insn(s, fmov, DX, lb->datalo_reg, TCG_REG_X0);
+        tcg_out_insn(s, simd_copy, INS, 0, lb->datalo_reg, TCG_REG_X1, 24, 0);
+    } else {
+        tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
+        tcg_out_ldst_save(s, lb->save_regs, true);
+    }
     tcg_out_goto(s, lb->raddr);
     return true;
 }
@@ -1940,7 +1947,21 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     }
 
     tcg_out_ldst_save(s, lb->save_regs, false);
-    tcg_out_st_helper_args(s, lb, &ldst_helper_param);
+    if (lb->type == TCG_TYPE_V128) {
+        /* The vector as an Int128 argument, by way of two scratch registers. */
+        TCGLabelQemuLdst l = *lb;
+
+        tcg_out_insn(s, simd_copy, UMOV, 1, TCG_REG_TMP1,
+                     lb->datalo_reg, 8, 0);
+        tcg_out_insn(s, simd_copy, UMOV, 1, TCG_REG_TMP2,
+                     lb->datalo_reg, 24, 0);
+        l.type = TCG_TYPE_I128;
+        l.datalo_reg = TCG_REG_TMP1;
+        l.datahi_reg = TCG_REG_TMP2;
+        tcg_out_st_helper_args(s, &l, &ldst_helper_param);
+    } else {
+        tcg_out_st_helper_args(s, lb, &ldst_helper_param);
+    }
     tcg_out_call_int(s, qemu_st_helpers[opc & MO_SIZE]);
     tcg_out_ldst_save(s, lb->save_regs, true);
     tcg_out_goto(s, lb->raddr);
@@ -2316,6 +2337,27 @@ static const TCGOutOpQemuLdSt outop_qemu_st = {
     .base.static_constraint = C_O0_I2(rz, r),
     .out = tgen_qemu_st,
 };
+
+/*
+ * A 128-bit guest access into or from a vector register: the fast path is
+ * one LDR or STR (Q), which is single-copy atomic for each 64-bit half when
+ * aligned, as tcg_can_qemu_ldst_vec() requires.
+ */
+static void tcg_out_qemu_ldst_vec(TCGContext *s, TCGReg data,
+                                  TCGReg addr_reg, MemOpIdx oi, bool is_ld)
+{
+    TCGLabelQemuLdst *ldst;
+    HostAddress h;
+
+    ldst = prepare_host_addr(s, &h, addr_reg, oi, is_ld);
+    tcg_out_insn_ldst_reg(s, is_ld ? Ildst_imm_LDRVQ : Ildst_imm_STRVQ,
+                          data, h.base, h.index_ext, h.index);
+    if (ldst) {
+        ldst->type = TCG_TYPE_V128;
+        ldst->datalo_reg = data;
+        ldst->raddr = tcg_splitwx_to_rx(s->code_ptr);
+    }
+}
 
 static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
                                    TCGReg addr_reg, MemOpIdx oi, bool is_ld)
@@ -3950,6 +3992,12 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_perm_vec:
         tcg_out_perm_vec(s, vece, a0, a1, a2, args[3]);
         break;
+    case INDEX_op_qemu_ld_vec:
+        tcg_out_qemu_ldst_vec(s, a0, a1, args[2], true);
+        break;
+    case INDEX_op_qemu_st_vec:
+        tcg_out_qemu_ldst_vec(s, a0, a1, args[2], false);
+        break;
     case INDEX_op_concat_i64_vec:
         /*
          * FMOV into element 0, which writes the whole register and so
@@ -4647,6 +4695,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I2(w, r, r);
     case INDEX_op_perm_vec:
         return C_O1_I2(w, w, w);
+    case INDEX_op_qemu_ld_vec:
+        return C_O1_I1(w, r);
+    case INDEX_op_qemu_st_vec:
+        return C_O0_I2(w, r);
     case INDEX_op_dup_vec:
         return C_O1_I1(w, wr);
     case INDEX_op_or_vec:

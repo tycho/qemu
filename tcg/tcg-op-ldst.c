@@ -717,6 +717,83 @@ void tcg_gen_qemu_ld_i128_chk(TCGv_i128 val, TCGTemp *addr, TCGArg idx,
     tcg_gen_qemu_ld_i128_int(val, addr, idx, memop);
 }
 
+/*
+ * 128-bit accesses into and from a vector.  A host's 128-bit vector access
+ * is at most a pair of single-copy atomic 64-bit halves (AArch64, even
+ * with FEAT_LSE2), so only accesses that need no more are allowed, after
+ * the reduction of atomicity in serial mode.
+ */
+static MemOp qemu_ldst_vec_memop(MemOp memop)
+{
+    if (!(tcg_ctx->gen_tb->cflags & CF_PARALLEL)) {
+        memop &= ~MO_ATOM_MASK;
+        memop |= MO_ATOM_NONE;
+    }
+    return memop;
+}
+
+bool tcg_can_qemu_ldst_vec(MemOp memop)
+{
+    MemOp atom = qemu_ldst_vec_memop(memop) & MO_ATOM_MASK;
+
+    if (!TCG_TARGET_HAS_qemu_ldst_vec) {
+        return false;
+    }
+#ifdef CONFIG_PLUGIN
+    /* Plugins see the value of a load as an integer. */
+    if (tcg_ctx->plugin_insn != NULL) {
+        return false;
+    }
+#endif
+    if ((memop & MO_SIZE) != MO_128 || (memop & (MO_BSWAP | MO_SIGN))) {
+        return false;
+    }
+    return atom == MO_ATOM_NONE || atom == MO_ATOM_IFALIGN_PAIR;
+}
+
+void tcg_gen_qemu_ld_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
+                             MemOp memop, TCGType addr_type)
+{
+    TCGTemp *addr_new;
+    bool after;
+
+    tcg_debug_assert(addr_type == tcg_ctx->addr_type);
+    tcg_debug_assert(tcg_can_qemu_ldst_vec(memop));
+    check_max_alignment(memop_alignment_bits(memop));
+
+    /*
+     * As for tcg_gen_qemu_ld_i128: any barrier the mode needs before the
+     * load is emitted here; with x-tso=acqrel the load is not an acquire,
+     * so a barrier follows it instead.
+     */
+    after = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
+
+    addr_new = tci_extend_addr(addr);
+    gen_ldst1(INDEX_op_qemu_ld_vec, TCG_TYPE_V128, tcgv_vec_temp(val),
+              addr_new, make_memop_idx(qemu_ldst_vec_memop(memop), idx));
+    maybe_free_addr(addr, addr_new);
+
+    if (after) {
+        tcg_gen_mb(TCG_MO_LD_LD | TCG_MO_LD_ST | TCG_BAR_SC);
+    }
+}
+
+void tcg_gen_qemu_st_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
+                             MemOp memop, TCGType addr_type)
+{
+    TCGTemp *addr_new;
+
+    tcg_debug_assert(addr_type == tcg_ctx->addr_type);
+    tcg_debug_assert(tcg_can_qemu_ldst_vec(memop));
+    check_max_alignment(memop_alignment_bits(memop));
+    tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
+
+    addr_new = tci_extend_addr(addr);
+    gen_ldst1(INDEX_op_qemu_st_vec, TCG_TYPE_V128, tcgv_vec_temp(val),
+              addr_new, make_memop_idx(qemu_ldst_vec_memop(memop), idx));
+    maybe_free_addr(addr, addr_new);
+}
+
 static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
                                      TCGArg idx, MemOp memop)
 {
