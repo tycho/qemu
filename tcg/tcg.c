@@ -107,6 +107,7 @@ struct TCGLabelQemuLdst {
     const tcg_insn_unit *raddr;   /* addr of the next IR of qemu_ld/st IR */
     tcg_insn_unit *label_ptr[2]; /* label pointers to be updated */
     bool fallback;          /* backend-specific out-of-line code, no helper */
+    TCGRegSet save_regs;    /* to save around the slow path's call */
     uint64_t site;          /* fallback: guest pc of the access's insn */
     QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 };
@@ -246,6 +247,8 @@ bool tcg_ssefp_vec;
 bool tcg_ssefp_native;
 bool tcg_vecld;
 bool tcg_vperm;
+bool tcg_dse;
+bool tcg_ldstkeep;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
 static QemuMutex tso_cross_lock;
@@ -300,6 +303,12 @@ tcg_prologue_fn *tcg_qemu_tb_exec;
 
 static TCGRegSet tcg_target_available_regs[TCG_TYPE_COUNT];
 static TCGRegSet tcg_target_call_clobber_regs;
+/*
+ * The registers a guest memory access's slow path clobbers, if the
+ * backend's slow path saves the rest of the call-clobbered registers that
+ * hold values (TCGLabelQemuLdst.save_regs); by default, all of them.
+ */
+static TCGRegSet tcg_target_ldst_clobber_regs;
 
 #if TCG_TARGET_INSN_UNIT_SIZE == 1
 static __attribute__((unused)) inline void tcg_out8(TCGContext *s, uint8_t v)
@@ -693,6 +702,7 @@ static TCGLabelQemuLdst *new_ldst_label(TCGContext *s)
     TCGLabelQemuLdst *l = tcg_malloc(sizeof(*l));
 
     memset(l, 0, sizeof(*l));
+    l->save_regs = s->ldst_save_regs;
     QSIMPLEQ_INSERT_TAIL(&s->ldst_labels, l, next);
 
     return l;
@@ -1834,6 +1844,9 @@ static void tcg_context_init(unsigned max_threads)
     init_call_layout(&info_helper_st128_mmu);
 
     tcg_target_init(s);
+    if (!tcg_target_ldst_clobber_regs) {
+        tcg_target_ldst_clobber_regs = tcg_target_call_clobber_regs;
+    }
     process_constraint_sets();
 
     /* Reverse the order of the saved registers, assuming they're all at
@@ -3667,6 +3680,201 @@ static void move_label_uses(TCGLabel *to, TCGLabel *from)
     QSIMPLEQ_CONCAT(&to->branches, &from->branches);
 }
 
+/*
+ * x-dse: dead stores to CPUArchState.  Walking each extended basic block
+ * backward, keep the byte ranges of env that are certainly stored again
+ * before anything reads them; a store entirely within those is removed.
+ * The ranges are forgotten at anything that could read env or observe
+ * it: a helper call, a guest memory access (which may fault), a branch,
+ * label or exit, a plugin callback, and a host load or store not based on
+ * env (which may alias it).  Stores overlapping a global's memory are
+ * kept, because the register allocator reads globals implicitly.
+ *
+ * The front end's scratch area (tcg_set_env_scratch) holds values only
+ * within one guest instruction: a fault or an exit doesn't observe it, so
+ * it stays dead across guest memory accesses and is dead at exits.
+ */
+#define DSE_RANGES 32
+
+/* Front-end scratch in env: never read across instructions. */
+static intptr_t dse_scratch_lo, dse_scratch_hi;
+
+void tcg_set_env_scratch(intptr_t ofs, intptr_t size)
+{
+    dse_scratch_lo = ofs;
+    dse_scratch_hi = ofs + size;
+}
+
+typedef struct DseRange {
+    intptr_t lo, hi;            /* [lo, hi) */
+} DseRange;
+
+typedef struct DseSet {
+    DseRange r[DSE_RANGES];
+    int n;
+} DseSet;
+
+static bool dse_covered(const DseSet *d, intptr_t lo, intptr_t hi)
+{
+    for (int i = 0; i < d->n; i++) {
+        if (d->r[i].lo <= lo && hi <= d->r[i].hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Remove [lo, hi) from the set (a read of those bytes). */
+static void dse_read(DseSet *d, intptr_t lo, intptr_t hi)
+{
+    for (int i = 0; i < d->n; i++) {
+        DseRange r = d->r[i];
+
+        if (r.hi <= lo || hi <= r.lo) {
+            continue;
+        }
+        if (r.lo < lo && hi < r.hi && d->n < DSE_RANGES) {
+            d->r[d->n++] = (DseRange){ hi, r.hi };
+            d->r[i].hi = lo;
+        } else if (r.lo < lo) {
+            d->r[i].hi = lo;
+        } else if (hi < r.hi) {
+            d->r[i].lo = hi;
+        } else {
+            d->r[i--] = d->r[--d->n];
+        }
+    }
+}
+
+/* Keep only the parts of the set within [lo, hi). */
+static void dse_keep_only(DseSet *d, intptr_t lo, intptr_t hi)
+{
+    for (int i = 0; i < d->n; i++) {
+        d->r[i].lo = MAX(d->r[i].lo, lo);
+        d->r[i].hi = MIN(d->r[i].hi, hi);
+        if (d->r[i].lo >= d->r[i].hi) {
+            d->r[i--] = d->r[--d->n];
+        }
+    }
+}
+
+/* Add [lo, hi) to the set (a store of those bytes). */
+static void dse_write(DseSet *d, intptr_t lo, intptr_t hi)
+{
+    for (int i = 0; i < d->n; i++) {
+        if (d->r[i].lo <= hi && lo <= d->r[i].hi) {
+            lo = MIN(lo, d->r[i].lo);
+            hi = MAX(hi, d->r[i].hi);
+            d->r[i--] = d->r[--d->n];
+        }
+    }
+    if (d->n < DSE_RANGES) {
+        d->r[d->n++] = (DseRange){ lo, hi };
+    }
+}
+
+static int dse_access_size(TCGOp *op)
+{
+    switch (op->opc) {
+    case INDEX_op_ld8u:
+    case INDEX_op_ld8s:
+    case INDEX_op_st8:
+        return 1;
+    case INDEX_op_ld16u:
+    case INDEX_op_ld16s:
+    case INDEX_op_st16:
+        return 2;
+    case INDEX_op_ld32u:
+    case INDEX_op_ld32s:
+    case INDEX_op_st32:
+        return 4;
+    case INDEX_op_ld:
+    case INDEX_op_st:
+    case INDEX_op_ld_vec:
+    case INDEX_op_st_vec:
+        return tcg_type_size(TCGOP_TYPE(op));
+    case INDEX_op_dupm_vec:
+        return 1 << TCGOP_VECE(op);
+    default:
+        return 0;
+    }
+}
+
+static void __attribute__((noinline))
+dead_env_store_pass(TCGContext *s)
+{
+    TCGTemp *env = tcgv_ptr_temp(tcg_env);
+    DseSet dead = { .n = 0 };
+    TCGOp *op, *prev;
+
+    QTAILQ_FOREACH_REVERSE_SAFE(op, &s->ops, link, prev) {
+        int size = dse_access_size(op);
+        bool store;
+        intptr_t lo;
+
+        if (size) {
+            store = tcg_op_defs[op->opc].nb_oargs == 0;
+            if (arg_temp(op->args[1]) != env) {
+                dead.n = 0;
+                continue;
+            }
+            lo = op->args[2];
+            if (!store) {
+                dse_read(&dead, lo, lo + size);
+            } else if (dse_covered(&dead, lo, lo + size)) {
+                bool global = false;
+
+                for (int i = 0; i < s->nb_globals && !global; i++) {
+                    TCGTemp *ts = &s->temps[i];
+
+                    global = ts->mem_base == env && ts->mem_offset < lo + size
+                             && lo < ts->mem_offset
+                                     + tcg_type_size(ts->base_type);
+                }
+                if (!global) {
+                    tcg_op_remove(s, op);
+                }
+            } else {
+                dse_write(&dead, lo, lo + size);
+            }
+            continue;
+        }
+        switch (op->opc) {
+        case INDEX_op_insn_start:
+        case INDEX_op_discard:
+        case INDEX_op_mb:
+            break;
+        case INDEX_op_qemu_ld:
+        case INDEX_op_qemu_st:
+        case INDEX_op_qemu_ld2:
+        case INDEX_op_qemu_st2:
+            dse_keep_only(&dead, dse_scratch_lo, dse_scratch_hi);
+            break;
+        case INDEX_op_exit_tb:
+        case INDEX_op_goto_tb:
+        case INDEX_op_goto_ptr:
+            dead.n = 0;
+            if (dse_scratch_lo < dse_scratch_hi) {
+                dse_write(&dead, dse_scratch_lo, dse_scratch_hi);
+            }
+            break;
+        case INDEX_op_call:
+        case INDEX_op_set_label:
+        case INDEX_op_plugin_cb:
+        case INDEX_op_plugin_mem_cb:
+            dead.n = 0;
+            break;
+        default:
+            if (tcg_op_defs[op->opc].flags
+                & (TCG_OPF_BB_END | TCG_OPF_CALL_CLOBBER
+                   | TCG_OPF_SIDE_EFFECTS)) {
+                dead.n = 0;
+            }
+            break;
+        }
+    }
+}
+
 /* Reachable analysis : remove unreachable code.  */
 static void __attribute__((noinline))
 reachable_code_pass(TCGContext *s)
@@ -3882,9 +4090,24 @@ static void la_global_kill(TCGContext *s, int ng)
 }
 
 /* liveness analysis: note live globals crossing calls.  */
-static void la_cross_call(TCGContext *s, int nt)
+/* x-ldstkeep: the narrower clobber set for guest memory accesses. */
+static TCGRegSet op_clobber_regs(TCGOpcode opc)
 {
-    TCGRegSet mask = ~tcg_target_call_clobber_regs;
+    switch (opc) {
+    case INDEX_op_qemu_ld:
+    case INDEX_op_qemu_st:
+    case INDEX_op_qemu_ld2:
+    case INDEX_op_qemu_st2:
+        return tcg_ldstkeep ? tcg_target_ldst_clobber_regs
+                            : tcg_target_call_clobber_regs;
+    default:
+        return tcg_target_call_clobber_regs;
+    }
+}
+
+static void la_cross_call(TCGContext *s, int nt, TCGRegSet clobber)
+{
+    TCGRegSet mask = ~clobber;
     int i;
 
     for (i = 0; i < nt; i++) {
@@ -4066,7 +4289,7 @@ liveness_pass_1(TCGContext *s)
                 }
 
                 /* For all live registers, remove call-clobbered prefs.  */
-                la_cross_call(s, nb_temps);
+                la_cross_call(s, nb_temps, tcg_target_call_clobber_regs);
 
                 /*
                  * Input arguments are live for preceding opcodes.
@@ -4302,7 +4525,7 @@ liveness_pass_1(TCGContext *s)
                 assert_carry_dead(s);
                 la_global_sync(s, nb_globals);
                 if (def->flags & TCG_OPF_CALL_CLOBBER) {
-                    la_cross_call(s, nb_temps);
+                    la_cross_call(s, nb_temps, op_clobber_regs(opc));
                 }
             }
 
@@ -5509,11 +5732,24 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         tcg_reg_alloc_bb_end(s, i_allocated_regs);
     } else {
         if (def->flags & TCG_OPF_CALL_CLOBBER) {
+            TCGRegSet clobber = op_clobber_regs(op->opc);
+
             assert_carry_dead(s);
-            /* XXX: permit generic clobber register list ? */
             for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
-                if (tcg_regset_test_reg(tcg_target_call_clobber_regs, i)) {
+                if (tcg_regset_test_reg(clobber, i)) {
                     tcg_reg_free(s, i, i_allocated_regs);
+                }
+            }
+            /*
+             * The call-clobbered registers still holding values: a guest
+             * access's slow path saves them (new_ldst_label).
+             */
+            s->ldst_save_regs = 0;
+            for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
+                if (tcg_regset_test_reg(tcg_target_call_clobber_regs, i)
+                    && !tcg_regset_test_reg(clobber, i)
+                    && s->reg_to_temp[i]) {
+                    tcg_regset_set_reg(s->ldst_save_regs, i);
                 }
             }
         }
@@ -6704,6 +6940,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     tcg_temp_ebb_reset_freed(s);
 
     tcg_optimize(s);
+    if (tcg_dse) {
+        dead_env_store_pass(s);
+    }
 
     reachable_code_pass(s);
     liveness_pass_0(s);
