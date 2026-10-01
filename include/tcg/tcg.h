@@ -350,6 +350,8 @@ struct TCGContext {
     int nb_globals;
     int nb_temps;
     int nb_indirects;
+    uint16_t *la_globals;       /* liveness: the globals the ops use */
+    int nb_la_globals;
     int nb_ops;
     TCGType addr_type;            /* TCG_TYPE_I32 or TCG_TYPE_I64 */
     TCGBar guest_mo;
