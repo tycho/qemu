@@ -91,6 +91,14 @@ extern bool tcg_vperm;
  */
 extern bool tcg_dse;
 
+/*
+ * The front end's scratch area in env, [ofs, ofs + size): values there
+ * live only within one guest instruction, so a fault or an exit never
+ * observes them (x-dse may remove stores to it across guest memory
+ * accesses and before exits).
+ */
+void tcg_set_env_scratch(intptr_t ofs, intptr_t size);
+
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);
 
