@@ -365,6 +365,16 @@ static void tcg_set_region(Object *obj, bool value, Error **errp)
     tcg_region = value;
 }
 
+static bool tcg_get_vpermvar(Object *obj, Error **errp)
+{
+    return tcg_vpermvar;
+}
+
+static void tcg_set_vpermvar(Object *obj, bool value, Error **errp)
+{
+    tcg_vpermvar = value;
+}
+
 static bool tcg_get_vecglobal(Object *obj, Error **errp)
 {
     return tcg_vecglobal;
@@ -668,6 +678,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-region",
         "Let a translation block loop back to its own start instead of "
         "chaining to itself");
+
+    object_class_property_add_bool(oc, "x-vpermvar",
+                                   tcg_get_vpermvar, tcg_set_vpermvar);
+    object_class_property_set_description(oc, "x-vpermvar",
+        "Permutes by indices in a register (vpermd, vpermps) as host "
+        "table lookups instead of helper calls");
 
     object_class_property_add_bool(oc, "x-vecglobal",
                                    tcg_get_vecglobal, tcg_set_vecglobal);

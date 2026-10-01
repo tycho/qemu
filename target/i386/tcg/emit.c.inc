@@ -5590,10 +5590,57 @@ static void gen_VPMASKMOV_st(DisasContext *s, X86DecodedInsn *decode)
     }
 }
 
+/*
+ * With x-vpermvar, vpermd/vpermps as table lookups: each dword index i
+ * (low 3 bits) becomes the bytes 4i..4i+3, looked up in the source's low
+ * 128 bits (bytes 0-15) and, 16 less, in its high 128 bits; a lookup out
+ * of range gives 0, so OR-ing the two gives the result.  Every operand is
+ * read before operand 0 is written.
+ */
+static bool gen_vpermd_tbl(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv_vec src[2], r[2];
+    TCGv_vec seven, scale, bytes, sixteen;
+
+    if (!tcg_vpermvar || decode->op[0].unit != X86_OP_SSE
+        || tcg_can_emit_vec_op(INDEX_op_tbl_vec, TCG_TYPE_V128, MO_8) <= 0
+        || tcg_can_emit_vec_op(INDEX_op_mul_vec, TCG_TYPE_V128, MO_32) <= 0) {
+        return false;
+    }
+    seven = tcg_constant_vec(TCG_TYPE_V128, MO_32, 7);
+    scale = tcg_constant_vec(TCG_TYPE_V128, MO_32, 0x04040404);
+    bytes = tcg_constant_vec(TCG_TYPE_V128, MO_32, 0x03020100);
+    sixteen = tcg_constant_vec(TCG_TYPE_V128, MO_8, 16);
+    for (int h = 0; h < 2; h++) {
+        src[h] = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_ld_vec(src[h], tcg_env, decode->op[2].offset + 16 * h);
+    }
+    for (int h = 0; h < 2; h++) {
+        TCGv_vec idx = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec hi = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(idx, tcg_env, decode->op[1].offset + 16 * h);
+        tcg_gen_and_vec(MO_32, idx, idx, seven);
+        tcg_gen_mul_vec(MO_32, idx, idx, scale);
+        tcg_gen_add_vec(MO_32, idx, idx, bytes);
+        r[h] = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_tbl_vec(r[h], src[0], idx);
+        tcg_gen_sub_vec(MO_8, idx, idx, sixteen);
+        tcg_gen_tbl_vec(hi, src[1], idx);
+        tcg_gen_or_vec(MO_8, r[h], r[h], hi);
+    }
+    for (int h = 0; h < 2; h++) {
+        tcg_gen_st_vec(r[h], tcg_env, decode->op[0].offset + 16 * h);
+    }
+    return true;
+}
+
 static void gen_VPERMD(DisasContext *s, X86DecodedInsn *decode)
 {
     assert(s->vex_l);
-    gen_helper_vpermd_ymm(OP_PTR0, OP_PTR1, OP_PTR2);
+    if (!gen_vpermd_tbl(s, decode)) {
+        gen_helper_vpermd_ymm(OP_PTR0, OP_PTR1, OP_PTR2);
+    }
 }
 
 static void gen_VPERM2x128(DisasContext *s, X86DecodedInsn *decode)

@@ -85,6 +85,12 @@ extern bool tcg_vecld;
 extern bool tcg_vperm;
 
 /*
+ * x-vpermvar: permutes by indices in a register (x86 vpermd/vpermps) as
+ * host table lookups (tbl_vec) instead of helper calls.
+ */
+extern bool tcg_vpermvar;
+
+/*
  * x-vecmem: 128-bit guest vector loads and stores use qemu_ld_vec and
  * qemu_st_vec where tcg_can_qemu_ldst_vec() allows.
  */
