@@ -33,6 +33,13 @@
 extern bool tcg_dse;
 
 /*
+ * Values stay in the registers that a guest memory access's slow path
+ * saves, instead of being spilled around every access (where the
+ * backend's slow path saves them).
+ */
+extern bool tcg_ldstkeep;
+
+/*
  * The front end's scratch area in env, [ofs, ofs + size): values there
  * live only within one guest instruction, so a fault or an exit never
  * observes them (tcg_dse may remove stores to it across guest memory
