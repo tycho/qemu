@@ -85,6 +85,12 @@ extern bool tcg_vecld;
 extern bool tcg_vperm;
 
 /*
+ * x-vecmem: 128-bit guest vector loads and stores use qemu_ld_vec and
+ * qemu_st_vec where tcg_can_qemu_ldst_vec() allows.
+ */
+extern bool tcg_vecmem;
+
+/*
  * x-dse: before liveness, remove stores to CPUArchState that are
  * overwritten later in the same extended basic block before any
  * operation could read them.

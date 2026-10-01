@@ -247,6 +247,7 @@ bool tcg_ssefp_vec;
 bool tcg_ssefp_native;
 bool tcg_vecld;
 bool tcg_vperm;
+bool tcg_vecmem;
 bool tcg_dse;
 bool tcg_ldstkeep;
 
@@ -2532,6 +2533,9 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_concat_vec;
     case INDEX_op_perm_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_perm_vec;
+    case INDEX_op_qemu_ld_vec:
+    case INDEX_op_qemu_st_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_qemu_ldst_vec;
     case INDEX_op_fadd_vec:
     case INDEX_op_fsub_vec:
     case INDEX_op_fmul_vec:
@@ -3848,6 +3852,8 @@ dead_env_store_pass(TCGContext *s)
         case INDEX_op_qemu_st:
         case INDEX_op_qemu_ld2:
         case INDEX_op_qemu_st2:
+        case INDEX_op_qemu_ld_vec:
+        case INDEX_op_qemu_st_vec:
             dse_keep_only(&dead, dse_scratch_lo, dse_scratch_hi);
             break;
         case INDEX_op_exit_tb:
@@ -4098,6 +4104,8 @@ static TCGRegSet op_clobber_regs(TCGOpcode opc)
     case INDEX_op_qemu_st:
     case INDEX_op_qemu_ld2:
     case INDEX_op_qemu_st2:
+    case INDEX_op_qemu_ld_vec:
+    case INDEX_op_qemu_st_vec:
         return tcg_ldstkeep ? tcg_target_ldst_clobber_regs
                             : tcg_target_call_clobber_regs;
     default:
