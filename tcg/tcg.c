@@ -261,6 +261,7 @@ bool tcg_ssefp_vec;
 bool tcg_ssefp_native;
 bool tcg_vecld;
 bool tcg_vperm;
+bool tcg_vpermvar;
 bool tcg_vecmem;
 bool tcg_dse;
 bool tcg_ldstkeep;
