@@ -331,6 +331,16 @@ static void tcg_set_ldstkeep(Object *obj, bool value, Error **errp)
     tcg_ldstkeep = value;
 }
 
+static bool tcg_get_lazysync(Object *obj, Error **errp)
+{
+    return tcg_lazysync;
+}
+
+static void tcg_set_lazysync(Object *obj, bool value, Error **errp)
+{
+    tcg_lazysync = value;
+}
+
 static bool tcg_get_dse(Object *obj, Error **errp)
 {
     return tcg_dse;
@@ -547,6 +557,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-ldstkeep",
         "Keep vector values in registers across guest memory accesses; "
         "the accesses' slow paths save them");
+
+    object_class_property_add_bool(oc, "x-lazysync",
+                                   tcg_get_lazysync, tcg_set_lazysync);
+    object_class_property_set_description(oc, "x-lazysync",
+        "Keep dirty guest registers in host registers across guest memory "
+        "accesses; a faulting access stores them (aarch64 hosts)");
 
     object_class_property_add_bool(oc, "x-pferr-hw",
                                    tcg_get_pferr_hw, tcg_set_pferr_hw);
