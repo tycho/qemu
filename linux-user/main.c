@@ -426,12 +426,13 @@ static void handle_arg_tb_size(const char *arg)
  * Development aid, not for upstream: QEMU_XTCG="k=v,k2=v2" sets the
  * experimental accelerator properties x-k=v and x-k2=v2 ("k" alone means
  * "k=on"), so the same binary can run with and without an experimental
- * TCG change.
+ * TCG change; "show" prints them all as resolved.
  */
 static void xtcg_set_accel_props(Object *accel)
 {
     const char *opts = getenv("QEMU_XTCG");
     g_auto(GStrv) kvs = NULL;
+    bool show = false;
 
     if (!opts) {
         return;
@@ -444,8 +445,27 @@ static void xtcg_set_accel_props(Object *accel)
         if (!p[0] || !*p[0]) {
             continue;
         }
+        if (!strcmp(p[0], "show")) {
+            show = true;
+            continue;
+        }
         name = g_strconcat("x-", p[0], NULL);
         object_property_parse(accel, name, p[1] ? p[1] : "on", &error_fatal);
+    }
+    if (show) {
+        /* "show": every x- setting as resolved, one per line on stderr. */
+        ObjectPropertyIterator iter;
+        ObjectProperty *prop;
+
+        object_property_iter_init(&iter, accel);
+        while ((prop = object_property_iter_next(&iter))) {
+            if (g_str_has_prefix(prop->name, "x-") && prop->get) {
+                g_autofree char *v = object_property_print(accel, prop->name,
+                                                           true, NULL);
+
+                fprintf(stderr, "xtcg: %s=%s\n", prop->name, v ? v : "?");
+            }
+        }
     }
 }
 
@@ -743,6 +763,12 @@ int main(int argc, char **argv, char **envp)
         wrk--;
         (void) envlist_setenv(envlist, *wrk);
     }
+    /*
+     * Development aid: QEMU_XTCG configures QEMU, not the guest; leave it
+     * out of the guest's environment, so that every setting runs the
+     * guest with the same environment (and so the same stack layout).
+     */
+    (void) envlist_unsetenv(envlist, "QEMU_XTCG");
 
     /* Read the stack limit from the kernel.  If it's "unlimited",
        then we can do little else besides use the default.  */

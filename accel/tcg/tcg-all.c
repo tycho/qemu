@@ -72,6 +72,8 @@ bool qemu_tcg_mttcg_enabled(void)
 }
 #endif /* !CONFIG_USER_ONLY */
 
+static void xtcg_fork_defaults(TCGState *s);
+
 static void tcg_accel_instance_init(Object *obj)
 {
     TCGState *s = TCG_STATE(obj);
@@ -83,6 +85,7 @@ static void tcg_accel_instance_init(Object *obj)
     s->splitwx_enabled = 0;
 #endif
     s->kvmvapic = true;
+    xtcg_fork_defaults(s);
 }
 
 bool one_insn_per_tb;
@@ -411,7 +414,14 @@ static char *tcg_get_ssefp(Object *obj, Error **errp)
 static void tcg_set_ssefp(Object *obj, const char *value, Error **errp)
 {
     if (!strcmp(value, "native")) {
-        /* Hosts that can't take the guest's FP mode get "vec". */
+        if (!host_fpenv_native()) {
+            error_setg(errp, "x-ssefp=native is not supported on this host");
+            return;
+        }
+        tcg_ssefp_native = true;
+        tcg_ssefp_vec = false;
+    } else if (!strcmp(value, "auto")) {
+        /* native where the host can take the guest's FP mode, else vec */
         tcg_ssefp_native = host_fpenv_native();
         tcg_ssefp_vec = !tcg_ssefp_native;
     } else if (!strcmp(value, "vec")) {
@@ -496,6 +506,11 @@ static char *tcg_get_tso(Object *obj, Error **errp)
 
 static void tcg_set_tso(Object *obj, const char *value, Error **errp)
 {
+    if (!strcmp(value, "auto")) {
+        tcg_tso_mode = tcg_can_ldst_acqrel() ? TCG_TSO_ACQREL
+                                             : TCG_TSO_BARRIER;
+        return;
+    }
     for (int i = 0; i < ARRAY_SIZE(tcg_tso_names); i++) {
         if (tcg_tso_names[i] && !strcmp(value, tcg_tso_names[i])) {
             if (i == TCG_TSO_ACQREL && !tcg_can_ldst_acqrel()) {
@@ -507,6 +522,37 @@ static void tcg_set_tso(Object *obj, const char *value, Error **errp)
         }
     }
     error_setg(errp, "Invalid 'x-tso' value: %s", value);
+}
+
+/*
+ * Fork defaults ([DEV], not for upstream): the adopted x- settings are on
+ * where they have been validated, on aarch64 hosts, each as far as the
+ * host supports it; on other hosts every setting keeps QEMU's default.
+ * Properties given on the command line or in QEMU_XTCG still override
+ * these (x-tso=barrier,x-ssefp=soft,... for QEMU's behaviour).
+ */
+static void xtcg_fork_defaults(TCGState *s)
+{
+#if defined(__aarch64__)
+    tcg_tso_mode = tcg_can_ldst_acqrel() ? TCG_TSO_ACQREL : TCG_TSO_BARRIER;
+    tcg_ssefp_native = host_fpenv_native();
+    tcg_ssefp_vec = !tcg_ssefp_native;
+    tcg_ijmp_inline = true;
+    tcg_tlb_grow = 1;
+    tcg_vecld = true;
+    tcg_vperm = true;
+    tcg_dse = true;
+    tcg_ldstkeep = true;
+    tcg_vecmem = true;
+    tcg_lazysync = true;
+    tcg_vecglobal = true;
+    tcg_region = true;
+    tcg_pferr_hw = true;
+    s->kvmvapic = false;
+#ifdef CONFIG_DARWIN
+    qemu_thread_jit_lazy = true;
+#endif
+#endif
 }
 
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
@@ -544,6 +590,7 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-tso",
         "Guest memory ordering: barrier (default), "
         "acqrel (load-acquire/store-release accesses), "
+        "auto (acqrel where the host supports it, else barrier), "
         "none (no barriers: unsafe, for measurement)");
 
     object_class_property_add(oc, "x-tso-promote", "uint32",
@@ -576,8 +623,9 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-ssefp",
         "SIMD floating point: soft (default, lane by lane), vec (compute "
         "whole vectors on the host FPU when that gives the same results "
-        "and flags) or native (run with the guest's FP mode in the host "
-        "FPU, where the host can express it; otherwise as vec)");
+        "and flags), native (run with the guest's FP mode in the host "
+        "FPU; needs a host that can express it) or auto (native where "
+        "possible, else vec)");
 
     object_class_property_add_str(oc, "x-jitwx", tcg_get_jitwx, tcg_set_jitwx);
     object_class_property_set_description(oc, "x-jitwx",
