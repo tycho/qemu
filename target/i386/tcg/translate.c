@@ -24,6 +24,7 @@
 #include "exec/translation-block.h"
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-op-gvec.h"
+#include "tcg/startup.h"
 #include "exec/translator.h"
 #include "exec/target_page.h"
 #include "fpu/softfloat.h"
@@ -3420,6 +3421,11 @@ void tcg_x86_init(void)
                                      offsetof(CPUX86State, bnd_regs[i].ub),
                                      bnd_regu_names[i]);
     }
+
+    /* xmm_t0 and mmx_t0 hold an operand only within one instruction. */
+    tcg_set_env_scratch(offsetof(CPUX86State, xmm_t0),
+                        offsetof(CPUX86State, mmx_t0) + sizeof(MMXReg)
+                        - offsetof(CPUX86State, xmm_t0));
 }
 
 static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
