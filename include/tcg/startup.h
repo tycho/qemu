@@ -121,6 +121,13 @@ extern bool tcg_lazysync;
 extern bool tcg_lazysync_user;
 
 /*
+ * x-vecglobal: front ends keep vector registers in env_alias vector
+ * globals (tcg_global_mem_new_vec), so TCG holds them in host registers
+ * within a TB.
+ */
+extern bool tcg_vecglobal;
+
+/*
  * The front end's scratch area in env, [ofs, ofs + size): values there
  * live only within one guest instruction, so a fault or an exit never
  * observes them (x-dse may remove stores to it across guest memory
