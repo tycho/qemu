@@ -128,6 +128,12 @@ extern bool tcg_lazysync_user;
 extern bool tcg_vecglobal;
 
 /*
+ * x-region: a TB whose direct jump returns to its first insn branches
+ * back within the TB instead of chaining to itself.
+ */
+extern bool tcg_region;
+
+/*
  * The front end's scratch area in env, [ofs, ofs + size): values there
  * live only within one guest instruction, so a fault or an exit never
  * observes them (x-dse may remove stores to it across guest memory

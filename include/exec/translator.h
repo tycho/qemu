@@ -80,6 +80,11 @@ struct DisasContextBase {
     uint8_t code_mmuidx;
     struct TCGOp *insn_start;
     void *host_addr[2];
+    /*
+     * x-region: the label before the TB's first insn, or NULL: a direct
+     * jump back to pc_first may branch to it (translator_loop_back).
+     */
+    struct TCGLabel *loop_label;
 
     /*
      * Record insn data that we cannot read directly from host memory.
@@ -163,6 +168,19 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
  * and the destination PC.
  */
 bool translator_use_goto_tb(DisasContextBase *db, vaddr dest);
+
+/**
+ * translator_loop_back:
+ * @db: Disassembly context
+ * @dest: the destination of a direct jump
+ *
+ * If @dest is the TB's first insn and the TB may loop (x-region), emit the
+ * check of the exit request that a TB entry does, then a branch back to
+ * the first insn, and return true: the caller has already brought the
+ * guest state up to date as for a jump between TBs.  Otherwise return
+ * false and emit nothing.
+ */
+bool translator_loop_back(DisasContextBase *db, vaddr dest);
 
 /**
  * translator_use_inline_lookup
