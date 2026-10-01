@@ -3583,8 +3583,21 @@ static void move_label_uses(TCGLabel *to, TCGLabel *from)
  * label or exit, a plugin callback, and a host load or store not based on
  * env (which may alias it).  Stores overlapping a global's memory are
  * kept, because the register allocator reads globals implicitly.
+ *
+ * The front end's scratch area (tcg_set_env_scratch) holds values only
+ * within one guest instruction: a fault or an exit doesn't observe it, so
+ * it stays dead across guest memory accesses and is dead at exits.
  */
 #define DSE_RANGES 32
+
+/* Front-end scratch in env: never read across instructions. */
+static intptr_t dse_scratch_lo, dse_scratch_hi;
+
+void tcg_set_env_scratch(intptr_t ofs, intptr_t size)
+{
+    dse_scratch_lo = ofs;
+    dse_scratch_hi = ofs + size;
+}
 
 typedef struct DseRange {
     intptr_t lo, hi;            /* [lo, hi) */
@@ -3622,6 +3635,18 @@ static void dse_read(DseSet *d, intptr_t lo, intptr_t hi)
         } else if (hi < r.hi) {
             d->r[i].lo = hi;
         } else {
+            d->r[i--] = d->r[--d->n];
+        }
+    }
+}
+
+/* Keep only the parts of the set within [lo, hi). */
+static void dse_keep_only(DseSet *d, intptr_t lo, intptr_t hi)
+{
+    for (int i = 0; i < d->n; i++) {
+        d->r[i].lo = MAX(d->r[i].lo, lo);
+        d->r[i].hi = MIN(d->r[i].hi, hi);
+        if (d->r[i].lo >= d->r[i].hi) {
             d->r[i--] = d->r[--d->n];
         }
     }
@@ -3712,6 +3737,20 @@ dead_env_store_pass(TCGContext *s)
         case INDEX_op_insn_start:
         case INDEX_op_discard:
         case INDEX_op_mb:
+            break;
+        case INDEX_op_qemu_ld:
+        case INDEX_op_qemu_st:
+        case INDEX_op_qemu_ld2:
+        case INDEX_op_qemu_st2:
+            dse_keep_only(&dead, dse_scratch_lo, dse_scratch_hi);
+            break;
+        case INDEX_op_exit_tb:
+        case INDEX_op_goto_tb:
+        case INDEX_op_goto_ptr:
+            dead.n = 0;
+            if (dse_scratch_lo < dse_scratch_hi) {
+                dse_write(&dead, dse_scratch_lo, dse_scratch_hi);
+            }
             break;
         case INDEX_op_call:
         case INDEX_op_set_label:
