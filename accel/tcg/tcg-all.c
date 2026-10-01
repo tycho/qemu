@@ -55,6 +55,7 @@ struct TCGState {
     bool one_insn_per_tb;
     int splitwx_enabled;
     unsigned long tb_size;
+    bool kvmvapic;
 };
 typedef struct TCGState TCGState;
 
@@ -81,6 +82,7 @@ static void tcg_accel_instance_init(Object *obj)
 #else
     s->splitwx_enabled = 0;
 #endif
+    s->kvmvapic = true;
 }
 
 bool one_insn_per_tb;
@@ -146,6 +148,25 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     }
 
     qemu_add_vm_change_state_handler(tcg_vm_change_state, NULL);
+
+    /*
+     * x-kvmvapic=off: no kvmvapic option ROM behind the x86 local APIC.
+     * It patches a guest's TPR accesses into port I/O so that KVM avoids
+     * an exit per access; under TCG each one becomes an I/O exit and its
+     * state updates invalidate code on the ROM page.  As an accelerator
+     * compat property it yields to -global apic.vapic=on.
+     */
+    if (!s->kvmvapic) {
+        static GlobalProperty novapic[] = {
+            { "apic", "vapic", "off" },
+        };
+        AccelClass *ac = ACCEL_GET_CLASS(as);
+
+        if (!ac->compat_props) {
+            ac->compat_props = g_ptr_array_new();
+        }
+        compat_props_add(ac->compat_props, novapic, G_N_ELEMENTS(novapic));
+    }
 #endif
 
     tcg_allowed = true;
@@ -438,6 +459,16 @@ static void tcg_set_splitwx(Object *obj, bool value, Error **errp)
     s->splitwx_enabled = value;
 }
 
+static bool tcg_get_kvmvapic(Object *obj, Error **errp)
+{
+    return TCG_STATE(obj)->kvmvapic;
+}
+
+static void tcg_set_kvmvapic(Object *obj, bool value, Error **errp)
+{
+    TCG_STATE(obj)->kvmvapic = value;
+}
+
 static bool tcg_get_one_insn_per_tb(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
@@ -528,6 +559,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Grow a softmmu TLB between flushes once it has had this many "
         "times its size in fills within 100 ms while over 70% used "
         "(0: resize only at flushes, the default)");
+
+    object_class_property_add_bool(oc, "x-kvmvapic",
+                                   tcg_get_kvmvapic, tcg_set_kvmvapic);
+    object_class_property_set_description(oc, "x-kvmvapic",
+        "x86 system: the kvmvapic option ROM behind the local APIC (on, "
+        "the default; off avoids an I/O exit per guest TPR access)");
 
     object_class_property_add_str(oc, "x-ijmp", tcg_get_ijmp, tcg_set_ijmp);
     object_class_property_set_description(oc, "x-ijmp",
