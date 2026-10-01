@@ -32,6 +32,14 @@
  */
 extern bool tcg_dse;
 
+/*
+ * The front end's scratch area in env, [ofs, ofs + size): values there
+ * live only within one guest instruction, so a fault or an exit never
+ * observes them (tcg_dse may remove stores to it across guest memory
+ * accesses and before exits).
+ */
+void tcg_set_env_scratch(intptr_t ofs, intptr_t size);
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size
