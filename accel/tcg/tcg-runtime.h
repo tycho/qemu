@@ -23,6 +23,7 @@ DEF_HELPER_FLAGS_1(ctpop_i64, TCG_CALL_NO_RWG_SE, i64, i64)
 DEF_HELPER_FLAGS_1(lookup_tb_ptr, TCG_CALL_NO_WG_SE, cptr, env)
 DEF_HELPER_FLAGS_4(lookup_tb_ptr_jc, TCG_CALL_NO_WG_SE,
                    cptr, env, i64, i64, i32)
+DEF_HELPER_FLAGS_2(region_hot, TCG_CALL_NO_RWG, void, env, i64)
 
 DEF_HELPER_FLAGS_1(exit_atomic, TCG_CALL_NO_WG, noreturn, env)
 

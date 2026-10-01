@@ -369,6 +369,34 @@ static inline bool check_for_breakpoints(CPUState *cpu, vaddr pc,
         check_for_breakpoints_slow(cpu, pc, cflags);
 }
 
+/*
+ * x-region-hot: a backward jump to @dest got hot.  Make @dest the head of
+ * a multi-block region and drop its current TB, so that the next lookup
+ * translates the region.
+ */
+void HELPER(region_hot)(CPUArchState *env, uint64_t dest)
+{
+    CPUState *cpu = env_cpu(env);
+    TCGTBCPUState s;
+    TranslationBlock *tb;
+
+    if (getenv("XTCG_REGION_DEBUG")) {
+        fprintf(stderr, "region_hot %" PRIx64 "\n", dest);
+    }
+    if (!translator_region_promote(dest)) {
+        return;
+    }
+    s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
+    s.pc = dest;
+    s.cflags = curr_cflags(cpu);
+    tb = tb_htable_lookup(cpu, s);
+    if (tb) {
+        mmap_lock();
+        tb_phys_invalidate(tb, -1);
+        mmap_unlock();
+    }
+}
+
 /**
  * helper_lookup_tb_ptr: quick check for next tb
  * @env: current cpu state

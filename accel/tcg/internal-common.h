@@ -54,6 +54,9 @@ extern bool tcg_mmio_lockless;
  */
 extern unsigned tcg_tlb_grow;
 
+/* x-region-hot: make @pc a region head; false if it already was one. */
+bool translator_region_promote(vaddr pc);
+
 extern bool icount_align_option;
 
 /*

@@ -321,6 +321,7 @@ bool tcg_ymmglobal;
 bool tcg_vregs_all;
 
 bool tcg_region;
+unsigned tcg_region_hot;
 
 bool tcg_tbpack;
 

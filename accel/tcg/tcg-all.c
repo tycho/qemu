@@ -634,6 +634,25 @@ static void tcg_set_flags(Object *obj, const char *value, Error **errp)
     }
 }
 
+static void tcg_get_superblock(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    uint32_t value = tcg_region_hot;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void tcg_set_superblock(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    tcg_region_hot = MIN(value, INT32_MAX);
+}
+
 static bool tcg_get_lazy_incdec(Object *obj, Error **errp)
 {
     return tcg_lazy_incdec;
@@ -784,6 +803,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Guest condition codes at block entry: off (compute them with the "
         "front end's helper) or guess (inline code for the state the "
         "block was translated in, tested at run time)");
+
+    object_class_property_add(oc, "x-superblock", "uint32",
+        tcg_get_superblock, tcg_set_superblock, NULL, NULL);
+    object_class_property_set_description(oc, "x-superblock",
+        "With x-region: after this many executions of a backward jump "
+        "between TBs, translate its destination's hot loop nest as one "
+        "multi-block region (0: never, the default)");
 
     object_class_property_add_bool(oc, "x-lazyinc",
                                    tcg_get_lazy_incdec,
