@@ -92,6 +92,13 @@ struct TranslationBlock {
      * Above fields used for comparing
      */
 
+    /*
+     * x-region: the TB branches back to its own start, so unlinking jumps
+     * does not get a vCPU out of it; invalidating it asks every vCPU to
+     * leave its TB (do_tb_phys_invalidate).
+     */
+    bool loops;
+
     /* size of target code for this block (1 <= size <= TARGET_PAGE_SIZE) */
     uint16_t size;
     uint16_t icount;
