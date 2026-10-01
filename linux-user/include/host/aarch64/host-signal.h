@@ -38,6 +38,17 @@ static inline uintptr_t host_signal_pc(host_sigcontext *uc)
     return uc->uc_mcontext.pc;
 }
 
+/* The registers at the signal, indexed by TCGReg (X0-X30, SP). */
+#define HOST_SIGNAL_TCG_REGS 32
+
+static inline void host_signal_tcg_regs(host_sigcontext *uc, uint64_t *regs)
+{
+    for (int i = 0; i < 31; i++) {
+        regs[i] = uc->uc_mcontext.regs[i];
+    }
+    regs[31] = uc->uc_mcontext.sp;
+}
+
 static inline void host_signal_set_pc(host_sigcontext *uc, uintptr_t pc)
 {
     uc->uc_mcontext.pc = pc;

@@ -805,6 +805,7 @@ int main(int argc, char **argv, char **envp)
                                  opt_one_insn_per_tb, &error_abort);
         object_property_set_int(OBJECT(accel), "tb-size",
                                 opt_tb_size, &error_abort);
+        tcg_lazysync_user = tcg_lazysync && host_signal_lazysync_ok();
         ac->init_machine(accel, NULL);
     }
 
