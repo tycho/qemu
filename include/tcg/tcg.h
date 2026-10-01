@@ -364,6 +364,7 @@ struct TCGContext {
     int nb_indirects;
     bool xblk;                  /* some label keeps registers */
     int xblk_pass;              /* liveness pass, 1 or 2 with a loop */
+    int8_t *xblk_home;          /* each temp's loop register */
     int nb_ops;
     TCGType addr_type;            /* TCG_TYPE_I32 or TCG_TYPE_I64 */
     TCGBar guest_mo;
