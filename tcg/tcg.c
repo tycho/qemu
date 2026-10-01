@@ -267,6 +267,7 @@ bool tcg_dse;
 bool tcg_ldstkeep;
 bool tcg_lazysync;
 bool tcg_vecglobal;
+bool tcg_ymmglobal;
 bool tcg_region;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
@@ -4571,6 +4572,9 @@ static bool la_xblk_label(TCGContext *s, TCGOp *op, int nt)
     return true;
 }
 
+/* Vector registers a loop leaves free for its temporaries and the back edge. */
+#define XBLK_VEC_SPARE 7
+
 /*
  * After a first liveness pass: the globals live into each loop, which the
  * second pass keeps live across the back edge, within a register budget.
@@ -4583,7 +4587,9 @@ static bool xblk_select_loops(TCGContext *s)
     QSIMPLEQ_FOREACH(l, &s->labels, next) {
         XblkLoopReg *lr;
         uint8_t *used;
-        TCGRegSet taken;
+        uint16_t *uses;
+        int *order, vec_budget;
+        TCGRegSet taken, vregs;
         int nint = 0, nvec = 0, nr;
         bool in_loop = false;
         TCGOp *op;
@@ -4591,9 +4597,14 @@ static bool xblk_select_loops(TCGContext *s)
         if (l->xkind != XLBL_LOOP || !l->live_in) {
             continue;
         }
-        /* The globals the loop's ops name, and which of them it writes. */
+        /*
+         * The globals the loop's ops name, which of them it writes, and how
+         * many times each is named.
+         */
         used = tcg_malloc(s->nb_globals);
         memset(used, 0, s->nb_globals);
+        uses = tcg_malloc(s->nb_globals * sizeof(*uses));
+        memset(uses, 0, s->nb_globals * sizeof(*uses));
         QTAILQ_FOREACH(op, &s->ops, link) {
             int no, ni;
 
@@ -4621,12 +4632,35 @@ static bool xblk_select_loops(TCGContext *s)
 
                 if (idx < s->nb_globals) {
                     used[idx] |= k < no ? 3 : 1;
+                    uses[idx] += uses[idx] < UINT16_MAX;
                 }
             }
         }
+        /*
+         * At most what the backend's vector registers allow with some left
+         * for temporaries; most used first, since more candidates than
+         * registers is common (a ymm loop names up to 32 halves).
+         */
+        vregs = tcg_target_available_regs[TCG_TYPE_V128] & ~s->reserved_regs;
+        vec_budget = -XBLK_VEC_SPARE;
+        for (int k = 0; k < ARRAY_SIZE(tcg_target_reg_alloc_order); k++) {
+            vec_budget += tcg_regset_test_reg(vregs,
+                                              tcg_target_reg_alloc_order[k]);
+        }
+        order = tcg_malloc(s->nb_globals * sizeof(*order));
+        for (int i = 0; i < s->nb_globals; i++) {
+            int j = i;
+
+            while (j > 0 && uses[order[j - 1]] < uses[i]) {
+                order[j] = order[j - 1];
+                j--;
+            }
+            order[j] = i;
+        }
         lr = tcg_malloc(sizeof(*lr) * s->nb_globals);
         l->nb_loopregs = 0;
-        for (int i = 0; i < s->nb_globals; i++) {
+        for (int o = 0; o < s->nb_globals; o++) {
+            int i = order[o];
             TCGTemp *ts = &s->temps[i];
 
             if (ts->kind != TEMP_GLOBAL || ts->indirect_reg || !used[i]
@@ -4642,7 +4676,7 @@ static bool xblk_select_loops(TCGContext *s)
                 break;
             case TCG_TYPE_V64:
             case TCG_TYPE_V128:
-                if (nvec++ >= 16) {
+                if (nvec++ >= vec_budget) {
                     continue;
                 }
                 break;
@@ -5638,6 +5672,38 @@ static void tcg_reg_free(TCGContext *s, TCGReg reg, TCGRegSet allocated_regs)
     }
 }
 
+/*
+ * The register to spill in a loop: cheapest first, a value already in
+ * memory (dropping it costs nothing now), then one that must be stored,
+ * and a loop global in its own register last (the back edge would have
+ * to reload it).
+ */
+static TCGReg xblk_victim(TCGContext *s, TCGRegSet set, const int *order,
+                          int n)
+{
+    TCGReg best = -1;
+    int best_cost = INT_MAX;
+
+    for (int i = 0; i < n; i++) {
+        TCGReg reg = order[i];
+        TCGTemp *ts = s->reg_to_temp[reg];
+        int cost;
+
+        if (!tcg_regset_test_reg(set, reg)) {
+            continue;
+        }
+        cost = temp_readonly(ts) || ts->mem_coherent ? 0 : 1;
+        if (ts->kind == TEMP_GLOBAL && s->xblk_home[temp_idx(ts)] == reg) {
+            cost += 2;
+        }
+        if (cost < best_cost) {
+            best = reg;
+            best_cost = cost;
+        }
+    }
+    return best;
+}
+
 /**
  * tcg_reg_alloc:
  * @required_regs: Set of registers in which we must allocate.
@@ -5691,6 +5757,12 @@ static TCGReg tcg_reg_alloc(TCGContext *s, TCGRegSet required_regs,
     for (j = f; j < 2; j++) {
         TCGRegSet set = reg_ct[j];
 
+        if (s->xblk_home && !tcg_regset_single(set)) {
+            TCGReg reg = xblk_victim(s, set, order, n);
+
+            tcg_reg_free(s, reg, allocated_regs);
+            return reg;
+        }
         if (tcg_regset_single(set)) {
             /* One register in the set.  */
             TCGReg reg = tcg_regset_first(set);
@@ -7918,6 +7990,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         /* The loop's globals stay live across its back edge. */
         s->xblk_pass = 2;
         liveness_pass_1(s);
+    } else {
+        s->xblk_home = NULL;
     }
 
     if (s->nb_indirects > 0) {
