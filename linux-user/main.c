@@ -763,6 +763,12 @@ int main(int argc, char **argv, char **envp)
         wrk--;
         (void) envlist_setenv(envlist, *wrk);
     }
+    /*
+     * Development aid: QEMU_XTCG configures QEMU, not the guest; leave it
+     * out of the guest's environment, so that every setting runs the
+     * guest with the same environment (and so the same stack layout).
+     */
+    (void) envlist_unsetenv(envlist, "QEMU_XTCG");
 
     /* Read the stack limit from the kernel.  If it's "unlimited",
        then we can do little else besides use the default.  */
