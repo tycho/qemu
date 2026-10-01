@@ -3688,13 +3688,20 @@ static inline void la_reset_pref(TCGTemp *ts)
 
 /* liveness analysis: end of function: all temps are dead, and globals
    should be in memory. */
+/*
+ * Liveness walks only the globals that some op of the TB names
+ * (s->la_globals): the others stay in memory throughout, so their state
+ * never matters.
+ */
 static void la_func_end(TCGContext *s, int ng, int nt)
 {
     int i;
 
-    for (i = 0; i < ng; ++i) {
-        s->temps[i].state = TS_DEAD | TS_MEM;
-        la_reset_pref(&s->temps[i]);
+    for (i = 0; i < s->nb_la_globals; ++i) {
+        TCGTemp *ts = &s->temps[s->la_globals[i]];
+
+        ts->state = TS_DEAD | TS_MEM;
+        la_reset_pref(ts);
     }
     for (i = ng; i < nt; ++i) {
         s->temps[i].state = TS_DEAD;
@@ -3708,7 +3715,13 @@ static void la_bb_end(TCGContext *s, int ng, int nt)
 {
     int i;
 
-    for (i = 0; i < nt; ++i) {
+    for (i = 0; i < s->nb_la_globals; ++i) {
+        TCGTemp *ts = &s->temps[s->la_globals[i]];
+
+        ts->state = TS_DEAD | TS_MEM;
+        la_reset_pref(ts);
+    }
+    for (i = ng; i < nt; ++i) {
         TCGTemp *ts = &s->temps[i];
         int state;
 
@@ -3733,9 +3746,8 @@ static void la_bb_end(TCGContext *s, int ng, int nt)
 /* liveness analysis: sync globals back to memory.  */
 static void la_global_sync(TCGContext *s, int ng)
 {
-    int i;
-
-    for (i = 0; i < ng; ++i) {
+    for (int k = 0; k < s->nb_la_globals; ++k) {
+        int i = s->la_globals[k];
         int state = s->temps[i].state;
         s->temps[i].state = state | TS_MEM;
         if (state == TS_DEAD) {
@@ -3779,11 +3791,45 @@ static void la_bb_sync(TCGContext *s, int ng, int nt)
 /* liveness analysis: sync globals back to memory and kill.  */
 static void la_global_kill(TCGContext *s, int ng)
 {
-    int i;
+    for (int k = 0; k < s->nb_la_globals; k++) {
+        int i = s->la_globals[k];
 
-    for (i = 0; i < ng; i++) {
         s->temps[i].state = TS_DEAD | TS_MEM;
         la_reset_pref(&s->temps[i]);
+    }
+}
+
+/* liveness analysis: list the globals that the ops name. */
+static void la_find_globals(TCGContext *s)
+{
+    int ng = s->nb_globals;
+    size_t size = BITS_TO_LONGS(ng) * sizeof(unsigned long);
+    unsigned long *seen = tcg_malloc(size);
+    TCGOp *op;
+
+    memset(seen, 0, size);
+
+    s->la_globals = tcg_malloc(sizeof(uint16_t) * ng);
+    s->nb_la_globals = 0;
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        int nargs = op->opc == INDEX_op_call
+                    ? TCGOP_CALLO(op) + TCGOP_CALLI(op)
+                    : def->nb_oargs + def->nb_iargs;
+
+        for (int i = 0; i < nargs; i++) {
+            TCGTemp *ts = arg_temp(op->args[i]);
+            size_t idx;
+
+            if (!ts) {
+                continue;
+            }
+            idx = temp_idx(ts);
+            if (idx < ng && !test_bit(idx, seen)) {
+                set_bit(idx, seen);
+                s->la_globals[s->nb_la_globals++] = idx;
+            }
+        }
     }
 }
 
@@ -3904,6 +3950,13 @@ liveness_pass_1(TCGContext *s)
     for (int i = 0; i < nb_temps; ++i) {
         s->temps[i].state_ptr = prefs + i;
     }
+
+    /* Every global starts out in memory; liveness tracks those named. */
+    for (int i = 0; i < nb_globals; ++i) {
+        s->temps[i].state = TS_DEAD | TS_MEM;
+        la_reset_pref(&s->temps[i]);
+    }
+    la_find_globals(s);
 
     /* ??? Should be redundant with the exit_tb that ends the TB.  */
     la_func_end(s, nb_globals, nb_temps);
