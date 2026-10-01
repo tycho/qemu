@@ -25,6 +25,13 @@
 #ifndef TCG_STARTUP_H
 #define TCG_STARTUP_H
 
+/*
+ * A TB whose direct jump returns to its first insn branches back within
+ * the TB instead of chaining to itself, and the register allocator keeps
+ * values in host registers across the labels of such a loop.
+ */
+extern bool tcg_region;
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size
