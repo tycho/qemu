@@ -1637,37 +1637,84 @@ static const TCGLdstHelperParam ldst_helper_param = {
 };
 
 /*
- * Save (restore) the vector registers that hold values around a guest
- * access slow path's helper call, below the frame.
+ * Around a guest access slow path's helper call: save @regs below SP, or
+ * restore them except @keep (the access's outputs) and release the area.
  */
-static void tcg_out_ldst_save(TCGContext *s, TCGRegSet regs, bool restore)
+static void tcg_out_ldst_save(TCGContext *s, TCGRegSet regs, bool restore,
+                              TCGRegSet keep)
 {
-    unsigned n = 0, off = 0;
+    unsigned nv = 0, nx = 0, size, off = 0;
 
-    for (TCGReg r = TCG_REG_V0; r <= TCG_REG_V31; r++) {
-        n += tcg_regset_test_reg(regs, r);
+    for (TCGReg r = TCG_REG_X0; r <= TCG_REG_V31; r++) {
+        if (tcg_regset_test_reg(regs, r)) {
+            if (r >= TCG_REG_V0) {
+                nv++;
+            } else {
+                nx++;
+            }
+        }
     }
-    if (n == 0) {
+    size = nv * 16 + ROUND_UP(nx * 8, 16);
+    if (size == 0) {
         return;
     }
     if (!restore) {
         tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64,
-                     TCG_REG_SP, TCG_REG_SP, n * 16);
+                     TCG_REG_SP, TCG_REG_SP, size);
     }
     for (TCGReg r = TCG_REG_V0; r <= TCG_REG_V31; r++) {
         if (tcg_regset_test_reg(regs, r)) {
-            if (restore) {
-                tcg_out_ld(s, TCG_TYPE_V128, r, TCG_REG_SP, off);
-            } else {
+            if (!restore) {
                 tcg_out_st(s, TCG_TYPE_V128, r, TCG_REG_SP, off);
+            } else if (!tcg_regset_test_reg(keep, r)) {
+                tcg_out_ld(s, TCG_TYPE_V128, r, TCG_REG_SP, off);
             }
             off += 16;
         }
     }
+    for (TCGReg r = TCG_REG_X0; r < TCG_REG_V0; r++) {
+        if (tcg_regset_test_reg(regs, r)) {
+            if (!restore) {
+                tcg_out_st(s, TCG_TYPE_I64, r, TCG_REG_SP, off);
+            } else if (!tcg_regset_test_reg(keep, r)) {
+                tcg_out_ld(s, TCG_TYPE_I64, r, TCG_REG_SP, off);
+            }
+            off += 8;
+        }
+    }
     if (restore) {
         tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64,
-                     TCG_REG_SP, TCG_REG_SP, n * 16);
+                     TCG_REG_SP, TCG_REG_SP, size);
     }
+}
+
+/* tcg_lazysync: store the dirty globals before the slow path's call. */
+static void tcg_out_ldst_writeback(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    for (unsigned i = 0; i < lb->nb_wb; i++) {
+        const TCGLdstWriteback *wb = &lb->wb[i];
+
+        if (wb->is_const) {
+            tcg_out_movi(s, wb->type, TCG_REG_TMP0, wb->val);
+            tcg_out_st(s, wb->type, TCG_REG_TMP0, wb->base, wb->offset);
+        } else {
+            tcg_out_st(s, wb->type, wb->reg, wb->base, wb->offset);
+        }
+    }
+}
+
+/* The registers a load's slow path sets, not to be restored over. */
+static TCGRegSet ldst_outputs(TCGLabelQemuLdst *lb)
+{
+    TCGRegSet set = 0;
+
+    if (lb->is_ld) {
+        tcg_regset_set_reg(set, lb->datalo_reg);
+        if (lb->type == TCG_TYPE_I128) {
+            tcg_regset_set_reg(set, lb->datahi_reg);
+        }
+    }
+    return set;
 }
 
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
@@ -1678,11 +1725,12 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
         return false;
     }
 
-    tcg_out_ldst_save(s, lb->save_regs, false);
+    tcg_out_ldst_writeback(s, lb);
+    tcg_out_ldst_save(s, lb->save_regs, false, 0);
     tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
     tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
-    tcg_out_ldst_save(s, lb->save_regs, true);
+    tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
     tcg_out_goto(s, lb->raddr);
     return true;
 }
@@ -1695,10 +1743,11 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
         return false;
     }
 
-    tcg_out_ldst_save(s, lb->save_regs, false);
+    tcg_out_ldst_writeback(s, lb);
+    tcg_out_ldst_save(s, lb->save_regs, false, 0);
     tcg_out_st_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_st_helpers[opc & MO_SIZE]);
-    tcg_out_ldst_save(s, lb->save_regs, true);
+    tcg_out_ldst_save(s, lb->save_regs, true, 0);
     tcg_out_goto(s, lb->raddr);
     return true;
 }
@@ -3649,6 +3698,8 @@ static void tcg_target_init(TCGContext *s)
     for (TCGReg r = TCG_REG_V0; r <= TCG_REG_V31; r++) {
         tcg_regset_reset_reg(tcg_target_ldst_clobber_regs, r);
     }
+    /* They also save the integer registers, and store dirty globals. */
+    tcg_target_ldst_writeback = true;
 
     s->reserved_regs = 0;
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_SP);
