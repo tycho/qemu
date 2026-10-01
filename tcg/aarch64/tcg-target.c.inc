@@ -590,6 +590,7 @@ typedef enum {
     Isimd_copy_DUP     = 0x0e000400,
     Isimd_copy_INS     = 0x4e001c00,
     Isimd_copy_UMOV    = 0x0e003c00,
+    Isimd_copy_INSE    = 0x6e000400,     /* INS (element) */
 
     /* FMOV (general), X to D: writes the whole vector register. */
     Ifmov_DX          = 0x9e670000,
@@ -646,6 +647,15 @@ typedef enum {
 
     /* AdvSIMD three same.  */
     Iqrrr_e_ADD       = 0x0e208400,
+    Iqrrr_e_UZP1      = 0x0e001800,
+    Iqrrr_e_TRN1      = 0x0e002800,
+    Iqrrr_e_ZIP1      = 0x0e003800,
+    Iqrrr_e_UZP2      = 0x0e005800,
+    Iqrrr_e_TRN2      = 0x0e006800,
+    Iqrrr_e_ZIP2      = 0x0e007800,
+    Iqrrr_e_TBL       = 0x0e000000,      /* one table register */
+    Iqrrr_e_TBX       = 0x0e001000,
+    Iqrrr_e_EXT       = 0x2e000000,      /* index in bits 11-14 */
     Iqrrr_e_AND       = 0x0e201c00,
     Iqrrr_e_BIC       = 0x0e601c00,
     Iqrrr_e_BIF       = 0x2ee01c00,
@@ -690,6 +700,9 @@ typedef enum {
     Iqrrr_e_FCMGT     = 0x2ea0e400,
 
     /* AdvSIMD two-reg misc.  */
+    Iqrr_e_REV64      = 0x0e200800,
+    Iqrr_e_REV32      = 0x2e200800,
+    Iqrr_e_REV16      = 0x0e201800,
     Iqrr_e_CMGT0      = 0x0e208800,
     Iqrr_e_CMEQ0      = 0x0e209800,
     Iqrr_e_CMLT0      = 0x0e20a800,
@@ -3457,6 +3470,388 @@ static const TCGOutOpStore outop_st = {
     .out_r = tcg_out_st,
 };
 
+/*
+ * perm_vec.  The result is described byte by byte, as indices into the
+ * 32 bytes of a1:a2.  Every single instruction that permutes a1 and a2
+ * is listed with the bytes it gives; the cheapest way to get the result
+ * from those is emitted:
+ *
+ * - one of them (or MOV, or nothing);
+ * - the two 64-bit halves from two of them or from the inputs, joined by
+ *   ZIP1 .2D;
+ * - a copy of one input with up to two elements inserted (INS);
+ * - TBL of one input, or TBL of one then TBX of the other, with index
+ *   vectors from the constant pool.
+ */
+typedef struct PermCand {
+    void (*emit)(TCGContext *s, const struct PermCand *c, TCGReg rd);
+    AArch64Insn insn;
+    unsigned size;              /* log2 of the element size in bytes */
+    TCGReg n, m;
+    unsigned imm;
+    uint8_t bytes[16];          /* result, as indices into a1:a2 */
+} PermCand;
+
+static void perm_emit_rrr(TCGContext *s, const PermCand *c, TCGReg rd)
+{
+    tcg_out_insn_qrrr_e(s, c->insn, 1, c->size, rd, c->n, c->m);
+}
+
+static void perm_emit_ext(TCGContext *s, const PermCand *c, TCGReg rd)
+{
+    tcg_out32(s, Iqrrr_e_EXT | 1 << 30 | (c->m & 0x1f) << 16 | c->imm << 11
+              | (c->n & 0x1f) << 5 | (rd & 0x1f));
+}
+
+static void perm_emit_rr(TCGContext *s, const PermCand *c, TCGReg rd)
+{
+    tcg_out_insn_qrr_e(s, c->insn, 1, c->size, rd, c->n);
+}
+
+static void perm_emit_dup(TCGContext *s, const PermCand *c, TCGReg rd)
+{
+    tcg_out_insn(s, simd_copy, DUP, 1, rd, c->n,
+                 (c->imm << (c->size + 1)) | (1 << c->size), 0);
+}
+
+/* The element an instruction takes for element e, from n (0..ne-1) or m. */
+static unsigned perm_rrr_src(AArch64Insn insn, unsigned ne, unsigned e)
+{
+    unsigned h = ne / 2;
+
+    switch (insn) {
+    case Iqrrr_e_ZIP1:
+        return (e & 1 ? ne : 0) + e / 2;
+    case Iqrrr_e_ZIP2:
+        return (e & 1 ? ne : 0) + h + e / 2;
+    case Iqrrr_e_UZP1:
+        return e < h ? 2 * e : ne + 2 * (e - h);
+    case Iqrrr_e_UZP2:
+        return e < h ? 2 * e + 1 : ne + 2 * (e - h) + 1;
+    case Iqrrr_e_TRN1:
+        return e & 1 ? ne + e - 1 : e;
+    case Iqrrr_e_TRN2:
+        return e & 1 ? ne + e : e + 1;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+/*
+ * Record candidate c, whose result bytes are given in terms of its own
+ * operands (0-15 for n, 16-31 for m), in a1:a2 terms.
+ */
+static void perm_add(PermCand *list, unsigned *count, PermCand c,
+                     const uint8_t *opbytes, unsigned nx, unsigned mx)
+{
+    for (int i = 0; i < 16; i++) {
+        c.bytes[i] = opbytes[i] < 16 ? nx + opbytes[i]
+                                     : mx + opbytes[i] - 16;
+    }
+    list[(*count)++] = c;
+}
+
+static unsigned perm_list(PermCand *list, TCGReg a1, TCGReg a2)
+{
+    static const AArch64Insn rrr[] = {
+        Iqrrr_e_ZIP1, Iqrrr_e_ZIP2, Iqrrr_e_UZP1,
+        Iqrrr_e_UZP2, Iqrrr_e_TRN1, Iqrrr_e_TRN2,
+    };
+    static const AArch64Insn rev[] = {
+        Iqrr_e_REV64, Iqrr_e_REV32, Iqrr_e_REV16,
+    };
+    TCGReg reg[2] = { a1, a2 };
+    int nsrc = a1 == a2 ? 1 : 2;
+    unsigned count = 0;
+    uint8_t b[16];
+
+    for (int x = 0; x < nsrc; x++) {
+        for (unsigned sz = 0; sz < 4; sz++) {
+            unsigned w = 1 << sz;
+
+            for (unsigned j = 0; j < 16 / w; j++) {
+                for (int i = 0; i < 16; i++) {
+                    b[i] = j * w + i % w;
+                }
+                perm_add(list, &count, (PermCand){
+                    .emit = perm_emit_dup, .size = sz, .n = reg[x], .imm = j,
+                }, b, 16 * x, 16 * x);
+            }
+        }
+        for (int k = 0; k < ARRAY_SIZE(rev); k++) {
+            unsigned span = 8 >> k;     /* container: 8, 4, 2 bytes */
+
+            for (unsigned sz = 0; (1u << sz) < span; sz++) {
+                unsigned w = 1 << sz;
+
+                for (int i = 0; i < 16; i++) {
+                    unsigned base = i / span * span, off = i % span;
+                    b[i] = base + (span - w - off / w * w) + off % w;
+                }
+                perm_add(list, &count, (PermCand){
+                    .emit = perm_emit_rr, .insn = rev[k], .size = sz,
+                    .n = reg[x],
+                }, b, 16 * x, 16 * x);
+            }
+        }
+        for (int y = 0; y < nsrc; y++) {
+            for (unsigned sz = 0; sz < 4; sz++) {
+                unsigned w = 1 << sz, ne = 16 / w;
+
+                for (int k = 0; k < ARRAY_SIZE(rrr); k++) {
+                    for (unsigned e = 0; e < ne; e++) {
+                        unsigned src = perm_rrr_src(rrr[k], ne, e);
+
+                        for (unsigned i = 0; i < w; i++) {
+                            b[e * w + i] = src * w + i;
+                        }
+                    }
+                    perm_add(list, &count, (PermCand){
+                        .emit = perm_emit_rrr, .insn = rrr[k], .size = sz,
+                        .n = reg[x], .m = reg[y],
+                    }, b, 16 * x, 16 * y);
+                }
+            }
+            for (unsigned k = 1; k < 16; k++) {
+                for (int i = 0; i < 16; i++) {
+                    b[i] = i + k;
+                }
+                perm_add(list, &count, (PermCand){
+                    .emit = perm_emit_ext, .n = reg[x], .m = reg[y], .imm = k,
+                }, b, 16 * x, 16 * y);
+            }
+        }
+    }
+    return count;
+}
+
+/* Load the 16-byte constant idx into TCG_VEC_TMP0. */
+static void perm_load_index(TCGContext *s, const uint8_t *idx)
+{
+    uint64_t lo, hi;
+
+    memcpy(&lo, idx, 8);
+    memcpy(&hi, idx + 8, 8);
+    new_pool_l2(s, R_AARCH64_CONDBR19, s->code_ptr, 0, lo, hi);
+    tcg_out_insn(s, ldlit, LDR_v128, 0, TCG_VEC_TMP0);
+}
+
+/*
+ * A copy of input bx with the elements (of 1 << sz bytes) that differ
+ * inserted: the number of instructions, or UINT_MAX if more than three.
+ */
+static unsigned perm_ins_cost(const uint8_t *want, unsigned sz, int bx,
+                              TCGReg a0, const TCGReg *reg, bool *tmp)
+{
+    unsigned w = 1 << sz, cost = reg[bx] != a0, nd = 0;
+
+    *tmp = false;
+    for (unsigned e = 0; e < 16 / w; e++) {
+        unsigned first = want[e * w];
+
+        for (unsigned i = 0; i < w; i++) {
+            if (want[e * w + i] != first + i
+                || (sz && first % w)) {
+                return UINT_MAX;
+            }
+        }
+        if (first != 16 * bx + e * w) {
+            nd++;
+            /* A source a0 overwrites is read from a copy. */
+            if (reg[first >= 16] == a0 && !*tmp) {
+                *tmp = true;
+                cost++;
+            }
+        }
+    }
+    cost += nd;
+    return nd <= 2 && cost <= 3 ? cost : UINT_MAX;
+}
+
+static void tcg_out_perm_vec(TCGContext *s, unsigned vece, TCGReg a0,
+                             TCGReg a1, TCGReg a2, uint32_t pattern)
+{
+    PermCand list[320];
+    unsigned es = 1 << vece, ne = 16 >> vece, count;
+    unsigned best = UINT_MAX, half_cost[2];
+    uint8_t want[16];
+    TCGReg reg[2] = { a1, a2 };
+    bool from[2] = { false, false };
+    int half[2] = { -1, -1 };
+    int ins_sz = -1, ins_bx = 0;
+    bool ins_tmp = false;
+
+    for (unsigned e = 0; e < ne; e++) {
+        unsigned idx = (pattern >> (4 * e)) & 15;
+
+        tcg_debug_assert(idx < 2 * ne);
+        for (unsigned b = 0; b < es; b++) {
+            want[e * es + b] = idx * es + b;
+        }
+    }
+    /* The same register as both inputs: one source. */
+    if (a1 == a2) {
+        for (int i = 0; i < 16; i++) {
+            want[i] &= 15;
+        }
+    }
+    for (int i = 0; i < 16; i++) {
+        from[want[i] >= 16] = true;
+    }
+
+    /* An input as it is. */
+    for (int x = 0; x < 2; x++) {
+        bool same = true;
+
+        for (int i = 0; i < 16; i++) {
+            same &= want[i] == 16 * x + i;
+        }
+        if (same) {
+            if (reg[x] != a0) {
+                tcg_out_mov(s, TCG_TYPE_V128, a0, reg[x]);
+            }
+            return;
+        }
+    }
+
+    /* One instruction. */
+    count = perm_list(list, a1, a2);
+    tcg_debug_assert(count <= ARRAY_SIZE(list));
+    for (unsigned k = 0; k < count; k++) {
+        if (!memcmp(list[k].bytes, want, 16)) {
+            list[k].emit(s, &list[k], a0);
+            return;
+        }
+    }
+
+    /*
+     * Two halves.  For each, the cheapest register that has it in its low
+     * 64 bits: an input (half[h] = -2 - x, free) or a candidate (1).  If
+     * the high half is an input that a0 is, and the low half is computed
+     * into a0, the high half is copied first.
+     */
+    for (int h = 0; h < 2; h++) {
+        half_cost[h] = UINT_MAX;
+        for (int x = 0; x < 2; x++) {
+            bool same = true;
+
+            for (int i = 0; i < 8; i++) {
+                same &= want[8 * h + i] == 16 * x + i;
+            }
+            if (same) {
+                half_cost[h] = 0;
+                half[h] = -2 - x;
+            }
+        }
+        for (unsigned k = 0; k < count && half_cost[h]; k++) {
+            if (!memcmp(list[k].bytes, want + 8 * h, 8)) {
+                half_cost[h] = 1;
+                half[h] = k;
+            }
+        }
+    }
+    if (half_cost[0] != UINT_MAX && half_cost[1] != UINT_MAX) {
+        best = half_cost[0] + half_cost[1] + 1;
+        if (half[1] < 0 && reg[-2 - half[1]] == a0 && half[0] >= 0) {
+            best++;
+        }
+    }
+
+    /* INS into a copy of an input, at the widest element size that fits. */
+    for (int sz = 3; sz >= 0; sz--) {
+        for (int x = 0; x < 2; x++) {
+            bool tmp;
+            unsigned c = perm_ins_cost(want, sz, x, a0, reg, &tmp);
+
+            if (c < best) {
+                best = c;
+                ins_sz = sz;
+                ins_bx = x;
+                ins_tmp = tmp;
+            }
+        }
+    }
+
+    if (best <= 3 && ins_sz >= 0) {
+        unsigned w = 1 << ins_sz;
+        TCGReg src[2] = { a1, a2 };
+
+        if (ins_tmp) {
+            tcg_out_mov(s, TCG_TYPE_V128, TCG_VEC_TMP0, a0);
+            for (int x = 0; x < 2; x++) {
+                if (src[x] == a0) {
+                    src[x] = TCG_VEC_TMP0;
+                }
+            }
+        }
+        if (reg[ins_bx] != a0) {
+            tcg_out_mov(s, TCG_TYPE_V128, a0, src[ins_bx]);
+        }
+        for (unsigned e = 0; e < 16 / w; e++) {
+            unsigned f = want[e * w];
+
+            if (f != 16 * ins_bx + e * w) {
+                tcg_out_insn(s, simd_copy, INSE, 0, a0, src[f >= 16],
+                             (e << (ins_sz + 1)) | (1 << ins_sz),
+                             (f % 16 / w) << ins_sz);
+            }
+        }
+        return;
+    }
+    if (best <= 3) {
+        /* The high half first, into the scratch register if computed. */
+        TCGReg rl, rh;
+
+        if (half[1] >= 0) {
+            list[half[1]].emit(s, &list[half[1]], TCG_VEC_TMP0);
+            rh = TCG_VEC_TMP0;
+        } else {
+            rh = reg[-2 - half[1]];
+            if (rh == a0 && half[0] >= 0) {
+                tcg_out_mov(s, TCG_TYPE_V128, TCG_VEC_TMP0, rh);
+                rh = TCG_VEC_TMP0;
+            }
+        }
+        if (half[0] >= 0) {
+            list[half[0]].emit(s, &list[half[0]], a0);
+            rl = a0;
+        } else {
+            rl = reg[-2 - half[0]];
+        }
+        tcg_out_insn(s, qrrr_e, ZIP1, 1, MO_64, a0, rl, rh);
+        return;
+    }
+
+    /* TBL, one input; TBL then TBX, two (the input a0 overwrites first). */
+    if (!(from[0] && from[1])) {
+        uint8_t idx[16];
+
+        for (int i = 0; i < 16; i++) {
+            idx[i] = want[i] & 15;
+        }
+        perm_load_index(s, idx);
+        tcg_out_insn(s, qrrr_e, TBL, 1, 0, a0, from[0] ? a1 : a2,
+                     TCG_VEC_TMP0);
+    } else {
+        int first = a0 == a2 ? 1 : 0;
+
+        for (int pass = 0; pass < 2; pass++) {
+            int x = pass ? !first : first;
+            uint8_t idx[16];
+
+            for (int i = 0; i < 16; i++) {
+                idx[i] = (want[i] >= 16) == x ? want[i] & 15 : 0xff;
+            }
+            perm_load_index(s, idx);
+            if (pass) {
+                tcg_out_insn(s, qrrr_e, TBX, 1, 0, a0, reg[x], TCG_VEC_TMP0);
+            } else {
+                tcg_out_insn(s, qrrr_e, TBL, 1, 0, a0, reg[x], TCG_VEC_TMP0);
+            }
+        }
+    }
+}
+
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                            unsigned vecl, unsigned vece,
                            const TCGArg args[TCG_MAX_OP_ARGS],
@@ -3511,6 +3906,9 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         break;
     case INDEX_op_dupm_vec:
         tcg_out_dupm_vec(s, type, vece, a0, a1, a2);
+        break;
+    case INDEX_op_perm_vec:
+        tcg_out_perm_vec(s, vece, a0, a1, a2, args[3]);
         break;
     case INDEX_op_concat_i64_vec:
         /*
@@ -4003,6 +4401,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
 
     case INDEX_op_concat_i64_vec:
         return type == TCG_TYPE_V128 && vece == MO_64;
+    case INDEX_op_perm_vec:
+        return type == TCG_TYPE_V128 && vece >= MO_16 && vece <= MO_64;
 
     case INDEX_op_fadd_vec:
     case INDEX_op_fsub_vec:
@@ -4205,6 +4605,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O0_I2(w, r);
     case INDEX_op_concat_i64_vec:
         return C_O1_I2(w, r, r);
+    case INDEX_op_perm_vec:
+        return C_O1_I2(w, w, w);
     case INDEX_op_dup_vec:
         return C_O1_I1(w, wr);
     case INDEX_op_or_vec:

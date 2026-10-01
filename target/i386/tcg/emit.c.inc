@@ -925,19 +925,101 @@ FMA_SSE_PACKED(VFMSUBADD231, 1, 2, 0, 0, float_muladd_negate_c)
 FMA_SSE_PACKED(VFMSUBADD213, 1, 0, 2, 0, float_muladd_negate_c)
 FMA_SSE_PACKED(VFMSUBADD132, 0, 2, 1, 0, float_muladd_negate_c)
 
-#define FP_UNPACK_SSE(uname, lname)                                                \
-static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
-{                                                                                  \
-    /* PS maps to the DQ integer instruction, PD maps to QDQ.  */                  \
-    gen_fp_sse(s, decode,                                                          \
-               gen_helper_##lname##qdq_xmm,                                        \
-               gen_helper_##lname##dq_xmm,                                         \
-               gen_helper_##lname##qdq_ymm,                                        \
-               gen_helper_##lname##dq_ymm,                                         \
-               NULL, NULL);                                                        \
+/*
+ * With x-vperm, permutes by constants of 128-bit lanes: lane l of operand
+ * 0 is perm_vec (pattern pat[l]) of lane l of operands src1 and src2,
+ * which are the same for the one-source forms.  All lanes are read before
+ * any is written, so operand 0 may also be a source.
+ */
+static bool gen_vperm(DisasContext *s, X86DecodedInsn *decode, unsigned vece,
+                      int src1, int src2, const uint32_t *pat)
+{
+    int lanes = vector_len(s, decode) / 16;
+    TCGv_vec r[2];
+
+    /* The same register as both sources: one input, as the backend sees. */
+    if (decode->op[src1].offset == decode->op[src2].offset) {
+        src2 = src1;
+    }
+    if (!tcg_vperm || decode->op[0].unit != X86_OP_SSE
+        || tcg_can_emit_vec_op(INDEX_op_perm_vec, TCG_TYPE_V128, vece) <= 0) {
+        return false;
+    }
+    for (int l = 0; l < lanes; l++) {
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec b = a;
+
+        tcg_gen_ld_vec(a, tcg_env, decode->op[src1].offset + 16 * l);
+        if (src2 != src1) {
+            b = tcg_temp_new_vec(TCG_TYPE_V128);
+            tcg_gen_ld_vec(b, tcg_env, decode->op[src2].offset + 16 * l);
+        }
+        r[l] = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_perm_vec(vece, r[l], a, b, pat[l]);
+    }
+    for (int l = 0; l < lanes; l++) {
+        tcg_gen_st_vec(r[l], tcg_env, decode->op[0].offset + 16 * l);
+    }
+    return true;
 }
-FP_UNPACK_SSE(VUNPCKLPx, punpckl)
-FP_UNPACK_SSE(VUNPCKHPx, punpckh)
+
+/* perm_vec patterns: element i from element x_i of the two inputs. */
+#define PERM2(a, b)         ((a) | (b) << 4)
+#define PERM4(a, b, c, d)   ((a) | (b) << 4 | (c) << 8 | (d) << 12)
+
+/* The UNPCKL and UNPCKH interleaves of elements of size vece. */
+static uint32_t perm_unpck(unsigned vece, bool high)
+{
+    unsigned n = 16 >> vece;
+    uint32_t pat = 0;
+
+    for (unsigned k = 0; k < n / 2; k++) {
+        unsigned x = k + (high ? n / 2 : 0);
+
+        pat |= x << (8 * k) | (n + x) << (8 * k + 4);
+    }
+    return pat;
+}
+
+/* Blend: element i from the second input where bit i of imm is set. */
+static uint32_t perm_blend(unsigned vece, unsigned imm)
+{
+    unsigned n = 16 >> vece;
+    uint32_t pat = 0;
+
+    for (unsigned i = 0; i < n; i++) {
+        pat |= (i + ((imm >> i) & 1 ? n : 0)) << (4 * i);
+    }
+    return pat;
+}
+
+static bool gen_vperm_unpck(DisasContext *s, X86DecodedInsn *decode,
+                            unsigned vece, bool high)
+{
+    uint32_t pat[2];
+
+    pat[0] = pat[1] = perm_unpck(vece, high);
+    return gen_vperm(s, decode, vece, 1, 2, pat);
+}
+
+#define FP_UNPACK_SSE(uname, lname, high)                                     \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    if (!(s->prefix & (PREFIX_REPZ | PREFIX_REPNZ))                           \
+        && gen_vperm_unpck(s, decode,                                         \
+                           s->prefix & PREFIX_DATA ? MO_64 : MO_32, high)) {  \
+        return;                                                               \
+    }                                                                         \
+    /* PS maps to the DQ integer instruction, PD maps to QDQ.  */             \
+    gen_fp_sse(s, decode,                                                     \
+               gen_helper_##lname##qdq_xmm,                                   \
+               gen_helper_##lname##dq_xmm,                                    \
+               gen_helper_##lname##qdq_ymm,                                   \
+               gen_helper_##lname##dq_ymm,                                    \
+               NULL, NULL);                                                   \
+}
+FP_UNPACK_SSE(VUNPCKLPx, punpckl, false)
+FP_UNPACK_SSE(VUNPCKHPx, punpckh, true)
 
 /*
  * 00 = v*ps Vps, Wpd
@@ -1065,9 +1147,28 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                        gen_helper_##lname##_ymm);                                  \
 }
 
-BINARY_IMM_SSE(VBLENDPD,   blendpd)
-BINARY_IMM_SSE(VBLENDPS,   blendps)
-BINARY_IMM_SSE(VPBLENDW,   pblendw)
+/*
+ * Blends: VBLENDPS (and VPBLENDD) and VBLENDPD take one immediate bit per
+ * element across both lanes, VPBLENDW the same 8 bits in each lane.
+ */
+#define BLEND_SSE(uname, lname, vece, per_lane)                               \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    unsigned n = 16 >> (vece), imm = decode->immediate & 0xff;                \
+    uint32_t pat[2] = {                                                       \
+        perm_blend(vece, imm), perm_blend(vece, (per_lane) ? imm : imm >> n), \
+    };                                                                        \
+                                                                              \
+    if (gen_vperm(s, decode, vece, 1, 2, pat)) {                              \
+        return;                                                               \
+    }                                                                         \
+    gen_binary_imm_sse(s, decode,                                             \
+                       gen_helper_##lname##_xmm,                              \
+                       gen_helper_##lname##_ymm);                             \
+}
+BLEND_SSE(VBLENDPD,   blendpd, MO_64, false)
+BLEND_SSE(VBLENDPS,   blendps, MO_32, false)
+BLEND_SSE(VPBLENDW,   pblendw, MO_16, true)
 BINARY_IMM_SSE(VDPPS,      dpps)
 #define gen_helper_dppd_ymm NULL
 BINARY_IMM_SSE(VDPPD,      dppd)
@@ -1181,14 +1282,27 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                           gen_helper_##lname##_xmm,                                \
                           gen_helper_##lname##_ymm);                               \
 }
+/* Integer unpacks: with x-vperm, the SSE forms of 16-bit elements or wider. */
+#define PUNPCK_INT_MMX(uname, lname, vece, high)                              \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    if ((s->prefix & PREFIX_DATA)                                             \
+        && gen_vperm_unpck(s, decode, vece, high)) {                          \
+        return;                                                               \
+    }                                                                         \
+    gen_binary_int_sse(s, decode,                                             \
+                          gen_helper_##lname##_mmx,                           \
+                          gen_helper_##lname##_xmm,                           \
+                          gen_helper_##lname##_ymm);                          \
+}
 BINARY_INT_MMX(PUNPCKLBW,  punpcklbw)
-BINARY_INT_MMX(PUNPCKLWD,  punpcklwd)
-BINARY_INT_MMX(PUNPCKLDQ,  punpckldq)
+PUNPCK_INT_MMX(PUNPCKLWD,  punpcklwd, MO_16, false)
+PUNPCK_INT_MMX(PUNPCKLDQ,  punpckldq, MO_32, false)
 BINARY_INT_MMX(PACKSSWB,   packsswb)
 BINARY_INT_MMX(PACKUSWB,   packuswb)
 BINARY_INT_MMX(PUNPCKHBW,  punpckhbw)
-BINARY_INT_MMX(PUNPCKHWD,  punpckhwd)
-BINARY_INT_MMX(PUNPCKHDQ,  punpckhdq)
+PUNPCK_INT_MMX(PUNPCKHWD,  punpckhwd, MO_16, true)
+PUNPCK_INT_MMX(PUNPCKHDQ,  punpckhdq, MO_32, true)
 BINARY_INT_MMX(PACKSSDW,   packssdw)
 
 BINARY_INT_MMX(PAVGB,   pavgb)
@@ -1232,8 +1346,19 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
 }
 
 /* Instructions with no MMX equivalent.  */
-BINARY_INT_SSE(PUNPCKLQDQ, punpcklqdq)
-BINARY_INT_SSE(PUNPCKHQDQ, punpckhqdq)
+#define PUNPCK_INT_SSE(uname, lname, vece, high)                              \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    if (gen_vperm_unpck(s, decode, vece, high)) {                             \
+        return;                                                               \
+    }                                                                         \
+    gen_binary_int_sse(s, decode,                                             \
+                          NULL,                                               \
+                          gen_helper_##lname##_xmm,                           \
+                          gen_helper_##lname##_ymm);                          \
+}
+PUNPCK_INT_SSE(PUNPCKLQDQ, punpcklqdq, MO_64, false)
+PUNPCK_INT_SSE(PUNPCKHQDQ, punpckhqdq, MO_64, true)
 BINARY_INT_SSE(VPACKUSDW,  packusdw)
 BINARY_INT_SSE(VPERMILPS,  vpermilps)
 BINARY_INT_SSE(VPERMILPD,  vpermilpd)
@@ -1293,9 +1418,21 @@ UNARY_INT_SSE(VPMOVZXWD,    pmovzxwd)
 UNARY_INT_SSE(VPMOVZXWQ,    pmovzxwq)
 UNARY_INT_SSE(VPMOVZXDQ,    pmovzxdq)
 
-UNARY_INT_SSE(VMOVSLDUP,    pmovsldup)
-UNARY_INT_SSE(VMOVSHDUP,    pmovshdup)
-UNARY_INT_SSE(VMOVDDUP,     pmovdldup)
+#define DUP_SSE(uname, lname, vece, pattern)                                  \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    static const uint32_t pat[2] = { pattern, pattern };                      \
+                                                                              \
+    if (gen_vperm(s, decode, vece, 2, 2, pat)) {                              \
+        return;                                                               \
+    }                                                                         \
+    gen_unary_int_sse(s, decode,                                              \
+                      gen_helper_##lname##_xmm,                               \
+                      gen_helper_##lname##_ymm);                              \
+}
+DUP_SSE(VMOVSLDUP, pmovsldup, MO_32, PERM4(0, 0, 2, 2))
+DUP_SSE(VMOVSHDUP, pmovshdup, MO_32, PERM4(1, 1, 3, 3))
+DUP_SSE(VMOVDDUP,  pmovdldup, MO_64, PERM2(0, 0))
 
 UNARY_INT_SSE(VCVTDQ2PD, cvtdq2pd)
 UNARY_INT_SSE(VCVTPD2DQ, cvtpd2dq)
@@ -1377,13 +1514,71 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                       gen_helper_##lname##_ymm);                                   \
 }
 
-UNARY_IMM_SSE(PSHUFD,     pshufd)
-UNARY_IMM_SSE(PSHUFHW,    pshufhw)
-UNARY_IMM_SSE(PSHUFLW,    pshuflw)
+/* PSHUFD, PSHUFHW, PSHUFLW and VPERMILPS (immediate): the same in each lane. */
+#define PSHUF_SSE(uname, lname, vece, lo, hi)                                 \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    unsigned imm = decode->immediate & 0xff;                                  \
+    uint32_t f = PERM4(imm & 3, (imm >> 2) & 3, (imm >> 4) & 3, imm >> 6);    \
+    uint32_t pat[2];                                                          \
+                                                                              \
+    pat[0] = pat[1] = (lo) ? f | PERM4(4, 5, 6, 7) << 16                      \
+                    : (hi) ? PERM4(0, 1, 2, 3) | (f + 0x4444) << 16 : f;      \
+    if (gen_vperm(s, decode, vece, 1, 1, pat)) {                              \
+        return;                                                               \
+    }                                                                         \
+    gen_unary_imm_sse(s, decode,                                              \
+                      gen_helper_##lname##_xmm,                               \
+                      gen_helper_##lname##_ymm);                              \
+}
+PSHUF_SSE(PSHUFD,      pshufd,        MO_32, false, false)
+PSHUF_SSE(PSHUFHW,     pshufhw,       MO_16, false, true)
+PSHUF_SSE(PSHUFLW,     pshuflw,       MO_16, true,  false)
 #define gen_helper_vpermq_xmm NULL
-UNARY_IMM_SSE(VPERMQ,      vpermq)
-UNARY_IMM_SSE(VPERMILPS_i, vpermilps_imm)
-UNARY_IMM_SSE(VPERMILPD_i, vpermilpd_imm)
+PSHUF_SSE(VPERMILPS_i, vpermilps_imm, MO_32, false, false)
+
+/* VPERMILPD (immediate): element i of lane l from bit 2l + i. */
+static void gen_VPERMILPD_i(DisasContext *s, X86DecodedInsn *decode)
+{
+    unsigned imm = decode->immediate & 0xff;
+    uint32_t pat[2] = {
+        PERM2(imm & 1, (imm >> 1) & 1), PERM2((imm >> 2) & 1, (imm >> 3) & 1),
+    };
+
+    if (gen_vperm(s, decode, MO_64, 1, 1, pat)) {
+        return;
+    }
+    gen_unary_imm_sse(s, decode,
+                      gen_helper_vpermilpd_imm_xmm,
+                      gen_helper_vpermilpd_imm_ymm);
+}
+
+/*
+ * VPERMQ/VPERMPD: across the whole 256 bits, so each lane of the result
+ * is a permute of both lanes of the source.
+ */
+static void gen_VPERMQ(DisasContext *s, X86DecodedInsn *decode)
+{
+    unsigned imm = decode->immediate & 0xff;
+
+    if (tcg_vperm && decode->op[0].unit == X86_OP_SSE
+        && tcg_can_emit_vec_op(INDEX_op_perm_vec, TCG_TYPE_V128, MO_64) > 0) {
+        TCGv_vec lo = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec hi = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec r0 = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec r1 = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(lo, tcg_env, decode->op[1].offset);
+        tcg_gen_ld_vec(hi, tcg_env, decode->op[1].offset + 16);
+        tcg_gen_perm_vec(MO_64, r0, lo, hi, PERM2(imm & 3, (imm >> 2) & 3));
+        tcg_gen_perm_vec(MO_64, r1, lo, hi,
+                         PERM2((imm >> 4) & 3, (imm >> 6) & 3));
+        tcg_gen_st_vec(r0, tcg_env, decode->op[0].offset);
+        tcg_gen_st_vec(r1, tcg_env, decode->op[0].offset + 16);
+        return;
+    }
+    gen_unary_imm_sse(s, decode, gen_helper_vpermq_xmm, gen_helper_vpermq_ymm);
+}
 
 static inline void gen_unary_imm_fp_sse(DisasContext *s, X86DecodedInsn *decode,
                                         SSEFunc_0_eppi xmm, SSEFunc_0_eppi ymm)
@@ -5326,6 +5521,30 @@ static void gen_VPERM2x128(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
     assert(s->vex_l);
+
+    /* With x-vperm, 128-bit moves: each lane from one of four, or zero. */
+    if (tcg_vperm) {
+        TCGv_vec src[4], r[2];
+
+        for (int i = 0; i < 4; i++) {
+            src[i] = tcg_temp_new_vec(TCG_TYPE_V128);
+            tcg_gen_ld_vec(src[i], tcg_env,
+                           decode->op[1 + i / 2].offset + 16 * (i & 1));
+        }
+        for (int l = 0; l < 2; l++) {
+            unsigned sel = (decode->immediate & 0xff) >> (4 * l);
+
+            r[l] = tcg_temp_new_vec(TCG_TYPE_V128);
+            if (sel & 8) {
+                tcg_gen_dupi_vec(MO_64, r[l], 0);
+            } else {
+                tcg_gen_mov_vec(r[l], src[sel & 3]);
+            }
+        }
+        tcg_gen_st_vec(r[0], tcg_env, decode->op[0].offset);
+        tcg_gen_st_vec(r[1], tcg_env, decode->op[0].offset + 16);
+        return;
+    }
     gen_helper_vpermdq_ymm(OP_PTR0, OP_PTR1, OP_PTR2, imm);
 }
 
@@ -5352,7 +5571,25 @@ static void gen_VROUNDSS(DisasContext *s, X86DecodedInsn *decode)
 static void gen_VSHUF(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i32 imm = tcg_constant_i32(decode->immediate);
+    unsigned i = decode->immediate & 0xff;
     SSEFunc_0_pppi ps, pd, fn;
+    uint32_t pat[2];
+
+    /* SHUFPS: two elements of each input; SHUFPD: one bit per element. */
+    if (s->prefix & PREFIX_DATA) {
+        for (int l = 0; l < 2; l++) {
+            pat[l] = PERM2((i >> (2 * l)) & 1, 2 + ((i >> (2 * l + 1)) & 1));
+        }
+        if (gen_vperm(s, decode, MO_64, 1, 2, pat)) {
+            return;
+        }
+    } else {
+        pat[0] = pat[1] = PERM4(i & 3, (i >> 2) & 3,
+                                4 + ((i >> 4) & 3), 4 + (i >> 6));
+        if (gen_vperm(s, decode, MO_32, 1, 2, pat)) {
+            return;
+        }
+    }
     ps = s->vex_l ? gen_helper_shufps_ymm : gen_helper_shufps_xmm;
     pd = s->vex_l ? gen_helper_shufpd_ymm : gen_helper_shufpd_xmm;
     fn = s->prefix & PREFIX_DATA ? pd : ps;

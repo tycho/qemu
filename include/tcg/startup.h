@@ -78,6 +78,12 @@ extern bool tcg_ssefp_native;
  */
 extern bool tcg_vecld;
 
+/*
+ * x-vperm: guest permutes by a constant (shuffles, unpacks, blends) are
+ * generated with perm_vec where the backend has it.
+ */
+extern bool tcg_vperm;
+
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);
 
