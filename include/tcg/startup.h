@@ -63,6 +63,12 @@ extern bool tcg_lazysync_user;
 extern bool tcg_vecglobal;
 
 /*
+ * With tcg_vecglobal, the upper 128 bits of each ymm register as
+ * vector globals too.
+ */
+extern bool tcg_ymmglobal;
+
+/*
  * The front end's scratch area in env, [ofs, ofs + size): values there
  * live only within one guest instruction, so a fault or an exit never
  * observes them (tcg_dse may remove stores to it across guest memory

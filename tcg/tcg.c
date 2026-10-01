@@ -256,6 +256,7 @@ bool tcg_dse;
 bool tcg_ldstkeep;
 bool tcg_lazysync;
 bool tcg_vecglobal;
+bool tcg_ymmglobal;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
