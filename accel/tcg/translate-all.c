@@ -169,7 +169,8 @@ static int encode_search(TranslationBlock *tb, uint8_t *block)
  * that left dirty globals in registers (x-lazysync), store them from
  * @regs, the host's registers at the signal, numbered as TCGReg.
  */
-void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t *regs)
+void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t (*regs)[2],
+                        int nregs)
 {
     TranslationBlock *tb;
     const uint8_t *p;
@@ -201,13 +202,23 @@ void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t *regs)
             TCGType type = *p++;
             intptr_t ofs = decode_sleb128(&p);
 
-            if (hit) {
-                void *dst = (void *)(uintptr_t)(regs[base] + ofs);
+            if (hit && reg < nregs && base < nregs) {
+                uint64_t *dst = (void *)(uintptr_t)(regs[base][0] + ofs);
 
-                if (type == TCG_TYPE_I32) {
-                    *(uint32_t *)dst = regs[reg];
-                } else {
-                    *(uint64_t *)dst = regs[reg];
+                switch (type) {
+                case TCG_TYPE_I32:
+                    *(uint32_t *)dst = regs[reg][0];
+                    break;
+                case TCG_TYPE_I64:
+                case TCG_TYPE_V64:
+                    dst[0] = regs[reg][0];
+                    break;
+                case TCG_TYPE_V128:
+                    dst[0] = regs[reg][0];
+                    dst[1] = regs[reg][1];
+                    break;
+                default:
+                    g_assert_not_reached();
                 }
             }
         }
