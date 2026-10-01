@@ -73,6 +73,8 @@ static inline TCGv_i64 TCGV128_HIGH(TCGv_i128 t)
 bool tcg_target_has_memory_bswap(MemOp memop);
 
 TCGTemp *tcg_temp_new_internal(TCGType type, TCGTempKind kind);
+TCGTemp *tcg_alias_global(TCGContext *s, TCGTemp *base, intptr_t off,
+                          TCGType type);
 
 /*
  * Locate or create a read-only temporary that is a constant.

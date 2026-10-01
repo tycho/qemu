@@ -255,6 +255,7 @@ TCGContext tcg_init_ctx;
 bool tcg_dse;
 bool tcg_ldstkeep;
 bool tcg_lazysync;
+bool tcg_vecglobal;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
@@ -2094,6 +2095,54 @@ TCGv_ptr tcg_global_mem_new_ptr(TCGv_ptr reg, intptr_t off, const char *name)
 {
     TCGTemp *ts = tcg_global_mem_new_internal(reg, off, name, TCG_TYPE_PTR);
     return temp_tcgv_ptr(ts);
+}
+
+/*
+ * A vector global for state that the code also accesses through memory:
+ * whole-vector loads and stores of exactly [off, off + size) become moves
+ * of the global (tcg_gen_ld_vec, tcg_gen_st_vec); any other access to
+ * those bytes, and every helper call, sees memory, so liveness stores the
+ * global before them and reloads it after anything that may write it.
+ * NULL if the host has no vectors of @type.
+ */
+TCGv_vec tcg_global_mem_new_vec(TCGv_ptr reg, intptr_t off, TCGType type,
+                                const char *name)
+{
+    TCGContext *s = tcg_ctx;
+    TCGTemp *ts;
+
+    if (!tcg_op_supported(INDEX_op_mov_vec, type, 0)) {
+        return NULL;
+    }
+    tcg_debug_assert(tcgv_ptr_temp(reg)->kind == TEMP_FIXED);
+    tcg_debug_assert(s->nb_alias < TCG_MAX_ALIAS);
+    ts = tcg_global_mem_new_internal(reg, off, name, type);
+    ts->env_alias = 1;
+    if (!s->nb_alias) {
+        s->alias_base = ts->mem_base;
+        s->alias_lo = off;
+        s->alias_hi = off + tcg_type_size(type);
+    }
+    tcg_debug_assert(s->alias_base == ts->mem_base);
+    s->alias_lo = MIN(s->alias_lo, off);
+    s->alias_hi = MAX(s->alias_hi, off + (intptr_t)tcg_type_size(type));
+    s->alias_temp[s->nb_alias++] = temp_idx(ts);
+    return temp_tcgv_vec(ts);
+}
+
+/* The env_alias global stored at exactly @base + @off, of type @type. */
+TCGTemp *tcg_alias_global(TCGContext *s, TCGTemp *base, intptr_t off,
+                          TCGType type)
+{
+    for (int i = 0; i < s->nb_alias; i++) {
+        TCGTemp *ts = &s->temps[s->alias_temp[i]];
+
+        if (ts->mem_base == base && ts->mem_offset == off
+            && ts->base_type == type) {
+            return ts;
+        }
+    }
+    return NULL;
 }
 
 TCGTemp *tcg_temp_new_internal(TCGType type, TCGTempKind kind)
@@ -4060,6 +4109,67 @@ static void la_bb_sync(TCGContext *s, int ng, int nt)
     }
 }
 
+/*
+ * liveness analysis: an env_alias global before an op that may write its
+ * memory: in memory, and not needed in a register (it is reloaded).
+ */
+static void la_alias_kill(TCGTemp *ts)
+{
+    ts->state = TS_DEAD | TS_MEM;
+    la_reset_pref(ts);
+}
+
+/* ... before an op that may read its memory: in memory as well. */
+static void la_alias_sync(TCGTemp *ts)
+{
+    if (ts->state == TS_DEAD) {
+        la_reset_pref(ts);
+    }
+    ts->state |= TS_MEM;
+}
+
+/* liveness analysis: a helper call may read and write any env memory. */
+static void la_alias_call(TCGContext *s)
+{
+    for (int i = 0; i < s->nb_alias; i++) {
+        la_alias_kill(&s->temps[s->alias_temp[i]]);
+    }
+}
+
+/* liveness analysis: a load or store of memory an env_alias global holds. */
+static void la_alias_access(TCGContext *s, TCGOp *op)
+{
+    int size = dse_access_size(op);
+    bool store = tcg_op_defs[op->opc].nb_oargs == 0;
+    TCGTemp *base;
+    intptr_t lo;
+
+    if (!size) {
+        return;
+    }
+    base = arg_temp(op->args[1]);
+    lo = op->args[2];
+    if (base == s->alias_base
+        && (lo >= s->alias_hi || lo + size <= s->alias_lo)) {
+        return;
+    }
+    for (int i = 0; i < s->nb_alias; i++) {
+        TCGTemp *ts = &s->temps[s->alias_temp[i]];
+
+        /* Through another pointer, any byte may be the global's. */
+        if (base == ts->mem_base
+            && (lo >= ts->mem_offset + tcg_type_size(ts->base_type)
+                || lo + size <= ts->mem_offset)) {
+            continue;
+        }
+        if (store) {
+            la_alias_kill(ts);
+        } else {
+            la_alias_sync(ts);
+        }
+    }
+}
+
 /* liveness analysis: sync globals back to memory and kill.  */
 static void la_global_kill(TCGContext *s, int ng)
 {
@@ -4334,6 +4444,7 @@ liveness_pass_1(TCGContext *s)
                 } else if (!(call_flags & TCG_CALL_NO_READ_GLOBALS)) {
                     la_global_sync(s, nb_globals);
                 }
+                la_alias_call(s);
 
                 /* Record arguments that die in this helper.  */
                 for (int i = nb_oargs; i < nb_iargs + nb_oargs; i++) {
@@ -4586,6 +4697,10 @@ liveness_pass_1(TCGContext *s)
                 if (def->flags & TCG_OPF_CALL_CLOBBER) {
                     la_cross_call(s, nb_temps, op_clobber_regs(opc));
                 }
+            }
+
+            if (s->nb_alias) {
+                la_alias_access(s, op);
             }
 
             /* Record arguments that die in this opcode.  */
