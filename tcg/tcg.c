@@ -3586,7 +3586,8 @@ static void move_label_uses(TCGLabel *to, TCGLabel *from)
  *
  * The front end's scratch area (tcg_set_env_scratch) holds values only
  * within one guest instruction: a fault or an exit doesn't observe it, so
- * it stays dead across guest memory accesses and is dead at exits.
+ * it stays dead across guest memory accesses, and it is dead at exits and
+ * at the start of the next instruction.
  */
 #define DSE_RANGES 32
 
@@ -3735,6 +3736,10 @@ dead_env_store_pass(TCGContext *s)
         }
         switch (op->opc) {
         case INDEX_op_insn_start:
+            if (dse_scratch_lo < dse_scratch_hi) {
+                dse_write(&dead, dse_scratch_lo, dse_scratch_hi);
+            }
+            break;
         case INDEX_op_discard:
         case INDEX_op_mb:
             break;
