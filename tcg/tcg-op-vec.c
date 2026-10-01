@@ -265,14 +265,39 @@ static void vec_gen_ldst(TCGOpcode opc, TCGv_vec r, TCGv_ptr b, TCGArg o)
     vec_gen_3(opc, type, 0, ri, bi, o);
 }
 
+/* The env_alias global stored exactly at @b + @o, as a vector like @r. */
+static TCGv_vec alias_global(TCGv_vec r, TCGv_ptr b, TCGArg o)
+{
+    TCGContext *s = tcg_ctx;
+    TCGTemp *g;
+
+    if (!s->nb_alias) {
+        return NULL;
+    }
+    g = tcg_alias_global(s, tcgv_ptr_temp(b), o, tcgv_vec_temp(r)->base_type);
+    return g ? temp_tcgv_vec(g) : NULL;
+}
+
 void tcg_gen_ld_vec(TCGv_vec r, TCGv_ptr b, TCGArg o)
 {
-    vec_gen_ldst(INDEX_op_ld_vec, r, b, o);
+    TCGv_vec g = alias_global(r, b, o);
+
+    if (g) {
+        tcg_gen_mov_vec(r, g);
+    } else {
+        vec_gen_ldst(INDEX_op_ld_vec, r, b, o);
+    }
 }
 
 void tcg_gen_st_vec(TCGv_vec r, TCGv_ptr b, TCGArg o)
 {
-    vec_gen_ldst(INDEX_op_st_vec, r, b, o);
+    TCGv_vec g = alias_global(r, b, o);
+
+    if (g) {
+        tcg_gen_mov_vec(g, r);
+    } else {
+        vec_gen_ldst(INDEX_op_st_vec, r, b, o);
+    }
 }
 
 void tcg_gen_stl_vec(TCGv_vec r, TCGv_ptr b, TCGArg o, TCGType low_type)

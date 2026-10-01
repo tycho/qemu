@@ -45,6 +45,8 @@ QEMU_RET_NONNULL
 TCGv_i64 tcg_global_mem_new_i64(TCGv_ptr reg, intptr_t off, const char *name);
 QEMU_RET_NONNULL
 TCGv_ptr tcg_global_mem_new_ptr(TCGv_ptr reg, intptr_t off, const char *name);
+TCGv_vec tcg_global_mem_new_vec(TCGv_ptr reg, intptr_t off, TCGType type,
+                                const char *name);
 
 /* Generic ops.  */
 static inline void tcg_gen_insn_start(uint64_t pc, uint64_t a1,
