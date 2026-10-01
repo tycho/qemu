@@ -50,6 +50,8 @@ int accel_init_machine(AccelState *accel, MachineState *ms)
         object_unref(OBJECT(accel));
     } else {
         object_set_accelerator_compat_props(acc->compat_props);
+        /* Visible to QMP (qom-list, qom-get) as /machine/accel. */
+        object_property_add_child(OBJECT(ms), "accel", OBJECT(accel));
     }
     return ret;
 }
