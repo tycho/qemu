@@ -4520,6 +4520,7 @@ static void la_loopback(TCGContext *s, TCGLabel *l, int nt)
      */
     for (int i = 0; i < l->nb_loopregs; i++) {
         lr[i].ts->state = l->live_in[temp_idx(lr[i].ts)] & TS_MEM;
+        *la_temp_pref(lr[i].ts) = (TCGRegSet)1 << lr[i].reg;
     }
 }
 
@@ -4579,7 +4580,8 @@ static bool xblk_select_loops(TCGContext *s)
     QSIMPLEQ_FOREACH(l, &s->labels, next) {
         XblkLoopReg *lr;
         uint8_t *used;
-        int nint = 0, nvec = 0;
+        TCGRegSet taken;
+        int nint = 0, nvec = 0, nr;
         bool in_loop = false;
         TCGOp *op;
 
@@ -4648,6 +4650,29 @@ static bool xblk_select_loops(TCGContext *s)
                 .ts = ts, .reg = -1, .written = used[i] & 2,
             };
         }
+        /*
+         * Each gets a register of its own now, the one the allocator would
+         * pick at the label (where nothing else is in a register), so that
+         * liveness can steer the loop's new values into it.
+         */
+        taken = s->reserved_regs;
+        nr = 0;
+        for (int i = 0; i < l->nb_loopregs; i++) {
+            TCGRegSet ok = tcg_target_available_regs[lr[i].ts->type] & ~taken;
+
+            for (int k = 0; k < ARRAY_SIZE(tcg_target_reg_alloc_order); k++) {
+                TCGReg r = tcg_target_reg_alloc_order[k];
+
+                if (tcg_regset_test_reg(ok, r)) {
+                    lr[i].reg = r;
+                    tcg_regset_set_reg(taken, r);
+                    s->xblk_home[temp_idx(lr[i].ts)] = r;
+                    lr[nr++] = lr[i];
+                    break;
+                }
+            }
+        }
+        l->nb_loopregs = nr;
         l->loopregs = lr;
         any |= l->nb_loopregs > 0;
     }
@@ -5182,12 +5207,39 @@ liveness_pass_1(TCGContext *s)
                    have proper constraints.  That said, special case
                    moves to propagate preferences backward.  */
                 if (IS_DEAD_ARG(1)) {
-                    *la_temp_pref(arg_temp(op->args[0]))
-                        = *la_temp_pref(arg_temp(op->args[1]));
+                    TCGTemp *in = arg_temp(op->args[1]);
+                    TCGRegSet set = op->output_pref[0]
+                                    & tcg_target_available_regs[in->type];
+
+                    if (s->xblk_pass == 2 && set) {
+                        /* x-region: compute the value where it will go. */
+                        *la_temp_pref(in) = set;
+                    } else {
+                        *la_temp_pref(arg_temp(op->args[0]))
+                            = *la_temp_pref(in);
+                    }
                 }
                 break;
 
+            case INDEX_op_mov_vec:
+                /*
+                 * x-region: as for mov, compute the value where it goes;
+                 * a copy that leaves its input live doesn't constrain it.
+                 */
+                if (s->xblk_pass == 2) {
+                    TCGTemp *in = arg_temp(op->args[1]);
+                    TCGRegSet set = op->output_pref[0]
+                                    & tcg_target_available_regs[in->type];
+
+                    if (IS_DEAD_ARG(1) && set) {
+                        *la_temp_pref(in) = set;
+                    }
+                    break;
+                }
+                goto do_constraints;
+
             default:
+            do_constraints:
                 args_ct = opcode_args_ct(op);
                 for (int i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
                     const TCGArgConstraint *ct = &args_ct[i];
@@ -5960,17 +6012,30 @@ static void xblk_loop_entry(TCGContext *s, TCGLabel *l)
 
     for (int i = 0; i < l->nb_loopregs; i++) {
         TCGTemp *ts = lr[i].ts;
-        TCGReg reg = tcg_reg_alloc(s, tcg_target_available_regs[ts->type],
-                                   used, 0, false);
+        TCGReg reg = lr[i].reg;
 
+        if (s->reg_to_temp[reg]) {
+            tcg_reg_free(s, reg, used);
+        }
         tcg_out_ld(s, ts->type, reg, ts->mem_base->reg, ts->mem_offset);
         set_temp_val_reg(s, ts, reg);
         /* Coherent if the loop never writes it, or stores it each pass. */
         ts->mem_coherent = !lr[i].written
                            || (l->live_in[temp_idx(ts)] & TS_MEM);
-        lr[i].reg = reg;
         tcg_regset_set_reg(used, reg);
     }
+}
+
+/*
+ * The register to prefer for a new value of @ts: a loop global's own
+ * register, so that the back edge finds it in place; else @pref.  The
+ * allocator falls back to another register if that one is busy.
+ */
+static TCGRegSet xblk_pref(TCGContext *s, TCGTemp *ts, TCGRegSet pref)
+{
+    int r = s->xblk_home ? s->xblk_home[temp_idx(ts)] : -1;
+
+    return r < 0 ? pref : (TCGRegSet)1 << r;
 }
 
 /* At the back edge: each loop global back in its register. */
@@ -6093,9 +6158,9 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
     TCGReg oreg, ireg;
 
     allocated_regs = s->reserved_regs;
-    preferred_regs = output_pref(op, 0);
     ots = arg_temp(op->args[0]);
     ts = arg_temp(op->args[1]);
+    preferred_regs = xblk_pref(s, ots, output_pref(op, 0));
 
     /* ENV should not be modified.  */
     tcg_debug_assert(!temp_readonly(ots));
@@ -6211,7 +6276,8 @@ static void tcg_reg_alloc_dup(TCGContext *s, const TCGOp *op)
         if (IS_DEAD_ARG(1)) {
             temp_dead(s, its);
         }
-        tcg_reg_alloc_do_movi(s, ots, val, arg_life, output_pref(op, 0));
+        tcg_reg_alloc_do_movi(s, ots, val, arg_life,
+                              xblk_pref(s, ots, output_pref(op, 0)));
         return;
     }
 
@@ -6617,10 +6683,12 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
                 } else if (arg_ct->newreg) {
                     reg = tcg_reg_alloc(s, arg_ct->regs,
                                         i_allocated_regs | o_allocated_regs,
-                                        output_pref(op, k), ts->indirect_base);
+                                        xblk_pref(s, ts, output_pref(op, k)),
+                                        ts->indirect_base);
                 } else {
                     reg = tcg_reg_alloc(s, arg_ct->regs, o_allocated_regs,
-                                        output_pref(op, k), ts->indirect_base);
+                                        xblk_pref(s, ts, output_pref(op, k)),
+                                        ts->indirect_base);
                 }
                 break;
 
@@ -7838,6 +7906,11 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     s->xblk = tcg_region && xblk_classify(s);
     s->xblk_pass = 1;
     liveness_pass_1(s);
+    s->xblk_home = NULL;
+    if (s->xblk) {
+        s->xblk_home = tcg_malloc(s->nb_temps);
+        memset(s->xblk_home, -1, s->nb_temps);
+    }
     if (s->xblk && xblk_select_loops(s)) {
         /* The loop's globals stay live across its back edge. */
         s->xblk_pass = 2;

@@ -389,6 +389,7 @@ struct TCGContext {
     int nb_indirects;
     bool xblk;                  /* x-region: some label keeps registers */
     int xblk_pass;              /* liveness pass, 1 or 2 with a loop */
+    int8_t *xblk_home;          /* x-region: each temp's loop register */
     uint16_t *la_globals;       /* liveness: the globals the ops use */
     int nb_la_globals;
     int nb_alias;                         /* env_alias globals */
