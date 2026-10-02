@@ -2060,6 +2060,10 @@ static uint64_t do_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
     section = io_prepare(&mr_offset, cpu, full, addr, ra);
     mr = section->mr;
 
+    if (tcg_mmio_lockless && mr->lockless_io) {
+        return int_ld_mmio_beN(cpu, full, ret_be, addr, size, mmu_idx,
+                               type, ra, mr, mr_offset);
+    }
     BQL_LOCK_GUARD();
     return int_ld_mmio_beN(cpu, full, ret_be, addr, size, mmu_idx,
                            type, ra, mr, mr_offset);
@@ -2576,6 +2580,10 @@ static uint64_t do_st_mmio_leN(CPUState *cpu, CPUTLBEntryFull *full,
     section = io_prepare(&mr_offset, cpu, full, addr, ra);
     mr = section->mr;
 
+    if (tcg_mmio_lockless && mr->lockless_io) {
+        return int_st_mmio_leN(cpu, full, val_le, addr, size, mmu_idx,
+                               ra, mr, mr_offset);
+    }
     BQL_LOCK_GUARD();
     return int_st_mmio_leN(cpu, full, val_le, addr, size, mmu_idx,
                            ra, mr, mr_offset);

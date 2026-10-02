@@ -39,6 +39,12 @@ extern bool tcg_ijmp_inline;
  * no longer unwind the TB (cpu_io_recompile).  Not with icount.
  */
 extern bool tcg_iolast;
+
+/*
+ * tcg_mmio_lockless: MMIO from generated code to a lockless_io region
+ * doesn't take the BQL (the region's callbacks do their own locking).
+ */
+extern bool tcg_mmio_lockless;
 bool tb_io_insn_known(vaddr pc);
 
 extern bool icount_align_option;
