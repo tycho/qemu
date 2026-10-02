@@ -778,6 +778,7 @@ static void xtcg_fork_defaults(TCGState *s)
     s->hostclock_raw = true;
     /* Replay needs a TSC from the instruction count. */
     s->tsc_counter = !icount_enabled();
+    s->fpcheck_runtime = true;
 #ifdef CONFIG_DARWIN
     qemu_thread_jit_lazy = true;
 #endif
