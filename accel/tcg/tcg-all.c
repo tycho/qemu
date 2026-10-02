@@ -56,6 +56,7 @@ struct TCGState {
     int splitwx_enabled;
     unsigned long tb_size;
     bool kvmvapic;
+    bool lockless_io;
 };
 typedef struct TCGState TCGState;
 
@@ -169,6 +170,24 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
             ac->compat_props = g_ptr_array_new();
         }
         compat_props_add(ac->compat_props, novapic, G_N_ELEMENTS(novapic));
+    }
+
+    /*
+     * x-lockless-io: MMIO from generated code to lockless_io regions
+     * skips the BQL, and the x86 local APIC serves a vCPU's own TPR
+     * accesses that way (apic.x-lockless-tpr).
+     */
+    tcg_mmio_lockless = s->lockless_io;
+    if (s->lockless_io) {
+        static GlobalProperty lockless[] = {
+            { "apic", "x-lockless-tpr", "on" },
+        };
+        AccelClass *ac = ACCEL_GET_CLASS(as);
+
+        if (!ac->compat_props) {
+            ac->compat_props = g_ptr_array_new();
+        }
+        compat_props_add(ac->compat_props, lockless, G_N_ELEMENTS(lockless));
     }
 #endif
 
@@ -501,6 +520,16 @@ static void tcg_set_splitwx(Object *obj, bool value, Error **errp)
     s->splitwx_enabled = value;
 }
 
+static bool tcg_get_lockless_io(Object *obj, Error **errp)
+{
+    return TCG_STATE(obj)->lockless_io;
+}
+
+static void tcg_set_lockless_io(Object *obj, bool value, Error **errp)
+{
+    TCG_STATE(obj)->lockless_io = value;
+}
+
 static bool tcg_get_kvmvapic(Object *obj, Error **errp)
 {
     return TCG_STATE(obj)->kvmvapic;
@@ -641,6 +670,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Grow a softmmu TLB between flushes once it has had this many "
         "times its size in fills within 100 ms while over 70% used "
         "(0: resize only at flushes, the default)");
+
+    object_class_property_add_bool(oc, "x-lockless-io",
+                                   tcg_get_lockless_io, tcg_set_lockless_io);
+    object_class_property_set_description(oc, "x-lockless-io",
+        "System: MMIO to regions that allow it (lockless_io) without the "
+        "BQL; on x86, a vCPU's own local APIC TPR accesses are such");
 
     object_class_property_add_bool(oc, "x-kvmvapic",
                                    tcg_get_kvmvapic, tcg_set_kvmvapic);
