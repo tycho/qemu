@@ -14,7 +14,7 @@
 
 /* log2 of the entries per vCPU; a compile-time constant, overridable. */
 #ifndef TB_JMP_CACHE_BITS
-#define TB_JMP_CACHE_BITS 12
+#define TB_JMP_CACHE_BITS 16
 #endif
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
 
