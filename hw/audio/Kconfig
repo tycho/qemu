@@ -52,8 +52,5 @@ config VIRTIO_SND
     default y
     depends on VIRTIO
 
-config MARVELL_88W8618
-    bool
-
 config SCREAMER
     bool
