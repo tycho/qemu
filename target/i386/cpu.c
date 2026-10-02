@@ -18,6 +18,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
+#include "tcg/startup.h"
 #include "qemu/units.h"
 #include "qemu/cutils.h"
 #include "qemu/qemu-print.h"
@@ -9389,6 +9391,9 @@ static void x86_cpu_reset_hold(Object *obj, ResetType type)
 
     if (tcg_enabled()) {
         cpu_init_fp_statuses(env);
+#ifndef CONFIG_USER_ONLY
+        x86_tsc_counter_reset(env);
+#endif
     }
 
     env->old_exception = -1;
