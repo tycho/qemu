@@ -58,6 +58,7 @@ struct TCGState {
     unsigned long tb_size;
     bool kvmvapic;
     bool lockless_io;
+    bool lockless_rtc;
 };
 typedef struct TCGState TCGState;
 
@@ -189,6 +190,23 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
             ac->compat_props = g_ptr_array_new();
         }
         compat_props_add(ac->compat_props, lockless, G_N_ELEMENTS(lockless));
+    }
+
+    /*
+     * x-lockless-rtc: the MC146818 RTC serves index writes and register A
+     * (update-in-progress) polls without the BQL.
+     */
+    if (s->lockless_rtc) {
+        static GlobalProperty lockless_rtc[] = {
+            { "mc146818rtc", "x-lockless-uip", "on" },
+        };
+        AccelClass *ac = ACCEL_GET_CLASS(as);
+
+        if (!ac->compat_props) {
+            ac->compat_props = g_ptr_array_new();
+        }
+        compat_props_add(ac->compat_props, lockless_rtc,
+                         G_N_ELEMENTS(lockless_rtc));
     }
 #endif
 
@@ -531,6 +549,16 @@ static void tcg_set_lockless_io(Object *obj, bool value, Error **errp)
     TCG_STATE(obj)->lockless_io = value;
 }
 
+static bool tcg_get_lockless_rtc(Object *obj, Error **errp)
+{
+    return TCG_STATE(obj)->lockless_rtc;
+}
+
+static void tcg_set_lockless_rtc(Object *obj, bool value, Error **errp)
+{
+    TCG_STATE(obj)->lockless_rtc = value;
+}
+
 static bool tcg_get_kvmvapic(Object *obj, Error **errp)
 {
     return TCG_STATE(obj)->kvmvapic;
@@ -625,6 +653,7 @@ static void xtcg_fork_defaults(TCGState *s)
     tcg_pferr_hw = true;
     s->kvmvapic = false;
     s->lockless_io = true;
+    s->lockless_rtc = true;
 #ifdef CONFIG_DARWIN
     qemu_thread_jit_lazy = true;
 #endif
@@ -694,6 +723,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-lockless-io",
         "System: MMIO to regions that allow it (lockless_io) without the "
         "BQL; on x86, a vCPU's own local APIC TPR accesses are such");
+
+    object_class_property_add_bool(oc, "x-lockless-rtc",
+                                   tcg_get_lockless_rtc, tcg_set_lockless_rtc);
+    object_class_property_set_description(oc, "x-lockless-rtc",
+        "x86 system: the RTC's index writes and update-in-progress polls "
+        "without the BQL");
 
     object_class_property_add_bool(oc, "x-kvmvapic",
                                    tcg_get_kvmvapic, tcg_set_kvmvapic);
