@@ -22,7 +22,7 @@ struct VirtIORAMFBBase {
 struct VirtIORAMFBBaseClass {
     VirtioPCIClass parent_class;
 
-    DeviceReset parent_reset;
+    ResettablePhases parent_phases;
 };
 
 #endif /* VIRTIO_RAMFB_H */
