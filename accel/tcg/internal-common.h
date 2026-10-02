@@ -27,6 +27,12 @@ extern bool one_insn_per_tb;
 extern bool tcg_iolast;
 bool tb_io_insn_known(vaddr pc);
 
+/*
+ * tcg_mmio_lockless: MMIO from generated code to a lockless_io region
+ * doesn't take the BQL (the region's callbacks do their own locking).
+ */
+extern bool tcg_mmio_lockless;
+
 extern bool icount_align_option;
 
 /*
