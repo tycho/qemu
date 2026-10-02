@@ -268,6 +268,7 @@ bool tcg_ldstkeep;
 bool tcg_lazysync;
 bool tcg_vecglobal;
 bool tcg_ymmglobal;
+bool tcg_pause_hint;
 bool tcg_region;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
