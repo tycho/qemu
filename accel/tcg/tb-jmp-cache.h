@@ -31,6 +31,16 @@ typedef struct CPUJumpCache {
         TranslationBlock *tb;
         vaddr pc;
     } array[TB_JMP_CACHE_SIZE];
+    /*
+     * tcg_jcgen: entries store pc ^ salt, and a flush moves the salt on
+     * instead of clearing every entry.  The salt lives in bits 48-63,
+     * which a guest pc never needs to tell two addresses apart on x86
+     * (canonical 64-bit addresses, 32-bit ones otherwise).  Zero without
+     * tcg_jcgen.
+     */
+    uint64_t salt;
 } CPUJumpCache;
+
+#define TB_JMP_SALT_STEP (1ull << 48)
 
 #endif /* ACCEL_TCG_TB_JMP_CACHE_H */
