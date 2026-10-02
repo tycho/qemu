@@ -27,6 +27,7 @@
 #include "accel/tcg/cpu-ops.h"
 #include "tcg-cpu.h"
 #include "host-fpenv.h"
+#include "tcg/startup.h"
 
 /* Frob eflags into and out of the CPU temporary format.  */
 
@@ -59,6 +60,12 @@ static TCGTBCPUState x86_get_tb_cpu_state(CPUState *cs)
 
     flags = env->hflags |
         (env->eflags & (IOPL_MASK | TF_MASK | RF_MASK | VM_MASK | AC_MASK));
+#ifndef CONFIG_USER_ONLY
+    if (tcg_fpcheck_runtime) {
+        /* The translator checks them at run time: gen_check_cr0_fp. */
+        flags &= ~(HF_MP_MASK | HF_EM_MASK | HF_TS_MASK);
+    }
+#endif
     if (env->hflags & HF_CS64_MASK) {
         cs_base = 0;
         pc = env->eip;
