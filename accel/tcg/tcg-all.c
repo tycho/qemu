@@ -755,7 +755,8 @@ static void xtcg_fork_defaults(TCGState *s)
     s->lockless_rtc = true;
     s->pause_hint = true;
     s->hostclock_raw = true;
-    s->tsc_counter = true;
+    /* Replay needs a TSC from the instruction count. */
+    s->tsc_counter = !icount_enabled();
 #ifdef CONFIG_DARWIN
     qemu_thread_jit_lazy = true;
 #endif
