@@ -155,6 +155,12 @@ extern bool tcg_pause_hint;
 extern bool tcg_tsc_counter;
 
 /*
+ * x86 guests: CR0.MP, EM and TS are not part of the TB flags; the first
+ * instruction in a TB that depends on them checks them at run time.
+ */
+extern bool tcg_fpcheck_runtime;
+
+/*
  * x-region: a TB whose direct jump returns to its first insn branches
  * back within the TB instead of chaining to itself.
  */

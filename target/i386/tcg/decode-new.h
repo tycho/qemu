@@ -344,6 +344,7 @@ struct X86DecodedInsn {
     int8_t cc_op;
 
     uint8_t b;
+    bool cr0_check; /* CR0.EM and TS apply (gen_check_cr0_fp) */
 };
 
 static void gen_lea_modrm(struct DisasContext *s, X86DecodedInsn *decode);
