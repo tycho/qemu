@@ -24,6 +24,9 @@
 #include "system/whpx.h"
 #include "system/mshv.h"
 #include "system/cpu-timers.h"
+#include "system/runstate.h"
+#include "host/counter.h"
+#include "tcg/startup.h"
 #include "trace.h"
 
 #include "hw/i386/x86.h"
@@ -33,9 +36,87 @@
 #include "system/kvm.h"
 
 /* TSC handling */
+
+#if HOST_COUNTER_SUPPORTED
+/*
+ * tcg_tsc_counter: the TSC is the host counter in ns plus a per-vCPU
+ * offset.  The TSC must not advance while the VM is stopped: at a stop
+ * the counter's value is kept, and at the next start every offset loses
+ * the stopped interval.  New vCPUs start from tsc_counter_base, so all
+ * of them agree.
+ */
+static int64_t tsc_counter_base;
+static uint64_t tsc_counter_stopped_at;
+static bool tsc_counter_stopped = true;
+
+static uint64_t tsc_counter_now(void)
+{
+    return tsc_counter_stopped ? tsc_counter_stopped_at : host_counter_ns();
+}
+
+static void tsc_counter_vm_state(void *opaque, bool running, RunState state)
+{
+    uint64_t now = host_counter_ns();
+    int64_t d;
+    CPUState *cs;
+
+    if (!running) {
+        if (!tsc_counter_stopped) {
+            tsc_counter_stopped_at = now;
+            tsc_counter_stopped = true;
+        }
+        return;
+    }
+    if (tsc_counter_stopped) {
+        d = now - tsc_counter_stopped_at;
+        tsc_counter_base -= d;
+        CPU_FOREACH(cs) {
+            X86_CPU(cs)->env.tsc_counter_offset -= d;
+        }
+        tsc_counter_stopped = false;
+    }
+}
+
+static void tsc_counter_init_once(void)
+{
+    static bool done;
+
+    if (!done) {
+        done = true;
+        tsc_counter_stopped_at = host_counter_ns();
+        tsc_counter_base = -(int64_t)tsc_counter_stopped_at;
+        qemu_add_vm_change_state_handler(tsc_counter_vm_state, NULL);
+    }
+}
+#endif
+
 uint64_t cpu_get_tsc(CPUX86State *env)
 {
+#if HOST_COUNTER_SUPPORTED
+    if (tcg_tsc_counter) {
+        return tsc_counter_now() + env->tsc_counter_offset;
+    }
+#endif
     return cpus_get_elapsed_ticks();
+}
+
+/* Make the vCPU's TSC read @tsc now (tcg_tsc_counter). */
+void x86_tsc_counter_set(CPUX86State *env, uint64_t tsc)
+{
+#if HOST_COUNTER_SUPPORTED
+    env->tsc_counter_offset = tsc - tsc_counter_now();
+#endif
+}
+
+/* A vCPU's TSC at reset: the shared base, so that all vCPUs agree. */
+void x86_tsc_counter_reset(CPUX86State *env)
+{
+#if HOST_COUNTER_SUPPORTED
+    if (tcg_tsc_counter) {
+        tsc_counter_init_once();
+        env->tsc_counter_offset = tsc_counter_base;
+    }
+#endif
 }
 
 /* IRQ handling */
