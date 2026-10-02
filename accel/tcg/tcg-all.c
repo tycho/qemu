@@ -653,6 +653,11 @@ static void tcg_set_tsc(Object *obj, const char *value, Error **errp)
             error_setg(errp, "x-tsc=counter: no host counter on this host");
             return;
         }
+        if (icount_enabled()) {
+            /* The TSC must follow the instruction count, for replay. */
+            error_setg(errp, "x-tsc=counter: not with icount");
+            return;
+        }
         s->tsc_counter = true;
     } else if (strcmp(value, "ticks") == 0) {
         s->tsc_counter = false;
