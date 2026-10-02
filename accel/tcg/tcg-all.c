@@ -613,6 +613,7 @@ static void xtcg_fork_defaults(TCGState *s)
     tcg_region = true;
     tcg_pferr_hw = true;
     s->kvmvapic = false;
+    s->lockless_io = true;
 #ifdef CONFIG_DARWIN
     qemu_thread_jit_lazy = true;
 #endif
