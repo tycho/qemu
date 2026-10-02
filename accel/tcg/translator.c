@@ -15,6 +15,7 @@
 #include "accel/tcg/cpu-mmu-index.h"
 #include "exec/target_page.h"
 #include "exec/translator.h"
+#include "exec/icount.h"
 #include "tcg/startup.h"
 #ifdef CONFIG_USER_ONLY
 #include "gdbstub/user.h"
@@ -387,6 +388,16 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
         /* Stop translation if translate_insn so indicated.  */
         if (db->is_jmp != DISAS_NEXT) {
+            break;
+        }
+
+        /*
+         * End the TB after an instruction known to do I/O, so that its
+         * accesses happen with can_do_io set.
+         */
+        if (tcg_iolast && !icount_enabled() &&
+            tb_io_insn_known(tcg_ctx->insn_pc)) {
+            db->is_jmp = DISAS_TOO_MANY;
             break;
         }
 

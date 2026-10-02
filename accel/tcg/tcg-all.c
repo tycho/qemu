@@ -277,6 +277,7 @@ static void tcg_set_tlb_grow(Object *obj, Visitor *v, const char *name,
 }
 
 bool tcg_ijmp_inline;
+bool tcg_iolast;
 
 static char *tcg_get_ijmp(Object *obj, Error **errp)
 {
