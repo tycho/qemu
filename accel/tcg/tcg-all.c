@@ -749,9 +749,10 @@ static void xtcg_fork_defaults(TCGState *s)
     s->lockless_io = true;
     s->lockless_rtc = true;
     s->pause_hint = true;
+    s->hostclock_raw = true;
+    s->tsc_counter = true;
 #ifdef CONFIG_DARWIN
     qemu_thread_jit_lazy = true;
-    s->hostclock_raw = true;
 #endif
 #endif
 }
