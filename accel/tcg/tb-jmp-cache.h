@@ -12,7 +12,10 @@
 #include "qemu/rcu.h"
 #include "exec/cpu-common.h"
 
+/* log2 of the entries per vCPU; a compile-time constant, overridable. */
+#ifndef TB_JMP_CACHE_BITS
 #define TB_JMP_CACHE_BITS 12
+#endif
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
 
 /*
