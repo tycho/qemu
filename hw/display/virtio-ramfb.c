@@ -1,8 +1,8 @@
 #include "qemu/osdep.h"
-#include "sysemu/sysemu.h"
+#include "system/system.h"
 #include "hw/pci/pci.h"
 #include "ui/console.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "virtio-ramfb.h"
 #include "qapi/error.h"
 #include "qom/object.h"
@@ -29,7 +29,7 @@ static void virtio_ramfb_invalidate_display(void *opaque)
     }
 }
 
-static void virtio_ramfb_text_update(void *opaque, console_ch_t *chardata)
+static void virtio_ramfb_text_update(void *opaque, uint32_t *chardata)
 {
     VirtIORAMFBBase *vramfb = opaque;
     VirtIOGPUBase *g = vramfb->vgpu;
@@ -39,27 +39,26 @@ static void virtio_ramfb_text_update(void *opaque, console_ch_t *chardata)
     }
 }
 
-static void virtio_ramfb_update_display(void *opaque)
+static bool virtio_ramfb_update_display(void *opaque)
 {
     VirtIORAMFBBase *vramfb = opaque;
     VirtIOGPUBase *g = vramfb->vgpu;
 
     if (g->enable) {
-        g->hw_ops->gfx_update(g);
-    } else {
-        ramfb_display_update(g->scanout[0].con, vramfb->ramfb);
+        return g->hw_ops->gfx_update(g);
     }
+    ramfb_display_update(g->scanout[0].con, vramfb->ramfb);
+    return true;
 }
 
-static int virtio_ramfb_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info)
+static void virtio_ramfb_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info)
 {
     VirtIORAMFBBase *vramfb = opaque;
     VirtIOGPUBase *g = vramfb->vgpu;
 
     if (g->hw_ops->ui_info) {
-        return g->hw_ops->ui_info(g, idx, info);
+        g->hw_ops->ui_info(g, idx, info);
     }
-    return -1;
 }
 
 static void virtio_ramfb_gl_block(void *opaque, bool block)
@@ -72,16 +71,6 @@ static void virtio_ramfb_gl_block(void *opaque, bool block)
     }
 }
 
-static void virtio_ramfb_gl_flushed(void *opaque)
-{
-    VirtIORAMFBBase *vramfb = opaque;
-    VirtIOGPUBase *g = vramfb->vgpu;
-
-    if (g->hw_ops->gl_flushed) {
-        g->hw_ops->gl_flushed(g);
-    }
-}
-
 static const GraphicHwOps virtio_ramfb_ops = {
     .get_flags = virtio_ramfb_get_flags,
     .invalidate = virtio_ramfb_invalidate_display,
@@ -89,7 +78,6 @@ static const GraphicHwOps virtio_ramfb_ops = {
     .text_update = virtio_ramfb_text_update,
     .ui_info = virtio_ramfb_ui_info,
     .gl_block = virtio_ramfb_gl_block,
-    .gl_flushed = virtio_ramfb_gl_flushed,
 };
 
 static const VMStateDescription vmstate_virtio_ramfb = {
@@ -131,8 +119,9 @@ static void virtio_ramfb_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
     }
 
     /* init ramfb */
-    vramfb->ramfb = ramfb_setup(errp);
-    graphic_console_set_hwops(g->scanout[0].con, &virtio_ramfb_ops, vramfb);
+    vramfb->ramfb = ramfb_setup(false, errp);
+    qemu_graphic_console_set_hwops(g->scanout[0].con, &virtio_ramfb_ops,
+                                   vramfb);
 
     for (i = 0; i < g->conf.max_outputs; i++) {
         object_property_set_link(OBJECT(g->scanout[i].con), "device",
@@ -140,38 +129,41 @@ static void virtio_ramfb_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
     }
 }
 
-static void virtio_ramfb_reset(DeviceState *dev)
+static void virtio_ramfb_reset_hold(Object *obj, ResetType type)
 {
+    VirtIORAMFBBase *dev = VIRTIO_RAMFB_BASE(obj);
     VirtIORAMFBBaseClass *klass = VIRTIO_RAMFB_BASE_GET_CLASS(dev);
 
     /* reset virtio-gpu */
-    klass->parent_reset(dev);
+    if (klass->parent_phases.hold) {
+        klass->parent_phases.hold(obj, type);
+    }
 }
 
-static Property virtio_ramfb_base_properties[] = {
+static const Property virtio_ramfb_base_properties[] = {
     DEFINE_VIRTIO_GPU_PCI_PROPERTIES(VirtIOPCIProxy),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void virtio_ramfb_base_class_init(ObjectClass *klass, void *data)
+static void virtio_ramfb_base_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtioPCIClass *k = VIRTIO_PCI_CLASS(klass);
     VirtIORAMFBBaseClass *v = VIRTIO_RAMFB_BASE_CLASS(klass);
     PCIDeviceClass *pcidev_k = PCI_DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     device_class_set_props(dc, virtio_ramfb_base_properties);
     dc->vmsd = &vmstate_virtio_ramfb;
     dc->hotpluggable = false;
-    device_class_set_parent_reset(dc, virtio_ramfb_reset,
-                                  &v->parent_reset);
+    resettable_class_set_parent_phases(rc, NULL, virtio_ramfb_reset_hold, NULL,
+                                       &v->parent_phases);
 
     k->realize = virtio_ramfb_realize;
     pcidev_k->class_id = PCI_CLASS_DISPLAY_OTHER;
 }
 
-static TypeInfo virtio_ramfb_base_info = {
+static const TypeInfo virtio_ramfb_base_info = {
     .name          = TYPE_VIRTIO_RAMFB_BASE,
     .parent        = TYPE_VIRTIO_PCI,
     .instance_size = sizeof(VirtIORAMFBBase),
