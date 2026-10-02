@@ -674,6 +674,7 @@ static void xtcg_fork_defaults(TCGState *s)
     tcg_ssefp_vec = !tcg_ssefp_native;
     tcg_ijmp_inline = true;
     tcg_iolast = true;
+    tcg_jcgen = true;
     tcg_tlb_grow = 1;
     tcg_vecld = true;
     tcg_vperm = true;
