@@ -19,6 +19,14 @@ extern int64_t max_advance;
 
 extern bool one_insn_per_tb;
 
+/*
+ * tcg_iolast: an instruction that did I/O from the middle of its TB is
+ * remembered, and translation ends TBs after it, so that its accesses
+ * no longer unwind the TB (cpu_io_recompile).  Not with icount.
+ */
+extern bool tcg_iolast;
+bool tb_io_insn_known(vaddr pc);
+
 extern bool icount_align_option;
 
 /*
