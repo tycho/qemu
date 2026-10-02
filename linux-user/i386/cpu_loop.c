@@ -25,12 +25,20 @@
 #include "signal-common.h"
 #include "user-mmap.h"
 #include "user/page-protection.h"
+#include "tcg/startup.h"
+#include "host/counter.h"
 
 /***********************************************************/
 /* CPUX86 core interface */
 
 uint64_t cpu_get_tsc(CPUX86State *env)
 {
+#if HOST_COUNTER_SUPPORTED
+    /* As the TSC that RDTSC reads inline (gen_tsc_counter). */
+    if (tcg_tsc_counter) {
+        return host_counter_ns();
+    }
+#endif
     return cpu_get_host_ticks();
 }
 
