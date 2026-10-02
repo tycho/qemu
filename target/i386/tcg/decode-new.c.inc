@@ -2749,6 +2749,7 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
     if (s->flags & HF_EM_MASK) {
         goto illegal;
     }
+    decode->cr0_check = true;
     return true;
 
 nm_exception:
@@ -3024,6 +3025,7 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         get_modrm(s, env);
     }
 
+    decode.cr0_check = false;
     if (decode.e.vex_class == 0) {
         if (s->prefix & PREFIX_VEX) {
             goto illegal_op;
@@ -3093,6 +3095,12 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
 
     if ((s->prefix & PREFIX_LOCK) && !accept_lock) {
         goto illegal_op;
+    }
+
+    /* After all of the insn's bytes are fetched: no restart past here. */
+    if (decode.cr0_check) {
+        gen_check_cr0_fp(s, HF_TS_MASK, false, EXCP07_PREX);
+        gen_check_cr0_fp(s, HF_EM_MASK, false, EXCP06_ILLOP);
     }
 
     /*

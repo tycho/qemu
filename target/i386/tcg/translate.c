@@ -117,6 +117,8 @@ typedef struct DisasContext {
     bool vex_w; /* used by AVX even on 32-bit processors */
     bool fence_insn; /* this insn is LFENCE or MFENCE */
     bool after_fence; /* the previous insn was */
+    bool fp_runtime; /* tcg_fpcheck_runtime: CR0.MP/EM/TS not in flags */
+    uint32_t fp_clear; /* HF_MP/EM/TS bits checked clear earlier in the TB */
     bool jmp_opt; /* use direct block chaining for direct jumps */
     bool cc_op_dirty;
 
@@ -1527,6 +1529,43 @@ static void gen_illegal_opcode(DisasContext *s)
     gen_exception(s, EXCP06_ILLOP);
 }
 
+/*
+ * With tcg_fpcheck_runtime, CR0.MP, EM and TS (HF_MP/EM/TS) are not in
+ * the TB flags, so a guest that sets TS on task switches (lazy FPU state
+ * switching) runs one translation of its code in both states.  An
+ * instruction that depends on them checks env->hflags here instead of
+ * s->flags: raise @trapno if any bit of @mask is set (or, with @all, if
+ * all of them are).  CR0 writes end the TB, so a check that passed holds
+ * for the rest of the TB and is emitted once.
+ */
+static void gen_check_cr0_fp(DisasContext *s, uint32_t mask, bool all,
+                             int trapno)
+{
+    TCGLabel *ok;
+    TCGv_i32 t;
+
+    if (!s->fp_runtime ||
+        (all ? (s->fp_clear & mask) != 0 : (s->fp_clear & mask) == mask)) {
+        return;
+    }
+    gen_update_cc_op(s);
+    gen_update_eip_cur(s);
+    t = tcg_temp_new_i32();
+    tcg_gen_ld_i32(t, tcg_env, offsetof(CPUX86State, hflags));
+    tcg_gen_andi_i32(t, t, mask);
+    ok = gen_new_label();
+    if (all) {
+        tcg_gen_brcondi_i32(TCG_COND_NE, t, mask, ok);
+    } else {
+        tcg_gen_brcondi_i32(TCG_COND_EQ, t, 0, ok);
+    }
+    gen_helper_raise_exception(tcg_env, tcg_constant_i32(trapno));
+    gen_set_label(ok);
+    if (!all) {
+        s->fp_clear |= mask;
+    }
+}
+
 /* Generate #GP for the current instruction. */
 static void gen_exception_gpf(DisasContext *s)
 {
@@ -2371,6 +2410,7 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
         gen_exception(s, EXCP07_PREX);
         return;
     }
+    gen_check_cr0_fp(s, HF_EM_MASK | HF_TS_MASK, false, EXCP07_PREX);
     mod = (modrm >> 6) & 3;
     rm = modrm & 7;
     op = ((b & 7) << 3) | ((modrm >> 3) & 7);
@@ -3701,6 +3741,12 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     int cpl = (flags >> HF_CPL_SHIFT) & 3;
     int iopl = (flags >> IOPL_SHIFT) & 3;
     dc->fence_insn = false;
+#ifndef CONFIG_USER_ONLY
+    dc->fp_runtime = tcg_fpcheck_runtime;
+#else
+    dc->fp_runtime = false;
+#endif
+    dc->fp_clear = 0;
 
     dc->cs_base = dc->base.tb->cs_base;
     dc->pc_save = dc->base.pc_next;

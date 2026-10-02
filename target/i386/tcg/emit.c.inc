@@ -518,6 +518,8 @@ static void gen_3dnow(DisasContext *s, X86DecodedInsn *decode)
         gen_illegal_opcode(s);
         return;
     }
+    gen_check_cr0_fp(s, HF_TS_MASK, false, EXCP07_PREX);
+    gen_check_cr0_fp(s, HF_EM_MASK, false, EXCP06_ILLOP);
 
     gen_helper_enter_mmx(tcg_env);
     if (fn == FN_3DNOW_MOVE) {
@@ -2628,6 +2630,7 @@ static void gen_FXRSTOR(DisasContext *s, X86DecodedInsn *decode)
     if ((s->flags & HF_EM_MASK) || (s->flags & HF_TS_MASK)) {
         gen_NM_exception(s);
     } else {
+        gen_check_cr0_fp(s, HF_EM_MASK | HF_TS_MASK, false, EXCP07_PREX);
         gen_helper_fxrstor(tcg_env, s->A0);
     }
 }
@@ -2637,6 +2640,7 @@ static void gen_FXSAVE(DisasContext *s, X86DecodedInsn *decode)
     if ((s->flags & HF_EM_MASK) || (s->flags & HF_TS_MASK)) {
         gen_NM_exception(s);
     } else {
+        gen_check_cr0_fp(s, HF_EM_MASK | HF_TS_MASK, false, EXCP07_PREX);
         gen_helper_fxsave(tcg_env, s->A0);
     }
 }
@@ -5773,6 +5777,7 @@ static void gen_WAIT(DisasContext *s, X86DecodedInsn *decode)
     if ((s->flags & (HF_MP_MASK | HF_TS_MASK)) == (HF_MP_MASK | HF_TS_MASK)) {
         gen_NM_exception(s);
     } else {
+        gen_check_cr0_fp(s, HF_MP_MASK | HF_TS_MASK, true, EXCP07_PREX);
         /* needs to be treated as I/O because of ferr_irq */
         translator_io_start(&s->base);
         gen_helper_fwait(tcg_env);

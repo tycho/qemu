@@ -64,6 +64,7 @@ struct TCGState {
     bool hostclock_raw;
     bool pause_hint;
     bool tsc_counter;
+    bool fpcheck_runtime;
 };
 typedef struct TCGState TCGState;
 
@@ -234,6 +235,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #endif
 
     tcg_tsc_counter = s->tsc_counter;
+    tcg_fpcheck_runtime = s->fpcheck_runtime;
 
     tcg_allowed = true;
 
@@ -654,11 +656,35 @@ static void tcg_set_tsc(Object *obj, const char *value, Error **errp)
             error_setg(errp, "x-tsc=counter: no host counter on this host");
             return;
         }
+        if (icount_enabled()) {
+            /* The TSC must follow the instruction count, for replay. */
+            error_setg(errp, "x-tsc=counter: not with icount");
+            return;
+        }
         s->tsc_counter = true;
     } else if (strcmp(value, "ticks") == 0) {
         s->tsc_counter = false;
     } else {
         error_setg(errp, "Invalid 'x-tsc' value: %s (ticks, counter)",
+                   value);
+    }
+}
+
+static char *tcg_get_fpcheck(Object *obj, Error **errp)
+{
+    return g_strdup(TCG_STATE(obj)->fpcheck_runtime ? "runtime" : "tb");
+}
+
+static void tcg_set_fpcheck(Object *obj, const char *value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+
+    if (strcmp(value, "runtime") == 0) {
+        s->fpcheck_runtime = true;
+    } else if (strcmp(value, "tb") == 0) {
+        s->fpcheck_runtime = false;
+    } else {
+        error_setg(errp, "Invalid 'x-fpcheck' value: %s (tb, runtime)",
                    value);
     }
 }
@@ -761,7 +787,9 @@ static void xtcg_fork_defaults(TCGState *s)
     s->lockless_rtc = true;
     s->pause_hint = true;
     s->hostclock_raw = true;
-    s->tsc_counter = true;
+    /* Replay needs a TSC from the instruction count. */
+    s->tsc_counter = !icount_enabled();
+    s->fpcheck_runtime = true;
 #ifdef CONFIG_DARWIN
     qemu_thread_jit_lazy = true;
 #endif
@@ -859,6 +887,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-tsc",
         "x86: the TSC from QEMU's ticks (ticks), or from the host's "
         "constant-rate counter, invariant, with IA32_TSC_ADJUST (counter)");
+
+    object_class_property_add_str(oc, "x-fpcheck",
+                                  tcg_get_fpcheck, tcg_set_fpcheck);
+    object_class_property_set_description(oc, "x-fpcheck",
+        "x86: CR0.MP, EM and TS in the TB flags (tb, QEMU's), or checked "
+        "at run time, once per TB that uses the FPU (runtime)");
 
     object_class_property_add_bool(oc, "x-kvmvapic",
                                    tcg_get_kvmvapic, tcg_set_kvmvapic);
