@@ -231,6 +231,7 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 }
 
 bool tcg_iolast;
+bool tcg_mmio_lockless;
 
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
