@@ -60,6 +60,7 @@ struct TCGState {
     bool lockless_io;
     bool lockless_rtc;
     bool hostclock_raw;
+    bool pause_hint;
 };
 typedef struct TCGState TCGState;
 
@@ -215,6 +216,18 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     if (s->hostclock_raw) {
         qemu_clock_use_raw();
     }
+#endif
+
+    /*
+     * x-pause=hint: only where no other vCPU shares the thread (with
+     * round-robin TCG the exit is how the others get to run).
+     */
+#ifdef CONFIG_USER_ONLY
+    tcg_pause_hint = s->pause_hint;
+#else
+    tcg_pause_hint = s->pause_hint &&
+                     (s->mttcg_enabled == ON_OFF_AUTO_ON ||
+                      ms->smp.max_cpus == 1);
 #endif
 
     tcg_allowed = true;
@@ -604,6 +617,24 @@ static void tcg_set_jcgen(Object *obj, bool value, Error **errp)
     tcg_jcgen = value;
 }
 
+static char *tcg_get_pause(Object *obj, Error **errp)
+{
+    return g_strdup(TCG_STATE(obj)->pause_hint ? "hint" : "exit");
+}
+
+static void tcg_set_pause(Object *obj, const char *value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+
+    if (strcmp(value, "hint") == 0) {
+        s->pause_hint = true;
+    } else if (strcmp(value, "exit") == 0) {
+        s->pause_hint = false;
+    } else {
+        error_setg(errp, "Invalid 'x-pause' value: %s (exit, hint)", value);
+    }
+}
+
 static bool tcg_get_kvmvapic(Object *obj, Error **errp)
 {
     return TCG_STATE(obj)->kvmvapic;
@@ -772,6 +803,11 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-jcgen",
         "Flush the jump cache by moving a salt on instead of clearing it "
         "(x86 guests)");
+
+    object_class_property_add_str(oc, "x-pause", tcg_get_pause, tcg_set_pause);
+    object_class_property_set_description(oc, "x-pause",
+        "x86 PAUSE: leave the execution loop (exit, QEMU's) or a host "
+        "spin hint inline (hint; with a thread per vCPU)");
 
     object_class_property_add_bool(oc, "x-kvmvapic",
                                    tcg_get_kvmvapic, tcg_set_kvmvapic);

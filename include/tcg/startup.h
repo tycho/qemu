@@ -140,6 +140,13 @@ extern bool tcg_vecglobal;
 extern bool tcg_ymmglobal;
 
 /*
+ * Translate x86 PAUSE as a host spin hint inline (spin_hint) instead of
+ * a helper that leaves the execution loop; for MTTCG, where each vCPU
+ * has its own thread.
+ */
+extern bool tcg_pause_hint;
+
+/*
  * x-region: a TB whose direct jump returns to its first insn branches
  * back within the TB instead of chaining to itself.
  */
