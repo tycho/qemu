@@ -1738,6 +1738,15 @@ static bool cmd_set_features(IDEState *s, uint8_t cmd)
     case 0x9a: /* NOP */
     case 0x42: /* enable Automatic Acoustic Mode */
     case 0xc2: /* disable Automatic Acoustic Mode */
+    /* ATA-2 subcommands, retired since; nothing to change here */
+    case 0x04: /* enable automatic defect reassignment */
+    case 0x84: /* disable automatic defect reassignment */
+    case 0x33: /* disable retries */
+    case 0x99: /* enable retries */
+    case 0x77: /* disable ECC */
+    case 0x88: /* enable ECC */
+    case 0x54: /* set cache segments */
+    case 0xab: /* set maximum prefetch */
         return true;
     case 0x03: /* set transfer mode */
         {
