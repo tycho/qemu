@@ -26,6 +26,12 @@ extern bool one_insn_per_tb;
  */
 extern bool tcg_ijmp_inline;
 
+/*
+ * tcg_jcgen: flushing a vCPU's jump cache moves its salt on (O(1))
+ * instead of clearing every entry (see CPUJumpCache).
+ */
+extern bool tcg_jcgen;
+
 extern bool icount_align_option;
 
 /*
