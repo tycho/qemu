@@ -188,6 +188,8 @@ F: include/system/tcg.h
 F: include/accel/tcg/
 F: host/include/*/host/cpuinfo.h
 F: util/cpuinfo-*.c
+F: host/include/*/host/counter.h
+F: util/host-counter-*.c
 F: include/tcg/
 F: tests/decode/
 
