@@ -835,10 +835,28 @@ static inline int64_t get_clock(void)
 
 extern int use_rt_clock;
 
+#ifdef CONFIG_DARWIN
+/*
+ * macOS's CLOCK_MONOTONIC has a resolution of 1 us.  CLOCK_MONOTONIC_RAW
+ * counts the same time (sleep included) at the timebase's resolution
+ * (41.7 ns on Apple silicon); qemu_clock_use_raw() switches get_clock()
+ * to it, offset so that the clock goes on from where it was.
+ */
+extern bool clock_raw;
+extern int64_t clock_raw_offset;
+void qemu_clock_use_raw(void);
+#endif
+
 static inline int64_t get_clock(void)
 {
     if (use_rt_clock) {
         struct timespec ts;
+#ifdef CONFIG_DARWIN
+        if (qatomic_load_acquire(&clock_raw)) {
+            return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) +
+                   clock_raw_offset;
+        }
+#endif
         clock_gettime(CLOCK_MONOTONIC, &ts);
         return ts.tv_sec * 1000000000LL + ts.tv_nsec;
     } else {
