@@ -18,6 +18,8 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/thread.h"
+#include "qemu/main-loop.h"
+#include "hw/core/qdev-properties.h"
 #include "qemu/error-report.h"
 #include "hw/i386/apic_internal.h"
 #include "hw/i386/apic.h"
@@ -861,7 +863,42 @@ static int apic_register_read(APICCommonState *s, int index, uint64_t *value)
     return ret;
 }
 
-static uint64_t apic_mem_read(void *opaque, hwaddr addr, unsigned size)
+/*
+ * x-lockless-tpr: the APIC's MMIO region is lockless_io.  A vCPU's reads
+ * and writes of its own TPR take no BQL (XP's HAL makes one at every
+ * IRQL change); every other access takes it here.
+ *
+ * Only the owning vCPU writes its TPR and ISR, and other threads change
+ * its IRR under the BQL and then ask it to re-evaluate (CPU_INTERRUPT_POLL,
+ * see apic_update_irq), so the owner may read IRR without the lock: a
+ * bit it misses is evaluated at that poll.  A TPR write needs
+ * apic_update_irq only if it can change the CPU's interrupt line: when
+ * an interrupt is now deliverable, or CPU_INTERRUPT_HARD is raised (a
+ * higher TPR can mask it).
+ */
+static bool apic_tpr_lockless(APICCommonState *s, hwaddr addr, unsigned size)
+{
+    return s && s->lockless_tpr && size >= 4 && addr <= 0xfff &&
+           ((addr >> 4) & 0xff) == 0x08 &&
+           (s->apicbase & MSR_IA32_APICBASE_ENABLE) && !is_x2apic_mode(s) &&
+           !s->vapic_paddr && !apic_report_tpr_access;
+}
+
+static void apic_tpr_write_lockless(APICCommonState *s, uint8_t val)
+{
+    CPUState *cpu = CPU(s->cpu);
+
+    qatomic_set(&s->tpr, val);
+    if (!(qatomic_read(&cpu->interrupt_request) & CPU_INTERRUPT_HARD) &&
+        apic_irq_pending(s) <= 0) {
+        return;
+    }
+    BQL_LOCK_GUARD();
+    apic_update_irq(s);
+}
+
+static uint64_t apic_mem_read_locked(void *opaque, hwaddr addr,
+                                     unsigned size)
 {
     APICCommonState *s = cpu_get_current_apic();
     uint64_t val;
@@ -888,6 +925,21 @@ static uint64_t apic_mem_read(void *opaque, hwaddr addr, unsigned size)
     apic_register_read(s, index, &val);
 
     return val;
+}
+
+static uint64_t apic_mem_read(void *opaque, hwaddr addr, unsigned size)
+{
+    APICCommonState *s = cpu_get_current_apic();
+    APICCommonState *self = opaque;
+
+    if (apic_tpr_lockless(s, addr, size)) {
+        return qatomic_read(&s->tpr);
+    }
+    if (self->lockless_tpr) {
+        BQL_LOCK_GUARD();
+        return apic_mem_read_locked(opaque, addr, size);
+    }
+    return apic_mem_read_locked(opaque, addr, size);
 }
 
 int apic_msr_read(APICCommonState *s, int index, uint64_t *val)
@@ -1053,8 +1105,8 @@ static int apic_register_write(APICCommonState *s, int index, uint64_t val)
     return 0;
 }
 
-static void apic_mem_write(void *opaque, hwaddr addr, uint64_t val,
-                           unsigned size)
+static void apic_mem_write_locked(void *opaque, hwaddr addr, uint64_t val,
+                                  unsigned size)
 {
     APICCommonState *s = cpu_get_current_apic();
     int index = (addr >> 4) & 0xff;
@@ -1081,6 +1133,25 @@ static void apic_mem_write(void *opaque, hwaddr addr, uint64_t val,
     }
 
     apic_register_write(s, index, val);
+}
+
+static void apic_mem_write(void *opaque, hwaddr addr, uint64_t val,
+                           unsigned size)
+{
+    APICCommonState *s = cpu_get_current_apic();
+    APICCommonState *self = opaque;
+
+    if (apic_tpr_lockless(s, addr, size)) {
+        apic_tpr_write_lockless(s, val);
+        return;
+    }
+    /* MSI writes come from any thread, with no APIC of their own. */
+    if (self->lockless_tpr) {
+        BQL_LOCK_GUARD();
+        apic_mem_write_locked(opaque, addr, val, size);
+        return;
+    }
+    apic_mem_write_locked(opaque, addr, val, size);
 }
 
 int apic_msr_write(APICCommonState *s, int index, uint64_t val)
@@ -1138,6 +1209,9 @@ static void apic_realize(DeviceState *dev, Error **errp)
      * safe.
      */
     s->io_memory.disable_reentrancy_guard = true;
+    if (s->lockless_tpr) {
+        memory_region_enable_lockless_io(&s->io_memory);
+    }
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apic_timer, s);
 
@@ -1162,9 +1236,14 @@ static void apic_unrealize(DeviceState *dev)
     local_apics[s->initial_apic_id] = NULL;
 }
 
+static const Property apic_properties[] = {
+    DEFINE_PROP_BOOL("x-lockless-tpr", APICCommonState, lockless_tpr, false),
+};
+
 static void apic_class_init(ObjectClass *klass, const void *data)
 {
     APICCommonClass *k = APIC_COMMON_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
     k->realize = apic_realize;
     k->unrealize = apic_unrealize;
@@ -1176,6 +1255,7 @@ static void apic_class_init(ObjectClass *klass, const void *data)
     k->pre_save = apic_pre_save;
     k->post_load = apic_post_load;
     k->send_msi = apic_send_msi;
+    device_class_set_props(dc, apic_properties);
 }
 
 static const TypeInfo apic_info = {
