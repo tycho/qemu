@@ -44,6 +44,7 @@ static inline void tcg_gen_insn_start(uint64_t pc, uint64_t a1,
 void gen_set_label(TCGLabel *l);
 void tcg_gen_br(TCGLabel *l);
 void tcg_gen_mb(TCGBar);
+void tcg_gen_spin_hint(void);
 
 /**
  * tcg_gen_exit_tb() - output exit_tb TCG operation
