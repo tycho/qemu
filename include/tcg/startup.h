@@ -55,4 +55,11 @@ void tcg_register_thread(void);
  */
 void tcg_prologue_init(void);
 
+/*
+ * Translate x86 PAUSE as a host spin hint inline (spin_hint) instead of
+ * a helper that leaves the execution loop; for MTTCG, where each vCPU
+ * has its own thread.
+ */
+extern bool tcg_pause_hint;
+
 #endif
