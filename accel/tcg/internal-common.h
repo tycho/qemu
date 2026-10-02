@@ -34,6 +34,12 @@ extern unsigned tcg_tlb_grow;
 extern bool tcg_ijmp_inline;
 
 /*
+ * tcg_jcgen: flushing a vCPU's jump cache moves its salt on (O(1))
+ * instead of clearing every entry (see CPUJumpCache).
+ */
+extern bool tcg_jcgen;
+
+/*
  * tcg_iolast: an instruction that did I/O from the middle of its TB is
  * remembered, and translation ends TBs after it, so that its accesses
  * no longer unwind the TB (cpu_io_recompile).  Not with icount.
