@@ -711,7 +711,11 @@ static void openpic_tmr_set_tmr(OpenPICTimer *tmr, uint32_t val, bool enabled)
      * configuration.  On real hardware, this situation would generate an
      * interrupt on every clock cycle if the interrupt was unmasked.
      */
-    if ((ns == 0) || !enabled) {
+    if (!tmr->qemu_timer) {
+        /* The model has no timers (KeyLargo): the count doesn't run. */
+        tmr->qemu_timer_active = false;
+        tmr->tccr = tmr->tccr & TCCR_TOG;
+    } else if ((ns == 0) || !enabled) {
         tmr->qemu_timer_active = false;
         tmr->tccr = tmr->tccr & TCCR_TOG;
         timer_del(tmr->qemu_timer); /* set timer to never expire. */
