@@ -147,6 +147,14 @@ extern bool tcg_ymmglobal;
 extern bool tcg_pause_hint;
 
 /*
+ * x86 guests: the TSC from the host's constant-rate counter
+ * (host/counter.h) plus a per-vCPU offset, instead of
+ * cpu_get_ticks(); with IA32_TSC and IA32_TSC_ADJUST, invariant TSC and
+ * CPUID leaf 0x15.
+ */
+extern bool tcg_tsc_counter;
+
+/*
  * x-region: a TB whose direct jump returns to its first insn branches
  * back within the TB instead of chaining to itself.
  */

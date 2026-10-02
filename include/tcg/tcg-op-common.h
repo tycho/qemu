@@ -47,6 +47,7 @@ void gen_set_label(TCGLabel *l);
 void tcg_gen_br(TCGLabel *l);
 void tcg_gen_mb(TCGBar);
 void tcg_gen_spin_hint(void);
+void tcg_gen_host_counter_i64(TCGv_i64 ret, bool ordered);
 
 /**
  * tcg_gen_exit_tb() - output exit_tb TCG operation
