@@ -235,16 +235,18 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s,
     TranslationBlock *tb;
     CPUJumpCache *jc;
     uint32_t hash;
+    vaddr key;
 
     /* we should never be trying to look up an INVALID tb */
     tcg_debug_assert(!(s.cflags & CF_INVALID));
 
     hash = tb_jmp_cache_hash_func(s.pc);
     jc = cpu->tb_jmp_cache;
+    key = s.pc ^ qatomic_read(&jc->salt);
 
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
-               jc->array[hash].pc == s.pc &&
+               jc->array[hash].pc == key &&
                tb->cs_base == s.cs_base &&
                tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
@@ -258,7 +260,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s,
     }
     xtcg_stat_inc(from_helper ? XS_LOOKUP_PTR_HT_HIT : XS_LOOP_HT_HIT);
 
-    jc->array[hash].pc = s.pc;
+    jc->array[hash].pc = key;
     qatomic_set(&jc->array[hash].tb, tb);
 
 hit:
@@ -1011,7 +1013,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                  */
                 h = tb_jmp_cache_hash_func(s.pc);
                 jc = cpu->tb_jmp_cache;
-                jc->array[h].pc = s.pc;
+                jc->array[h].pc = s.pc ^ qatomic_read(&jc->salt);
                 qatomic_set(&jc->array[h].tb, tb);
             }
 

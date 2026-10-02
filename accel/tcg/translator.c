@@ -241,6 +241,7 @@ void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
     TCGv_i64 t64 = tcg_temp_ebb_new_i64();
     TCGv_i32 t32 = tcg_temp_ebb_new_i32();
     TCGv_i32 cf = tcg_temp_ebb_new_i32();
+    TCGv_i64 key = pc;
 
     assert(translator_use_inline_lookup(db));
     plugin_gen_disable_mem_helpers();
@@ -248,19 +249,26 @@ void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
     /*
      * The same checks as tb_lookup(), against the jump cache only.  The
      * cache holds only TBs that are valid for the vCPU's current mappings:
-     * TLB flushes clear it, and TB invalidation removes the TB from it.
+     * TLB flushes clear it (or move its salt on), and TB invalidation
+     * removes the TB from it.
      * The pc is compared before the first branch, so it needn't stay live
      * across them.
      */
     tcg_gen_ld_ptr(jc, tcg_env,
                    offsetof(CPUState, tb_jmp_cache) - sizeof(CPUState));
+    if (tcg_jcgen) {
+        /* Entries hold pc ^ salt; a flush moves the salt on. */
+        key = tcg_temp_ebb_new_i64();
+        tcg_gen_ld_i64(key, jc, offsetof(CPUJumpCache, salt));
+        tcg_gen_xor_i64(key, key, pc);
+    }
     gen_jmp_cache_offset(t64, pc);
     tcg_gen_trunc_i64_ptr(tb, t64);
     tcg_gen_add_ptr(jc, jc, tb);
     QEMU_BUILD_BUG_ON(sizeof(vaddr) != sizeof(uint64_t));
     tcg_gen_ld_i64(t64, jc, offsetof(CPUJumpCache, array[0].pc));
     tcg_gen_ld_ptr(tb, jc, offsetof(CPUJumpCache, array[0].tb));
-    tcg_gen_brcond_i64(TCG_COND_NE, t64, pc, miss);
+    tcg_gen_brcond_i64(TCG_COND_NE, t64, key, miss);
     tcg_gen_brcondi_ptr(TCG_COND_EQ, tb, 0, miss);
 
     /* check_for_breakpoints() runs only in the helper. */
@@ -288,6 +296,9 @@ void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
     gen_set_label(miss);
     tcg_gen_lookup_and_goto_ptr();
 
+    if (key != pc) {
+        tcg_temp_free_i64(key);
+    }
     tcg_temp_free_i32(cf);
     tcg_temp_free_i32(t32);
     tcg_temp_free_i64(t64);

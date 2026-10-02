@@ -323,6 +323,7 @@ static void tcg_set_tlb_grow(Object *obj, Visitor *v, const char *name,
 }
 
 bool tcg_ijmp_inline;
+bool tcg_jcgen;
 bool tcg_iolast;
 bool tcg_mmio_lockless;
 
@@ -594,6 +595,16 @@ static void tcg_set_hostclock(Object *obj, const char *value, Error **errp)
     }
 }
 
+static bool tcg_get_jcgen(Object *obj, Error **errp)
+{
+    return tcg_jcgen;
+}
+
+static void tcg_set_jcgen(Object *obj, bool value, Error **errp)
+{
+    tcg_jcgen = value;
+}
+
 static bool tcg_get_kvmvapic(Object *obj, Error **errp)
 {
     return TCG_STATE(obj)->kvmvapic;
@@ -674,6 +685,7 @@ static void xtcg_fork_defaults(TCGState *s)
     tcg_ssefp_vec = !tcg_ssefp_native;
     tcg_ijmp_inline = true;
     tcg_iolast = true;
+    tcg_jcgen = true;
     tcg_tlb_grow = 1;
     tcg_vecld = true;
     tcg_vperm = true;
@@ -771,6 +783,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-hostclock",
         "macOS: QEMU's clock from CLOCK_MONOTONIC (mono, 1 us resolution) "
         "or CLOCK_MONOTONIC_RAW (raw, the timebase's resolution)");
+
+    object_class_property_add_bool(oc, "x-jcgen",
+                                   tcg_get_jcgen, tcg_set_jcgen);
+    object_class_property_set_description(oc, "x-jcgen",
+        "Flush the jump cache by moving a salt on instead of clearing it "
+        "(x86 guests)");
 
     object_class_property_add_bool(oc, "x-kvmvapic",
                                    tcg_get_kvmvapic, tcg_set_kvmvapic);
