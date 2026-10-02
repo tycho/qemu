@@ -793,6 +793,16 @@ void tcg_flush_jmp_cache(CPUState *cpu)
         return;
     }
 
+    if (tcg_jcgen) {
+        uint64_t salt = qatomic_read(&jc->salt) + TB_JMP_SALT_STEP;
+
+        /* Once every 65536 flushes the salt comes round: clear for real. */
+        if (salt != 0) {
+            qatomic_set(&jc->salt, salt);
+            return;
+        }
+        qatomic_set(&jc->salt, 0);
+    }
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
         qatomic_set(&jc->array[i].tb, NULL);
     }
