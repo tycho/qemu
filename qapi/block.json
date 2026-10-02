@@ -350,8 +350,8 @@
 # @read-only-mode: change the read-only mode of the device; defaults
 #     to 'retain'
 #
-# @file-locking-mode: change the locking mode of the file image; defaults
-#     to 'auto' (since: 9.2)
+# @file-locking-mode: change the locking mode of the file image;
+#     defaults to 'auto' (since: 9.2)
 #
 # @force: if false (the default), an eject request through
 #     `blockdev-open-tray` will be sent to the guest if it has locked
