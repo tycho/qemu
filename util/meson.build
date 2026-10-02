@@ -115,6 +115,7 @@ endif
 
 if cpu == 'aarch64'
   util_ss.add(files('cpuinfo-aarch64.c'))
+  util_ss.add(files('host-counter-aarch64.c'))
 elif cpu == 'x86_64'
   util_ss.add(files('cpuinfo-i386.c'))
 elif cpu == 'loongarch64'

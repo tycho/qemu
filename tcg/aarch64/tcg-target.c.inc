@@ -1752,6 +1752,20 @@ static void tcg_out_extrl_i64_i32(TCGContext *s, TCGReg rd, TCGReg rn)
  * a NOP, while ISB holds the core for some tens of cycles, as x86 PAUSE
  * does.
  */
+#define TCG_TARGET_HAS_host_counter
+static void tgen_host_counter(TCGContext *s, TCGReg a0, bool ordered)
+{
+    if (ordered) {
+        tcg_out32(s, 0xd5033fdf);           /* isb */
+    }
+    tcg_out32(s, 0xd53be040 | a0);          /* mrs a0, cntvct_el0 */
+}
+
+static const TCGOutOpHostCounter outop_host_counter = {
+    .base.static_constraint = C_O1_I0(r),
+    .out_r = tgen_host_counter,
+};
+
 #define TCG_TARGET_HAS_SPIN_HINT
 static void tcg_out_spin_hint(TCGContext *s)
 {

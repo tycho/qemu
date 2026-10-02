@@ -25,6 +25,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
+#include "host/counter.h"
 #include "system/tcg.h"
 #include "exec/replay-core.h"
 #include "exec/icount.h"
@@ -62,6 +63,7 @@ struct TCGState {
     bool lockless_rtc;
     bool hostclock_raw;
     bool pause_hint;
+    bool tsc_counter;
 };
 typedef struct TCGState TCGState;
 
@@ -213,7 +215,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     }
 #endif
 
-#ifdef CONFIG_DARWIN
+#if QEMU_CLOCK_RAW_SUPPORTED
     if (s->hostclock_raw) {
         qemu_clock_use_raw();
     }
@@ -230,6 +232,8 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
                      (s->mttcg_enabled == ON_OFF_AUTO_ON ||
                       ms->smp.max_cpus == 1);
 #endif
+
+    tcg_tsc_counter = s->tsc_counter;
 
     tcg_allowed = true;
 
@@ -587,7 +591,7 @@ static char *tcg_get_hostclock(Object *obj, Error **errp)
 }
 
 /*
- * x-hostclock=raw: get_clock() at the timebase's resolution on macOS (see
+ * x-hostclock=raw: get_clock() from CLOCK_MONOTONIC_RAW (see
  * include/qemu/timer.h); tcg_init_machine() applies it.
  */
 static void tcg_set_hostclock(Object *obj, const char *value, Error **errp)
@@ -595,10 +599,10 @@ static void tcg_set_hostclock(Object *obj, const char *value, Error **errp)
     TCGState *s = TCG_STATE(obj);
 
     if (strcmp(value, "raw") == 0) {
-#ifdef CONFIG_DARWIN
+#if QEMU_CLOCK_RAW_SUPPORTED
         s->hostclock_raw = true;
 #else
-        error_setg(errp, "x-hostclock=raw: only on macOS hosts");
+        error_setg(errp, "x-hostclock=raw: not on this host");
 #endif
     } else if (strcmp(value, "mono") == 0) {
         s->hostclock_raw = false;
@@ -633,6 +637,29 @@ static void tcg_set_pause(Object *obj, const char *value, Error **errp)
         s->pause_hint = false;
     } else {
         error_setg(errp, "Invalid 'x-pause' value: %s (exit, hint)", value);
+    }
+}
+
+static char *tcg_get_tsc(Object *obj, Error **errp)
+{
+    return g_strdup(TCG_STATE(obj)->tsc_counter ? "counter" : "ticks");
+}
+
+static void tcg_set_tsc(Object *obj, const char *value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+
+    if (strcmp(value, "counter") == 0) {
+        if (!HOST_COUNTER_SUPPORTED) {
+            error_setg(errp, "x-tsc=counter: no host counter on this host");
+            return;
+        }
+        s->tsc_counter = true;
+    } else if (strcmp(value, "ticks") == 0) {
+        s->tsc_counter = false;
+    } else {
+        error_setg(errp, "Invalid 'x-tsc' value: %s (ticks, counter)",
+                   value);
     }
 }
 
@@ -733,9 +760,10 @@ static void xtcg_fork_defaults(TCGState *s)
     s->lockless_io = true;
     s->lockless_rtc = true;
     s->pause_hint = true;
+    s->hostclock_raw = true;
+    s->tsc_counter = true;
 #ifdef CONFIG_DARWIN
     qemu_thread_jit_lazy = true;
-    s->hostclock_raw = true;
 #endif
 #endif
 }
@@ -813,8 +841,8 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "x-hostclock", tcg_get_hostclock,
                                   tcg_set_hostclock);
     object_class_property_set_description(oc, "x-hostclock",
-        "macOS: QEMU's clock from CLOCK_MONOTONIC (mono, 1 us resolution) "
-        "or CLOCK_MONOTONIC_RAW (raw, the timebase's resolution)");
+        "QEMU's clock from CLOCK_MONOTONIC (mono) or CLOCK_MONOTONIC_RAW "
+        "(raw: unadjusted, and on macOS finer than 1 us)");
 
     object_class_property_add_bool(oc, "x-jcgen",
                                    tcg_get_jcgen, tcg_set_jcgen);
@@ -826,6 +854,11 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-pause",
         "x86 PAUSE: leave the execution loop (exit, QEMU's) or a host "
         "spin hint inline (hint; with a thread per vCPU)");
+
+    object_class_property_add_str(oc, "x-tsc", tcg_get_tsc, tcg_set_tsc);
+    object_class_property_set_description(oc, "x-tsc",
+        "x86: the TSC from QEMU's ticks (ticks), or from the host's "
+        "constant-rate counter, invariant, with IA32_TSC_ADJUST (counter)");
 
     object_class_property_add_bool(oc, "x-kvmvapic",
                                    tcg_get_kvmvapic, tcg_set_kvmvapic);
