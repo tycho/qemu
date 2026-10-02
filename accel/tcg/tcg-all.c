@@ -24,6 +24,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
 #include "system/tcg.h"
 #include "exec/replay-core.h"
 #include "exec/icount.h"
@@ -59,6 +60,7 @@ struct TCGState {
     bool kvmvapic;
     bool lockless_io;
     bool lockless_rtc;
+    bool hostclock_raw;
 };
 typedef struct TCGState TCGState;
 
@@ -207,6 +209,12 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
         }
         compat_props_add(ac->compat_props, lockless_rtc,
                          G_N_ELEMENTS(lockless_rtc));
+    }
+#endif
+
+#ifdef CONFIG_DARWIN
+    if (s->hostclock_raw) {
+        qemu_clock_use_raw();
     }
 #endif
 
@@ -559,6 +567,33 @@ static void tcg_set_lockless_rtc(Object *obj, bool value, Error **errp)
     TCG_STATE(obj)->lockless_rtc = value;
 }
 
+static char *tcg_get_hostclock(Object *obj, Error **errp)
+{
+    return g_strdup(TCG_STATE(obj)->hostclock_raw ? "raw" : "mono");
+}
+
+/*
+ * x-hostclock=raw: get_clock() at the timebase's resolution on macOS (see
+ * include/qemu/timer.h); tcg_init_machine() applies it.
+ */
+static void tcg_set_hostclock(Object *obj, const char *value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+
+    if (strcmp(value, "raw") == 0) {
+#ifdef CONFIG_DARWIN
+        s->hostclock_raw = true;
+#else
+        error_setg(errp, "x-hostclock=raw: only on macOS hosts");
+#endif
+    } else if (strcmp(value, "mono") == 0) {
+        s->hostclock_raw = false;
+    } else {
+        error_setg(errp, "Invalid 'x-hostclock' value: %s (mono, raw)",
+                   value);
+    }
+}
+
 static bool tcg_get_kvmvapic(Object *obj, Error **errp)
 {
     return TCG_STATE(obj)->kvmvapic;
@@ -656,6 +691,7 @@ static void xtcg_fork_defaults(TCGState *s)
     s->lockless_rtc = true;
 #ifdef CONFIG_DARWIN
     qemu_thread_jit_lazy = true;
+    s->hostclock_raw = true;
 #endif
 #endif
 }
@@ -729,6 +765,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-lockless-rtc",
         "x86 system: the RTC's index writes and update-in-progress polls "
         "without the BQL");
+
+    object_class_property_add_str(oc, "x-hostclock", tcg_get_hostclock,
+                                  tcg_set_hostclock);
+    object_class_property_set_description(oc, "x-hostclock",
+        "macOS: QEMU's clock from CLOCK_MONOTONIC (mono, 1 us resolution) "
+        "or CLOCK_MONOTONIC_RAW (raw, the timebase's resolution)");
 
     object_class_property_add_bool(oc, "x-kvmvapic",
                                    tcg_get_kvmvapic, tcg_set_kvmvapic);
