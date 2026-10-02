@@ -278,6 +278,7 @@ static void tcg_set_tlb_grow(Object *obj, Visitor *v, const char *name,
 }
 
 bool tcg_ijmp_inline;
+bool tcg_iolast;
 
 static char *tcg_get_ijmp(Object *obj, Error **errp)
 {
@@ -374,6 +375,16 @@ static bool tcg_get_vpermvar(Object *obj, Error **errp)
 static void tcg_set_vpermvar(Object *obj, bool value, Error **errp)
 {
     tcg_vpermvar = value;
+}
+
+static bool tcg_get_iolast(Object *obj, Error **errp)
+{
+    return tcg_iolast;
+}
+
+static void tcg_set_iolast(Object *obj, bool value, Error **errp)
+{
+    tcg_iolast = value;
 }
 
 static bool tcg_get_ymmglobal(Object *obj, Error **errp)
@@ -569,6 +580,7 @@ static void xtcg_fork_defaults(TCGState *s)
     tcg_ssefp_native = host_fpenv_native();
     tcg_ssefp_vec = !tcg_ssefp_native;
     tcg_ijmp_inline = true;
+    tcg_iolast = true;
     tcg_tlb_grow = 1;
     tcg_vecld = true;
     tcg_vperm = true;
@@ -713,6 +725,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-vpermvar",
         "Permutes by indices in a register (vpermd, vpermps) as host "
         "table lookups instead of helper calls");
+
+    object_class_property_add_bool(oc, "x-iolast",
+                                   tcg_get_iolast, tcg_set_iolast);
+    object_class_property_set_description(oc, "x-iolast",
+        "End TBs after instructions that did I/O from the middle of a TB, "
+        "instead of unwinding the TB at every such access (not with icount)");
 
     object_class_property_add_bool(oc, "x-ymmglobal",
                                    tcg_get_ymmglobal, tcg_set_ymmglobal);

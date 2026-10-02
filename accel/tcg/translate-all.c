@@ -665,7 +665,61 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr)
     }
 }
 
+/*
+ * The guest pcs of instructions that did I/O from the middle of a TB
+ * (tcg_iolast): an insert-only, lock-free open-addressed set.  An entry
+ * is pc + 1, so that 0 means empty.  When the set is full, an
+ * instruction keeps the cpu_io_recompile path.
+ */
+#define TB_IO_INSN_BITS  12
+#define TB_IO_INSN_MASK  ((1 << TB_IO_INSN_BITS) - 1)
+#define TB_IO_INSN_PROBE 16
+
+static uint64_t tb_io_insns[1 << TB_IO_INSN_BITS];
+
+static unsigned tb_io_insn_hash(uint64_t key)
+{
+    return (key * 0x9e3779b97f4a7c15ull) >> (64 - TB_IO_INSN_BITS);
+}
+
+bool tb_io_insn_known(vaddr pc)
+{
+    uint64_t key = (uint64_t)pc + 1;
+    unsigned h = tb_io_insn_hash(key);
+
+    for (int i = 0; i < TB_IO_INSN_PROBE; i++) {
+        uint64_t e = qatomic_read(&tb_io_insns[(h + i) & TB_IO_INSN_MASK]);
+
+        if (e == key) {
+            return true;
+        }
+        if (e == 0) {
+            return false;
+        }
+    }
+    return false;
+}
+
 #ifndef CONFIG_USER_ONLY
+/* Add @pc to the set; false if the set has no room for it. */
+static bool tb_io_insn_add(vaddr pc)
+{
+    uint64_t key = (uint64_t)pc + 1;
+    unsigned h = tb_io_insn_hash(key);
+
+    for (int i = 0; i < TB_IO_INSN_PROBE; i++) {
+        uint64_t *slot = &tb_io_insns[(h + i) & TB_IO_INSN_MASK];
+        uint64_t e = qatomic_cmpxchg(slot, 0, key);
+
+        if (e == 0 || e == key) {
+            trace_tb_io_insn_add(pc, e == 0);
+            return true;
+        }
+    }
+    trace_tb_io_insn_add(pc, false);
+    return false;
+}
+
 /*
  * In deterministic execution mode, instructions doing device I/Os
  * must be at the end of the TB.
@@ -684,6 +738,15 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
                   (void *)retaddr);
     }
     cpu_restore_state_from_tb(cpu, tb, retaddr);
+
+    /*
+     * With tcg_iolast, the next translation ends a TB after this
+     * instruction, so that its accesses don't come back here: drop the
+     * TB that has it in the middle.
+     */
+    if (tcg_iolast && !icount_enabled() && tb_io_insn_add(cc->get_pc(cpu))) {
+        tb_phys_invalidate(tb, -1);
+    }
 
     /*
      * Some guests must re-execute the branch when re-executing a delay
