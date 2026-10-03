@@ -197,6 +197,7 @@ bool translator_use_inline_lookup(DisasContextBase *db);
  * @pc: virtual pc of the next TB
  * @cs_base: cs_base of the next TB
  * @flags: flags of the next TB
+ * @direct: the jump is direct (its target is fixed), to another page
  *
  * Like tcg_gen_lookup_and_goto_ptr(), for a target that knows at
  * translation time the CPU state at this TB exit: @cs_base and @flags must
@@ -206,7 +207,8 @@ bool translator_use_inline_lookup(DisasContextBase *db);
  * translator_use_inline_lookup() returns true.
  */
 void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
-                                    uint64_t cs_base, uint32_t flags);
+                                    uint64_t cs_base, uint32_t flags,
+                                    bool direct);
 
 /**
  * translator_io_start
