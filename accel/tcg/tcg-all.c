@@ -857,6 +857,7 @@ static void xtcg_fork_defaults(TCGState *s)
     tcg_vecglobal = true;
     tcg_region = true;
     tcg_pferr_hw = true;
+    tcg_addr32 = true;
     s->kvmvapic = false;
     s->lockless_io = true;
     s->lockless_rtc = true;
