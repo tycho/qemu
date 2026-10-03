@@ -118,6 +118,7 @@ typedef struct DisasContext {
     bool fence_insn; /* this insn is LFENCE or MFENCE */
     bool after_fence; /* the previous insn was */
     bool fp_runtime; /* tcg_fpcheck_runtime: CR0.MP/EM/TS not in flags */
+    bool cr0exc_hw; /* tcg_cr0exc_hw */
     uint32_t fp_clear; /* HF_MP/EM/TS bits checked clear earlier in the TB */
     bool jmp_opt; /* use direct block chaining for direct jumps */
     bool jmp_direct; /* the TB ends in a direct jump to another page */
@@ -3750,6 +3751,7 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->fp_runtime = false;
 #endif
     dc->fp_clear = 0;
+    dc->cr0exc_hw = tcg_cr0exc_hw;
 
     dc->cs_base = dc->base.tb->cs_base;
     dc->pc_save = dc->base.pc_next;
