@@ -305,10 +305,11 @@ static void gen_inline_lookup(TCGv_i64 pc, uint64_t cs_base, uint32_t flags)
 }
 
 void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
-                                    uint64_t cs_base, uint32_t flags)
+                                    uint64_t cs_base, uint32_t flags,
+                                    bool direct)
 {
     assert(translator_use_inline_lookup(db));
-    if (tcg_ijmp_call) {
+    if (tcg_ijmp_call || (tcg_ijmp_xcall && direct)) {
         tcg_gen_lookup_jc_and_goto_ptr(pc, cs_base, flags);
     } else {
         gen_inline_lookup(pc, cs_base, flags);

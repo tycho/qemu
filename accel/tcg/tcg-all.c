@@ -342,6 +342,7 @@ static void tcg_set_tlb_grow(Object *obj, Visitor *v, const char *name,
 
 bool tcg_ijmp_inline;
 bool tcg_ijmp_call;
+bool tcg_ijmp_xcall;
 bool tcg_jcgen;
 bool tcg_iolast;
 bool tcg_mmio_lockless;
@@ -349,20 +350,23 @@ bool tcg_mmio_lockless;
 static char *tcg_get_ijmp(Object *obj, Error **errp)
 {
     return g_strdup(!tcg_ijmp_inline ? "helper" :
-                    tcg_ijmp_call ? "call" : "inline");
+                    tcg_ijmp_call ? "call" :
+                    tcg_ijmp_xcall ? "xcall" : "inline");
 }
 
 static void tcg_set_ijmp(Object *obj, const char *value, Error **errp)
 {
     if (!strcmp(value, "inline")) {
         tcg_ijmp_inline = true;
-        tcg_ijmp_call = false;
+        tcg_ijmp_call = tcg_ijmp_xcall = false;
     } else if (!strcmp(value, "call")) {
-        tcg_ijmp_inline = true;
-        tcg_ijmp_call = true;
-    } else if (!strcmp(value, "helper")) {
-        tcg_ijmp_inline = false;
+        tcg_ijmp_inline = tcg_ijmp_call = true;
+        tcg_ijmp_xcall = false;
+    } else if (!strcmp(value, "xcall")) {
+        tcg_ijmp_inline = tcg_ijmp_xcall = true;
         tcg_ijmp_call = false;
+    } else if (!strcmp(value, "helper")) {
+        tcg_ijmp_inline = tcg_ijmp_call = tcg_ijmp_xcall = false;
     } else {
         error_setg(errp, "Invalid 'x-ijmp' value: %s", value);
     }
@@ -919,8 +923,9 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-ijmp",
         "Look up the next TB at an indirect or cross-page jump: helper "
         "(default), inline (probe the jump cache in generated code, "
-        "call the helper on a miss) or call (the same probe in a short "
-        "helper call)");
+        "call the helper on a miss), call (the same probe in a short "
+        "helper call) or xcall (the call for direct jumps to another "
+        "page, inline for indirect jumps)");
 
     object_class_property_add_str(oc, "x-ssefp", tcg_get_ssefp, tcg_set_ssefp);
     object_class_property_set_description(oc, "x-ssefp",
