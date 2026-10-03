@@ -232,8 +232,7 @@ static bool inline_lookup_checks_breakpoints(void)
 #endif
 }
 
-void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
-                                    uint64_t cs_base, uint32_t flags)
+static void gen_inline_lookup(TCGv_i64 pc, uint64_t cs_base, uint32_t flags)
 {
     TCGLabel *miss = gen_new_label();
     TCGv_ptr jc = tcg_temp_ebb_new_ptr();
@@ -243,7 +242,6 @@ void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
     TCGv_i32 cf = tcg_temp_ebb_new_i32();
     TCGv_i64 key = pc;
 
-    assert(translator_use_inline_lookup(db));
     plugin_gen_disable_mem_helpers();
 
     /*
@@ -304,6 +302,18 @@ void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
     tcg_temp_free_i64(t64);
     tcg_temp_free_ptr(tb);
     tcg_temp_free_ptr(jc);
+}
+
+void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
+                                    uint64_t cs_base, uint32_t flags,
+                                    bool direct)
+{
+    assert(translator_use_inline_lookup(db));
+    if (tcg_ijmp_call || (tcg_ijmp_xcall && direct)) {
+        tcg_gen_lookup_jc_and_goto_ptr(pc, cs_base, flags);
+    } else {
+        gen_inline_lookup(pc, cs_base, flags);
+    }
 }
 
 void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
