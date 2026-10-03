@@ -349,6 +349,8 @@ typedef struct TCGLdstWriteback {
     TCGReg reg;             /* the register holding the global's value */
     TCGReg base;            /* its canonical location: base + offset */
     intptr_t offset;
+    bool is_const;          /* the value is @val, in no register */
+    int64_t val;
 } TCGLdstWriteback;
 
 /*

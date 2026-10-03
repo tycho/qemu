@@ -1915,7 +1915,12 @@ static void tcg_out_ldst_writeback(TCGContext *s, TCGLabelQemuLdst *lb)
     for (unsigned i = 0; i < lb->nb_wb; i++) {
         const TCGLdstWriteback *wb = &lb->wb[i];
 
-        tcg_out_st(s, wb->type, wb->reg, wb->base, wb->offset);
+        if (wb->is_const) {
+            tcg_out_movi(s, wb->type, TCG_REG_TMP0, wb->val);
+            tcg_out_st(s, wb->type, TCG_REG_TMP0, wb->base, wb->offset);
+        } else {
+            tcg_out_st(s, wb->type, wb->reg, wb->base, wb->offset);
+        }
     }
 }
 

@@ -113,6 +113,9 @@ extern bool tcg_ldstkeep;
  */
 extern bool tcg_lazysync;
 
+/* x-lazyconst: with x-lazysync, constant-valued globals too. */
+extern bool tcg_lazyconst;
+
 /*
  * User mode: the host signal handler stores the dirty globals a faulting
  * guest access had in registers (tb_lazysync_unwind), so x-lazysync can

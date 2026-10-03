@@ -102,6 +102,9 @@ static int64_t decode_sleb128(const uint8_t **pp)
    That is, the first column is seeded with the guest pc, the last column
    with the host pc, and the middle columns with zeros.  */
 
+/* x-lazysync map: the register byte of a constant (x-lazyconst). */
+#define LAZY_WB_CONST 0xff
+
 static int encode_search(TranslationBlock *tb, uint8_t *block)
 {
     uint8_t *highwater = tcg_ctx->code_gen_highwater;
@@ -148,10 +151,13 @@ static int encode_search(TranslationBlock *tb, uint8_t *block)
             p = encode_sleb128(p, m->end - m->start);
             p = encode_sleb128(p, m->nb_wb);
             for (j = 0; j < m->nb_wb; ++j) {
-                *p++ = m->wb[j].reg;
+                *p++ = m->wb[j].is_const ? LAZY_WB_CONST : m->wb[j].reg;
                 *p++ = m->wb[j].base;
                 *p++ = m->wb[j].type;
                 p = encode_sleb128(p, m->wb[j].offset);
+                if (m->wb[j].is_const) {
+                    p = encode_sleb128(p, m->wb[j].val);
+                }
             }
             if (unlikely(p > highwater)) {
                 return -1;
@@ -196,18 +202,22 @@ void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t *regs)
         bool hit = off >= start && off < start + len;
 
         for (int j = 0; j < nb_wb; ++j) {
-            TCGReg reg = *p++;
+            unsigned reg = *p++;
             TCGReg base = *p++;
             TCGType type = *p++;
             intptr_t ofs = decode_sleb128(&p);
+            uint64_t val = reg == LAZY_WB_CONST ? decode_sleb128(&p) : 0;
 
             if (hit) {
                 void *dst = (void *)(uintptr_t)(regs[base] + ofs);
 
+                if (reg != LAZY_WB_CONST) {
+                    val = regs[reg];
+                }
                 if (type == TCG_TYPE_I32) {
-                    *(uint32_t *)dst = regs[reg];
+                    *(uint32_t *)dst = val;
                 } else {
-                    *(uint64_t *)dst = regs[reg];
+                    *(uint64_t *)dst = val;
                 }
             }
         }
