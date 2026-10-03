@@ -3681,10 +3681,11 @@ static void gen_POPF(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot;
     int mask = TF_MASK | AC_MASK | ID_MASK | NT_MASK;
+    TCGv_i32 m;
 
     if (CPL(s) == 0) {
         mask |= IF_MASK | IOPL_MASK;
-    } else if (CPL(s) <= IOPL(s)) {
+    } else if (!s->iopl_runtime && CPL(s) <= IOPL(s)) {
         mask |= IF_MASK;
     }
     if (s->dflag == MO_16) {
@@ -3692,7 +3693,18 @@ static void gen_POPF(DisasContext *s, X86DecodedInsn *decode)
     }
 
     ot = gen_pop_T0(s);
-    gen_helper_write_eflags(tcg_env, s->T0, tcg_constant_i32(mask));
+    if (CPL(s) != 0 && s->iopl_runtime) {
+        /* IF if CPL <= IOPL, tested at run time. */
+        m = tcg_temp_new_i32();
+        tcg_gen_ld_i32(m, tcg_env, offsetof(CPUX86State, eflags));
+        tcg_gen_extract_i32(m, m, IOPL_SHIFT, 2);
+        tcg_gen_setcondi_i32(TCG_COND_GEU, m, m, CPL(s));
+        tcg_gen_shli_i32(m, m, ctz32(IF_MASK));
+        tcg_gen_ori_i32(m, m, mask);
+    } else {
+        m = tcg_constant_i32(mask);
+    }
+    gen_helper_write_eflags(tcg_env, s->T0, m);
     gen_pop_update(s, ot);
     set_cc_op(s, CC_OP_EFLAGS);
     /* abort translation because TF/AC flag may change */
