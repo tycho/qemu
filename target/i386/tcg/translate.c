@@ -120,6 +120,7 @@ typedef struct DisasContext {
     bool fp_runtime; /* tcg_fpcheck_runtime: CR0.MP/EM/TS not in flags */
     uint32_t fp_clear; /* HF_MP/EM/TS bits checked clear earlier in the TB */
     bool jmp_opt; /* use direct block chaining for direct jumps */
+    bool jmp_direct; /* the TB ends in a direct jump to another page */
     bool cc_op_dirty;
 
     CCOp cc_op;  /* current CC operation */
@@ -2039,7 +2040,8 @@ static void gen_lookup_and_goto_ptr(DisasContext *s, int mode)
         tcg_gen_ext32u_tl(t, t);
         tcg_gen_extu_tl_i64(pc, t);
     }
-    translator_lookup_and_goto_ptr(&s->base, pc, s->cs_base, s->flags);
+    translator_lookup_and_goto_ptr(&s->base, pc, s->cs_base, s->flags,
+                                   s->jmp_direct);
 }
 
 /*
@@ -2140,6 +2142,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
             tcg_gen_movi_tl(cpu_eip, new_eip);
         }
         if (s->jmp_opt) {
+            s->jmp_direct = true;
             gen_eob(s, DISAS_JUMP);   /* jump to another page */
         } else {
             gen_eob(s, DISAS_EOB_ONLY);  /* exit to main loop */
@@ -3781,6 +3784,7 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->cpuid_7_0_ecx_features = env->features[FEAT_7_0_ECX];
     dc->cpuid_7_1_eax_features = env->features[FEAT_7_1_EAX];
     dc->cpuid_xsave_features = env->features[FEAT_XSAVE];
+    dc->jmp_direct = false;
     dc->jmp_opt = !((cflags & CF_NO_GOTO_TB) ||
                     (flags & (HF_RF_MASK | HF_TF_MASK | HF_INHIBIT_IRQ_MASK)));
 
