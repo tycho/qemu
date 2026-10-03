@@ -272,6 +272,8 @@ bool tcg_ymmglobal;
 bool tcg_pause_hint;
 bool tcg_tsc_counter;
 bool tcg_fpcheck_runtime;
+bool tcg_iopl_runtime;
+bool tcg_cr0exc_hw;
 bool tcg_region;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
