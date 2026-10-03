@@ -835,6 +835,7 @@ static void xtcg_fork_defaults(TCGState *s)
     /* Replay needs a TSC from the instruction count. */
     s->tsc_counter = !icount_enabled();
     s->fpcheck_runtime = true;
+    s->iopl_runtime = true;
     tcg_tbpack = TCG_TBPACK_ON;
 #ifdef CONFIG_DARWIN
     qemu_thread_jit_lazy = true;
