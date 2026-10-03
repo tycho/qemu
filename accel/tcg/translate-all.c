@@ -27,7 +27,6 @@
 #include "exec/mmap-lock.h"
 #include "tb-internal.h"
 #include "exec/tb-flush.h"
-#include "qemu/cacheinfo.h"
 #include "qemu/target-info.h"
 #include "exec/log.h"
 #include "exec/icount.h"
@@ -630,10 +629,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 
     /* if the TB already exists, discard what we just translated */
     if (unlikely(existing_tb != tb)) {
-        uintptr_t orig_aligned = (uintptr_t)gen_code_buf;
-
-        orig_aligned -= ROUND_UP(sizeof(*tb), qemu_icache_linesize);
-        qatomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);
+        /* Give back the TB and its code: tcg_tb_alloc put the TB first. */
+        qatomic_set(&tcg_ctx->code_gen_ptr, (void *)tb);
         tcg_tb_remove(tb);
         return existing_tb;
     }

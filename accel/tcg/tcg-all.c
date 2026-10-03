@@ -383,6 +383,30 @@ static void tcg_set_tso_promote(Object *obj, Visitor *v,
     tcg_tso_promote = value;
 }
 
+static char *tcg_get_tbpack(Object *obj, Error **errp)
+{
+    static const char *const names[] = {
+        [TCG_TBPACK_OFF] = "off",
+        [TCG_TBPACK_ON] = "on",
+        [TCG_TBPACK_CODELINE] = "codeline",
+    };
+
+    return g_strdup(names[tcg_tbpack]);
+}
+
+static void tcg_set_tbpack(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "off")) {
+        tcg_tbpack = TCG_TBPACK_OFF;
+    } else if (!strcmp(value, "on")) {
+        tcg_tbpack = TCG_TBPACK_ON;
+    } else if (!strcmp(value, "codeline")) {
+        tcg_tbpack = TCG_TBPACK_CODELINE;
+    } else {
+        error_setg(errp, "Invalid 'x-tbpack' value: %s", value);
+    }
+}
+
 static bool tcg_get_pferr_hw(Object *obj, Error **errp)
 {
     return tcg_pferr_hw;
@@ -790,6 +814,7 @@ static void xtcg_fork_defaults(TCGState *s)
     /* Replay needs a TSC from the instruction count. */
     s->tsc_counter = !icount_enabled();
     s->fpcheck_runtime = true;
+    tcg_tbpack = TCG_TBPACK_ON;
 #ifdef CONFIG_DARWIN
     qemu_thread_jit_lazy = true;
 #endif
@@ -985,6 +1010,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-lazysync",
         "Keep dirty guest registers in host registers across guest memory "
         "accesses; a faulting access stores them (aarch64 hosts)");
+
+    object_class_property_add_str(oc, "x-tbpack",
+                                  tcg_get_tbpack, tcg_set_tbpack);
+    object_class_property_set_description(oc, "x-tbpack",
+        "Where a TB's struct goes: off (default: struct and code in "
+        "separate cache lines), on (right below the code, 16-byte "
+        "aligned), codeline (right below line-aligned code)");
 
     object_class_property_add_bool(oc, "x-pferr-hw",
                                    tcg_get_pferr_hw, tcg_set_pferr_hw);
