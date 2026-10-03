@@ -175,6 +175,13 @@ extern bool tcg_tsc_counter;
 extern bool tcg_fpcheck_runtime;
 
 /*
+ * x-addr32: a target with 64-bit addresses may translate a TB with 32-bit
+ * ones (x86 outside long mode), and the optimizer lets an extrl_i64_i32
+ * read through an extension of the low 32 bits.
+ */
+extern bool tcg_addr32;
+
+/*
  * x86 guests outside virtual-8086 mode: EFLAGS.IOPL is not part of the TB
  * flags; the instructions that depend on it test it at run time.
  */
