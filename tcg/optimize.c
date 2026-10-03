@@ -29,6 +29,7 @@
 #include "tcg/tcg-op-common.h"
 #include "tcg-internal.h"
 #include "tcg-has.h"
+#include "tcg/startup.h"
 
 
 typedef struct MemCopyInfo {
@@ -45,6 +46,13 @@ typedef struct TempOptInfo {
     uint64_t z_mask;  /* mask bit is 0 if and only if value bit is 0 */
     uint64_t o_mask;  /* mask bit is 1 if and only if value bit is 1 */
     uint64_t s_mask;  /* mask bit is 1 if value bit matches msb */
+    /*
+     * The low 32 bits equal those of low32_src, as it was at generation
+     * low32_gen (an extension of its low 32 or more bits).
+     */
+    TCGTemp *low32_src;
+    unsigned low32_gen;
+    unsigned gen;     /* bumped whenever the temp gets a new value */
 } TempOptInfo;
 
 typedef struct OptContext {
@@ -137,7 +145,11 @@ static void init_ts_info(OptContext *ctx, TCGTemp *ts)
     if (ti == NULL) {
         ti = tcg_malloc(sizeof(TempOptInfo));
         ts->state_ptr = ti;
+        ti->gen = 0;
+    } else {
+        ti->gen++;
     }
+    ti->low32_src = NULL;
 
     ti->next_copy = ts;
     ti->prev_copy = ts;
@@ -234,6 +246,8 @@ static void reset_ts(OptContext *ctx, TCGTemp *ts)
     pi->next_copy = ti->next_copy;
     ti->next_copy = ts;
     ti->prev_copy = ts;
+    ti->low32_src = NULL;
+    ti->gen++;
     ti->z_mask = -1;
     ti->o_mask = 0;
     ti->s_mask = 0;
@@ -1954,6 +1968,47 @@ static bool fold_eqv(OptContext *ctx, TCGOp *op)
     return fold_masks_zos(ctx, op, z_mask, o_mask, s_mask);
 }
 
+/*
+ * After an extract or sextract of the low 32 or more bits of an i64:
+ * record that the output's low 32 bits are the input's.
+ */
+static void note_low32(OptContext *ctx, TCGOp *op)
+{
+    TCGTemp *src;
+
+    if ((op->opc != INDEX_op_extract && op->opc != INDEX_op_sextract) ||
+        TCGOP_TYPE(op) != TCG_TYPE_I64 ||
+        op->args[2] != 0 || op->args[3] < 32) {
+        return;
+    }
+    src = arg_temp(op->args[1]);
+    arg_info(op->args[0])->low32_src = src;
+    arg_info(op->args[0])->low32_gen = ts_info(src)->gen;
+}
+
+/*
+ * A guest access with a 32-bit address in a TB of a target whose
+ * addresses are 64-bit (tcg_gen_addr_va) reads the low 32 bits of the
+ * address operand: give it the extension's input, so the extension may
+ * die.
+ */
+static void fold_addr_low32(OptContext *ctx, TCGOp *op, int i)
+{
+    TempOptInfo *ti;
+    TCGTemp *src;
+
+    if (!tcg_addr32 || ctx->tcg->addr_type != TCG_TYPE_I32 ||
+        arg_temp(op->args[i])->base_type != TCG_TYPE_I64) {
+        return;
+    }
+    ti = arg_info(op->args[i]);
+    src = ti->low32_src;
+    if (src && test_bit(temp_idx(src), ctx->temps_used.l) &&
+        ts_info(src)->gen == ti->low32_gen) {
+        op->args[i] = temp_arg(src);
+    }
+}
+
 static bool fold_extract(OptContext *ctx, TCGOp *op)
 {
     uint64_t z_mask, o_mask, a_mask;
@@ -3178,6 +3233,7 @@ void tcg_optimize(TCGContext *s)
             break;
         case INDEX_op_extract:
             done = fold_extract(&ctx, op);
+            note_low32(&ctx, op);
             break;
         case INDEX_op_extract2:
             done = fold_extract2(&ctx, op);
@@ -3256,13 +3312,19 @@ void tcg_optimize(TCGContext *s)
             done = fold_orc(&ctx, op);
             break;
         case INDEX_op_qemu_ld:
+            fold_addr_low32(&ctx, op, 1);
             done = fold_qemu_ld_1reg(&ctx, op);
             break;
         case INDEX_op_qemu_ld2:
+            fold_addr_low32(&ctx, op, 2);
             done = fold_qemu_ld_2reg(&ctx, op);
             break;
         case INDEX_op_qemu_st:
+            fold_addr_low32(&ctx, op, 1);
+            done = fold_qemu_st(&ctx, op);
+            break;
         case INDEX_op_qemu_st2:
+            fold_addr_low32(&ctx, op, 2);
             done = fold_qemu_st(&ctx, op);
             break;
         case INDEX_op_rems:
@@ -3293,6 +3355,7 @@ void tcg_optimize(TCGContext *s)
             break;
         case INDEX_op_sextract:
             done = fold_sextract(&ctx, op);
+            note_low32(&ctx, op);
             break;
         case INDEX_op_smax:
             done = fold_minmax(&ctx, op, (ctx.type == TCG_TYPE_I32
