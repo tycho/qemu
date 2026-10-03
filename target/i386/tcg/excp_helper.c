@@ -23,6 +23,7 @@
 #include "qemu/log.h"
 #include "system/runstate.h"
 #include "exec/helper-proto.h"
+#include "exec/translation-block.h"
 #include "helper-tcg.h"
 #include "tcg/startup.h"
 #include "tcg/insn-start-words.h"
@@ -37,6 +38,20 @@ G_NORETURN void helper_raise_interrupt(CPUX86State *env, int intno,
 G_NORETURN void helper_raise_exception(CPUX86State *env, int exception_index)
 {
     raise_exception(env, exception_index);
+}
+
+/*
+ * tcg_fpcheck_runtime: a TB with FPU or SIMD instructions found CR0.EM or
+ * TS set on entry, before running any of them.  Run its code one
+ * instruction per TB, which checks CR0 at the instruction that needs it,
+ * until that instruction raises the exception.
+ */
+G_NORETURN void helper_cr0_fallback(CPUX86State *env)
+{
+    CPUState *cs = env_cpu(env);
+
+    cs->cflags_next_tb = (cs->tcg_cflags & ~CF_COUNT_MASK) | 1;
+    cpu_loop_exit(cs);
 }
 
 /*
