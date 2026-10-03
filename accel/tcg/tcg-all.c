@@ -341,16 +341,6 @@ static void tcg_set_lazysync(Object *obj, bool value, Error **errp)
     tcg_lazysync = value;
 }
 
-static bool tcg_get_lazyconst(Object *obj, Error **errp)
-{
-    return tcg_lazyconst;
-}
-
-static void tcg_set_lazyconst(Object *obj, bool value, Error **errp)
-{
-    tcg_lazyconst = value;
-}
-
 static bool tcg_get_dse(Object *obj, Error **errp)
 {
     return tcg_dse;
@@ -573,12 +563,6 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-lazysync",
         "Keep dirty guest registers in host registers across guest memory "
         "accesses; a faulting access stores them (aarch64 hosts)");
-
-    object_class_property_add_bool(oc, "x-lazyconst",
-                                   tcg_get_lazyconst, tcg_set_lazyconst);
-    object_class_property_set_description(oc, "x-lazyconst",
-        "With x-lazysync: constant-valued guest registers too, stored by "
-        "the slow path");
 
     object_class_property_add_bool(oc, "x-pferr-hw",
                                    tcg_get_pferr_hw, tcg_set_pferr_hw);

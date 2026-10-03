@@ -102,7 +102,7 @@ static int64_t decode_sleb128(const uint8_t **pp)
    That is, the first column is seeded with the guest pc, the last column
    with the host pc, and the middle columns with zeros.  */
 
-/* x-lazysync map: the register byte of a constant (x-lazyconst). */
+/* x-lazysync map: the register byte of a constant-valued global. */
 #define LAZY_WB_CONST 0xff
 
 static int encode_search(TranslationBlock *tb, uint8_t *block)
