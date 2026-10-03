@@ -44,6 +44,13 @@ extern TCGTsoMode tcg_tso_mode;
  */
 extern unsigned tcg_tso_promote;
 
+/*
+ * x-tso-stack: in qemu-user, guest accesses the front end marks as
+ * thread-private (TCGContext.ldst_private: x86 RSP-based and implicit
+ * stack accesses) get no memory-order constraint.
+ */
+extern bool tcg_tso_stack;
+
 /* Count one crossing at guest insn @pc; true once it is promoted. */
 bool tcg_tso_cross_count(uint64_t pc);
 /* True if guest insn @pc has been promoted. */
