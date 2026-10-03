@@ -1021,6 +1021,58 @@ static uint32_t perm_blend(unsigned vece, unsigned imm)
     return pat;
 }
 
+static bool vperm_insert_ok(X86DecodedInsn *decode, unsigned vece)
+{
+    return tcg_vperm && tcg_vpermins && vece >= MO_16
+        && decode->op[0].unit == X86_OP_SSE
+        && tcg_can_emit_vec_op(INDEX_op_perm_vec, TCG_TYPE_V128, vece) > 0;
+}
+
+/*
+ * With x-vperm, element inserts (insertps, pinsr*, the movhps loads):
+ * operand 0 is operand 1 with element dst replaced by element src of b,
+ * then the elements in zmask zeroed, as insertps does.  Elements of size
+ * vece.  One permute (two when an insert also zeroes other elements) in
+ * host vector registers, instead of element stores into CPU state, which
+ * would write back and reload a register kept in a host vector register.
+ */
+static void gen_vperm_insert(DisasContext *s, X86DecodedInsn *decode,
+                             unsigned vece, TCGv_vec b, unsigned src,
+                             unsigned dst, unsigned zmask)
+{
+    unsigned n = 16 >> vece;
+    TCGv_vec zero = tcg_constant_vec(TCG_TYPE_V128, MO_64, 0);
+    TCGv_vec a = NULL, r = tcg_temp_new_vec(TCG_TYPE_V128);
+    uint32_t ins = 0, zap = 0;
+
+    for (unsigned i = 0; i < n; i++) {
+        ins |= (i == dst ? n + src : i) << (4 * i);
+        zap |= ((zmask >> i) & 1 ? n + i : i) << (4 * i);
+    }
+    if (zmask & (1u << dst)) {
+        /* The inserted element is zeroed too: only the zeroing remains. */
+        b = NULL;
+    } else if ((zmask | 1u << dst) == (1u << n) - 1) {
+        /* Every other element is zeroed: insert into a zero vector. */
+        a = zero;
+        zmask = 0;
+    }
+    if (!a) {
+        a = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_ld_vec(a, tcg_env, decode->op[1].offset);
+    }
+    if (b) {
+        tcg_gen_perm_vec(vece, r, a, b, ins);
+        a = r;
+    }
+    if (zmask) {
+        tcg_gen_perm_vec(vece, r, a, zero, zap);
+    } else if (!b) {
+        tcg_gen_mov_vec(r, a);
+    }
+    tcg_gen_st_vec(r, tcg_env, decode->op[0].offset);
+}
+
 static bool gen_vperm_unpck(DisasContext *s, X86DecodedInsn *decode,
                             unsigned vece, bool high)
 {
@@ -3596,6 +3648,13 @@ static inline void gen_pinsr(DisasContext *s, X86DecodedInsn *decode, MemOp ot)
     int mask = (vec_len >> ot) - 1;
     int val = decode->immediate & mask;
 
+    if (vperm_insert_ok(decode, ot)) {
+        TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_dup_tl_vec(ot, b, s->T1);
+        gen_vperm_insert(s, decode, ot, b, 0, val, 0);
+        return;
+    }
     if (decode->op[1].offset != decode->op[0].offset) {
         assert(vec_len == 16);
         gen_store_sse(s, decode, decode->op[1].offset);
@@ -5444,8 +5503,17 @@ static void gen_vinsertps(DisasContext *s, X86DecodedInsn *decode, TCGv_i32 tmp)
 static void gen_VINSERTPS_r(DisasContext *s, X86DecodedInsn *decode)
 {
     int val = decode->immediate;
-    TCGv_i32 tmp = tcg_temp_new_i32();
+    TCGv_i32 tmp;
 
+    if (vperm_insert_ok(decode, MO_32)) {
+        TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(b, tcg_env, decode->op[2].offset);
+        gen_vperm_insert(s, decode, MO_32, b, (val >> 6) & 3,
+                         (val >> 4) & 3, val & 15);
+        return;
+    }
+    tmp = tcg_temp_new_i32();
     tcg_gen_ld_i32(tmp, tcg_env,
                    vector_elem_offset(&decode->op[2], MO_32, (val >> 6) & 3));
     gen_vinsertps(s, decode, tmp);
@@ -5453,9 +5521,17 @@ static void gen_VINSERTPS_r(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VINSERTPS_m(DisasContext *s, X86DecodedInsn *decode)
 {
+    int val = decode->immediate;
     TCGv_i32 tmp = tcg_temp_new_i32();
 
     tcg_gen_qemu_ld_i32(tmp, s->A0, s->mem_index, MO_LEUL);
+    if (vperm_insert_ok(decode, MO_32)) {
+        TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_dup_i32_vec(MO_32, b, tmp);
+        gen_vperm_insert(s, decode, MO_32, b, 0, (val >> 4) & 3, val & 15);
+        return;
+    }
     gen_vinsertps(s, decode, tmp);
 }
 
@@ -5494,6 +5570,14 @@ static void gen_VMOVHPx_ld(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i64 t = tcg_temp_new_i64();
 
+    if (vperm_insert_ok(decode, MO_64)) {
+        TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_qemu_ld_i64(t, s->A0, s->mem_index, MO_LEUQ);
+        tcg_gen_dup_i64_vec(MO_64, b, t);
+        gen_vperm_insert(s, decode, MO_64, b, 0, 1, 0);
+        return;
+    }
     gen_ldq_env_A0(s, decode->op[0].offset + offsetof(XMMReg, XMM_Q(1)));
     if (decode->op[0].offset != decode->op[1].offset) {
         tcg_gen_ld_i64(t, tcg_env, decode->op[1].offset + offsetof(XMMReg, XMM_Q(0)));

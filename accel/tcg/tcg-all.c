@@ -541,6 +541,16 @@ static void tcg_set_dse(Object *obj, bool value, Error **errp)
     tcg_dse = value;
 }
 
+static bool tcg_get_vpermins(Object *obj, Error **errp)
+{
+    return tcg_vpermins;
+}
+
+static void tcg_set_vpermins(Object *obj, bool value, Error **errp)
+{
+    tcg_vpermins = value;
+}
+
 static bool tcg_get_vecld(Object *obj, Error **errp)
 {
     return tcg_vecld;
@@ -1086,6 +1096,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-addr32",
         "Translate with 32-bit guest addresses where the target allows "
         "(x86 outside long mode): no zero-extension per access");
+
+    object_class_property_add_bool(oc, "x-vpermins",
+                                   tcg_get_vpermins, tcg_set_vpermins);
+    object_class_property_set_description(oc, "x-vpermins",
+        "With x-vperm, insert vector elements (insertps, pinsr, movhps) "
+        "with host permutes instead of element stores");
 
     object_class_property_add_bool(oc, "x-pferr-hw",
                                    tcg_get_pferr_hw, tcg_set_pferr_hw);

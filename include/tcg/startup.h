@@ -97,6 +97,8 @@ extern bool tcg_vecld;
  * generated with perm_vec where the backend has it.
  */
 extern bool tcg_vperm;
+/* x-vpermins: with x-vperm, vector element inserts as perm_vec too. */
+extern bool tcg_vpermins;
 
 /*
  * x-vpermvar: permutes by indices in a register (x86 vpermd/vpermps) as
