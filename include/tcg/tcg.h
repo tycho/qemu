@@ -499,6 +499,14 @@ struct TCGContext {
      */
     uint64_t insn_pc;
     uint64_t gen_insn_pc[TCG_MAX_INSNS];
+
+    /*
+     * The guest accesses being generated are to memory that only the
+     * current guest thread uses (an x86 stack slot).  Set by the front
+     * end, cleared at the start of each insn; with x-tso-stack, qemu-user
+     * gives such accesses no memory-order constraint.
+     */
+    bool ldst_private;
     int gen_cur_insn;
 
     /* Exit to translator on overflow. */
