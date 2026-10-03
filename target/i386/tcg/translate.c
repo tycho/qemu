@@ -119,6 +119,10 @@ typedef struct DisasContext {
     bool after_fence; /* the previous insn was */
     bool fp_runtime; /* tcg_fpcheck_runtime: CR0.MP/EM/TS not in flags */
     uint32_t fp_clear; /* HF_MP/EM/TS bits checked clear earlier in the TB */
+    /* tcg_fpcheck_runtime, TBs of more than one insn: the check on entry */
+    TCGLabel *fp_entry_label;
+    TCGOp *fp_entry_and;
+    uint32_t fp_entry_mask;
     bool jmp_opt; /* use direct block chaining for direct jumps */
     bool cc_op_dirty;
 
@@ -1533,10 +1537,15 @@ static void gen_illegal_opcode(DisasContext *s)
  * With tcg_fpcheck_runtime, CR0.MP, EM and TS (HF_MP/EM/TS) are not in
  * the TB flags, so a guest that sets TS on task switches (lazy FPU state
  * switching) runs one translation of its code in both states.  An
- * instruction that depends on them checks env->hflags here instead of
+ * instruction that depends on them checks env->hflags instead of
  * s->flags: raise @trapno if any bit of @mask is set (or, with @all, if
- * all of them are).  CR0 writes end the TB, so a check that passed holds
- * for the rest of the TB and is emitted once.
+ * all of them are).
+ *
+ * CR0 writes end the TB, so the bits hold for the whole TB.  A TB of
+ * more than one insn checks them once, on entry (gen_fp_entry_check,
+ * before x-region's loop label): if a bit that may fault is set, it runs
+ * nothing and asks for one-insn TBs (helper_cr0_fallback), which check
+ * here, at the insn, and raise the exception with its state.
  */
 static void gen_check_cr0_fp(DisasContext *s, uint32_t mask, bool all,
                              int trapno)
@@ -1546,6 +1555,11 @@ static void gen_check_cr0_fp(DisasContext *s, uint32_t mask, bool all,
 
     if (!s->fp_runtime ||
         (all ? (s->fp_clear & mask) != 0 : (s->fp_clear & mask) == mask)) {
+        return;
+    }
+    if (s->fp_entry_label) {
+        /* With @all, TS alone sends the TB to the exact checks. */
+        s->fp_entry_mask |= all ? HF_TS_MASK : mask;
         return;
     }
     gen_update_cc_op(s);
@@ -3747,6 +3761,8 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->fp_runtime = false;
 #endif
     dc->fp_clear = 0;
+    dc->fp_entry_label = NULL;
+    dc->fp_entry_mask = 0;
 
     dc->cs_base = dc->base.tb->cs_base;
     dc->pc_save = dc->base.pc_next;
@@ -3793,6 +3809,22 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
 
 static void i386_tr_tb_start(DisasContextBase *db, CPUState *cpu)
 {
+    DisasContext *dc = container_of(db, DisasContext, base);
+
+    /*
+     * The CR0 check on entry (gen_check_cr0_fp), its mask filled in by
+     * i386_tr_tb_stop; with no FPU or SIMD insn it stays 0 and the
+     * optimizer removes the check.
+     */
+    if (dc->fp_runtime && db->max_insns > 1) {
+        TCGv_i32 t = tcg_temp_new_i32();
+
+        dc->fp_entry_label = gen_new_label();
+        tcg_gen_ld_i32(t, tcg_env, offsetof(CPUX86State, hflags));
+        tcg_gen_and_i32(t, t, tcg_constant_i32(0));
+        dc->fp_entry_and = tcg_last_op();
+        tcg_gen_brcondi_i32(TCG_COND_NE, t, 0, dc->fp_entry_label);
+    }
 }
 
 static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
@@ -3908,6 +3940,15 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     default:
         g_assert_not_reached();
     }
+
+#ifndef CONFIG_USER_ONLY
+    if (dc->fp_entry_label) {
+        dc->fp_entry_and->args[2] =
+            tcgv_i32_arg(tcg_constant_i32(dc->fp_entry_mask));
+        gen_set_label(dc->fp_entry_label);
+        gen_helper_cr0_fallback(tcg_env);
+    }
+#endif
 }
 
 static const TranslatorOps i386_tr_ops = {
