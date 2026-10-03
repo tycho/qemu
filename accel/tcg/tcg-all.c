@@ -422,6 +422,16 @@ static void tcg_set_tbpack(Object *obj, const char *value, Error **errp)
     }
 }
 
+static bool tcg_get_addr32(Object *obj, Error **errp)
+{
+    return tcg_addr32;
+}
+
+static void tcg_set_addr32(Object *obj, bool value, Error **errp)
+{
+    tcg_addr32 = value;
+}
+
 static bool tcg_get_pferr_hw(Object *obj, Error **errp)
 {
     return tcg_pferr_hw;
@@ -858,6 +868,7 @@ static void xtcg_fork_defaults(TCGState *s)
     tcg_vecglobal = true;
     tcg_region = true;
     tcg_pferr_hw = true;
+    tcg_addr32 = true;
     s->kvmvapic = false;
     s->lockless_io = true;
     s->lockless_rtc = true;
@@ -1086,6 +1097,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Where a TB's struct goes: off (default: struct and code in "
         "separate cache lines), on (right below the code, 16-byte "
         "aligned), codeline (right below line-aligned code)");
+
+    object_class_property_add_bool(oc, "x-addr32",
+                                   tcg_get_addr32, tcg_set_addr32);
+    object_class_property_set_description(oc, "x-addr32",
+        "Translate with 32-bit guest addresses where the target allows "
+        "(x86 outside long mode): no zero-extension per access");
 
     object_class_property_add_bool(oc, "x-pferr-hw",
                                    tcg_get_pferr_hw, tcg_set_pferr_hw);
