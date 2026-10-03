@@ -115,8 +115,28 @@ static void gen_st_i64(TCGv_i64 v, TCGTemp *addr, MemOpIdx oi)
     gen_ldst1(INDEX_op_qemu_st, TCG_TYPE_I64, tcgv_i64_temp(v), addr, oi);
 }
 
+/*
+ * x-tso-stack: whether the access being generated needs no memory-order
+ * constraint because only the current guest thread uses its memory.
+ * Another thread that reaches that memory through a pointer keeps its own
+ * ordering, and a release by this thread still orders these accesses
+ * before it; what is lost is the order of this thread's own stack accesses
+ * against its other accesses, as other threads would see it.
+ */
+static bool tcg_ldst_private(void)
+{
+#ifdef CONFIG_USER_ONLY
+    return tcg_tso_stack && tcg_ctx->ldst_private;
+#else
+    return false;
+#endif
+}
+
 static void tcg_gen_req_mo(TCGBar type)
 {
+    if (tcg_ldst_private()) {
+        return;
+    }
     type &= tcg_ctx->guest_mo;
     type &= ~TCG_TARGET_DEFAULT_MO;
     if (type && tcg_tso_mode != TCG_TSO_NONE) {
@@ -152,6 +172,9 @@ static bool tcg_mb_emitted(void)
  */
 static MemOp tcg_gen_ldst_order(TCGBar type)
 {
+    if (tcg_ldst_private()) {
+        return 0;
+    }
     type &= tcg_ctx->guest_mo;
     type &= ~TCG_TARGET_DEFAULT_MO;
     if (!type || tcg_tso_mode == TCG_TSO_NONE) {

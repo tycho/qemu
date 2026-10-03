@@ -603,6 +603,16 @@ static void tcg_set_jitwx(Object *obj, const char *value, Error **errp)
 #endif
 }
 
+static bool tcg_get_tso_stack(Object *obj, Error **errp)
+{
+    return tcg_tso_stack;
+}
+
+static void tcg_set_tso_stack(Object *obj, bool value, Error **errp)
+{
+    tcg_tso_stack = value;
+}
+
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
@@ -1093,6 +1103,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-pferr-hw",
         "Report page-fault error codes as hardware does (x86: a "
         "read-modify-write faults as a write)");
+
+    object_class_property_add_bool(oc, "x-tso-stack",
+                                   tcg_get_tso_stack, tcg_set_tso_stack);
+    object_class_property_set_description(oc, "x-tso-stack",
+        "qemu-user: guest accesses to the thread's own stack (x86: RSP-based, "
+        "push/pop/call/ret) get no memory-order constraint");
 }
 
 static const TypeInfo tcg_accel_type = {
