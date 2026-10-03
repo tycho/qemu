@@ -257,6 +257,7 @@ TCGContext tcg_init_ctx;
 TCGTsoMode tcg_tso_mode;
 unsigned tcg_tso_promote = 1;
 bool tcg_pferr_hw;
+TCGTbPack tcg_tbpack;
 bool tcg_ssefp_vec;
 bool tcg_ssefp_native;
 bool tcg_vecld;
@@ -1945,25 +1946,45 @@ void tcg_init(size_t tb_size, int splitwx, unsigned max_threads)
     tcg_region_init(tb_size, splitwx, max_threads);
 }
 
+/* x-tbpack: the alignment of a packed TB struct and of its code. */
+#define TCG_TBPACK_ALIGN 16
+
 /*
- * Allocate TBs right before their corresponding translated code, making
- * sure that TBs and code are on different cache lines.
+ * Allocate TBs right before their corresponding translated code.  By
+ * default TBs and code are on different cache lines; x-tbpack packs them.
  */
 TranslationBlock *tcg_tb_alloc(TCGContext *s)
 {
-    uintptr_t align = qemu_icache_linesize;
+    uintptr_t line = qemu_icache_linesize;
     TranslationBlock *tb;
     void *next;
 
+    QEMU_BUILD_BUG_ON(TCG_TBPACK_ALIGN < __alignof__(TranslationBlock));
     while (1) {
-        tb = (void *)ROUND_UP((uintptr_t)s->code_gen_ptr, align);
+        uintptr_t ptr = (uintptr_t)s->code_gen_ptr;
+
+        switch (tcg_tbpack) {
+        case TCG_TBPACK_ON:
+            tb = (void *)ROUND_UP(ptr, TCG_TBPACK_ALIGN);
+            next = (void *)ROUND_UP((uintptr_t)(tb + 1), TCG_TBPACK_ALIGN);
+            break;
+        case TCG_TBPACK_CODELINE:
+            ptr = ROUND_UP(ptr, TCG_TBPACK_ALIGN);
+            next = (void *)ROUND_UP(ptr + sizeof(*tb), line);
+            tb = (void *)QEMU_ALIGN_DOWN((uintptr_t)next - sizeof(*tb),
+                                         TCG_TBPACK_ALIGN);
+            break;
+        default:
+            tb = (void *)ROUND_UP(ptr, line);
+            next = (void *)ROUND_UP((uintptr_t)(tb + 1), line);
+            break;
+        }
 
         /*
          * Note that code_gen_ptr can be NULL after vCPU hotplug.
          * See tcg_region_thread_initial_alloc.
          */
-        if (tb) {
-            next = (void *)ROUND_UP((uintptr_t)(tb + 1), align);
+        if (ptr) {
             if (next <= s->code_gen_highwater) {
                 qatomic_set(&s->code_gen_ptr, next);
                 return tb;
