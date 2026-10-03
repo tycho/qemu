@@ -809,6 +809,38 @@ void tcg_gen_qemu_ld_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
      */
     after = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
 
+    /*
+     * x-tso-vecld=pair: instead of a load and a barrier after it, two
+     * 64-bit halves that are each a load-acquire, joined in the vector.
+     * x86 guarantees single-copy atomicity only per 8 bytes for these.
+     */
+    if (after && tcg_tso_vecld_pair && !(memop & MO_BSWAP)
+        && tcg_can_emit_vec_op(INDEX_op_concat_i64_vec, TCG_TYPE_V128, MO_64) > 0) {
+        TCGv_i64 lo = tcg_temp_ebb_new_i64();
+        TCGv_i64 hi = tcg_temp_ebb_new_i64();
+        TCGTemp *a8;
+
+        if (tcg_ctx->addr_type == TCG_TYPE_I32) {
+            TCGv_i32 t = tcg_temp_ebb_new_i32();
+
+            tcg_gen_addi_i32(t, temp_tcgv_i32(addr), 8);
+            a8 = tcgv_i32_temp(t);
+        } else {
+            TCGv_i64 t = tcg_temp_ebb_new_i64();
+
+            tcg_gen_addi_i64(t, temp_tcgv_i64(addr), 8);
+            a8 = tcgv_i64_temp(t);
+        }
+        tcg_gen_qemu_ld_i64_int(lo, addr, idx,
+                                MO_LEUQ | (memop & MO_AMASK) | MO_ATOM_IFALIGN);
+        tcg_gen_qemu_ld_i64_int(hi, a8, idx, MO_LEUQ | MO_ATOM_IFALIGN);
+        tcg_gen_concat_i64_vec(val, lo, hi);
+        tcg_temp_free_internal(a8);
+        tcg_temp_free_i64(lo);
+        tcg_temp_free_i64(hi);
+        return;
+    }
+
     addr_new = tci_extend_addr(addr);
     gen_ldst1(INDEX_op_qemu_ld_vec, TCG_TYPE_V128, tcgv_vec_temp(val),
               addr_new, make_memop_idx(qemu_ldst_vec_memop(memop), idx));

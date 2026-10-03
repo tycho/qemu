@@ -51,6 +51,9 @@ extern unsigned tcg_tso_promote;
  */
 extern bool tcg_tso_stack;
 
+/* x-tso-vecld: pair (temporary, for measurement): see tcg_gen_qemu_ld_vec. */
+extern bool tcg_tso_vecld_pair;
+
 /* Count one crossing at guest insn @pc; true once it is promoted. */
 bool tcg_tso_cross_count(uint64_t pc);
 /* True if guest insn @pc has been promoted. */

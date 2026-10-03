@@ -603,6 +603,16 @@ static void tcg_set_jitwx(Object *obj, const char *value, Error **errp)
 #endif
 }
 
+static bool tcg_get_tso_vecld(Object *obj, Error **errp)
+{
+    return tcg_tso_vecld_pair;
+}
+
+static void tcg_set_tso_vecld(Object *obj, bool value, Error **errp)
+{
+    tcg_tso_vecld_pair = value;
+}
+
 static bool tcg_get_tso_stack(Object *obj, Error **errp)
 {
     return tcg_tso_stack;
@@ -1103,6 +1113,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-pferr-hw",
         "Report page-fault error codes as hardware does (x86: a "
         "read-modify-write faults as a write)");
+
+    object_class_property_add_bool(oc, "x-tso-vecld",
+                                   tcg_get_tso_vecld, tcg_set_tso_vecld);
+    object_class_property_set_description(oc, "x-tso-vecld",
+        "Temporary: with x-tso=acqrel, 128-bit vector loads as two 64-bit "
+        "load-acquires instead of a load and a barrier");
 
     object_class_property_add_bool(oc, "x-tso-stack",
                                    tcg_get_tso_stack, tcg_set_tso_stack);
