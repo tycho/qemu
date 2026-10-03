@@ -995,7 +995,7 @@ static uint32_t perm_blend(unsigned vece, unsigned imm)
 
 static bool vperm_insert_ok(X86DecodedInsn *decode, unsigned vece)
 {
-    return tcg_vperm && tcg_vpermins && vece >= MO_16
+    return tcg_vperm && vece >= MO_16
         && decode->op[0].unit == X86_OP_SSE
         && tcg_can_emit_vec_op(INDEX_op_perm_vec, TCG_TYPE_V128, vece) > 0;
 }

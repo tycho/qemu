@@ -311,16 +311,6 @@ static void tcg_set_vperm(Object *obj, bool value, Error **errp)
     tcg_vperm = value;
 }
 
-static bool tcg_get_vpermins(Object *obj, Error **errp)
-{
-    return tcg_vpermins;
-}
-
-static void tcg_set_vpermins(Object *obj, bool value, Error **errp)
-{
-    tcg_vpermins = value;
-}
-
 static bool tcg_get_vecld(Object *obj, Error **errp)
 {
     return tcg_vecld;
@@ -507,14 +497,9 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "x-vperm",
                                    tcg_get_vperm, tcg_set_vperm);
     object_class_property_set_description(oc, "x-vperm",
-        "Generate guest vector shuffles, unpacks and blends with constant "
-        "operands as host permutes instead of helper calls");
-
-    object_class_property_add_bool(oc, "x-vpermins",
-                                   tcg_get_vpermins, tcg_set_vpermins);
-    object_class_property_set_description(oc, "x-vpermins",
-        "With x-vperm, insert vector elements (insertps, pinsr, movhps) "
-        "with host permutes instead of element stores");
+        "Generate guest vector shuffles, unpacks, blends and element "
+        "inserts with constant operands as host permutes instead of "
+        "helper calls and element stores");
 
     object_class_property_add_bool(oc, "x-pferr-hw",
                                    tcg_get_pferr_hw, tcg_set_pferr_hw);
