@@ -175,6 +175,19 @@ extern bool tcg_tsc_counter;
 extern bool tcg_fpcheck_runtime;
 
 /*
+ * x86 guests outside virtual-8086 mode: EFLAGS.IOPL is not part of the TB
+ * flags; the instructions that depend on it test it at run time.
+ */
+extern bool tcg_iopl_runtime;
+
+/*
+ * x86 guests: CR0.EM and TS raise the exceptions hardware raises: EM
+ * before TS (#UD) for MMX and SSE, including EMMS and FEMMS; EM does not
+ * apply to VEX instructions.
+ */
+extern bool tcg_cr0exc_hw;
+
+/*
  * x-region: a TB whose direct jump returns to its first insn branches
  * back within the TB instead of chaining to itself.
  */
