@@ -1266,11 +1266,14 @@ static void tso_cross_probe(CPUArchState *env, uint64_t addr, MemOpIdx oi,
 #endif
 }
 
-static void tso_cross_note(CPUState *cpu, uintptr_t retaddr, uint64_t site)
+static void tso_cross_note(CPUState *cpu, uint64_t addr, MemOpIdx oi,
+                           uintptr_t retaddr, uint64_t site)
 {
     TranslationBlock *tb;
 
-    if (!tcg_tso_promote) {
+    /* x-tso-onepath also comes here on a TLB miss. */
+    if (!tcg_tso_promote ||
+        (addr & 15) + memop_size(get_memop(oi)) <= 16) {
         return;
     }
     /* The site table is a GHashTable, which uses host floating point. */
@@ -1290,7 +1293,7 @@ tcg_target_ulong helper_tso_cross_ld(CPUArchState *env, uint64_t addr,
                                      MemOpIdx oi, uintptr_t retaddr,
                                      uint64_t site)
 {
-    tso_cross_note(env_cpu(env), retaddr, site);
+    tso_cross_note(env_cpu(env), addr, oi, retaddr, site);
     tso_cross_probe(env, addr, oi, MMU_DATA_LOAD, retaddr);
     switch (get_memop(oi) & MO_SIZE) {
     case MO_16:
@@ -1307,7 +1310,7 @@ tcg_target_ulong helper_tso_cross_ld(CPUArchState *env, uint64_t addr,
 void helper_tso_cross_st(CPUArchState *env, uint64_t addr, uint64_t val,
                          MemOpIdx oi, uintptr_t retaddr, uint64_t site)
 {
-    tso_cross_note(env_cpu(env), retaddr, site);
+    tso_cross_note(env_cpu(env), addr, oi, retaddr, site);
     tso_cross_probe(env, addr, oi, MMU_DATA_STORE, retaddr);
     switch (get_memop(oi) & MO_SIZE) {
     case MO_16:

@@ -44,6 +44,12 @@ extern TCGTsoMode tcg_tso_mode;
  */
 extern unsigned tcg_tso_promote;
 
+/*
+ * x-tso-onepath: with x-tso=acqrel in system mode, an access that may
+ * cross 16 bytes has one out-of-line path for a TLB miss and a crossing.
+ */
+extern bool tcg_tso_onepath;
+
 /* Count one crossing at guest insn @pc; true once it is promoted. */
 bool tcg_tso_cross_count(uint64_t pc);
 /* True if guest insn @pc has been promoted. */

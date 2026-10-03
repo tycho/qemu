@@ -382,6 +382,16 @@ static void tcg_set_tso_promote(Object *obj, Visitor *v,
     tcg_tso_promote = value;
 }
 
+static bool tcg_get_tso_onepath(Object *obj, Error **errp)
+{
+    return tcg_tso_onepath;
+}
+
+static void tcg_set_tso_onepath(Object *obj, bool value, Error **errp)
+{
+    tcg_tso_onepath = value;
+}
+
 static bool tcg_get_pferr_hw(Object *obj, Error **errp)
 {
     return tcg_pferr_hw;
@@ -829,6 +839,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "With x-tso=acqrel: retranslate a guest insn whose access crossed "
         "a 16-byte boundary this many times with a branch-free form "
         "(0: never; default 1)");
+
+    object_class_property_add_bool(oc, "x-tso-onepath",
+                                   tcg_get_tso_onepath, tcg_set_tso_onepath);
+    object_class_property_set_description(oc, "x-tso-onepath",
+        "With x-tso=acqrel in system mode: one branch and one out-of-line "
+        "path for an access's TLB miss and 16-byte crossing");
 
     object_class_property_add(oc, "x-tlb-grow", "uint32",
         tcg_get_tlb_grow, tcg_set_tlb_grow, NULL, NULL);
