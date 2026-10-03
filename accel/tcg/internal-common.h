@@ -32,6 +32,7 @@ extern unsigned tcg_tlb_grow;
  * miss (see translator_lookup_and_goto_ptr).
  */
 extern bool tcg_ijmp_inline;
+extern bool tcg_ijmp_call;
 
 /*
  * tcg_jcgen: flushing a vCPU's jump cache moves its salt on (O(1))
