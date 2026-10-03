@@ -57,6 +57,20 @@ bool tcg_tso_cross_promoted(uint64_t pc);
 extern bool tcg_pferr_hw;
 
 /*
+ * x-tbpack: where tcg_tb_alloc puts a TB's struct and its code.
+ * OFF: each in its own instruction-cache lines.
+ * ON: the struct right below the code, 16-byte aligned.
+ * CODELINE: the code at a line boundary, the struct right below it.
+ */
+typedef enum {
+    TCG_TBPACK_OFF,
+    TCG_TBPACK_ON,
+    TCG_TBPACK_CODELINE,
+} TCGTbPack;
+
+extern TCGTbPack tcg_tbpack;
+
+/*
  * x-ssefp=vec: target SIMD floating-point helpers try the softfloat vector
  * fast paths (float32_add_vec etc.) before computing lane by lane.
  */
