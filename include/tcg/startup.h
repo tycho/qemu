@@ -83,6 +83,8 @@ extern bool tcg_vecld;
  * generated with perm_vec where the backend has it.
  */
 extern bool tcg_vperm;
+/* x-vpermins: with x-vperm, vector element inserts as perm_vec too. */
+extern bool tcg_vpermins;
 
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);

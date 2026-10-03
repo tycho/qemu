@@ -246,6 +246,7 @@ bool tcg_ssefp_vec;
 bool tcg_ssefp_native;
 bool tcg_vecld;
 bool tcg_vperm;
+bool tcg_vpermins;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
 static QemuMutex tso_cross_lock;
