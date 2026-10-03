@@ -118,6 +118,7 @@ typedef struct DisasContext {
     bool fence_insn; /* this insn is LFENCE or MFENCE */
     bool after_fence; /* the previous insn was */
     bool fp_runtime; /* tcg_fpcheck_runtime: CR0.MP/EM/TS not in flags */
+    bool iopl_runtime; /* tcg_iopl_runtime, not vm86: IOPL not in flags */
     uint32_t fp_clear; /* HF_MP/EM/TS bits checked clear earlier in the TB */
     bool jmp_opt; /* use direct block chaining for direct jumps */
     bool jmp_direct; /* the TB ends in a direct jump to another page */
@@ -766,7 +767,11 @@ static bool gen_check_io(DisasContext *s, MemOp ot, TCGv_i32 port,
     return false;
 #else
     if (PE(s) && (CPL(s) > IOPL(s) || VM86(s))) {
-        gen_helper_check_io(tcg_env, port, tcg_constant_i32(1 << ot));
+        if (s->iopl_runtime) {
+            gen_helper_check_io_iopl(tcg_env, port, tcg_constant_i32(1 << ot));
+        } else {
+            gen_helper_check_io(tcg_env, port, tcg_constant_i32(1 << ot));
+        }
     }
     if (GUEST(s)) {
         gen_update_cc_op(s);
@@ -1565,6 +1570,29 @@ static void gen_check_cr0_fp(DisasContext *s, uint32_t mask, bool all,
     if (!all) {
         s->fp_clear |= mask;
     }
+}
+
+/*
+ * With tcg_iopl_runtime, IOPL is not in the TB flags (outside vm86 mode):
+ * test CPL <= IOPL at run time, and raise #GP if not.
+ */
+static void gen_check_iopl(DisasContext *s)
+{
+    TCGLabel *ok;
+    TCGv_i32 t;
+
+    if (CPL(s) == 0) {
+        return;
+    }
+    gen_update_cc_op(s);
+    gen_update_eip_cur(s);
+    t = tcg_temp_new_i32();
+    tcg_gen_ld_i32(t, tcg_env, offsetof(CPUX86State, eflags));
+    tcg_gen_extract_i32(t, t, IOPL_SHIFT, 2);
+    ok = gen_new_label();
+    tcg_gen_brcondi_i32(TCG_COND_GEU, t, CPL(s), ok);
+    gen_helper_raise_exception(tcg_env, tcg_constant_i32(EXCP0D_GPF));
+    gen_set_label(ok);
 }
 
 /* Generate #GP for the current instruction. */
@@ -3746,8 +3774,10 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->fence_insn = false;
 #ifndef CONFIG_USER_ONLY
     dc->fp_runtime = tcg_fpcheck_runtime;
+    dc->iopl_runtime = tcg_iopl_runtime && !(flags & HF_VM_MASK);
 #else
     dc->fp_runtime = false;
+    dc->iopl_runtime = false;
 #endif
     dc->fp_clear = 0;
 

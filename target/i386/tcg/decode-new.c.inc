@@ -3140,7 +3140,9 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
                 goto gp_fault;
             }
         } else if (decode.e.check & X86_CHECK_cpl_iopl) {
-            if (IOPL(s) < CPL(s)) {
+            if (s->iopl_runtime) {
+                gen_check_iopl(s);
+            } else if (IOPL(s) < CPL(s)) {
                 goto gp_fault;
             }
         }

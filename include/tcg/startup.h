@@ -175,6 +175,12 @@ extern bool tcg_tsc_counter;
 extern bool tcg_fpcheck_runtime;
 
 /*
+ * x86 guests outside virtual-8086 mode: EFLAGS.IOPL is not part of the TB
+ * flags; the instructions that depend on it test it at run time.
+ */
+extern bool tcg_iopl_runtime;
+
+/*
  * x-region: a TB whose direct jump returns to its first insn branches
  * back within the TB instead of chaining to itself.
  */
