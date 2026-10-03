@@ -93,8 +93,8 @@ extern bool tcg_ssefp_native;
 extern bool tcg_vecld;
 
 /*
- * x-vperm: guest permutes by a constant (shuffles, unpacks, blends) are
- * generated with perm_vec where the backend has it.
+ * x-vperm: guest permutes by a constant (shuffles, unpacks, blends,
+ * element inserts) are generated with perm_vec where the backend has it.
  */
 extern bool tcg_vperm;
 

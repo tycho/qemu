@@ -1023,8 +1023,9 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "x-vperm",
                                    tcg_get_vperm, tcg_set_vperm);
     object_class_property_set_description(oc, "x-vperm",
-        "Generate guest vector shuffles, unpacks and blends with constant "
-        "operands as host permutes instead of helper calls");
+        "Generate guest vector shuffles, unpacks, blends and element "
+        "inserts with constant operands as host permutes instead of "
+        "helper calls and element stores");
 
     object_class_property_add_bool(oc, "x-dse",
                                    tcg_get_dse, tcg_set_dse);
