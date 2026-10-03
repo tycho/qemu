@@ -856,6 +856,7 @@ static void xtcg_fork_defaults(TCGState *s)
     s->tsc_counter = !icount_enabled();
     s->fpcheck_runtime = true;
     s->iopl_runtime = true;
+    s->cr0exc_hw = true;
     tcg_tbpack = TCG_TBPACK_ON;
 #ifdef CONFIG_DARWIN
     qemu_thread_jit_lazy = true;
