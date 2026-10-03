@@ -276,6 +276,7 @@ bool tcg_addr32;
 bool tcg_iopl_runtime;
 bool tcg_cr0exc_hw;
 bool tcg_region;
+bool tcg_lazyconst;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
 static QemuMutex tso_cross_lock;
@@ -5981,6 +5982,23 @@ static void ldst_record_writeback(TCGContext *s, TCGRegSet allocated_regs)
 
         if (ts->kind == TEMP_FIXED || ts->mem_coherent
             || ts->val_type == TEMP_VAL_MEM || ts->val_type == TEMP_VAL_DEAD) {
+            continue;
+        }
+        if (tcg_lazyconst && ts->val_type == TEMP_VAL_CONST
+            && (ts->type == TCG_TYPE_I32 || ts->type == TCG_TYPE_I64)
+            && ts->mem_base->kind == TEMP_FIXED) {
+            /* A constant: the slow path materializes it. */
+            if (!wb) {
+                wb = tcg_malloc(sizeof(*wb) * s->nb_globals);
+            }
+            wb[n++] = (TCGLdstWriteback){
+                .type = ts->type,
+                .reg = (TCGReg)TCG_TARGET_NB_REGS,
+                .base = ts->mem_base->reg,
+                .offset = ts->mem_offset,
+                .is_const = true,
+                .val = ts->val,
+            };
             continue;
         }
         if (ts->val_type != TEMP_VAL_REG || ts->mem_base->kind != TEMP_FIXED) {
