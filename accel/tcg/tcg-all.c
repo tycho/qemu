@@ -65,6 +65,7 @@ struct TCGState {
     bool tsc_counter;
     bool fpcheck_runtime;
     bool iopl_runtime;
+    bool cr0exc_hw;
 };
 typedef struct TCGState TCGState;
 
@@ -237,6 +238,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     tcg_tsc_counter = s->tsc_counter;
     tcg_fpcheck_runtime = s->fpcheck_runtime;
     tcg_iopl_runtime = s->iopl_runtime;
+    tcg_cr0exc_hw = s->cr0exc_hw;
 
     tcg_allowed = true;
 
@@ -724,6 +726,24 @@ static void tcg_set_iopl(Object *obj, const char *value, Error **errp)
     }
 }
 
+static char *tcg_get_cr0exc(Object *obj, Error **errp)
+{
+    return g_strdup(TCG_STATE(obj)->cr0exc_hw ? "hw" : "qemu");
+}
+
+static void tcg_set_cr0exc(Object *obj, const char *value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+
+    if (strcmp(value, "hw") == 0) {
+        s->cr0exc_hw = true;
+    } else if (strcmp(value, "qemu") == 0) {
+        s->cr0exc_hw = false;
+    } else {
+        error_setg(errp, "Invalid 'x-cr0exc' value: %s (qemu, hw)", value);
+    }
+}
+
 static char *tcg_get_fpcheck(Object *obj, Error **errp)
 {
     return g_strdup(TCG_STATE(obj)->fpcheck_runtime ? "runtime" : "tb");
@@ -940,6 +960,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "x86: EFLAGS.IOPL in the TB flags (tb, QEMU's), or tested at run "
         "time by the instructions that depend on it (runtime; not in "
         "virtual-8086 mode)");
+
+    object_class_property_add_str(oc, "x-cr0exc",
+                                  tcg_get_cr0exc, tcg_set_cr0exc);
+    object_class_property_set_description(oc, "x-cr0exc",
+        "x86: the exceptions CR0.EM and TS raise: QEMU's (qemu), or "
+        "hardware's (hw: EM before TS for MMX and SSE, EMMS included; "
+        "EM ignored for VEX)");
 
     object_class_property_add_bool(oc, "x-kvmvapic",
                                    tcg_get_kvmvapic, tcg_set_kvmvapic);

@@ -64,6 +64,26 @@ static void gen_NM_exception(DisasContext *s)
     gen_exception(s, EXCP07_PREX);
 }
 
+/*
+ * tcg_cr0exc_hw: the CR0 checks of an MMX or 3DNow! instruction that
+ * validate_vex doesn't see: #UD with EM, else #NM with TS.  Return false
+ * if the instruction raises one in any case.
+ */
+static bool gen_check_cr0_mmx(DisasContext *s)
+{
+    if (s->flags & HF_EM_MASK) {
+        gen_illegal_opcode(s);
+        return false;
+    }
+    if (s->flags & HF_TS_MASK) {
+        gen_NM_exception(s);
+        return false;
+    }
+    gen_check_cr0_fp(s, HF_EM_MASK, false, EXCP06_ILLOP);
+    gen_check_cr0_fp(s, HF_TS_MASK, false, EXCP07_PREX);
+    return true;
+}
+
 static void gen_lea_modrm(DisasContext *s, X86DecodedInsn *decode)
 {
     AddressParts *mem = &decode->mem;
@@ -510,16 +530,22 @@ static void gen_3dnow(DisasContext *s, X86DecodedInsn *decode)
         gen_illegal_opcode(s);
         return;
     }
-    if (s->flags & HF_TS_MASK) {
-        gen_NM_exception(s);
-        return;
+    if (s->cr0exc_hw) {
+        if (!gen_check_cr0_mmx(s)) {
+            return;
+        }
+    } else {
+        if (s->flags & HF_TS_MASK) {
+            gen_NM_exception(s);
+            return;
+        }
+        if (s->flags & HF_EM_MASK) {
+            gen_illegal_opcode(s);
+            return;
+        }
+        gen_check_cr0_fp(s, HF_TS_MASK, false, EXCP07_PREX);
+        gen_check_cr0_fp(s, HF_EM_MASK, false, EXCP06_ILLOP);
     }
-    if (s->flags & HF_EM_MASK) {
-        gen_illegal_opcode(s);
-        return;
-    }
-    gen_check_cr0_fp(s, HF_TS_MASK, false, EXCP07_PREX);
-    gen_check_cr0_fp(s, HF_EM_MASK, false, EXCP06_ILLOP);
 
     gen_helper_enter_mmx(tcg_env);
     if (fn == FN_3DNOW_MOVE) {
@@ -2604,6 +2630,9 @@ static void gen_DIV(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_EMMS(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (s->cr0exc_hw && !gen_check_cr0_mmx(s)) {
+        return;
+    }
     gen_helper_emms(tcg_env);
 }
 

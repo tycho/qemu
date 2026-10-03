@@ -2743,11 +2743,21 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
         goto illegal;
     }
 
-    if (s->flags & HF_TS_MASK) {
-        goto nm_exception;
-    }
-    if (s->flags & HF_EM_MASK) {
-        goto illegal;
+    if (s->cr0exc_hw) {
+        /* EM comes first, and does not apply to VEX instructions. */
+        if (!(s->prefix & PREFIX_VEX) && (s->flags & HF_EM_MASK)) {
+            goto illegal;
+        }
+        if (s->flags & HF_TS_MASK) {
+            goto nm_exception;
+        }
+    } else {
+        if (s->flags & HF_TS_MASK) {
+            goto nm_exception;
+        }
+        if (s->flags & HF_EM_MASK) {
+            goto illegal;
+        }
     }
     decode->cr0_check = true;
     return true;
@@ -3099,8 +3109,15 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
 
     /* After all of the insn's bytes are fetched: no restart past here. */
     if (decode.cr0_check) {
-        gen_check_cr0_fp(s, HF_TS_MASK, false, EXCP07_PREX);
-        gen_check_cr0_fp(s, HF_EM_MASK, false, EXCP06_ILLOP);
+        if (!s->cr0exc_hw) {
+            gen_check_cr0_fp(s, HF_TS_MASK, false, EXCP07_PREX);
+            gen_check_cr0_fp(s, HF_EM_MASK, false, EXCP06_ILLOP);
+        } else {
+            if (!(s->prefix & PREFIX_VEX)) {
+                gen_check_cr0_fp(s, HF_EM_MASK, false, EXCP06_ILLOP);
+            }
+            gen_check_cr0_fp(s, HF_TS_MASK, false, EXCP07_PREX);
+        }
     }
 
     /*
