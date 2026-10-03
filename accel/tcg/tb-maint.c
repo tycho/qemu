@@ -1251,11 +1251,15 @@ static void tso_cross_probe(CPUArchState *env, uint64_t addr, MemOpIdx oi,
 #endif
 }
 
-static void tso_cross_note(uintptr_t retaddr, uint64_t site)
+static void tso_cross_note(uint64_t addr, MemOpIdx oi, uintptr_t retaddr,
+                           uint64_t site)
 {
     TranslationBlock *tb;
 
-    if (!tcg_tso_promote || !tcg_tso_cross_count(site)) {
+    /* In system mode, a TLB miss comes here too. */
+    if (!tcg_tso_promote ||
+        (addr & 15) + memop_size(get_memop(oi)) <= 16 ||
+        !tcg_tso_cross_count(site)) {
         return;
     }
     tb = tcg_tb_lookup(retaddr);
@@ -1270,7 +1274,7 @@ tcg_target_ulong helper_tso_cross_ld(CPUArchState *env, uint64_t addr,
                                      MemOpIdx oi, uintptr_t retaddr,
                                      uint64_t site)
 {
-    tso_cross_note(retaddr, site);
+    tso_cross_note(addr, oi, retaddr, site);
     tso_cross_probe(env, addr, oi, MMU_DATA_LOAD, retaddr);
     switch (get_memop(oi) & MO_SIZE) {
     case MO_16:
@@ -1287,7 +1291,7 @@ tcg_target_ulong helper_tso_cross_ld(CPUArchState *env, uint64_t addr,
 void helper_tso_cross_st(CPUArchState *env, uint64_t addr, uint64_t val,
                          MemOpIdx oi, uintptr_t retaddr, uint64_t site)
 {
-    tso_cross_note(retaddr, site);
+    tso_cross_note(addr, oi, retaddr, site);
     tso_cross_probe(env, addr, oi, MMU_DATA_STORE, retaddr);
     switch (get_memop(oi) & MO_SIZE) {
     case MO_16:
