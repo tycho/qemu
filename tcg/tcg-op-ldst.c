@@ -624,7 +624,7 @@ static bool tcg_ldst_i128_acqrel(MemOp memop)
 {
     if (!TCG_TARGET_HAS_qemu_ldst_i128 ||
         !TCG_TARGET_HAS_qemu_ldst_i128_acqrel ||
-        !tcg_tso_lrcpc3 || tcg_tso_mode != TCG_TSO_ACQREL) {
+        tcg_tso_mode != TCG_TSO_ACQREL) {
         return false;
     }
     return memop_alignment_bits(memop) >= MO_128 &&

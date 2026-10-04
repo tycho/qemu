@@ -51,13 +51,6 @@ extern unsigned tcg_tso_promote;
  */
 extern bool tcg_tso_stack;
 
-/*
- * x-tso-lrcpc3 (temporary, for measurement; default on): with
- * x-tso=acqrel, 16-byte aligned accesses as load-acquire/store-release
- * pairs where the host has them (FEAT_LRCPC3) instead of a barrier.
- */
-extern bool tcg_tso_lrcpc3;
-
 /* Count one crossing at guest insn @pc; true once it is promoted. */
 bool tcg_tso_cross_count(uint64_t pc);
 /* True if guest insn @pc has been promoted. */
