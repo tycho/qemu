@@ -1976,7 +1976,19 @@ static bool fold_extract(OptContext *ctx, TCGOp *op)
 /* The element is zero-extended into the integer output. */
 static bool fold_extract_vec(OptContext *ctx, TCGOp *op)
 {
-    return fold_masks_z(ctx, op, MAKE_64BIT_MASK(0, 8 << TCGOP_VECE(op)));
+    TempOptInfo *t1 = arg_info(op->args[1]);
+    unsigned bits = 8 << TCGOP_VECE(op);
+
+    /* The output is a 64-bit integer, whatever the vector type. */
+    ctx->type = TCG_TYPE_I64;
+
+    /* A vector constant is a 64-bit pattern repeated across the vector. */
+    if (ti_is_const(t1)) {
+        return tcg_opt_gen_movi(ctx, op, op->args[0],
+                                extract64(ti_const_val(t1),
+                                          op->args[2] * bits % 64, bits));
+    }
+    return fold_masks_z(ctx, op, MAKE_64BIT_MASK(0, bits));
 }
 
 static bool fold_extract2(OptContext *ctx, TCGOp *op)
