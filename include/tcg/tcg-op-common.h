@@ -590,6 +590,12 @@ void tcg_gen_dup_mem_vec(unsigned vece, TCGv_vec, TCGv_ptr, tcg_target_long);
  */
 void tcg_gen_extract_vec_i64(unsigned vece, TCGv_i64 r, TCGv_vec a,
                              unsigned idx);
+/*
+ * @a with element @idx (of size vece) replaced by the low bits of @b.  No
+ * fallback: check tcg_can_emit_vec_op(INDEX_op_insert_vec) first.
+ */
+void tcg_gen_insert_vec_i64(unsigned vece, TCGv_vec r, TCGv_vec a,
+                            TCGv_i64 b, unsigned idx);
 void tcg_gen_dupi_vec(unsigned vece, TCGv_vec, uint64_t);
 void tcg_gen_add_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_sub_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
