@@ -638,6 +638,20 @@ bool x86_cpu_tlb_fill(CPUState *cs, vaddr addr, int size,
         return false;
     }
 
+    /*
+     * The load of a read-modify-write faults as a write on x86: raise the
+     * fault a store would (the store walk fails too, as writable implies
+     * readable).
+     */
+    if (access_type == MMU_DATA_LOAD && x86_insn_is_rmw(cs, retaddr)) {
+        TranslateFault werr;
+
+        if (!get_physical_address(env, addr, MMU_DATA_STORE, mmu_idx,
+                                  &out, &werr, retaddr)) {
+            err = werr;
+        }
+    }
+
     if (err.stage2 != S2_NONE) {
         raise_stage2(env, &err, retaddr);
     }
