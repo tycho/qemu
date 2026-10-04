@@ -1104,7 +1104,47 @@ BINARY_INT_MMX(PHSUBW,    phsubw)
 BINARY_INT_MMX(PHSUBSW,   phsubsw)
 BINARY_INT_MMX(PHSUBD,    phsubd)
 BINARY_INT_MMX(PMADDUBSW, pmaddubsw)
-BINARY_INT_MMX(PSHUFB,    pshufb)
+/*
+ * tcg_vpermvar: pshufb as table lookups, one per 128-bit lane.  A byte
+ * whose index has bit 7 set is zero; tbl_vec gives zero for any index of
+ * 16 or more, so the index keeps only bits 7 and 3:0.  Both operands are
+ * read before operand 0 is written.
+ */
+static bool gen_pshufb_tbl(DisasContext *s, X86DecodedInsn *decode)
+{
+    int lanes = s->vex_l ? 2 : 1;
+    TCGv_vec tbl[2], idx[2], mask;
+
+    if (!tcg_vpermvar || !(s->prefix & PREFIX_DATA)
+        || decode->op[0].unit != X86_OP_SSE
+        || tcg_can_emit_vec_op(INDEX_op_tbl_vec, TCG_TYPE_V128, MO_8) <= 0) {
+        return false;
+    }
+    mask = tcg_constant_vec(TCG_TYPE_V128, MO_8, 0x8f);
+    for (int l = 0; l < lanes; l++) {
+        tbl[l] = tcg_temp_new_vec(TCG_TYPE_V128);
+        idx[l] = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_ld_vec(tbl[l], tcg_env, decode->op[1].offset + 16 * l);
+        tcg_gen_ld_vec(idx[l], tcg_env, decode->op[2].offset + 16 * l);
+        tcg_gen_and_vec(MO_8, idx[l], idx[l], mask);
+    }
+    for (int l = 0; l < lanes; l++) {
+        tcg_gen_tbl_vec(tbl[l], tbl[l], idx[l]);
+        tcg_gen_st_vec(tbl[l], tcg_env, decode->op[0].offset + 16 * l);
+    }
+    return true;
+}
+
+static void gen_PSHUFB(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (gen_pshufb_tbl(s, decode)) {
+        return;
+    }
+    gen_binary_int_sse(s, decode,
+                       gen_helper_pshufb_mmx,
+                       gen_helper_pshufb_xmm,
+                       gen_helper_pshufb_ymm);
+}
 BINARY_INT_MMX(PSIGNB,    psignb)
 BINARY_INT_MMX(PSIGNW,    psignw)
 BINARY_INT_MMX(PSIGND,    psignd)
