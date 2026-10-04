@@ -25,6 +25,17 @@
 #ifndef TCG_STARTUP_H
 #define TCG_STARTUP_H
 
+/*
+ * How guest memory ordering is implemented for ordinary guest loads and
+ * stores (accel property x-tso).
+ */
+typedef enum TCGTsoMode {
+    TCG_TSO_BARRIER,    /* a barrier before each access (default) */
+    TCG_TSO_NONE,       /* no barriers at all: UNSAFE, for measurement */
+} TCGTsoMode;
+
+extern TCGTsoMode tcg_tso_mode;
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size
