@@ -409,6 +409,31 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     return tb->tc.ptr;
 }
 
+/*
+ * translator_lookup_and_goto_ptr's jump-cache probe, out of line, for
+ * direct jumps to another page.  @cs_base and @flags are the calling TB's,
+ * which the next TB must share (see translator_lookup_and_goto_ptr);
+ * anything else goes to helper_lookup_tb_ptr.
+ */
+const void *HELPER(lookup_tb_ptr_jc)(CPUArchState *env, uint64_t pc,
+                                     uint64_t cs_base, uint32_t flags)
+{
+    CPUState *cpu = env_cpu(env);
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    uint32_t hash = tb_jmp_cache_hash_func(pc);
+    TranslationBlock *tb = qatomic_read(&jc->array[hash].tb);
+
+    if (likely(tb &&
+               jc->array[hash].pc == (pc ^ qatomic_read(&jc->salt)) &&
+               QTAILQ_EMPTY(&cpu->breakpoints) &&
+               tb->cs_base == cs_base &&
+               tb->flags == flags &&
+               tb_cflags(tb) == cpu->tcg_cflags)) {
+        return tb->tc.ptr;
+    }
+    return HELPER(lookup_tb_ptr)(env);
+}
+
 /* Return the current PC from CPU, which may be cached in TB. */
 static vaddr log_pc(CPUState *cpu, const TranslationBlock *tb)
 {
