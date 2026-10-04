@@ -792,6 +792,11 @@ specifies the length of the element (if applicable) in log2 8-bit units.
 
      - | Duplicate the low N bits of *r1* into TYPE/VECE copies across *v0*.
 
+   * - extract_vec *r0*, *v1*, *idx*
+
+     - | Element *idx* of *v1*, of size ``TCGOP_VECE``, zero-extended into
+         the 64-bit integer *r0*.
+
    * - dupi_vec *v0*, *c*
 
      - | Similarly, for a constant.
