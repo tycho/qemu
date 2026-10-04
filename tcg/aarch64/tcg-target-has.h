@@ -23,6 +23,9 @@
 /* 16-byte aligned, single-copy atomic acquire/release: LDIAPP/STILP */
 #define TCG_TARGET_HAS_qemu_ldst_i128_acqrel \
     (TCG_TARGET_HAS_qemu_ldst_acqrel && have_lrcpc3)
+/* 16-byte aligned vector load-acquire/store-release: LDAPUR/STLUR (Q) */
+#define TCG_TARGET_HAS_qemu_ldst_vec_acqrel \
+    (TCG_TARGET_HAS_qemu_ldst_acqrel && have_lrcpc3)
 
 /* optional instructions */
 #define TCG_TARGET_HAS_extr_i64_i32     0
