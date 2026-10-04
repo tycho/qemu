@@ -388,6 +388,16 @@ static void tcg_set_regcache(Object *obj, bool value, Error **errp)
     tcg_ymmglobal = value;
 }
 
+static bool tcg_get_region(Object *obj, Error **errp)
+{
+    return tcg_region;
+}
+
+static void tcg_set_region(Object *obj, bool value, Error **errp)
+{
+    tcg_region = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -463,6 +473,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Keep guest registers in host registers: remove dead stores to CPU "
         "state, keep dirty and vector values in registers across guest "
         "memory accesses, and the x86 vector registers as TCG globals");
+}
+
+    object_class_property_add_bool(oc, "x-region",
+                                   tcg_get_region, tcg_set_region);
+    object_class_property_set_description(oc, "x-region",
+        "Let a translation block loop back to its own start instead of "
+        "chaining to itself, keeping the loop's guest registers in host "
+        "registers (not with plugins or icount)");
 }
 
 static const TypeInfo tcg_accel_type = {
