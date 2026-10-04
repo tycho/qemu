@@ -464,6 +464,19 @@ void tcg_gen_concat_i64_vec(TCGv_vec r, TCGv_i64 lo, TCGv_i64 hi);
 void tcg_gen_perm_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
                       uint32_t pattern);
 void tcg_gen_tbl_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b);
+/*
+ * Interleave the elements of the low (or, with @high, the high) halves of
+ * a and b: r = a[k], b[k], a[k + 1], b[k + 1], ... from k = 0 (or n / 2),
+ * for n elements of vece in 128 bits.  No fallback: check
+ * tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_zip_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                     bool high);
+/*
+ * Bytes n to n + 15 of the concatenation a:b, whose bytes 0 to 15 are a's
+ * (0 <= n <= 15).  No fallback: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_ext_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, unsigned n);
 void tcg_gen_dup_mem_vec(unsigned vece, TCGv_vec, TCGv_ptr, tcg_target_long);
 void tcg_gen_dupi_vec(unsigned vece, TCGv_vec, uint64_t);
 void tcg_gen_add_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);

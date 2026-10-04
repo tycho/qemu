@@ -146,6 +146,8 @@ DEF(dupm_vec, 1, 1, 1, TCG_OPF_VECTOR)
 DEF(concat_i64_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(perm_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(tbl_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(zip_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(ext_vec, 1, 2, 1, TCG_OPF_VECTOR)
 
 DEF(add_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(sub_vec, 1, 2, 0, TCG_OPF_VECTOR)
