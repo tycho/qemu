@@ -950,6 +950,29 @@ static void vint_phop(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t c)
     }
 }
 
+/* PACKSS/PACKUS: c = TCGNarrow kind | the narrow vece << 8. */
+static void vint_pack(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t c)
+{
+    tcg_gen_narrow_vec(c >> 8, r, a, b, c & 0xff, 0, false);
+}
+
+/*
+ * PMULHW/PMULHUW/PMULHRSW: the word products at full precision, then the
+ * high halves (shift 16, truncate) or, for PMULHRSW, (p + 2^14) >> 15
+ * truncated: c = signedness | shift << 1 | rounding << 6.
+ */
+static void vint_pmulh(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t c)
+{
+    TCGv_vec lo = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec hi = tcg_temp_new_vec(TCG_TYPE_V128);
+    bool is_signed = c & 1;
+
+    tcg_gen_mulw_vec(MO_16, lo, a, b, is_signed, false);
+    tcg_gen_mulw_vec(MO_16, hi, a, b, is_signed, true);
+    tcg_gen_narrow_vec(MO_16, r, lo, hi, TCG_NARROW_TRUNC, (c >> 1) & 31,
+                       c >> 6);
+}
+
 /* An SSE/AVX integer op with a tcg_vint lowering, else its helpers. */
 #define VINT_BINARY(uname, lname, mmx, cond, fn, c)                           \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
@@ -1243,12 +1266,18 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
 PUNPCK_BYTES(PUNPCKLBW,  punpcklbw, false)
 PUNPCK_INT_MMX(PUNPCKLWD,  punpcklwd, MO_16, false)
 PUNPCK_INT_MMX(PUNPCKLDQ,  punpckldq, MO_32, false)
-BINARY_INT_MMX(PACKSSWB,   packsswb)
-BINARY_INT_MMX(PACKUSWB,   packuswb)
+VINT_BINARY(PACKSSWB, packsswb, gen_helper_packsswb_mmx,
+            vint_can(INDEX_op_narrow_vec, MO_8),
+            vint_pack, TCG_NARROW_SAT_S | MO_8 << 8)
+VINT_BINARY(PACKUSWB, packuswb, gen_helper_packuswb_mmx,
+            vint_can(INDEX_op_narrow_vec, MO_8),
+            vint_pack, TCG_NARROW_SAT_SU | MO_8 << 8)
 PUNPCK_BYTES(PUNPCKHBW,  punpckhbw, true)
 PUNPCK_INT_MMX(PUNPCKHWD,  punpckhwd, MO_16, true)
 PUNPCK_INT_MMX(PUNPCKHDQ,  punpckhdq, MO_32, true)
-BINARY_INT_MMX(PACKSSDW,   packssdw)
+VINT_BINARY(PACKSSDW, packssdw, gen_helper_packssdw_mmx,
+            vint_can(INDEX_op_narrow_vec, MO_16),
+            vint_pack, TCG_NARROW_SAT_S | MO_16 << 8)
 
 BINARY_INT_MMX(PAVGB,   pavgb)
 BINARY_INT_MMX(PAVGW,   pavgw)
@@ -1256,8 +1285,14 @@ VINT_BINARY(PMADDWD, pmaddwd, gen_helper_pmaddwd_mmx,
             vint_can(INDEX_op_mulw_vec, MO_16)
             && vint_can(INDEX_op_addp_vec, MO_32),
             vint_pmaddwd, 0)
-BINARY_INT_MMX(PMULHUW, pmulhuw)
-BINARY_INT_MMX(PMULHW,  pmulhw)
+VINT_BINARY(PMULHUW, pmulhuw, gen_helper_pmulhuw_mmx,
+            vint_can(INDEX_op_mulw_vec, MO_16)
+            && vint_can(INDEX_op_narrow_vec, MO_16),
+            vint_pmulh, false | 16 << 1)
+VINT_BINARY(PMULHW, pmulhw, gen_helper_pmulhw_mmx,
+            vint_can(INDEX_op_mulw_vec, MO_16)
+            && vint_can(INDEX_op_narrow_vec, MO_16),
+            vint_pmulh, true | 16 << 1)
 VINT_BINARY(PMULUDQ, pmuludq, gen_helper_pmuludq_mmx,
             vint_can(INDEX_op_mulw_vec, MO_32)
             && vint_can(INDEX_op_perm_vec, MO_32),
@@ -1336,7 +1371,10 @@ static void gen_PSHUFB(DisasContext *s, X86DecodedInsn *decode)
 BINARY_INT_MMX(PSIGNB,    psignb)
 BINARY_INT_MMX(PSIGNW,    psignw)
 BINARY_INT_MMX(PSIGND,    psignd)
-BINARY_INT_MMX(PMULHRSW,  pmulhrsw)
+VINT_BINARY(PMULHRSW, pmulhrsw, gen_helper_pmulhrsw_mmx,
+            vint_can(INDEX_op_mulw_vec, MO_16)
+            && vint_can(INDEX_op_narrow_vec, MO_16),
+            vint_pmulh, true | 15 << 1 | 1 << 6)
 
 /* Instructions with no MMX equivalent.  */
 #define BINARY_INT_SSE(uname, lname)                                               \
@@ -1362,7 +1400,9 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
 }
 PUNPCK_INT_SSE(PUNPCKLQDQ, punpcklqdq, MO_64, false)
 PUNPCK_INT_SSE(PUNPCKHQDQ, punpckhqdq, MO_64, true)
-BINARY_INT_SSE(VPACKUSDW,  packusdw)
+VINT_BINARY(VPACKUSDW, packusdw, NULL,
+            vint_can(INDEX_op_narrow_vec, MO_16),
+            vint_pack, TCG_NARROW_SAT_SU | MO_16 << 8)
 BINARY_INT_SSE(VPERMILPS,  vpermilps)
 BINARY_INT_SSE(VPERMILPD,  vpermilpd)
 BINARY_INT_SSE(VMASKMOVPS, vpmaskmovd)
