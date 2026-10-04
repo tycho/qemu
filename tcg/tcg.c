@@ -2250,6 +2250,27 @@ TCGTemp *tcg_alias_global(TCGContext *s, TCGTemp *base, intptr_t off,
     return NULL;
 }
 
+/*
+ * The env_alias global whose memory holds element *@idx, of size @size, at
+ * @base + @off; NULL if none does.
+ */
+TCGTemp *tcg_alias_element(TCGContext *s, TCGTemp *base, intptr_t off,
+                           MemOp size, unsigned *idx)
+{
+    for (int i = 0; i < s->nb_alias; i++) {
+        TCGTemp *ts = &s->temps[s->alias_temp[i]];
+        intptr_t rel = off - ts->mem_offset;
+
+        if (ts->mem_base == base && rel >= 0
+            && rel + (1 << size) <= tcg_type_size(ts->base_type)
+            && !(rel & ((1 << size) - 1))) {
+            *idx = rel >> size;
+            return ts;
+        }
+    }
+    return NULL;
+}
+
 TCGTemp *tcg_temp_new_internal(TCGType type, TCGTempKind kind)
 {
     TCGContext *s = tcg_ctx;
@@ -2717,6 +2738,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_frecpes_vec:
     case INDEX_op_frsqrtes_vec:
         return has_type && TCG_TARGET_HAS_fp_vec;
+    case INDEX_op_extract_vec:
+        return has_type && TCG_TARGET_HAS_extract_vec;
 
     default:
         if (op < INDEX_op_last_generic) {

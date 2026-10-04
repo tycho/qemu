@@ -883,6 +883,11 @@ specifies the length of the element (if applicable) in log2 8-bit units.
          of *v2* indexes, or 0 if that index is 16 or more (128-bit
          vectors, ``TCGOP_VECE`` = MO_8).
 
+   * - extract_vec *r0*, *v1*, *idx*
+
+     - | Element *idx* of *v1*, of size ``TCGOP_VECE``, zero-extended into
+         the 64-bit integer *r0*.
+
    * - dupi_vec *v0*, *c*
 
      - | Similarly, for a constant.

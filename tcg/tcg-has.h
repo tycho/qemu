@@ -94,6 +94,9 @@
 #ifndef TCG_TARGET_HAS_v128
 #define TCG_TARGET_HAS_v128             0
 #endif
+#ifndef TCG_TARGET_HAS_extract_vec
+#define TCG_TARGET_HAS_extract_vec      0
+#endif
 #ifndef TCG_TARGET_HAS_v256
 #define TCG_TARGET_HAS_v256             0
 #endif
