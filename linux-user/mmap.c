@@ -416,6 +416,24 @@ static bool mmap_frag(abi_ulong real_start, abi_ulong start, abi_ulong last,
 abi_ulong task_unmapped_base;
 abi_ulong elf_et_dyn_base;
 abi_ulong mmap_next_start;
+abi_ulong guest_user_max;
+
+/*
+ * Without reserved_va, the host kernel places every guest mapping that has
+ * no fixed address, anywhere in the host's user address space.  When that
+ * reaches above guest_user_max, QEMU places those mappings itself.
+ */
+static bool mmap_place_below_user_max;
+
+void mmap_check_host_va(void)
+{
+    int local;
+
+    /* The host kernel puts the stack at the top of its user space. */
+    mmap_place_below_user_max =
+        !reserved_va && guest_user_max < guest_addr_max &&
+        (uintptr_t)&local - guest_base > guest_user_max;
+}
 
 /*
  * Subroutine of mmap_find_vma, used when we have pre-allocated
@@ -492,7 +510,8 @@ abi_ulong mmap_find_vma(abi_ulong start, abi_ulong size, abi_ulong align)
          */
         repeat = (ptr == prev ? repeat + 1 : 0);
 
-        if (h2g_valid(ptr + size - 1)) {
+        if (h2g_valid(ptr + size - 1) &&
+            h2g(ptr + size - 1) <= guest_user_max) {
             addr = h2g(ptr);
 
             if ((addr & (align - 1)) == 0) {
@@ -918,32 +937,34 @@ static abi_long target_mmap__locked(abi_ulong start, abi_ulong len,
     int host_page_size = qemu_real_host_page_size();
     int host_prot;
 
-    /*
-     * For reserved_va, we are in full control of the allocation.
-     * Find a suitable hole and convert to MAP_FIXED.
-     */
-    if (reserved_va) {
-        if (flags & MAP_FIXED_NOREPLACE) {
-            /* Validate that the chosen range is empty. */
-            if (!page_check_range_empty(start, start + len - 1)) {
-                errno = EEXIST;
-                return -1;
-            }
-            flags = (flags & ~MAP_FIXED_NOREPLACE) | MAP_FIXED;
-        } else if (!(flags & MAP_FIXED)) {
-            abi_ulong real_start = start & -host_page_size;
-            off_t host_offset = offset & -host_page_size;
-            size_t real_len = len + offset - host_offset;
-            abi_ulong align = MAX(host_page_size, TARGET_PAGE_SIZE);
-
-            start = mmap_find_vma(real_start, real_len, align);
-            if (start == (abi_ulong)-1) {
-                errno = ENOMEM;
-                return -1;
-            }
-            start += offset - host_offset;
-            flags |= MAP_FIXED;
+    /* For reserved_va, we are in full control of the allocation. */
+    if (reserved_va && (flags & MAP_FIXED_NOREPLACE)) {
+        /* Validate that the chosen range is empty. */
+        if (!page_check_range_empty(start, start + len - 1)) {
+            errno = EEXIST;
+            return -1;
         }
+        flags = (flags & ~MAP_FIXED_NOREPLACE) | MAP_FIXED;
+    }
+
+    /*
+     * With reserved_va, or when the host kernel could place the mapping
+     * above guest_user_max, find a suitable hole and convert to MAP_FIXED.
+     */
+    if (!(flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) &&
+        (reserved_va || mmap_place_below_user_max)) {
+        abi_ulong real_start = start & -host_page_size;
+        off_t host_offset = offset & -host_page_size;
+        size_t real_len = len + offset - host_offset;
+        abi_ulong align = MAX(host_page_size, TARGET_PAGE_SIZE);
+
+        start = mmap_find_vma(real_start, real_len, align);
+        if (start == (abi_ulong)-1) {
+            errno = ENOMEM;
+            return -1;
+        }
+        start += offset - host_offset;
+        flags |= MAP_FIXED;
     }
 
     host_prot = target_to_host_prot(target_prot);

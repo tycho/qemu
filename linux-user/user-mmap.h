@@ -41,6 +41,15 @@
 extern abi_ulong task_unmapped_base;
 extern abi_ulong elf_et_dyn_base;
 
+/*
+ * guest_user_max: the end of the guest's user address space when it is
+ * narrower than guest_addr_max (47 bits for x86_64, whose vsyscall page
+ * keeps guest_addr_max at the whole range), else guest_addr_max.
+ */
+extern abi_ulong guest_user_max;
+
+void mmap_check_host_va(void);
+
 abi_long target_madvise(abi_ulong start, abi_ulong len_in, int advice);
 
 abi_ulong target_shmat(CPUArchState *cpu_env, int shmid,
