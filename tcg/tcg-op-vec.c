@@ -939,6 +939,17 @@ void tcg_gen_fsqrts_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
     do_op3_nofail(vece, r, a, b, INDEX_op_fsqrts_vec);
 }
 
+void tcg_gen_frintxs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_frintxs_vec);
+}
+
+void tcg_gen_frints_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                        TCGFrint mode)
+{
+    do_op4_nofail(vece, r, a, b, mode, INDEX_op_frints_vec);
+}
+
 void tcg_gen_fcvts_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
 {
     do_op3_nofail(vece, r, a, b, INDEX_op_fcvts_vec);

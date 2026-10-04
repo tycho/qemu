@@ -527,6 +527,9 @@ void tcg_gen_fdivs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_fmins_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_fmaxs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_fsqrts_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_frintxs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_frints_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                        TCGFrint mode);
 void tcg_gen_fmadds_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
                         TCGv_vec b, TCGv_vec c);
 void tcg_gen_fmsubs_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
