@@ -161,6 +161,11 @@ const TCGCPUOps x86_tcg_ops = {
     .mttcg_supported = true,
     .precise_smc = true,
     /*
+     * Canonical 64-bit addresses, 32-bit ones otherwise; user and kernel
+     * code with the same low 48 bits differ in CPL, part of the flags.
+     */
+    .jmp_cache_salt = true,
+    /*
      * The x86 has a strong memory model with some store-after-load re-ordering
      */
     .guest_default_memory_order = TCG_MO_ALL & ~TCG_MO_ST_LD,
