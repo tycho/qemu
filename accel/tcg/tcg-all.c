@@ -287,6 +287,16 @@ static void tcg_set_tso(Object *obj, const char *value, Error **errp)
     error_setg(errp, "Invalid 'x-tso' value: %s", value);
 }
 
+static bool tcg_get_tso_stack(Object *obj, Error **errp)
+{
+    return tcg_tso_stack;
+}
+
+static void tcg_set_tso_stack(Object *obj, bool value, Error **errp)
+{
+    tcg_tso_stack = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -324,6 +334,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "acqrel (load-acquire/store-release accesses), "
         "auto (acqrel where the host supports it, else barrier), "
         "none (no barriers: unsafe, for measurement)");
+
+    object_class_property_add_bool(oc, "x-tso-stack",
+                                   tcg_get_tso_stack, tcg_set_tso_stack);
+    object_class_property_set_description(oc, "x-tso-stack",
+        "qemu-user: guest accesses to the thread's own stack (x86: RSP-based, "
+        "push/pop/call/ret) get no memory-order constraint");
 }
 
 static const TypeInfo tcg_accel_type = {
