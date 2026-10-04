@@ -1357,10 +1357,71 @@ UNARY_INT_GVEC(PABSB,          tcg_gen_gvec_abs, MO_8)
 UNARY_INT_GVEC(PABSW,          tcg_gen_gvec_abs, MO_16)
 UNARY_INT_GVEC(PABSD,          tcg_gen_gvec_abs, MO_32)
 UNARY_INT_GVEC(VBROADCASTx128, tcg_gen_gvec_dup_mem, MO_128)
-UNARY_INT_GVEC(VPBROADCASTB,   tcg_gen_gvec_dup_mem, MO_8)
-UNARY_INT_GVEC(VPBROADCASTW,   tcg_gen_gvec_dup_mem, MO_16)
-UNARY_INT_GVEC(VPBROADCASTD,   tcg_gen_gvec_dup_mem, MO_32)
-UNARY_INT_GVEC(VPBROADCASTQ,   tcg_gen_gvec_dup_mem, MO_64)
+/*
+ * With tcg_vint, VPBROADCAST (and VBROADCASTSS/SD): from memory, a dup of
+ * the scalar the operand load left in T1 (bytes to dwords; a qword is read
+ * back from the operand's scratch slot); from a register, element 0 by a
+ * constant permute (bytes: a table lookup with zero indices).  Then the
+ * normal stores of operand 0's lanes.
+ */
+static bool gen_vint_broadcast(DisasContext *s, X86DecodedInsn *decode,
+                               unsigned vece)
+{
+    int lanes = vector_len(s, decode) / 16;
+    TCGv_vec v;
+
+    if (!tcg_vint || decode->op[0].unit != X86_OP_SSE) {
+        return false;
+    }
+    if (decode->op[2].has_ea) {
+        v = tcg_temp_new_vec(TCG_TYPE_V128);
+        if (vece == MO_64) {
+            TCGv_i64 t = tcg_temp_new_i64();
+
+            tcg_gen_ld_i64(t, tcg_env, decode->op[2].offset);
+            tcg_gen_dup_i64_vec(MO_64, v, t);
+        } else {
+#ifdef TARGET_X86_64
+            tcg_gen_dup_i64_vec(vece, v, s->T1);
+#else
+            tcg_gen_dup_i32_vec(vece, v, s->T1);
+#endif
+        }
+    } else {
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        if (vece == MO_8 ? !vint_can(INDEX_op_tbl_vec, MO_8)
+                         : !vint_can(INDEX_op_perm_vec, vece)) {
+            return false;
+        }
+        tcg_gen_ld_vec(a, tcg_env, decode->op[2].offset);
+        v = tcg_temp_new_vec(TCG_TYPE_V128);
+        if (vece == MO_8) {
+            tcg_gen_tbl_vec(v, a, tcg_constant_vec(TCG_TYPE_V128, MO_8, 0));
+        } else {
+            tcg_gen_perm_vec(vece, v, a, a, 0);
+        }
+    }
+    for (int l = 0; l < lanes; l++) {
+        tcg_gen_st_vec(v, tcg_env, decode->op[0].offset + 16 * l);
+    }
+    return true;
+}
+
+#define VPBROADCAST(uname, vece)                                              \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    int vec_len = vector_len(s, decode);                                      \
+                                                                              \
+    if (!gen_vint_broadcast(s, decode, vece)) {                               \
+        tcg_gen_gvec_dup_mem(vece, decode->op[0].offset,                      \
+                             decode->op[2].offset, vec_len, vec_len);         \
+    }                                                                         \
+}
+VPBROADCAST(VPBROADCASTB, MO_8)
+VPBROADCAST(VPBROADCASTW, MO_16)
+VPBROADCAST(VPBROADCASTD, MO_32)
+VPBROADCAST(VPBROADCASTQ, MO_64)
 
 
 #define BINARY_INT_GVEC(uname, func, ...)                                          \
