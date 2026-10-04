@@ -625,6 +625,8 @@ typedef enum {
     Isimd_shift_imm_SLI  = 0x2f005400,
     Isimd_shift_imm_USHR = 0x2f000400,
     Isimd_shift_imm_USRA = 0x2f001400,
+    Isimd_shift_imm_SSHLL = 0x0f00a400,
+    Isimd_shift_imm_USHLL = 0x2f00a400,
 
     /* AdvSIMD three same.  */
     Iqrrr_e_ADD       = 0x0e208400,
@@ -3591,6 +3593,12 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out32(s, Iqrrr_e_EXT | 1 << 30 | (a2 & 0x1f) << 16
                   | (args[3] & 15) << 11 | (a1 & 0x1f) << 5 | (a0 & 0x1f));
         break;
+    case INDEX_op_widen_vec:
+        /* SXTL/UXTL{,2}: SSHLL/USHLL by 0; Q selects the high half. */
+        tcg_out_insn_simd_shift_imm(s, a2 & 1 ? Isimd_shift_imm_SSHLL
+                                    : Isimd_shift_imm_USHLL,
+                                    a2 >> 1, a0, a1, 8 << vece);
+        break;
     case INDEX_op_qemu_ld_vec:
         tcg_out_qemu_ldst_vec(s, a0, a1, args[2], true);
         break;
@@ -3932,6 +3940,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return type == TCG_TYPE_V128 && vece == MO_8;
     case INDEX_op_zip_vec:
         return type == TCG_TYPE_V128;
+    case INDEX_op_widen_vec:
+        return type == TCG_TYPE_V128 && vece <= MO_32;
 
     default:
         return 0;
@@ -4053,6 +4063,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_zip_vec:
     case INDEX_op_ext_vec:
         return C_O1_I2(w, w, w);
+    case INDEX_op_widen_vec:
+        return C_O1_I1(w, w);
     case INDEX_op_dup_vec:
         return C_O1_I1(w, wr);
     case INDEX_op_or_vec:
