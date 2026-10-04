@@ -39,6 +39,9 @@
 #ifndef TCG_TARGET_HAS_concat_vec
 #define TCG_TARGET_HAS_concat_vec       0
 #endif
+#ifndef TCG_TARGET_HAS_qemu_ldst_vec
+#define TCG_TARGET_HAS_qemu_ldst_vec    0
+#endif
 #ifndef TCG_TARGET_HAS_v64
 #define TCG_TARGET_HAS_v64              0
 #endif

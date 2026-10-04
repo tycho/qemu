@@ -228,6 +228,15 @@ QEMU_ARG_NONNULL
 void tcg_gen_qemu_ld_chk_i128(TCGv_i128, TCGTemp *, TCGArg, MemOp, TCGType);
 QEMU_ARG_NONNULL
 void tcg_gen_qemu_st_chk_i128(TCGv_i128, TCGTemp *, TCGArg, MemOp, TCGType);
+/*
+ * 128-bit guest accesses with the value in a vector, where the backend has
+ * them and the access needs no more than 64-bit atomicity (each half, if
+ * aligned), no byte swap and no plugin memory callback: check with
+ * tcg_can_qemu_ldst_vec() first.
+ */
+bool tcg_can_qemu_ldst_vec(MemOp);
+void tcg_gen_qemu_ld_vec_chk(TCGv_vec, TCGTemp *, TCGArg, MemOp, TCGType);
+void tcg_gen_qemu_st_vec_chk(TCGv_vec, TCGTemp *, TCGArg, MemOp, TCGType);
 
 QEMU_ARG_NONNULL
 void tcg_gen_atomic_cmpxchg_chk_i128(TCGv_i128, TCGTemp *, TCGv_i128,
