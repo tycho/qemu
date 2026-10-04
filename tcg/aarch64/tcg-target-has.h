@@ -55,6 +55,7 @@
 #define TCG_TARGET_HAS_concat_vec       1
 #define TCG_TARGET_HAS_qemu_ldst_vec    1
 #define TCG_TARGET_HAS_perm_vec         1
+#define TCG_TARGET_HAS_tbl_vec          1
 
 #define TCG_TARGET_extract_valid(type, ofs, len)   1
 #define TCG_TARGET_sextract_valid(type, ofs, len)  1
