@@ -5727,12 +5727,14 @@ static void tcg_reg_free(TCGContext *s, TCGReg reg, TCGRegSet allocated_regs)
  * The register to spill in a loop: cheapest first, a value already in
  * memory (dropping it costs nothing now), then one that must be stored,
  * and a loop global in its own register last (the back edge would have
- * to reload it).
+ * to reload it).  -1 if no register of @set is in @order: a preferred set
+ * may hold only registers TCG doesn't allocate (on aarch64 a value live
+ * across a call is preferred in the callee-saved V8-V15).
  */
-static TCGReg xblk_victim(TCGContext *s, TCGRegSet set, const int *order,
-                          int n)
+static int xblk_victim(TCGContext *s, TCGRegSet set, const int *order,
+                       int n)
 {
-    TCGReg best = -1;
+    int best = -1;
     int best_cost = INT_MAX;
 
     for (int i = 0; i < n; i++) {
@@ -5809,8 +5811,12 @@ static TCGReg tcg_reg_alloc(TCGContext *s, TCGRegSet required_regs,
         TCGRegSet set = reg_ct[j];
 
         if (s->xblk_home && !tcg_regset_single(set)) {
-            TCGReg reg = xblk_victim(s, set, order, n);
+            int reg = xblk_victim(s, set, order, n);
 
+            /* None of the set is in the allocation order: try the next. */
+            if (reg < 0) {
+                continue;
+            }
             tcg_reg_free(s, reg, allocated_regs);
             return reg;
         }
