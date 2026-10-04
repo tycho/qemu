@@ -45,6 +45,9 @@
 #ifndef TCG_TARGET_HAS_perm_vec
 #define TCG_TARGET_HAS_perm_vec         0
 #endif
+#ifndef TCG_TARGET_HAS_tbl_vec
+#define TCG_TARGET_HAS_tbl_vec          0
+#endif
 #ifndef TCG_TARGET_HAS_v64
 #define TCG_TARGET_HAS_v64              0
 #endif
