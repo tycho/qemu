@@ -888,6 +888,11 @@ specifies the length of the element (if applicable) in log2 8-bit units.
      - | Element *idx* of *v1*, of size ``TCGOP_VECE``, zero-extended into
          the 64-bit integer *r0*.
 
+   * - insert_vec *v0*, *v1*, *r2*, *idx*
+
+     - | *v1* with element *idx*, of size ``TCGOP_VECE``, replaced by the
+         low bits of the 64-bit integer *r2*.
+
    * - dupi_vec *v0*, *c*
 
      - | Similarly, for a constant.
