@@ -240,6 +240,7 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 
 TCGContext tcg_init_ctx;
 TCGTsoMode tcg_tso_mode;
+bool tcg_tso_stack;
 
 /*
  * A guest insn is promoted (see tcg_tso_cross_count) once its MO_ACQ_REL

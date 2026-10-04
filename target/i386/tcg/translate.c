@@ -1817,6 +1817,18 @@ static void gen_lea_ss_ofs(DisasContext *s, TCGv dest, TCGv src, target_ulong of
     gen_lea_v_seg_dest(s, mo_stacksize(s), dest, src, R_SS, -1);
 }
 
+/*
+ * Implicit stack accesses (push, pop, call, ret, enter, leave) are to this
+ * thread's stack whatever the insn's other operand is (x-tso-stack).
+ */
+static bool gen_stack_private(bool private)
+{
+    bool old = tcg_ctx->ldst_private;
+
+    tcg_ctx->ldst_private = private;
+    return old;
+}
+
 /* Generate a push. It depends on ss32, addseg and dflag.  */
 static void gen_push_v(DisasContext *s, TCGv val)
 {
@@ -1824,12 +1836,15 @@ static void gen_push_v(DisasContext *s, TCGv val)
     MemOp a_ot = mo_stacksize(s);
     int size = 1 << d_ot;
     TCGv new_esp = tcg_temp_new();
+    bool old;
 
     tcg_gen_subi_tl(new_esp, cpu_regs[R_ESP], size);
 
     /* Now reduce the value to the address size and apply SS base.  */
     gen_lea_ss_ofs(s, s->A0, new_esp, 0);
+    old = gen_stack_private(true);
     gen_op_st_v(s, d_ot, val, s->A0);
+    gen_stack_private(old);
     gen_op_mov_reg_v(s, a_ot, R_ESP, new_esp);
 }
 
@@ -1837,9 +1852,12 @@ static void gen_push_v(DisasContext *s, TCGv val)
 static MemOp gen_pop_T0(DisasContext *s)
 {
     MemOp d_ot = mo_pushpop(s, s->dflag);
+    bool old;
 
     gen_lea_ss_ofs(s, s->T0, cpu_regs[R_ESP], 0);
+    old = gen_stack_private(true);
     gen_op_ld_v(s, d_ot, s->T0, s->T0);
+    gen_stack_private(old);
 
     return d_ot;
 }
@@ -1853,12 +1871,14 @@ static void gen_pusha(DisasContext *s)
 {
     MemOp d_ot = s->dflag;
     int size = 1 << d_ot;
+    bool old = gen_stack_private(true);
     int i;
 
     for (i = 0; i < 8; i++) {
         gen_lea_ss_ofs(s, s->A0, cpu_regs[R_ESP], (i - 8) * size);
         gen_op_st_v(s, d_ot, cpu_regs[7 - i], s->A0);
     }
+    gen_stack_private(old);
 
     gen_stack_update(s, -8 * size);
 }
@@ -1867,6 +1887,7 @@ static void gen_popa(DisasContext *s)
 {
     MemOp d_ot = s->dflag;
     int size = 1 << d_ot;
+    bool old = gen_stack_private(true);
     int i;
 
     for (i = 0; i < 8; i++) {
@@ -1878,6 +1899,7 @@ static void gen_popa(DisasContext *s)
         gen_op_ld_v(s, d_ot, s->T0, s->A0);
         gen_op_mov_reg_v(s, d_ot, 7 - i, s->T0);
     }
+    gen_stack_private(old);
 
     gen_stack_update(s, 8 * size);
 }
@@ -1887,6 +1909,7 @@ static void gen_enter(DisasContext *s, int esp_addend, int level)
     MemOp d_ot = mo_pushpop(s, s->dflag);
     MemOp a_ot = mo_stacksize(s);
     int size = 1 << d_ot;
+    bool old = gen_stack_private(true);
 
     /* Push BP; compute FrameTemp into T1.  */
     tcg_gen_subi_tl(s->T1, cpu_regs[R_ESP], size);
@@ -1914,6 +1937,8 @@ static void gen_enter(DisasContext *s, int esp_addend, int level)
         gen_op_st_v(s, d_ot, s->T1, s->A0);
     }
 
+    gen_stack_private(old);
+
     /* Copy the FrameTemp value to EBP.  */
     gen_op_mov_reg_v(s, d_ot, R_EBP, s->T1);
 
@@ -1926,9 +1951,12 @@ static void gen_leave(DisasContext *s)
 {
     MemOp d_ot = mo_pushpop(s, s->dflag);
     MemOp a_ot = mo_stacksize(s);
+    bool old;
 
     gen_lea_ss_ofs(s, s->A0, cpu_regs[R_EBP], 0);
+    old = gen_stack_private(true);
     gen_op_ld_v(s, d_ot, s->T0, s->A0);
+    gen_stack_private(old);
 
     tcg_gen_addi_tl(s->T1, cpu_regs[R_EBP], 1 << d_ot);
 
