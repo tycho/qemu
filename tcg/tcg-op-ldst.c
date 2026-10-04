@@ -592,6 +592,22 @@ static void maybe_free_addr64(TCGv_i64 a64)
     }
 }
 
+/*
+ * x-tso=acqrel: whether a 16-byte access can itself be a load-acquire or
+ * store-release, single-copy atomic (aarch64: FEAT_LRCPC3 LDIAPP/STILP,
+ * which need 16-byte alignment).
+ */
+static bool tcg_ldst_i128_acqrel(MemOp memop)
+{
+    if (!TCG_TARGET_HAS_qemu_ldst_i128 ||
+        !TCG_TARGET_HAS_qemu_ldst_i128_acqrel ||
+        tcg_tso_mode != TCG_TSO_ACQREL) {
+        return false;
+    }
+    return memop_alignment_bits(memop) >= MO_128 &&
+           !((memop & MO_BSWAP) && !tcg_target_has_memory_bswap(memop));
+}
+
 static void tcg_gen_qemu_ld_i128_int(TCGv_i128 val, TCGTemp *addr,
                                      TCGArg idx, MemOp memop)
 {
@@ -599,16 +615,21 @@ static void tcg_gen_qemu_ld_i128_int(TCGv_i128 val, TCGTemp *addr,
     TCGv_i64 ext_addr = NULL;
     TCGTemp *addr_new;
     TCGBar after = 0;
+    MemOp acq = 0;
 
     check_max_alignment(memop_alignment_bits(memop));
     if (tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD)) {
-        /*
-         * x-tso=acqrel: this load is not a load-acquire, so order it
-         * before later accesses with a barrier after it.  Nothing is
-         * needed before it: earlier loads were acquires, and TSO lets a
-         * load pass earlier stores.
-         */
-        after = TCG_MO_LD_LD | TCG_MO_LD_ST;
+        if (tcg_ldst_i128_acqrel(memop)) {
+            acq = MO_ACQ_REL;
+        } else {
+            /*
+             * x-tso=acqrel: this load is not a load-acquire, so order it
+             * before later accesses with a barrier after it.  Nothing is
+             * needed before it: earlier loads were acquires, and TSO lets
+             * a load pass earlier stores.
+             */
+            after = TCG_MO_LD_LD | TCG_MO_LD_ST;
+        }
     }
 
     /* In serial mode, reduce atomicity. */
@@ -622,7 +643,7 @@ static void tcg_gen_qemu_ld_i128_int(TCGv_i128 val, TCGTemp *addr,
     if (TCG_TARGET_HAS_qemu_ldst_i128) {
         TCGv_i64 lo, hi;
         bool need_bswap = false;
-        MemOpIdx oi = orig_oi;
+        MemOpIdx oi = make_memop_idx(memop | acq, idx);
 
         if ((memop & MO_BSWAP) && !tcg_target_has_memory_bswap(memop)) {
             lo = TCGV128_HIGH(val);
@@ -723,9 +744,15 @@ static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
     MemOpIdx orig_oi;
     TCGv_i64 ext_addr = NULL;
     TCGTemp *addr_new;
+    MemOp rel = 0;
 
     check_max_alignment(memop_alignment_bits(memop));
-    tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
+    if (tcg_ldst_i128_acqrel(memop)) {
+        /* A store-release orders earlier loads and stores before it. */
+        rel = tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST);
+    } else {
+        tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
+    }
 
     /* In serial mode, reduce atomicity. */
     if (!(tcg_ctx->gen_tb->cflags & CF_PARALLEL)) {
@@ -738,7 +765,7 @@ static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
 
     if (TCG_TARGET_HAS_qemu_ldst_i128) {
         TCGv_i64 lo, hi;
-        MemOpIdx oi = orig_oi;
+        MemOpIdx oi = make_memop_idx(memop | rel, idx);
         bool need_bswap = false;
 
         if ((memop & MO_BSWAP) && !tcg_target_has_memory_bswap(memop)) {
