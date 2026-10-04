@@ -444,6 +444,12 @@ void tcg_gen_mov_vec(TCGv_vec, TCGv_vec);
 void tcg_gen_dup_i32_vec(unsigned vece, TCGv_vec, TCGv_i32);
 void tcg_gen_dup_i64_vec(unsigned vece, TCGv_vec, TCGv_i64);
 void tcg_gen_dup_mem_vec(unsigned vece, TCGv_vec, TCGv_ptr, tcg_target_long);
+/*
+ * Element @idx of @a (of size vece), zero-extended into @r.  No fallback:
+ * check tcg_can_emit_vec_op(INDEX_op_extract_vec) first.
+ */
+void tcg_gen_extract_vec_i64(unsigned vece, TCGv_i64 r, TCGv_vec a,
+                             unsigned idx);
 void tcg_gen_dupi_vec(unsigned vece, TCGv_vec, uint64_t);
 void tcg_gen_add_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_sub_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
