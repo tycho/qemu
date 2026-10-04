@@ -636,6 +636,9 @@ typedef enum {
     Iqrrr_e_UZP2      = 0x0e005800,
     Iqrrr_e_TRN2      = 0x0e006800,
     Iqrrr_e_ZIP2      = 0x0e007800,
+    Iqrrr_e_ADDP      = 0x0e20bc00,
+    Iqrrr_e_SMULL     = 0x0e20c000,      /* three different */
+    Iqrrr_e_UMULL     = 0x2e20c000,
     Iqrrr_e_TBL       = 0x0e000000,      /* one table register */
     Iqrrr_e_TBX       = 0x0e001000,
     Iqrrr_e_EXT       = 0x2e000000,      /* index in bits 11-14 */
@@ -3593,6 +3596,14 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out32(s, Iqrrr_e_EXT | 1 << 30 | (a2 & 0x1f) << 16
                   | (args[3] & 15) << 11 | (a1 & 0x1f) << 5 | (a0 & 0x1f));
         break;
+    case INDEX_op_mulw_vec:
+        /* SMULL/UMULL{,2}: Q selects the high halves. */
+        tcg_out_insn_qrrr_e(s, args[3] & 1 ? Iqrrr_e_SMULL : Iqrrr_e_UMULL,
+                            args[3] >> 1, vece, a0, a1, a2);
+        break;
+    case INDEX_op_addp_vec:
+        tcg_out_insn_qrrr_e(s, Iqrrr_e_ADDP, 1, vece, a0, a1, a2);
+        break;
     case INDEX_op_widen_vec:
         /* SXTL/UXTL{,2}: SSHLL/USHLL by 0; Q selects the high half. */
         tcg_out_insn_simd_shift_imm(s, a2 & 1 ? Isimd_shift_imm_SSHLL
@@ -3941,7 +3952,10 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_zip_vec:
         return type == TCG_TYPE_V128;
     case INDEX_op_widen_vec:
+    case INDEX_op_mulw_vec:
         return type == TCG_TYPE_V128 && vece <= MO_32;
+    case INDEX_op_addp_vec:
+        return type == TCG_TYPE_V128;
 
     default:
         return 0;
@@ -4062,6 +4076,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_tbl_vec:
     case INDEX_op_zip_vec:
     case INDEX_op_ext_vec:
+    case INDEX_op_mulw_vec:
+    case INDEX_op_addp_vec:
         return C_O1_I2(w, w, w);
     case INDEX_op_widen_vec:
         return C_O1_I1(w, w);
