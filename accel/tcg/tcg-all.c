@@ -287,6 +287,16 @@ static void tcg_set_tso(Object *obj, const char *value, Error **errp)
     error_setg(errp, "Invalid 'x-tso' value: %s", value);
 }
 
+static bool tcg_get_tso_stack(Object *obj, Error **errp)
+{
+    return tcg_tso_stack;
+}
+
+static void tcg_set_tso_stack(Object *obj, bool value, Error **errp)
+{
+    tcg_tso_stack = value;
+}
+
 static char *tcg_get_tso_vec(Object *obj, Error **errp)
 {
     return g_strdup(tcg_tso_vec_group ? "group" : "strict");
@@ -347,6 +357,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Guest accesses wider than 8 bytes the guest doesn't make atomic: "
         "strict (each ordered, default), group (with x-tso=acqrel, "
         "barriers only where a run of them begins and ends: not exact)");
+
+    object_class_property_add_bool(oc, "x-tso-stack",
+                                   tcg_get_tso_stack, tcg_set_tso_stack);
+    object_class_property_set_description(oc, "x-tso-stack",
+        "qemu-user: guest accesses to the thread's own stack (x86: RSP-based, "
+        "push/pop/call/ret) get no memory-order constraint");
 }
 
 static const TypeInfo tcg_accel_type = {
