@@ -627,6 +627,14 @@ typedef enum {
     Isimd_shift_imm_USRA = 0x2f001400,
     Isimd_shift_imm_SSHLL = 0x0f00a400,
     Isimd_shift_imm_USHLL = 0x2f00a400,
+    Isimd_shift_imm_SHRN = 0x0f008400,
+    Isimd_shift_imm_RSHRN = 0x0f008c00,
+    Isimd_shift_imm_SQSHRN = 0x0f009400,
+    Isimd_shift_imm_SQRSHRN = 0x0f009c00,
+    Isimd_shift_imm_SQSHRUN = 0x2f008400,
+    Isimd_shift_imm_SQRSHRUN = 0x2f008c00,
+    Isimd_shift_imm_UQSHRN = 0x2f009400,
+    Isimd_shift_imm_UQRSHRN = 0x2f009c00,
 
     /* AdvSIMD three same.  */
     Iqrrr_e_ADD       = 0x0e208400,
@@ -671,6 +679,10 @@ typedef enum {
 
     /* AdvSIMD two-reg misc.  */
     Iqrr_e_REV64      = 0x0e200800,
+    Iqrr_e_XTN        = 0x0e212800,
+    Iqrr_e_SQXTN      = 0x0e214800,
+    Iqrr_e_SQXTUN     = 0x2e212800,
+    Iqrr_e_UQXTN      = 0x2e214800,
     Iqrr_e_REV32      = 0x2e200800,
     Iqrr_e_REV16      = 0x0e201800,
     Iqrr_e_CMGT0      = 0x0e208800,
@@ -3531,6 +3543,48 @@ static void tcg_out_perm_vec(TCGContext *s, unsigned vece, TCGReg a0,
     }
 }
 
+/*
+ * narrow_vec: the low half of the result from a, then the high half from
+ * b (the "2" forms keep the low half).  If rd is b, the first write would
+ * destroy it: build the result in TCG_VEC_TMP0.
+ */
+static void tcg_out_narrow_vec(TCGContext *s, unsigned vece, TCGReg rd,
+                               TCGReg a, TCGReg b, unsigned k)
+{
+    static const AArch64Insn xtn[4] = {
+        [TCG_NARROW_TRUNC] = Iqrr_e_XTN,
+        [TCG_NARROW_SAT_S] = Iqrr_e_SQXTN,
+        [TCG_NARROW_SAT_SU] = Iqrr_e_SQXTUN,
+        [TCG_NARROW_SAT_U] = Iqrr_e_UQXTN,
+    };
+    static const AArch64Insn shrn[4][2] = {
+        [TCG_NARROW_TRUNC] = { Isimd_shift_imm_SHRN, Isimd_shift_imm_RSHRN },
+        [TCG_NARROW_SAT_S] = { Isimd_shift_imm_SQSHRN,
+                               Isimd_shift_imm_SQRSHRN },
+        [TCG_NARROW_SAT_SU] = { Isimd_shift_imm_SQSHRUN,
+                                Isimd_shift_imm_SQRSHRUN },
+        [TCG_NARROW_SAT_U] = { Isimd_shift_imm_UQSHRN,
+                               Isimd_shift_imm_UQRSHRN },
+    };
+    unsigned shift = k & 0xff, kind = (k >> 8) & 15, round = (k >> 12) & 1;
+    TCGReg d = rd == b ? TCG_VEC_TMP0 : rd;
+
+    for (int q = 0; q < 2; q++) {
+        TCGReg n = q ? b : a;
+
+        if (shift) {
+            /* immh:immb = 2 * esize - shift, esize the narrow size */
+            tcg_out_insn_simd_shift_imm(s, shrn[kind][round], q, d, n,
+                                        (16 << vece) - shift);
+        } else {
+            tcg_out_insn_qrr_e(s, xtn[kind], q, vece, d, n);
+        }
+    }
+    if (d != rd) {
+        tcg_out_mov(s, TCG_TYPE_V128, rd, d);
+    }
+}
+
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                            unsigned vecl, unsigned vece,
                            const TCGArg args[TCG_MAX_OP_ARGS],
@@ -3603,6 +3657,9 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         break;
     case INDEX_op_addp_vec:
         tcg_out_insn_qrrr_e(s, Iqrrr_e_ADDP, 1, vece, a0, a1, a2);
+        break;
+    case INDEX_op_narrow_vec:
+        tcg_out_narrow_vec(s, vece, a0, a1, a2, args[3]);
         break;
     case INDEX_op_widen_vec:
         /* SXTL/UXTL{,2}: SSHLL/USHLL by 0; Q selects the high half. */
@@ -3953,6 +4010,7 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return type == TCG_TYPE_V128;
     case INDEX_op_widen_vec:
     case INDEX_op_mulw_vec:
+    case INDEX_op_narrow_vec:
         return type == TCG_TYPE_V128 && vece <= MO_32;
     case INDEX_op_addp_vec:
         return type == TCG_TYPE_V128;
@@ -4078,6 +4136,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_ext_vec:
     case INDEX_op_mulw_vec:
     case INDEX_op_addp_vec:
+    case INDEX_op_narrow_vec:
         return C_O1_I2(w, w, w);
     case INDEX_op_widen_vec:
         return C_O1_I1(w, w);
