@@ -251,6 +251,16 @@ static void tcg_set_tso_promote(Object *obj, Visitor *v,
     tcg_tso_promote = value;
 }
 
+static bool tcg_get_tso_lrcpc3(Object *obj, Error **errp)
+{
+    return tcg_tso_lrcpc3;
+}
+
+static void tcg_set_tso_lrcpc3(Object *obj, bool value, Error **errp)
+{
+    tcg_tso_lrcpc3 = value;
+}
+
 static bool tcg_get_tso_stack(Object *obj, Error **errp)
 {
     return tcg_tso_stack;
@@ -356,6 +366,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "With x-tso=acqrel: retranslate a guest insn whose access crossed "
         "a 16-byte boundary this many times with a branch-free form "
         "(0: never; default 1)");
+
+    object_class_property_add_bool(oc, "x-tso-lrcpc3",
+                                   tcg_get_tso_lrcpc3, tcg_set_tso_lrcpc3);
+    object_class_property_set_description(oc, "x-tso-lrcpc3",
+        "Temporary: with x-tso=acqrel, 16-byte aligned accesses as LRCPC3 "
+        "load-acquire/store-release pairs where the host has them");
 
     object_class_property_add_bool(oc, "x-tso-stack",
                                    tcg_get_tso_stack, tcg_set_tso_stack);

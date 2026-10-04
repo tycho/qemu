@@ -242,6 +242,7 @@ TCGContext tcg_init_ctx;
 TCGTsoMode tcg_tso_mode;
 unsigned tcg_tso_promote = 1;
 bool tcg_tso_stack;
+bool tcg_tso_lrcpc3 = true;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
 static QemuMutex tso_cross_lock;
