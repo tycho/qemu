@@ -857,6 +857,26 @@ specifies the length of the element (if applicable) in log2 8-bit units.
          (``TCG_NARROW_SAT_S``), signed to unsigned (``TCG_NARROW_SAT_SU``)
          or unsigned to unsigned (``TCG_NARROW_SAT_U``).
 
+   * - abd_vec *v0*, *v1*, *v2*, *is_signed*
+
+     - | Absolute difference: element *i* of *v0* is \|*v1*\[*i*\] -
+         *v2*\[*i*\]\|, the inputs signed if *is_signed* is 1, else
+         unsigned; the result is unsigned (``TCGOP_VECE`` MO_8, MO_16 or
+         MO_32).
+
+   * - addlp_vec *v0*, *v1*, *is_signed*
+
+     - | Pairwise add long: element *i* of *v0* is the exact sum of
+         elements 2 * *i* and 2 * *i* + 1 of *v1* at twice the element
+         size ``TCGOP_VECE`` (MO_8, MO_16 or MO_32) of the input, signed
+         if *is_signed* is 1.
+
+   * - avgr_vec *v0*, *v1*, *v2*
+
+     - | Rounding average of unsigned elements: (*v1*\[*i*\] +
+         *v2*\[*i*\] + 1) >> 1 without overflow (``TCGOP_VECE`` MO_8,
+         MO_16 or MO_32).
+
    * - tbl_vec *v0*, *v1*, *v2*
 
      - | Table lookup: byte *i* of *v0* is the byte of *v1* that byte *i*

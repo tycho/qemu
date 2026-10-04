@@ -521,6 +521,25 @@ typedef enum {
  */
 void tcg_gen_narrow_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
                         TCGNarrow kind, unsigned shift, bool round);
+/*
+ * Absolute difference: r[i] = |a[i] - b[i]|, the inputs signed or unsigned
+ * and the result unsigned (it fits).  vece is MO_8, MO_16 or MO_32.  No
+ * fallback: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_abd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                     bool is_signed);
+/*
+ * Pairwise add long: r[i] = a[2 * i] + a[2 * i + 1] at twice the element
+ * size (exact), the elements signed or unsigned.  vece is the input's
+ * (MO_8, MO_16 or MO_32).  No fallback: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_addlp_vec(unsigned vece, TCGv_vec r, TCGv_vec a, bool is_signed);
+/*
+ * Rounding average of unsigned elements: r[i] = (a[i] + b[i] + 1) >> 1,
+ * without overflow.  vece is MO_8, MO_16 or MO_32.  No fallback: check
+ * tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_avgr_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_dup_mem_vec(unsigned vece, TCGv_vec, TCGv_ptr, tcg_target_long);
 void tcg_gen_dupi_vec(unsigned vece, TCGv_vec, uint64_t);
 void tcg_gen_add_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
