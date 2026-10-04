@@ -341,6 +341,15 @@ void tcg_gen_qemu_ld_i64_chk(TCGv_i64, TCGTemp *, TCGArg, MemOp, TCGType);
 void tcg_gen_qemu_st_i64_chk(TCGv_i64, TCGTemp *, TCGArg, MemOp, TCGType);
 void tcg_gen_qemu_ld_i128_chk(TCGv_i128, TCGTemp *, TCGArg, MemOp, TCGType);
 void tcg_gen_qemu_st_i128_chk(TCGv_i128, TCGTemp *, TCGArg, MemOp, TCGType);
+/*
+ * 128-bit guest accesses with the value in a vector, where the backend has
+ * them and the access needs no more than 64-bit atomicity (each half, if
+ * aligned), no byte swap and no plugin memory callback: check with
+ * tcg_can_qemu_ldst_vec() first.
+ */
+bool tcg_can_qemu_ldst_vec(MemOp);
+void tcg_gen_qemu_ld_vec_chk(TCGv_vec, TCGTemp *, TCGArg, MemOp, TCGType);
+void tcg_gen_qemu_st_vec_chk(TCGv_vec, TCGTemp *, TCGArg, MemOp, TCGType);
 
 /* Atomic ops */
 
@@ -441,6 +450,20 @@ void tcg_gen_atomic_fetch_or_i128_chk(TCGv_i128, TCGTemp *, TCGv_i128,
 void tcg_gen_mov_vec(TCGv_vec, TCGv_vec);
 void tcg_gen_dup_i32_vec(unsigned vece, TCGv_vec, TCGv_i32);
 void tcg_gen_dup_i64_vec(unsigned vece, TCGv_vec, TCGv_i64);
+/*
+ * A 128-bit vector from two 64-bit values, element 0 from lo.  No
+ * fallback: check tcg_can_emit_vec_op(INDEX_op_concat_i64_vec) first.
+ */
+void tcg_gen_concat_i64_vec(TCGv_vec r, TCGv_i64 lo, TCGv_i64 hi);
+/*
+ * A 128-bit vector of elements chosen from a and b: element i of r is
+ * element (pattern >> 4 * i) & 15 of the concatenation a:b, whose elements
+ * 0 to n-1 are a's and n to 2n-1 b's (n = 16 >> vece; vece is MO_16,
+ * MO_32 or MO_64).  No fallback: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_perm_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                      uint32_t pattern);
+void tcg_gen_tbl_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_dup_mem_vec(unsigned vece, TCGv_vec, TCGv_ptr, tcg_target_long);
 void tcg_gen_dupi_vec(unsigned vece, TCGv_vec, uint64_t);
 void tcg_gen_add_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);

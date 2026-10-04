@@ -43,6 +43,18 @@
 #else
 #define TCG_TARGET_MAYBE_vec            1
 #endif
+#ifndef TCG_TARGET_HAS_concat_vec
+#define TCG_TARGET_HAS_concat_vec       0
+#endif
+#ifndef TCG_TARGET_HAS_qemu_ldst_vec
+#define TCG_TARGET_HAS_qemu_ldst_vec    0
+#endif
+#ifndef TCG_TARGET_HAS_perm_vec
+#define TCG_TARGET_HAS_perm_vec         0
+#endif
+#ifndef TCG_TARGET_HAS_tbl_vec
+#define TCG_TARGET_HAS_tbl_vec          0
+#endif
 #ifndef TCG_TARGET_HAS_v64
 #define TCG_TARGET_HAS_v64              0
 #endif

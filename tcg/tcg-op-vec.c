@@ -234,6 +234,48 @@ void tcg_gen_dup_i64_vec(unsigned vece, TCGv_vec r, TCGv_i64 a)
     vec_gen_2(INDEX_op_dup_vec, type, vece, ri, ai);
 }
 
+void tcg_gen_concat_i64_vec(TCGv_vec r, TCGv_i64 lo, TCGv_i64 hi)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_assert_listed_vecop(INDEX_op_concat_i64_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_concat_i64_vec,
+                                         TCG_TYPE_V128, MO_64) > 0);
+    vec_gen_3(INDEX_op_concat_i64_vec, TCG_TYPE_V128, MO_64, temp_arg(rt),
+              tcgv_i64_arg(lo), tcgv_i64_arg(hi));
+}
+
+void tcg_gen_perm_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                      uint32_t pattern)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(vece >= MO_16 && vece <= MO_64);
+    tcg_assert_listed_vecop(INDEX_op_perm_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_perm_vec,
+                                         TCG_TYPE_V128, vece) > 0);
+    vec_gen_4(INDEX_op_perm_vec, TCG_TYPE_V128, vece, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b), pattern);
+}
+
+/*
+ * r = a table lookup in a by the bytes of b: byte i of r is byte b[i] of a,
+ * or 0 if b[i] is 16 or more (AArch64 TBL).  V128 only.
+ */
+void tcg_gen_tbl_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_assert_listed_vecop(INDEX_op_tbl_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_tbl_vec,
+                                         TCG_TYPE_V128, MO_8) > 0);
+    vec_gen_3(INDEX_op_tbl_vec, TCG_TYPE_V128, MO_8, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b));
+}
+
 void tcg_gen_dup_i32_vec(unsigned vece, TCGv_vec r, TCGv_i32 a)
 {
     TCGArg ri = tcgv_vec_arg(r);
