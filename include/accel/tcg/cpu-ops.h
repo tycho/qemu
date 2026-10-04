@@ -41,6 +41,13 @@ struct TCGCPUOps {
     bool precise_smc;
 
     /**
+     * @jmp_cache_salt: guest pcs never need bits 48-63 to tell apart TBs
+     *                  with the same cs_base and flags, so the jump cache
+     *                  may keep a salt there and flush in O(1).
+     */
+    bool jmp_cache_salt;
+
+    /**
      * @guest_default_memory_order: default barrier that is required
      *                              for the guest memory ordering.
      */
