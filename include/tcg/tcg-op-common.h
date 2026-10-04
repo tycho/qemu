@@ -477,6 +477,14 @@ void tcg_gen_zip_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
  * (0 <= n <= 15).  No fallback: check tcg_can_emit_vec_op() first.
  */
 void tcg_gen_ext_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, unsigned n);
+/*
+ * The elements of a's low (or, with @high, high) half, sign-extended (or,
+ * without @is_signed, zero-extended) from vece to vece + 1: r[i] =
+ * ext(a[i]) or ext(a[n / 2 + i]), for n elements of vece in 128 bits (vece
+ * is MO_8, MO_16 or MO_32).  No fallback: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_widen_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                       bool is_signed, bool high);
 void tcg_gen_dup_mem_vec(unsigned vece, TCGv_vec, TCGv_ptr, tcg_target_long);
 void tcg_gen_dupi_vec(unsigned vece, TCGv_vec, uint64_t);
 void tcg_gen_add_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);

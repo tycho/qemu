@@ -54,6 +54,9 @@
 #ifndef TCG_TARGET_HAS_ext_vec
 #define TCG_TARGET_HAS_ext_vec          0
 #endif
+#ifndef TCG_TARGET_HAS_widen_vec
+#define TCG_TARGET_HAS_widen_vec        0
+#endif
 #ifndef TCG_TARGET_HAS_v64
 #define TCG_TARGET_HAS_v64              0
 #endif

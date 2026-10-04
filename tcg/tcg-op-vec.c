@@ -302,6 +302,20 @@ void tcg_gen_ext_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, unsigned n)
               tcgv_vec_arg(a), tcgv_vec_arg(b), n);
 }
 
+void tcg_gen_widen_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                       bool is_signed, bool high)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(vece <= MO_32);
+    tcg_assert_listed_vecop(INDEX_op_widen_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_widen_vec,
+                                         TCG_TYPE_V128, vece) > 0);
+    vec_gen_3(INDEX_op_widen_vec, TCG_TYPE_V128, vece, temp_arg(rt),
+              tcgv_vec_arg(a), is_signed | high << 1);
+}
+
 void tcg_gen_dup_i32_vec(unsigned vece, TCGv_vec r, TCGv_i32 a)
 {
     TCGArg ri = tcgv_vec_arg(r);

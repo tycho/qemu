@@ -825,6 +825,13 @@ specifies the length of the element (if applicable) in log2 8-bit units.
      - | Extract: bytes *n* to *n* + 15 of the concatenation *v1*:*v2*,
          whose bytes 0 to 15 are *v1*'s (128-bit vectors, 0 <= *n* <= 15).
 
+   * - widen_vec *v0*, *v1*, *k*
+
+     - | Widen: the elements of the low half of *v1* (the high half if
+         bit 1 of *k* is set), sign-extended if bit 0 of *k* is set, else
+         zero-extended, from ``TCGOP_VECE`` (MO_8, MO_16 or MO_32) to twice
+         that size (128-bit vectors).
+
    * - tbl_vec *v0*, *v1*, *v2*
 
      - | Table lookup: byte *i* of *v0* is the byte of *v1* that byte *i*
