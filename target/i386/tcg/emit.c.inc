@@ -1098,6 +1098,46 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
                           gen_helper_##lname##_ymm);                          \
 }
 
+/* PSADBW: per qword, the sum of the 8 absolute byte differences. */
+static void vint_psadbw(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t c)
+{
+    TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    tcg_gen_abd_vec(MO_8, t, a, b, false);
+    tcg_gen_addlp_vec(MO_8, t, t, false);
+    tcg_gen_addlp_vec(MO_16, t, t, false);
+    tcg_gen_addlp_vec(MO_32, r, t, false);
+}
+
+static void vint_pavg(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t vece)
+{
+    tcg_gen_avgr_vec(vece, r, a, b);
+}
+
+/*
+ * PMADDUBSW: unsigned bytes of a times signed bytes of b (each product
+ * fits a word), then adjacent products added with signed saturation.
+ */
+static void vint_pmaddubsw(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t c)
+{
+    TCGv_vec p[2], ev, od;
+
+    for (int h = 0; h < 2; h++) {
+        TCGv_vec wa = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec wb = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_widen_vec(MO_8, wa, a, false, h);
+        tcg_gen_widen_vec(MO_8, wb, b, true, h);
+        p[h] = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_mul_vec(MO_16, p[h], wa, wb);
+    }
+    ev = tcg_temp_new_vec(TCG_TYPE_V128);
+    od = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_perm_vec(MO_16, ev, p[0], p[1], vint_uzp_pat(MO_16, false));
+    tcg_gen_perm_vec(MO_16, od, p[0], p[1], vint_uzp_pat(MO_16, true));
+    tcg_gen_ssadd_vec(MO_16, r, ev, od);
+}
+
 /* An SSE/AVX integer op with a tcg_vint lowering, else its helpers. */
 #define VINT_BINARY(uname, lname, mmx, cond, fn, c)                           \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
@@ -1443,8 +1483,10 @@ VINT_BINARY(PACKSSDW, packssdw, gen_helper_packssdw_mmx,
             vint_can(INDEX_op_narrow_vec, MO_16),
             vint_pack, TCG_NARROW_SAT_S | MO_16 << 8)
 
-BINARY_INT_MMX(PAVGB,   pavgb)
-BINARY_INT_MMX(PAVGW,   pavgw)
+VINT_BINARY(PAVGB, pavgb, gen_helper_pavgb_mmx,
+            vint_can(INDEX_op_avgr_vec, MO_8), vint_pavg, MO_8)
+VINT_BINARY(PAVGW, pavgw, gen_helper_pavgw_mmx,
+            vint_can(INDEX_op_avgr_vec, MO_16), vint_pavg, MO_16)
 VINT_BINARY(PMADDWD, pmaddwd, gen_helper_pmaddwd_mmx,
             vint_can(INDEX_op_mulw_vec, MO_16)
             && vint_can(INDEX_op_addp_vec, MO_32),
@@ -1461,7 +1503,12 @@ VINT_BINARY(PMULUDQ, pmuludq, gen_helper_pmuludq_mmx,
             vint_can(INDEX_op_mulw_vec, MO_32)
             && vint_can(INDEX_op_perm_vec, MO_32),
             vint_pmul_even, false)
-BINARY_INT_MMX(PSADBW,  psadbw)
+VINT_BINARY(PSADBW, psadbw, gen_helper_psadbw_mmx,
+            vint_can(INDEX_op_abd_vec, MO_8)
+            && vint_can(INDEX_op_addlp_vec, MO_8)
+            && vint_can(INDEX_op_addlp_vec, MO_16)
+            && vint_can(INDEX_op_addlp_vec, MO_32),
+            vint_psadbw, 0)
 
 SHIFT_XMM(PSLLW_r, psllw, MO_16, INDEX_op_shlv_vec)
 SHIFT_XMM(PSLLD_r, pslld, MO_32, INDEX_op_shlv_vec)
@@ -1490,7 +1537,11 @@ VINT_BINARY(PHSUBSW, phsubsw, gen_helper_phsubsw_mmx,
             vint_can(INDEX_op_perm_vec, MO_16)
             && vint_can(INDEX_op_sssub_vec, MO_16),
             vint_phop, VINT_PHSUBS | MO_16 << 8)
-BINARY_INT_MMX(PMADDUBSW, pmaddubsw)
+VINT_BINARY(PMADDUBSW, pmaddubsw, gen_helper_pmaddubsw_mmx,
+            vint_can(INDEX_op_widen_vec, MO_8)
+            && vint_can(INDEX_op_perm_vec, MO_16)
+            && vint_can(INDEX_op_ssadd_vec, MO_16),
+            vint_pmaddubsw, 0)
 /*
  * tcg_vpermvar: pshufb as table lookups, one per 128-bit lane.  A byte
  * whose index has bit 7 set is zero; tbl_vec gives zero for any index of
