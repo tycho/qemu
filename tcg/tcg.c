@@ -2549,6 +2549,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return has_type && TCG_TARGET_HAS_bitsel_vec;
     case INDEX_op_cmpsel_vec:
         return has_type && TCG_TARGET_HAS_cmpsel_vec;
+    case INDEX_op_extract_vec:
+        return has_type && TCG_TARGET_HAS_extract_vec;
 
     default:
         if (op < INDEX_op_last_generic) {
