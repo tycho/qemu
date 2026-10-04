@@ -155,6 +155,7 @@ DEF(narrow_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(abd_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(addlp_vec, 1, 1, 1, TCG_OPF_VECTOR)
 DEF(avgr_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(extract_vec, 1, 1, 1, TCG_OPF_VECTOR)
 
 DEF(add_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(sub_vec, 1, 2, 0, TCG_OPF_VECTOR)
