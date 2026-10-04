@@ -1026,6 +1026,13 @@ elements of *v0* are those of *v1*.
 
      - | *v0*\ [0] = sqrt(*v2*\ [0]).
 
+   * - frintxs_vec *v0*, *v1*, *v2*
+
+       frints_vec *v0*, *v1*, *v2*, *mode*
+
+     - | *v0*\ [0] = *v2*\ [0] rounded to an integral value, as
+         frintx_vec and frint_vec.
+
    * - fmadds_vec *v0*, *v1*, *v2*, *v3*
 
        fmsubs_vec *v0*, *v1*, *v2*, *v3*
