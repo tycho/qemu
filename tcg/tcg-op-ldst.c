@@ -194,6 +194,22 @@ static MemOp tcg_gen_ldst_order(TCGBar type)
     return 0;
 }
 
+/*
+ * The barrier before a guest store that is not itself a store-release.
+ * With TCG_TSO_ACQREL every earlier guest load is a load-acquire, or is
+ * followed by a barrier, which already orders it before later accesses:
+ * only earlier stores need ordering.  Otherwise earlier loads and
+ * stores.
+ */
+static void tcg_gen_req_mo_plain_st(void)
+{
+    if (tcg_tso_mode == TCG_TSO_ACQREL && TCG_TARGET_HAS_qemu_ldst_acqrel) {
+        tcg_gen_req_mo(TCG_MO_ST_ST);
+    } else {
+        tcg_gen_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
+    }
+}
+
 static TCGTemp *tci_extend_addr(TCGTemp *addr)
 {
 #ifdef CONFIG_TCG_INTERPRETER
@@ -923,7 +939,7 @@ static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
     if (tcg_tso_grouped(memop) &&
         tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST)) {
         if (!tcg_ctx->tso_run_st) {
-            tcg_gen_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
+            tcg_gen_req_mo_plain_st();
             tcg_ctx->tso_run_st = true;
         }
         tcg_ctx->tso_run_emit = true;
@@ -933,7 +949,7 @@ static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
             /* A store-release orders earlier loads and stores before it. */
             rel = tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST);
         } else {
-            tcg_gen_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
+            tcg_gen_req_mo_plain_st();
         }
     }
 
