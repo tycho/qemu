@@ -3701,6 +3701,12 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out_insn(s, fmov, DX, a0, a1);
         tcg_out_insn(s, simd_copy, INS, 0, a0, a2, 24, 0);
         break;
+    case INDEX_op_extract_vec:
+        /* UMOV: imm5 = index << (vece + 1) | 1 << vece; Q for doublewords. */
+        tcg_out32(s, 0x0e003c00 | (vece == MO_64) << 30
+                  | (a2 << (vece + 1) | 1 << vece) << 16
+                  | (a1 & 0x1f) << 5 | (a0 & 0x1f));
+        break;
     case INDEX_op_add_vec:
         if (is_scalar) {
             tcg_out_insn(s, rrr_e, ADD, vece, a0, a1, a2);
@@ -3981,6 +3987,7 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
 int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
 {
     switch (opc) {
+    case INDEX_op_extract_vec:
     case INDEX_op_add_vec:
     case INDEX_op_sub_vec:
     case INDEX_op_and_vec:
@@ -4141,6 +4148,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_ld_vec:
     case INDEX_op_dupm_vec:
         return C_O1_I1(w, r);
+    case INDEX_op_extract_vec:
+        return C_O1_I1(r, w);
     case INDEX_op_st_vec:
         return C_O0_I2(w, r);
     case INDEX_op_concat_i64_vec:
