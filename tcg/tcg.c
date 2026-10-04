@@ -322,6 +322,8 @@ bool tcg_region;
 
 bool tcg_tbpack;
 
+bool tcg_addr32;
+
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;

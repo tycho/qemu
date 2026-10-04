@@ -108,6 +108,17 @@ void tcg_gen_lookup_jc_and_goto_ptr(TCGv_i64 pc, uint64_t cs_base,
  */
 void tcg_gen_goto_ptr(TCGv_ptr ptr);
 
+/*
+ * tcg_gen_addr_va() - the address operand of a guest access
+ * @addr: the address, of type *@type
+ * @type: the target's address type; updated to the TB's
+ *
+ * For a target with 64-bit addresses that translates this TB with 32-bit
+ * ones (tcg_ctx->addr_type), *@type becomes TCG_TYPE_I32 and the access
+ * reads the low 32 bits of @addr.
+ */
+TCGTemp *tcg_gen_addr_va(TCGTemp *addr, TCGType *type);
+
 void tcg_gen_plugin_cb(unsigned from);
 void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo);
 
