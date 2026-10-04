@@ -192,6 +192,49 @@ DEF(cmp_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(bitsel_vec, 1, 3, 0, TCG_OPF_VECTOR)
 DEF(cmpsel_vec, 1, 4, 1, TCG_OPF_VECTOR)
 
+/* Host floating point, in the host's FP environment. */
+DEF(fadd_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fsub_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fmul_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fdiv_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fmin_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fmax_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fsqrt_vec, 1, 1, 0, TCG_OPF_VECTOR)
+DEF(fneg_vec, 1, 1, 0, TCG_OPF_VECTOR)
+DEF(fmla_vec, 1, 3, 0, TCG_OPF_VECTOR)
+DEF(fmls_vec, 1, 3, 0, TCG_OPF_VECTOR)
+DEF(fcmp_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(scvtf_vec, 1, 1, 0, TCG_OPF_VECTOR)
+DEF(fcvtzs_vec, 1, 1, 0, TCG_OPF_VECTOR)
+DEF(frintx_vec, 1, 1, 0, TCG_OPF_VECTOR)
+
+/* The same on element 0; the other elements come from the first input. */
+DEF(fadds_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fsubs_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fmuls_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fdivs_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fmins_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fmaxs_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fsqrts_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(fmadds_vec, 1, 3, 0, TCG_OPF_VECTOR)
+DEF(fmsubs_vec, 1, 3, 0, TCG_OPF_VECTOR)
+DEF(fnmadds_vec, 1, 3, 0, TCG_OPF_VECTOR)
+DEF(fnmsubs_vec, 1, 3, 0, TCG_OPF_VECTOR)
+DEF(fcmps_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(fcvts_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(movs_vec, 1, 2, 0, TCG_OPF_VECTOR)
+
+/* Scalar FP to and from general registers. */
+DEF(fcmp3_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(scvtfs_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(fcvtzsi_vec, 1, 1, 1, TCG_OPF_VECTOR)
+
+/* Reciprocal and reciprocal square root estimates. */
+DEF(frecpe_vec, 1, 1, 0, TCG_OPF_VECTOR)
+DEF(frsqrte_vec, 1, 1, 0, TCG_OPF_VECTOR)
+DEF(frecpes_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(frsqrtes_vec, 1, 2, 0, TCG_OPF_VECTOR)
+
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 
 #include "tcg-target-opc.h.inc"

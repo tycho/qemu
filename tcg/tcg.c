@@ -294,6 +294,9 @@ bool tcg_vecld;
 bool tcg_vecmem;
 bool tcg_vperm;
 bool tcg_vpermvar;
+bool tcg_ssefp_vec;
+bool tcg_ssefp_native;
+
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
@@ -2533,6 +2536,42 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_qemu_ldst_vec;
     case INDEX_op_perm_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_perm_vec;
+    case INDEX_op_fadd_vec:
+    case INDEX_op_fsub_vec:
+    case INDEX_op_fmul_vec:
+    case INDEX_op_fdiv_vec:
+    case INDEX_op_fmin_vec:
+    case INDEX_op_fmax_vec:
+    case INDEX_op_fsqrt_vec:
+    case INDEX_op_fneg_vec:
+    case INDEX_op_fmla_vec:
+    case INDEX_op_fmls_vec:
+    case INDEX_op_fcmp_vec:
+    case INDEX_op_scvtf_vec:
+    case INDEX_op_fcvtzs_vec:
+    case INDEX_op_frintx_vec:
+    case INDEX_op_fadds_vec:
+    case INDEX_op_fsubs_vec:
+    case INDEX_op_fmuls_vec:
+    case INDEX_op_fdivs_vec:
+    case INDEX_op_fmins_vec:
+    case INDEX_op_fmaxs_vec:
+    case INDEX_op_fsqrts_vec:
+    case INDEX_op_fmadds_vec:
+    case INDEX_op_fmsubs_vec:
+    case INDEX_op_fnmadds_vec:
+    case INDEX_op_fnmsubs_vec:
+    case INDEX_op_fcmps_vec:
+    case INDEX_op_fcvts_vec:
+    case INDEX_op_movs_vec:
+    case INDEX_op_fcmp3_vec:
+    case INDEX_op_scvtfs_vec:
+    case INDEX_op_fcvtzsi_vec:
+    case INDEX_op_frecpe_vec:
+    case INDEX_op_frsqrte_vec:
+    case INDEX_op_frecpes_vec:
+    case INDEX_op_frsqrtes_vec:
+        return has_type && TCG_TARGET_HAS_fp_vec;
 
     default:
         if (op < INDEX_op_last_generic) {
@@ -2987,6 +3026,8 @@ void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs)
             case INDEX_op_movcond:
             case INDEX_op_cmp_vec:
             case INDEX_op_cmpsel_vec:
+            case INDEX_op_fcmp_vec:
+            case INDEX_op_fcmps_vec:
                 if (op->args[k] < ARRAY_SIZE(cond_name)
                     && cond_name[op->args[k]]) {
                     col += ne_fprintf(f, ",%s", cond_name[op->args[k++]]);

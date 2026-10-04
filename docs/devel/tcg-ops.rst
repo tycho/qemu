@@ -955,6 +955,157 @@ specifies the length of the element (if applicable) in log2 8-bit units.
               v0[i] = (c1[i] cond c2[i]) ? v3[i] : v4[i].
           }
 
+Host floating-point vector operations
+-------------------------------------
+
+These compute IEEE floating point on the elements of a vector, which are
+32 or 64 bits wide (``TCGOP_VECE``), with the host's FPU in its current
+state: they round as the host's FP control register says and set the
+host's cumulative exception flags.  They are for front ends that keep
+the guest's FP environment in the host's FP registers while generated
+code runs (``accel/tcg/host-fp.h``), on hosts whose FPU can take the
+guest's semantics.  The result is what the host instruction gives,
+including which NaN it propagates.  There are no fallbacks, so check
+``tcg_can_emit_vec_op`` first.
+
+Because the exception flags are an effect that TCG doesn't track, the
+result of each operation must be used.
+
+.. list-table::
+
+   * - fadd_vec *v0*, *v1*, *v2*
+
+       fsub_vec *v0*, *v1*, *v2*
+
+       fmul_vec *v0*, *v1*, *v2*
+
+       fdiv_vec *v0*, *v1*, *v2*
+
+     - | *v0* = *v1* op *v2*.
+
+   * - fmin_vec *v0*, *v1*, *v2*
+
+       fmax_vec *v0*, *v1*, *v2*
+
+     - | Minimum and maximum.
+
+   * - fsqrt_vec *v0*, *v1*
+
+       fneg_vec *v0*, *v1*
+
+     - | Square root; negation.
+
+   * - fmla_vec *v0*, *v1*, *v2*, *v3*
+
+       fmls_vec *v0*, *v1*, *v2*, *v3*
+
+     - | Fused multiply-add: *v0* = *v1* + *v2* * *v3*, and
+         *v0* = *v1* - *v2* * *v3*.
+
+   * - fcmp_vec *v0*, *v1*, *v2*, *cond*
+
+     - | Compare, storing -1 for true and 0 for false.  *cond* is EQ, which
+         is quiet (invalid for a signaling NaN only), or GE, GT, LE or LT,
+         which signal invalid for any NaN.  Unordered is false.
+
+   * - scvtf_vec *v0*, *v1*
+
+     - | Convert signed integers to floating point of the same width.
+
+   * - fcvtzs_vec *v0*, *v1*
+
+     - | Convert floating point to signed integers of the same width,
+         rounding toward zero.  What an out-of-range value or a NaN gives
+         is the host's choice.
+
+   * - frintx_vec *v0*, *v1*
+
+     - | Round to an integral value in floating-point format, in the
+         current rounding mode, signaling inexact.
+
+The scalar operations work on element 0 of a 128-bit vector.  The other
+elements of *v0* are those of *v1*.
+
+.. list-table::
+
+   * - fadds_vec *v0*, *v1*, *v2*
+
+       fsubs_vec *v0*, *v1*, *v2*
+
+       fmuls_vec *v0*, *v1*, *v2*
+
+       fdivs_vec *v0*, *v1*, *v2*
+
+       fmins_vec *v0*, *v1*, *v2*
+
+       fmaxs_vec *v0*, *v1*, *v2*
+
+     - | *v0*\ [0] = *v1*\ [0] op *v2*\ [0].
+
+   * - fsqrts_vec *v0*, *v1*, *v2*
+
+     - | *v0*\ [0] = sqrt(*v2*\ [0]).
+
+   * - fmadds_vec *v0*, *v1*, *v2*, *v3*
+
+       fmsubs_vec *v0*, *v1*, *v2*, *v3*
+
+       fnmadds_vec *v0*, *v1*, *v2*, *v3*
+
+       fnmsubs_vec *v0*, *v1*, *v2*, *v3*
+
+     - | Fused: *v0*\ [0] = *v1*\ [0] + *v2*\ [0] * *v3*\ [0];
+         *v1*\ [0] - *v2*\ [0] * *v3*\ [0];
+         -*v1*\ [0] - *v2*\ [0] * *v3*\ [0];
+         -*v1*\ [0] + *v2*\ [0] * *v3*\ [0].
+
+   * - fcmps_vec *v0*, *v1*, *v2*, *cond*
+
+     - | *v0*\ [0] = *v1*\ [0] *cond* *v2*\ [0] ? -1 : 0, for EQ (quiet),
+         LT or LE (signaling).
+
+   * - fcvts_vec *v0*, *v1*, *v2*
+
+     - | Convert between single and double precision: *v0*\ [0], of the
+         size ``TCGOP_VECE``, is *v2*\ [0] of the other size.  Only the
+         bits of *v0* above the result are those of *v1*.
+
+   * - movs_vec *v0*, *v1*, *v2*
+
+     - | *v0*\ [0] = *v2*\ [0], with no floating-point processing.
+
+   * - fcmp3_vec *t0*, *v1*, *v2*, *signaling*
+
+     - | Compare *v1*\ [0] with *v2*\ [0]: *t0* (an i32) = 0 if less,
+         1 if equal, 2 if greater, 3 if unordered.  If *signaling*, any
+         NaN operand raises invalid; otherwise only a signaling NaN.
+
+   * - scvtfs_vec *v0*, *v1*, *t2*, *is64*
+
+     - | *v0*\ [0] = the signed integer *t2* (64 bits wide if *is64*,
+         else 32), converted.
+
+   * - fcvtzsi_vec *t0*, *v1*, *is64*
+
+     - | *t0* = *v1*\ [0] converted to a signed integer of 64 bits if
+         *is64*, else 32, rounding toward zero.  What an out-of-range
+         value or a NaN gives is the host's choice.
+
+   * - frecpe_vec *v0*, *v1*
+
+       frsqrte_vec *v0*, *v1*
+
+     - | Estimates of 1 / *v1* and 1 / sqrt(*v1*), with a relative error
+         of at most 1.5 * 2^-12 (x86's bound for RCPPS and RSQRTPS).
+         Which zero, infinity or NaN special inputs give, and which
+         flags they raise, is the host's.
+
+   * - frecpes_vec *v0*, *v1*, *v2*
+
+       frsqrtes_vec *v0*, *v1*, *v2*
+
+     - | The same on *v0*\ [0], of *v2*\ [0].
+
 **Note 1**: Some shortcuts are defined when the last operand is known to be
 a constant (e.g. addi for add, movi for mov).
 

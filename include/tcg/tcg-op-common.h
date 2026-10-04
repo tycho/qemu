@@ -509,6 +509,75 @@ void tcg_gen_rotrv_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec s);
 void tcg_gen_cmp_vec(TCGCond cond, unsigned vece, TCGv_vec r,
                      TCGv_vec a, TCGv_vec b);
 
+/*
+ * Host floating point on MO_32 or MO_64 elements, in the host's FP
+ * environment.  There are no fallbacks: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_fadd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fsub_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fmul_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fdiv_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fmin_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fmax_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fsqrt_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+void tcg_gen_fneg_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+void tcg_gen_fmla_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                      TCGv_vec b, TCGv_vec c);
+void tcg_gen_fmls_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                      TCGv_vec b, TCGv_vec c);
+void tcg_gen_fcmp_vec(TCGCond cond, unsigned vece, TCGv_vec r,
+                      TCGv_vec a, TCGv_vec b);
+void tcg_gen_scvtf_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+void tcg_gen_fcvtzs_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+void tcg_gen_frintx_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+/*
+ * The same on element 0 of 128-bit vectors.  The result's other elements
+ * are those of the first input.
+ */
+void tcg_gen_fadds_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fsubs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fmuls_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fdivs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fmins_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fmaxs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fsqrts_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_fmadds_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                        TCGv_vec b, TCGv_vec c);
+void tcg_gen_fmsubs_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                        TCGv_vec b, TCGv_vec c);
+void tcg_gen_fnmadds_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                         TCGv_vec b, TCGv_vec c);
+void tcg_gen_fnmsubs_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                         TCGv_vec b, TCGv_vec c);
+void tcg_gen_fcmps_vec(TCGCond cond, unsigned vece, TCGv_vec r,
+                       TCGv_vec a, TCGv_vec b);
+void tcg_gen_fcvts_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_movs_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+/*
+ * Element 0 against general registers.  fcmp3: r = 0, 1, 2 or 3 for a
+ * less than, equal to, greater than or unordered with b; signaling (any
+ * NaN is invalid) or quiet.  scvtfs: element 0 of r = the signed integer
+ * i (32 or 64 bits wide), the other elements a's.  fcvtzsi: the signed
+ * integer (32 or 64 bits wide, as r is) of element 0 of a, rounded toward
+ * zero; what an out-of-range value or a NaN gives is the host's choice.
+ */
+void tcg_gen_fcmp3_vec(unsigned vece, TCGv_i32 r, TCGv_vec a, TCGv_vec b,
+                       bool signaling);
+void tcg_gen_scvtfs_i32_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                            TCGv_i32 i);
+void tcg_gen_scvtfs_i64_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                            TCGv_i64 i);
+void tcg_gen_fcvtzsi_i32_vec(unsigned vece, TCGv_i32 r, TCGv_vec a);
+void tcg_gen_fcvtzsi_i64_vec(unsigned vece, TCGv_i64 r, TCGv_vec a);
+/*
+ * Estimates of 1/x and 1/sqrt(x) with a relative error of at most
+ * 1.5 * 2^-12; the scalar forms on element 0, the other elements from a.
+ */
+void tcg_gen_frecpe_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+void tcg_gen_frsqrte_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+void tcg_gen_frecpes_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_frsqrtes_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+
 void tcg_gen_bitsel_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
                         TCGv_vec b, TCGv_vec c);
 void tcg_gen_cmpsel_vec(TCGCond cond, unsigned vece, TCGv_vec r,

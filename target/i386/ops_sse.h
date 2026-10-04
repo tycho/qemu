@@ -468,6 +468,9 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
             Reg *d, Reg *v, Reg *s)                                     \
     {                                                                   \
         int i;                                                          \
+        if (sse_vec_ ## name ## 32(env, d, v, s, 2 << SHIFT)) {         \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < 2 << SHIFT; i++) {                              \
             d->ZMM_S(i) = F(32, v->ZMM_S(i), s->ZMM_S(i));              \
         }                                                               \
@@ -477,6 +480,9 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
             Reg *d, Reg *v, Reg *s)                                     \
     {                                                                   \
         int i;                                                          \
+        if (sse_vec_ ## name ## 64(env, d, v, s, 1 << SHIFT)) {         \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < 1 << SHIFT; i++) {                              \
             d->ZMM_D(i) = F(64, v->ZMM_D(i), s->ZMM_D(i));              \
         }                                                               \
@@ -535,6 +541,9 @@ SSE_HELPER_S(max, FPU_MAX)
 void glue(helper_sqrtps, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 {
     int i;
+    if (sse_vec_sqrt32(env, d, s, 2 << SHIFT)) {
+        return;
+    }
     for (i = 0; i < 2 << SHIFT; i++) {
         d->ZMM_S(i) = float32_sqrt(s->ZMM_S(i), &env->sse_status);
     }
@@ -543,6 +552,9 @@ void glue(helper_sqrtps, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 void glue(helper_sqrtpd, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 {
     int i;
+    if (sse_vec_sqrt64(env, d, s, 1 << SHIFT)) {
+        return;
+    }
     for (i = 0; i < 1 << SHIFT; i++) {
         d->ZMM_D(i) = float64_sqrt(s->ZMM_D(i), &env->sse_status);
     }
@@ -641,6 +653,9 @@ void helper_cvtsd2ss(CPUX86State *env, Reg *d, Reg *v, Reg *s)
 void glue(helper_cvtdq2ps, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 {
     int i;
+    if (sse_vec_cvtdq2ps(env, d, s, 2 << SHIFT)) {
+        return;
+    }
     for (i = 0; i < 2 << SHIFT; i++) {
         d->ZMM_S(i) = int32_to_float32(s->ZMM_L(i), &env->sse_status);
     }
@@ -730,6 +745,9 @@ WRAP_FLOATCONV(int64_t, float64_to_int64_round_to_zero, float64, INT64_MIN)
 void glue(helper_cvtps2dq, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 {
     int i;
+    if (sse_vec_cvtps2dq(env, d, s, 2 << SHIFT)) {
+        return;
+    }
     for (i = 0; i < 2 << SHIFT; i++) {
         d->ZMM_L(i) = x86_float32_to_int32(s->ZMM_S(i), &env->sse_status);
     }
@@ -786,6 +804,9 @@ int64_t helper_cvtsd2sq(CPUX86State *env, ZMMReg *s)
 void glue(helper_cvttps2dq, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 {
     int i;
+    if (sse_vec_cvttps2dq(env, d, s, 2 << SHIFT)) {
+        return;
+    }
     for (i = 0; i < 2 << SHIFT; i++) {
         d->ZMM_L(i) = x86_float32_to_int32_round_to_zero(s->ZMM_S(i),
                                                          &env->sse_status);
@@ -842,6 +863,8 @@ int64_t helper_cvttsd2sq(CPUX86State *env, ZMMReg *s)
 
 void glue(helper_rsqrtps, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 {
+    /* No exceptions: the host's flags are discarded with QEMU's. */
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     int old_flags = get_float_exception_flags(&env->sse_status);
     int i;
     for (i = 0; i < 2 << SHIFT; i++) {
@@ -855,6 +878,8 @@ void glue(helper_rsqrtps, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 #if SHIFT == 1
 void helper_rsqrtss(CPUX86State *env, ZMMReg *d, ZMMReg *v, ZMMReg *s)
 {
+    /* No exceptions: the host's flags are discarded with QEMU's. */
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     int old_flags = get_float_exception_flags(&env->sse_status);
     int i;
     d->ZMM_S(0) = float32_div(float32_one,
@@ -869,6 +894,8 @@ void helper_rsqrtss(CPUX86State *env, ZMMReg *d, ZMMReg *v, ZMMReg *s)
 
 void glue(helper_rcpps, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 {
+    /* No exceptions: the host's flags are discarded with QEMU's. */
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     int old_flags = get_float_exception_flags(&env->sse_status);
     int i;
     for (i = 0; i < 2 << SHIFT; i++) {
@@ -880,6 +907,8 @@ void glue(helper_rcpps, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 #if SHIFT == 1
 void helper_rcpss(CPUX86State *env, ZMMReg *d, ZMMReg *v, ZMMReg *s)
 {
+    /* No exceptions: the host's flags are discarded with QEMU's. */
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     int old_flags = get_float_exception_flags(&env->sse_status);
     int i;
     d->ZMM_S(0) = float32_div(float32_one, s->ZMM_S(0), &env->sse_status);
@@ -1000,7 +1029,15 @@ void glue(helper_addsubpd, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
     void glue(helper_ ## name ## ps, SUFFIX)(CPUX86State *env,          \
                                              Reg *d, Reg *v, Reg *s)    \
     {                                                                   \
+        FloatRelation rel[2 << SHIFT];                                  \
         int i;                                                          \
+        if (sse_vec_compare32(env, rel, v, s, 2 << SHIFT)) {            \
+            uint32_t *m = SSE_LANES(d, _l_ZMMReg, 2 << SHIFT);          \
+            for (i = 0; i < 2 << SHIFT; i++) {                          \
+                m[i] = C(rel[i]) ? -1 : 0;                              \
+            }                                                           \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < 2 << SHIFT; i++) {                              \
             d->ZMM_L(i) = C(F(32, v->ZMM_S(i), s->ZMM_S(i))) ? -1 : 0;  \
         }                                                               \
@@ -1009,7 +1046,15 @@ void glue(helper_addsubpd, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
     void glue(helper_ ## name ## pd, SUFFIX)(CPUX86State *env,          \
                                              Reg *d, Reg *v, Reg *s)    \
     {                                                                   \
+        FloatRelation rel[1 << SHIFT];                                  \
         int i;                                                          \
+        if (sse_vec_compare64(env, rel, v, s, 1 << SHIFT)) {            \
+            uint64_t *m = SSE_LANES(d, _q_ZMMReg, 1 << SHIFT);          \
+            for (i = 0; i < 1 << SHIFT; i++) {                          \
+                m[i] = C(rel[i]) ? -1 : 0;                              \
+            }                                                           \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < 1 << SHIFT; i++) {                              \
             d->ZMM_Q(i) = C(F(64, v->ZMM_D(i), s->ZMM_D(i))) ? -1 : 0;  \
         }                                                               \
@@ -1301,24 +1346,32 @@ UNPCK_OP(h, 1)
 #if SHIFT == 0
 void helper_pi2fd(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = int32_to_float32(s->MMX_L(0), &env->mmx_status);
     d->MMX_S(1) = int32_to_float32(s->MMX_L(1), &env->mmx_status);
 }
 
 void helper_pi2fw(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = int32_to_float32((int16_t)s->MMX_W(0), &env->mmx_status);
     d->MMX_S(1) = int32_to_float32((int16_t)s->MMX_W(2), &env->mmx_status);
 }
 
 void helper_pf2id(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_L(0) = float32_to_int32_round_to_zero(s->MMX_S(0), &env->mmx_status);
     d->MMX_L(1) = float32_to_int32_round_to_zero(s->MMX_S(1), &env->mmx_status);
 }
 
 void helper_pf2iw(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_L(0) = satsw(float32_to_int32_round_to_zero(s->MMX_S(0),
                                                        &env->mmx_status));
     d->MMX_L(1) = satsw(float32_to_int32_round_to_zero(s->MMX_S(1),
@@ -1327,6 +1380,7 @@ void helper_pf2iw(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfacc(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     float32 r;
 
     r = float32_add(d->MMX_S(0), d->MMX_S(1), &env->mmx_status);
@@ -1336,12 +1390,16 @@ void helper_pfacc(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfadd(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = float32_add(d->MMX_S(0), s->MMX_S(0), &env->mmx_status);
     d->MMX_S(1) = float32_add(d->MMX_S(1), s->MMX_S(1), &env->mmx_status);
 }
 
 void helper_pfcmpeq(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_L(0) = float32_eq_quiet(d->MMX_S(0), s->MMX_S(0),
                                    &env->mmx_status) ? -1 : 0;
     d->MMX_L(1) = float32_eq_quiet(d->MMX_S(1), s->MMX_S(1),
@@ -1350,6 +1408,8 @@ void helper_pfcmpeq(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfcmpge(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_L(0) = float32_le(s->MMX_S(0), d->MMX_S(0),
                              &env->mmx_status) ? -1 : 0;
     d->MMX_L(1) = float32_le(s->MMX_S(1), d->MMX_S(1),
@@ -1358,6 +1418,8 @@ void helper_pfcmpge(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfcmpgt(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_L(0) = float32_lt(s->MMX_S(0), d->MMX_S(0),
                              &env->mmx_status) ? -1 : 0;
     d->MMX_L(1) = float32_lt(s->MMX_S(1), d->MMX_S(1),
@@ -1366,6 +1428,8 @@ void helper_pfcmpgt(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfmax(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     if (float32_lt(d->MMX_S(0), s->MMX_S(0), &env->mmx_status)) {
         d->MMX_S(0) = s->MMX_S(0);
     }
@@ -1376,6 +1440,8 @@ void helper_pfmax(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfmin(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     if (float32_lt(s->MMX_S(0), d->MMX_S(0), &env->mmx_status)) {
         d->MMX_S(0) = s->MMX_S(0);
     }
@@ -1386,12 +1452,15 @@ void helper_pfmin(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfmul(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = float32_mul(d->MMX_S(0), s->MMX_S(0), &env->mmx_status);
     d->MMX_S(1) = float32_mul(d->MMX_S(1), s->MMX_S(1), &env->mmx_status);
 }
 
 void helper_pfnacc(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     float32 r;
 
     r = float32_sub(d->MMX_S(0), d->MMX_S(1), &env->mmx_status);
@@ -1401,6 +1470,7 @@ void helper_pfnacc(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfpnacc(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     float32 r;
 
     r = float32_sub(d->MMX_S(0), d->MMX_S(1), &env->mmx_status);
@@ -1410,12 +1480,16 @@ void helper_pfpnacc(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfrcp(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = float32_div(float32_one, s->MMX_S(0), &env->mmx_status);
     d->MMX_S(1) = d->MMX_S(0);
 }
 
 void helper_pfrsqrt(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_L(1) = s->MMX_L(0) & 0x7fffffff;
     d->MMX_S(1) = float32_div(float32_one,
                               float32_sqrt(d->MMX_S(1), &env->mmx_status),
@@ -1426,12 +1500,16 @@ void helper_pfrsqrt(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfsub(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = float32_sub(d->MMX_S(0), s->MMX_S(0), &env->mmx_status);
     d->MMX_S(1) = float32_sub(d->MMX_S(1), s->MMX_S(1), &env->mmx_status);
 }
 
 void helper_pfsubr(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = float32_sub(s->MMX_S(0), d->MMX_S(0), &env->mmx_status);
     d->MMX_S(1) = float32_sub(s->MMX_S(1), d->MMX_S(1), &env->mmx_status);
 }
@@ -2511,11 +2589,14 @@ void helper_vpermd_ymm(Reg *d, Reg *v, Reg *s)
     {                                                                          \
         d->elem(0) = F(a->elem(0), b->elem(0), c->elem(0), flags, &env->sse_status); \
     }
-#define SSE_HELPER_FMAP(name, elem, num, F)                                    \
+#define SSE_HELPER_FMAP(name, elem, num, F, VEC)                               \
     void glue(name, SUFFIX)(CPUX86State *env, Reg *d, Reg *a, Reg *b, Reg *c,  \
                             int flags, int flip)                               \
     {                                                                          \
         int i;                                                                 \
+        if (!flip && VEC(env, d, a, b, c, num, flags)) {                       \
+            return;                                                            \
+        }                                                                      \
         for (i = 0; i < num; i++) {                                            \
             d->elem(i) = F(a->elem(i), b->elem(i), c->elem(i), flags, &env->sse_status); \
             flags ^= flip;                                                     \
@@ -2527,8 +2608,10 @@ SSE_HELPER_FMAS(helper_fma4sd,  ZMM_D, float64_muladd)
 #endif
 
 #if SHIFT >= 1
-SSE_HELPER_FMAP(helper_fma4ps,  ZMM_S, 2 << SHIFT, float32_muladd)
-SSE_HELPER_FMAP(helper_fma4pd,  ZMM_D, 1 << SHIFT, float64_muladd)
+SSE_HELPER_FMAP(helper_fma4ps,  ZMM_S, 2 << SHIFT, float32_muladd,
+                sse_vec_muladd32)
+SSE_HELPER_FMAP(helper_fma4pd,  ZMM_D, 1 << SHIFT, float64_muladd,
+                sse_vec_muladd64)
 #endif
 
 #if SHIFT == 1
