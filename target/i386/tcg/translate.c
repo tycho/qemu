@@ -2374,6 +2374,16 @@ static inline void gen_sto_env_A0(DisasContext *s, int offset, bool align)
     tcg_gen_qemu_st_i128(t, s->A0, mem_index, mop);
 }
 
+/*
+ * The upper half of a 32-byte aligned access is 16-byte aligned; say so
+ * under x-tso=acqrel, where aligned halves can be ordered accesses
+ * themselves (tcg_ldst_vec_acqrel).
+ */
+static MemOp ymm_hi_align(bool align)
+{
+    return align && tcg_tso_mode == TCG_TSO_ACQREL ? MO_ALIGN_16 : 0;
+}
+
 static void gen_ldy_env_A0(DisasContext *s, int offset, bool align)
 {
     MemOp mop = MO_128 | MO_LE | MO_ATOM_IFALIGN_PAIR;
@@ -2390,7 +2400,7 @@ static void gen_ldy_env_A0(DisasContext *s, int offset, bool align)
         tcg_gen_qemu_ld_vec(v0, s->A0, mem_index,
                             mop | (align ? MO_ALIGN_32 : 0));
         tcg_gen_addi_tl(a0_hi, s->A0, 16);
-        tcg_gen_qemu_ld_vec(v1, a0_hi, mem_index, mop);
+        tcg_gen_qemu_ld_vec(v1, a0_hi, mem_index, mop | ymm_hi_align(align));
         tcg_gen_st_vec(v0, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));
         tcg_gen_st_vec(v1, tcg_env, offset + offsetof(YMMReg, YMM_X(1)));
         return;
@@ -2413,7 +2423,8 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
     if (gen_st_vec_env(s, s->A0, offset + offsetof(YMMReg, YMM_X(0)),
                        mop | (align ? MO_ALIGN_32 : 0))) {
         tcg_gen_addi_tl(a0_hi, s->A0, 16);
-        gen_st_vec_env(s, a0_hi, offset + offsetof(YMMReg, YMM_X(1)), mop);
+        gen_st_vec_env(s, a0_hi, offset + offsetof(YMMReg, YMM_X(1)),
+                       mop | ymm_hi_align(align));
         return;
     }
     tcg_gen_ld_i128(t, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));
