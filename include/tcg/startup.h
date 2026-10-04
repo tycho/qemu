@@ -80,4 +80,12 @@ extern bool tcg_vperm;
  */
 extern bool tcg_vpermvar;
 
+/*
+ * tcg_vint: guest integer vector operations that TCG has no single op for
+ * (unpacks of bytes, byte shifts and aligns, widening and narrowing,
+ * pairwise sums, ...) as sequences of host vector ops instead of helper
+ * calls, where the backend has them.
+ */
+extern bool tcg_vint;
+
 #endif
