@@ -2230,6 +2230,18 @@ static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
         }
     }
 
+    if (get_memop(oi) & MO_ACQ_REL) {
+        /*
+         * x-tso=acqrel, 16-byte aligned (tcg_ldst_i128_acqrel): FEAT_LRCPC3
+         * LDIAPP / STILP, a load-acquire / store-release pair that is
+         * single-copy atomic with FEAT_LSE2.  No barrier.
+         */
+        tcg_debug_assert(have_lrcpc3 && have_lse2);
+        tcg_out32(s, (is_ld ? 0xd9401800 : 0xd9001800)
+                  | datahi << 16 | base << 5 | datalo);
+        goto done;
+    }
+
     use_pair = h.aa.atom < MO_128 || have_lse2;
 
     if (!use_pair) {
@@ -2295,6 +2307,7 @@ static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
         }
     }
 
+ done:
     if (ldst) {
         ldst->type = TCG_TYPE_I128;
         ldst->datalo_reg = datalo;
