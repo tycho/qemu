@@ -1396,16 +1396,60 @@ static inline void gen_unary_imm_fp_sse(DisasContext *s, X86DecodedInsn *decode,
     }
 }
 
-#define UNARY_IMM_FP_SSE(uname, lname)                                             \
-static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
-{                                                                                  \
-    gen_unary_imm_fp_sse(s, decode,                                                \
-                      gen_helper_##lname##_xmm,                                    \
-                      gen_helper_##lname##_ymm);                                   \
+static void gen_frint_vec(unsigned vece, TCGv_vec d, TCGv_vec a,
+                          int64_t mode)
+{
+    if (mode < 0) {
+        tcg_gen_frintx_vec(vece, d, a);
+    } else {
+        tcg_gen_frint_vec(vece, d, a, mode);
+    }
 }
 
-UNARY_IMM_FP_SSE(VROUNDPS,    roundps)
-UNARY_IMM_FP_SSE(VROUNDPD,    roundpd)
+/*
+ * With x-ssefp=native, ROUNDPS/ROUNDPD on the host FPU, which runs in the
+ * guest's MXCSR mode: imm8 bit 2 rounds in that mode (signaling inexact
+ * unless bit 3 is set), else bits 1:0 give the mode, with bit 3 set only;
+ * a given mode that signals inexact keeps the helper.
+ */
+static bool gen_fp_native_round(DisasContext *s, X86DecodedInsn *decode,
+                                unsigned vece)
+{
+    static const TCGOpcode frint[] = { INDEX_op_frint_vec, 0 };
+    static const TCGOpcode frintx[] = { INDEX_op_frintx_vec, 0 };
+    uint8_t imm = decode->immediate;
+    int vec_len = vector_len(s, decode);
+    int64_t mode;
+    GVecGen2i g = { .fniv = gen_frint_vec, .vece = vece };
+
+    if (imm & 4) {
+        mode = imm & 8 ? TCG_FRINT_CURRENT : -1;
+    } else if (imm & 8) {
+        mode = imm & 3;
+    } else {
+        return false;
+    }
+    g.opt_opc = mode < 0 ? frintx : frint;
+    if (!fp_native(g.opt_opc, vece)) {
+        return false;
+    }
+    tcg_gen_gvec_2i(decode->op[0].offset, decode->op[1].offset,
+                    vec_len, vec_len, mode, &g);
+    return true;
+}
+
+#define ROUND_FP_SSE(uname, lname, vece)                                      \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    if (gen_fp_native_round(s, decode, vece)) {                               \
+        return;                                                               \
+    }                                                                         \
+    gen_unary_imm_fp_sse(s, decode,                                           \
+                         gen_helper_##lname##_xmm,                            \
+                         gen_helper_##lname##_ymm);                           \
+}
+ROUND_FP_SSE(VROUNDPS, roundps, MO_32)
+ROUND_FP_SSE(VROUNDPD, roundpd, MO_64)
 
 static inline void gen_vexw_avx(DisasContext *s, X86DecodedInsn *decode,
                                 SSEFunc_0_eppp d_xmm, SSEFunc_0_eppp q_xmm,
