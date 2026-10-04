@@ -240,6 +240,7 @@ TCGContext tcg_init_ctx;
 bool tcg_vecld;
 bool tcg_vecmem;
 bool tcg_vperm;
+bool tcg_vpermvar;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
