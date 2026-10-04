@@ -2743,11 +2743,12 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
         goto illegal;
     }
 
+    /* EM comes first, and does not apply to VEX instructions. */
+    if (!(s->prefix & PREFIX_VEX) && (s->flags & HF_EM_MASK)) {
+        goto illegal;
+    }
     if (s->flags & HF_TS_MASK) {
         goto nm_exception;
-    }
-    if (s->flags & HF_EM_MASK) {
-        goto illegal;
     }
     return true;
 
