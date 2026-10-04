@@ -33,6 +33,7 @@
 #include "exec/helper-gen.h"
 #include "helper-tcg.h"
 #include "tcg/startup.h"
+#include "host/counter.h"
 #include "decode-new.h"
 #include "tcg/startup.h"
 
@@ -123,6 +124,8 @@ typedef struct DisasContext {
     TCGLabel *fp_entry_label;
     TCGOp *fp_entry_and;
     uint32_t fp_entry_mask;
+    bool fence_insn; /* this insn is LFENCE or MFENCE */
+    bool after_fence; /* the previous insn was */
     bool jmp_opt; /* use direct block chaining for direct jumps */
     bool jmp_direct; /* the TB ends in a direct jump to another page */
     bool cc_op_dirty;
@@ -2421,6 +2424,62 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
     tcg_gen_qemu_st_i128(t, a0_hi, mem_index, mop);
 }
 
+/*
+ * tcg_tsc_counter: RDTSC (and RDTSCP's TSC) without a helper: the host
+ * counter scaled to the guest's 1 GHz TSC (host/counter.h), plus the
+ * vCPU's offset (and SVM's, as helper_rdtsc).  With @ordered the counter
+ * isn't read before earlier instructions complete.  The helper stays for
+ * the SVM intercept, icount, and, checked at run time outside ring 0,
+ * CR4.TSD.  Returns false, emitting nothing, where the helper is needed.
+ */
+static bool gen_tsc_counter(DisasContext *s, bool ordered)
+{
+#if HOST_COUNTER_SUPPORTED && !defined(CONFIG_USER_ONLY)
+    TCGLabel *slow = NULL, *done;
+    TCGv_i64 t, o;
+
+    if (!tcg_tsc_counter || GUEST(s) ||
+        (tb_cflags(s->base.tb) & CF_USE_ICOUNT) ||
+        !tcg_op_supported(INDEX_op_host_counter, TCG_TYPE_I64, 0)) {
+        return false;
+    }
+    if (CPL(s) != 0) {
+        TCGv cr4 = tcg_temp_new();
+
+        slow = gen_new_label();
+        tcg_gen_ld_tl(cr4, tcg_env, offsetof(CPUX86State, cr[4]));
+        tcg_gen_andi_tl(cr4, cr4, CR4_TSD_MASK);
+        tcg_gen_brcondi_tl(TCG_COND_NE, cr4, 0, slow);
+    }
+
+    t = tcg_temp_new_i64();
+    o = tcg_temp_new_i64();
+    tcg_gen_host_counter_i64(t, ordered);
+    if (host_counter_shift) {
+        tcg_gen_mulu2_i64(o, t, t, tcg_constant_i64(host_counter_mult));
+        tcg_gen_extract2_i64(t, o, t, host_counter_shift);
+    } else if (host_counter_mult != 1) {
+        tcg_gen_muli_i64(t, t, host_counter_mult);
+    }
+    tcg_gen_ld_i64(o, tcg_env, offsetof(CPUX86State, tsc_counter_offset));
+    tcg_gen_add_i64(t, t, o);
+    tcg_gen_ld_i64(o, tcg_env, offsetof(CPUX86State, tsc_offset));
+    tcg_gen_add_i64(t, t, o);
+    tcg_gen_extr_i64_tl(cpu_regs[R_EAX], cpu_regs[R_EDX], t);
+
+    if (slow) {
+        done = gen_new_label();
+        tcg_gen_br(done);
+        gen_set_label(slow);
+        gen_helper_rdtsc(tcg_env);
+        gen_set_label(done);
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 #include "emit.c.inc"
 
 static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
@@ -3418,8 +3477,10 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             }
             gen_update_cc_op(s);
             gen_update_eip_cur(s);
-            translator_io_start(&s->base);
-            gen_helper_rdtsc(tcg_env);
+            if (!gen_tsc_counter(s, true)) {
+                translator_io_start(&s->base);
+                gen_helper_rdtsc(tcg_env);
+            }
             gen_helper_rdpid(s->T0, tcg_env);
             gen_op_mov_reg_v(s, dflag, R_ECX, s->T0);
             break;
@@ -3774,6 +3835,7 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->fp_clear = 0;
     dc->fp_entry_label = NULL;
     dc->fp_entry_mask = 0;
+    dc->fence_insn = false;
 
     dc->cs_base = dc->base.tb->cs_base;
     dc->pc_save = dc->base.pc_next;
@@ -3869,6 +3931,9 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         return;
     }
 #endif
+
+    dc->after_fence = dc->fence_insn;
+    dc->fence_insn = false;
 
     switch (sigsetjmp(dc->jmpbuf, 0)) {
     case 0:

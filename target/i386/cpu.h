@@ -2290,6 +2290,8 @@ typedef struct CPUArchState {
     int64_t user_tsc_khz; /* for sanity check only */
     uint64_t apic_bus_freq;
     uint64_t tsc;
+    /* tcg_tsc_counter: TSC = host counter (ns) + this */
+    int64_t tsc_counter_offset;
     void *xsave_buf;
     uint32_t xsave_buf_len;
 #if defined(CONFIG_KVM)
@@ -2812,6 +2814,8 @@ void cpu_x86_update_dr7(CPUX86State *env, uint32_t new_dr7);
 
 /* hw/pc.c */
 uint64_t cpu_get_tsc(CPUX86State *env);
+void x86_tsc_counter_set(CPUX86State *env, uint64_t tsc);
+void x86_tsc_counter_reset(CPUX86State *env);
 
 #define CPU_RESOLVING_TYPE TYPE_X86_CPU
 
