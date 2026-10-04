@@ -277,6 +277,7 @@ bool tcg_iopl_runtime;
 bool tcg_cr0exc_hw;
 bool tcg_region;
 bool tcg_tso_stack;
+bool tcg_tso_lrcpc3 = true;
 
 /* x-tso-promote: crossings seen per guest insn pc (all vCPUs). */
 static QemuMutex tso_cross_lock;
