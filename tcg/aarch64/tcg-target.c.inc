@@ -647,6 +647,16 @@ typedef enum {
     Isimd_shift_imm_SLI  = 0x2f005400,
     Isimd_shift_imm_USHR = 0x2f000400,
     Isimd_shift_imm_USRA = 0x2f001400,
+    Isimd_shift_imm_SSHLL = 0x0f00a400,
+    Isimd_shift_imm_USHLL = 0x2f00a400,
+    Isimd_shift_imm_SHRN = 0x0f008400,
+    Isimd_shift_imm_RSHRN = 0x0f008c00,
+    Isimd_shift_imm_SQSHRN = 0x0f009400,
+    Isimd_shift_imm_SQRSHRN = 0x0f009c00,
+    Isimd_shift_imm_SQSHRUN = 0x2f008400,
+    Isimd_shift_imm_SQRSHRUN = 0x2f008c00,
+    Isimd_shift_imm_UQSHRN = 0x2f009400,
+    Isimd_shift_imm_UQRSHRN = 0x2f009c00,
 
     /* AdvSIMD three same.  */
     Iqrrr_e_ADD       = 0x0e208400,
@@ -656,6 +666,12 @@ typedef enum {
     Iqrrr_e_UZP2      = 0x0e005800,
     Iqrrr_e_TRN2      = 0x0e006800,
     Iqrrr_e_ZIP2      = 0x0e007800,
+    Iqrrr_e_ADDP      = 0x0e20bc00,
+    Iqrrr_e_SABD      = 0x0e207400,
+    Iqrrr_e_UABD      = 0x2e207400,
+    Iqrrr_e_URHADD    = 0x2e201400,
+    Iqrrr_e_SMULL     = 0x0e20c000,      /* three different */
+    Iqrrr_e_UMULL     = 0x2e20c000,
     Iqrrr_e_TBL       = 0x0e000000,      /* one table register */
     Iqrrr_e_TBX       = 0x0e001000,
     Iqrrr_e_EXT       = 0x2e000000,      /* index in bits 11-14 */
@@ -704,6 +720,12 @@ typedef enum {
 
     /* AdvSIMD two-reg misc.  */
     Iqrr_e_REV64      = 0x0e200800,
+    Iqrr_e_XTN        = 0x0e212800,
+    Iqrr_e_SADDLP     = 0x0e202800,
+    Iqrr_e_UADDLP     = 0x2e202800,
+    Iqrr_e_SQXTN      = 0x0e214800,
+    Iqrr_e_SQXTUN     = 0x2e212800,
+    Iqrr_e_UQXTN      = 0x2e214800,
     Iqrr_e_REV32      = 0x2e200800,
     Iqrr_e_REV16      = 0x0e201800,
     Iqrr_e_CMGT0      = 0x0e208800,
@@ -4086,6 +4108,48 @@ static void tcg_out_perm_vec(TCGContext *s, unsigned vece, TCGReg a0,
     }
 }
 
+/*
+ * narrow_vec: the low half of the result from a, then the high half from
+ * b (the "2" forms keep the low half).  If rd is b, the first write would
+ * destroy it: build the result in TCG_VEC_TMP0.
+ */
+static void tcg_out_narrow_vec(TCGContext *s, unsigned vece, TCGReg rd,
+                               TCGReg a, TCGReg b, unsigned k)
+{
+    static const AArch64Insn xtn[4] = {
+        [TCG_NARROW_TRUNC] = Iqrr_e_XTN,
+        [TCG_NARROW_SAT_S] = Iqrr_e_SQXTN,
+        [TCG_NARROW_SAT_SU] = Iqrr_e_SQXTUN,
+        [TCG_NARROW_SAT_U] = Iqrr_e_UQXTN,
+    };
+    static const AArch64Insn shrn[4][2] = {
+        [TCG_NARROW_TRUNC] = { Isimd_shift_imm_SHRN, Isimd_shift_imm_RSHRN },
+        [TCG_NARROW_SAT_S] = { Isimd_shift_imm_SQSHRN,
+                               Isimd_shift_imm_SQRSHRN },
+        [TCG_NARROW_SAT_SU] = { Isimd_shift_imm_SQSHRUN,
+                                Isimd_shift_imm_SQRSHRUN },
+        [TCG_NARROW_SAT_U] = { Isimd_shift_imm_UQSHRN,
+                               Isimd_shift_imm_UQRSHRN },
+    };
+    unsigned shift = k & 0xff, kind = (k >> 8) & 15, round = (k >> 12) & 1;
+    TCGReg d = rd == b ? TCG_VEC_TMP0 : rd;
+
+    for (int q = 0; q < 2; q++) {
+        TCGReg n = q ? b : a;
+
+        if (shift) {
+            /* immh:immb = 2 * esize - shift, esize the narrow size */
+            tcg_out_insn_simd_shift_imm(s, shrn[kind][round], q, d, n,
+                                        (16 << vece) - shift);
+        } else {
+            tcg_out_insn_qrr_e(s, xtn[kind], q, vece, d, n);
+        }
+    }
+    if (d != rd) {
+        tcg_out_mov(s, TCG_TYPE_V128, rd, d);
+    }
+}
+
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                            unsigned vecl, unsigned vece,
                            const TCGArg args[TCG_MAX_OP_ARGS],
@@ -4143,6 +4207,42 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         break;
     case INDEX_op_tbl_vec:
         tcg_out_insn(s, qrrr_e, TBL, 1, 0, a0, a1, a2);
+        break;
+    case INDEX_op_zip_vec:
+        tcg_out_insn_qrrr_e(s, args[3] ? Iqrrr_e_ZIP2 : Iqrrr_e_ZIP1, 1,
+                            vece, a0, a1, a2);
+        break;
+    case INDEX_op_ext_vec:
+        tcg_out32(s, Iqrrr_e_EXT | 1 << 30 | (a2 & 0x1f) << 16
+                  | (args[3] & 15) << 11 | (a1 & 0x1f) << 5 | (a0 & 0x1f));
+        break;
+    case INDEX_op_mulw_vec:
+        /* SMULL/UMULL{,2}: Q selects the high halves. */
+        tcg_out_insn_qrrr_e(s, args[3] & 1 ? Iqrrr_e_SMULL : Iqrrr_e_UMULL,
+                            args[3] >> 1, vece, a0, a1, a2);
+        break;
+    case INDEX_op_addp_vec:
+        tcg_out_insn_qrrr_e(s, Iqrrr_e_ADDP, 1, vece, a0, a1, a2);
+        break;
+    case INDEX_op_narrow_vec:
+        tcg_out_narrow_vec(s, vece, a0, a1, a2, args[3]);
+        break;
+    case INDEX_op_abd_vec:
+        tcg_out_insn_qrrr_e(s, args[3] ? Iqrrr_e_SABD : Iqrrr_e_UABD, 1,
+                            vece, a0, a1, a2);
+        break;
+    case INDEX_op_addlp_vec:
+        tcg_out_insn_qrr_e(s, a2 ? Iqrr_e_SADDLP : Iqrr_e_UADDLP, 1,
+                           vece, a0, a1);
+        break;
+    case INDEX_op_avgr_vec:
+        tcg_out_insn_qrrr_e(s, Iqrrr_e_URHADD, 1, vece, a0, a1, a2);
+        break;
+    case INDEX_op_widen_vec:
+        /* SXTL/UXTL{,2}: SSHLL/USHLL by 0; Q selects the high half. */
+        tcg_out_insn_simd_shift_imm(s, a2 & 1 ? Isimd_shift_imm_SSHLL
+                                    : Isimd_shift_imm_USHLL,
+                                    a2 >> 1, a0, a1, 8 << vece);
         break;
     case INDEX_op_qemu_ld_vec:
         tcg_out_qemu_ldst_vec(s, a0, a1, args[2], true);
@@ -4647,6 +4747,7 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_perm_vec:
         return type == TCG_TYPE_V128 && vece >= MO_16 && vece <= MO_64;
     case INDEX_op_tbl_vec:
+    case INDEX_op_ext_vec:
         return type == TCG_TYPE_V128 && vece == MO_8;
     case INDEX_op_fadd_vec:
     case INDEX_op_fsub_vec:
@@ -4696,6 +4797,18 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
          */
         return type == TCG_TYPE_V128 && vece == MO_32
                && (cpuinfo & CPUINFO_AFP) && (cpuinfo & CPUINFO_RPRES);
+
+    case INDEX_op_zip_vec:
+        return type == TCG_TYPE_V128;
+    case INDEX_op_widen_vec:
+    case INDEX_op_mulw_vec:
+    case INDEX_op_narrow_vec:
+    case INDEX_op_abd_vec:
+    case INDEX_op_addlp_vec:
+    case INDEX_op_avgr_vec:
+        return type == TCG_TYPE_V128 && vece <= MO_32;
+    case INDEX_op_addp_vec:
+        return type == TCG_TYPE_V128;
 
     default:
         return 0;
@@ -4855,7 +4968,17 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O0_I2(w, r);
     case INDEX_op_perm_vec:
     case INDEX_op_tbl_vec:
+    case INDEX_op_zip_vec:
+    case INDEX_op_ext_vec:
+    case INDEX_op_mulw_vec:
+    case INDEX_op_addp_vec:
+    case INDEX_op_narrow_vec:
+    case INDEX_op_abd_vec:
+    case INDEX_op_avgr_vec:
         return C_O1_I2(w, w, w);
+    case INDEX_op_widen_vec:
+    case INDEX_op_addlp_vec:
+        return C_O1_I1(w, w);
     case INDEX_op_dup_vec:
         return C_O1_I1(w, wr);
     case INDEX_op_or_vec:

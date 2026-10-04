@@ -813,6 +813,70 @@ specifies the length of the element (if applicable) in log2 8-bit units.
          ``TCGOP_VECE`` (MO_16, MO_32 or MO_64) in 128 bits.  The pattern
          is a constant, so a backend can pick the instructions for it.
 
+   * - zip_vec *v0*, *v1*, *v2*, *high*
+
+     - | Interleave: *v0* holds the elements of the low halves of *v1* and
+         *v2* (the high halves if *high* is 1), alternately from *v1* and
+         *v2*, starting with *v1*'s (128-bit vectors, elements of
+         ``TCGOP_VECE``).
+
+   * - ext_vec *v0*, *v1*, *v2*, *n*
+
+     - | Extract: bytes *n* to *n* + 15 of the concatenation *v1*:*v2*,
+         whose bytes 0 to 15 are *v1*'s (128-bit vectors, 0 <= *n* <= 15).
+
+   * - widen_vec *v0*, *v1*, *k*
+
+     - | Widen: the elements of the low half of *v1* (the high half if
+         bit 1 of *k* is set), sign-extended if bit 0 of *k* is set, else
+         zero-extended, from ``TCGOP_VECE`` (MO_8, MO_16 or MO_32) to twice
+         that size (128-bit vectors).
+
+   * - mulw_vec *v0*, *v1*, *v2*, *k*
+
+     - | Widening multiply: element *i* of *v0* is the exact product of
+         elements *i* of the low halves of *v1* and *v2* (the high halves if
+         bit 1 of *k* is set), signed if bit 0 of *k* is set, at twice the
+         element size ``TCGOP_VECE`` (MO_8, MO_16 or MO_32) of the inputs.
+
+   * - addp_vec *v0*, *v1*, *v2*
+
+     - | Pairwise add: element *i* of *v0* is the sum, modulo 2 to the
+         element size, of elements 2 * *i* and 2 * *i* + 1 of the
+         concatenation *v1*:*v2* (128-bit vectors).
+
+   * - narrow_vec *v0*, *v1*, *v2*, *k*
+
+     - | Narrow: *v0* holds the elements of *v1*, then those of *v2*, each
+         shifted right by *k* & 0xff (0 to the narrow element size;
+         arithmetically for the signed saturations, else logically; if bit 12
+         of *k* is set, rounding: 1 << (shift - 1) is added first, at full
+         precision), then fitted into ``TCGOP_VECE`` (MO_8, MO_16 or
+         MO_32) from twice that size by (*k* >> 8) & 15: keep the low
+         bits (``TCG_NARROW_TRUNC``), or saturate signed to signed
+         (``TCG_NARROW_SAT_S``), signed to unsigned (``TCG_NARROW_SAT_SU``)
+         or unsigned to unsigned (``TCG_NARROW_SAT_U``).
+
+   * - abd_vec *v0*, *v1*, *v2*, *is_signed*
+
+     - | Absolute difference: element *i* of *v0* is \|*v1*\[*i*\] -
+         *v2*\[*i*\]\|, the inputs signed if *is_signed* is 1, else
+         unsigned; the result is unsigned (``TCGOP_VECE`` MO_8, MO_16 or
+         MO_32).
+
+   * - addlp_vec *v0*, *v1*, *is_signed*
+
+     - | Pairwise add long: element *i* of *v0* is the exact sum of
+         elements 2 * *i* and 2 * *i* + 1 of *v1* at twice the element
+         size ``TCGOP_VECE`` (MO_8, MO_16 or MO_32) of the input, signed
+         if *is_signed* is 1.
+
+   * - avgr_vec *v0*, *v1*, *v2*
+
+     - | Rounding average of unsigned elements: (*v1*\[*i*\] +
+         *v2*\[*i*\] + 1) >> 1 without overflow (``TCGOP_VECE`` MO_8,
+         MO_16 or MO_32).
+
    * - tbl_vec *v0*, *v1*, *v2*
 
      - | Table lookup: byte *i* of *v0* is the byte of *v1* that byte *i*

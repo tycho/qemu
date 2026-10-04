@@ -61,6 +61,33 @@
 #ifndef TCG_TARGET_HAS_fp_vec
 #define TCG_TARGET_HAS_fp_vec           0
 #endif
+#ifndef TCG_TARGET_HAS_zip_vec
+#define TCG_TARGET_HAS_zip_vec          0
+#endif
+#ifndef TCG_TARGET_HAS_ext_vec
+#define TCG_TARGET_HAS_ext_vec          0
+#endif
+#ifndef TCG_TARGET_HAS_widen_vec
+#define TCG_TARGET_HAS_widen_vec        0
+#endif
+#ifndef TCG_TARGET_HAS_mulw_vec
+#define TCG_TARGET_HAS_mulw_vec         0
+#endif
+#ifndef TCG_TARGET_HAS_addp_vec
+#define TCG_TARGET_HAS_addp_vec         0
+#endif
+#ifndef TCG_TARGET_HAS_narrow_vec
+#define TCG_TARGET_HAS_narrow_vec       0
+#endif
+#ifndef TCG_TARGET_HAS_abd_vec
+#define TCG_TARGET_HAS_abd_vec          0
+#endif
+#ifndef TCG_TARGET_HAS_addlp_vec
+#define TCG_TARGET_HAS_addlp_vec        0
+#endif
+#ifndef TCG_TARGET_HAS_avgr_vec
+#define TCG_TARGET_HAS_avgr_vec         0
+#endif
 #ifndef TCG_TARGET_HAS_v64
 #define TCG_TARGET_HAS_v64              0
 #endif
