@@ -468,6 +468,9 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
             Reg *d, Reg *v, Reg *s)                                     \
     {                                                                   \
         int i;                                                          \
+        if (sse_vec_ ## name ## 32(env, d, v, s, 2 << SHIFT)) {         \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < 2 << SHIFT; i++) {                              \
             d->ZMM_S(i) = F(32, v->ZMM_S(i), s->ZMM_S(i));              \
         }                                                               \
@@ -477,6 +480,9 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
             Reg *d, Reg *v, Reg *s)                                     \
     {                                                                   \
         int i;                                                          \
+        if (sse_vec_ ## name ## 64(env, d, v, s, 1 << SHIFT)) {         \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < 1 << SHIFT; i++) {                              \
             d->ZMM_D(i) = F(64, v->ZMM_D(i), s->ZMM_D(i));              \
         }                                                               \
@@ -535,6 +541,9 @@ SSE_HELPER_S(max, FPU_MAX)
 void glue(helper_sqrtps, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 {
     int i;
+    if (sse_vec_sqrt32(env, d, s, 2 << SHIFT)) {
+        return;
+    }
     for (i = 0; i < 2 << SHIFT; i++) {
         d->ZMM_S(i) = float32_sqrt(s->ZMM_S(i), &env->sse_status);
     }
@@ -543,6 +552,9 @@ void glue(helper_sqrtps, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 void glue(helper_sqrtpd, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 {
     int i;
+    if (sse_vec_sqrt64(env, d, s, 1 << SHIFT)) {
+        return;
+    }
     for (i = 0; i < 1 << SHIFT; i++) {
         d->ZMM_D(i) = float64_sqrt(s->ZMM_D(i), &env->sse_status);
     }
@@ -641,6 +653,9 @@ void helper_cvtsd2ss(CPUX86State *env, Reg *d, Reg *v, Reg *s)
 void glue(helper_cvtdq2ps, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 {
     int i;
+    if (sse_vec_cvtdq2ps(env, d, s, 2 << SHIFT)) {
+        return;
+    }
     for (i = 0; i < 2 << SHIFT; i++) {
         d->ZMM_S(i) = int32_to_float32(s->ZMM_L(i), &env->sse_status);
     }
@@ -730,6 +745,9 @@ WRAP_FLOATCONV(int64_t, float64_to_int64_round_to_zero, float64, INT64_MIN)
 void glue(helper_cvtps2dq, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 {
     int i;
+    if (sse_vec_cvtps2dq(env, d, s, 2 << SHIFT)) {
+        return;
+    }
     for (i = 0; i < 2 << SHIFT; i++) {
         d->ZMM_L(i) = x86_float32_to_int32(s->ZMM_S(i), &env->sse_status);
     }
@@ -786,6 +804,9 @@ int64_t helper_cvtsd2sq(CPUX86State *env, ZMMReg *s)
 void glue(helper_cvttps2dq, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 {
     int i;
+    if (sse_vec_cvttps2dq(env, d, s, 2 << SHIFT)) {
+        return;
+    }
     for (i = 0; i < 2 << SHIFT; i++) {
         d->ZMM_L(i) = x86_float32_to_int32_round_to_zero(s->ZMM_S(i),
                                                          &env->sse_status);
@@ -1000,7 +1021,15 @@ void glue(helper_addsubpd, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
     void glue(helper_ ## name ## ps, SUFFIX)(CPUX86State *env,          \
                                              Reg *d, Reg *v, Reg *s)    \
     {                                                                   \
+        FloatRelation rel[2 << SHIFT];                                  \
         int i;                                                          \
+        if (sse_vec_compare32(env, rel, v, s, 2 << SHIFT)) {            \
+            uint32_t *m = SSE_LANES(d, _l_ZMMReg, 2 << SHIFT);          \
+            for (i = 0; i < 2 << SHIFT; i++) {                          \
+                m[i] = C(rel[i]) ? -1 : 0;                              \
+            }                                                           \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < 2 << SHIFT; i++) {                              \
             d->ZMM_L(i) = C(F(32, v->ZMM_S(i), s->ZMM_S(i))) ? -1 : 0;  \
         }                                                               \
@@ -1009,7 +1038,15 @@ void glue(helper_addsubpd, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
     void glue(helper_ ## name ## pd, SUFFIX)(CPUX86State *env,          \
                                              Reg *d, Reg *v, Reg *s)    \
     {                                                                   \
+        FloatRelation rel[1 << SHIFT];                                  \
         int i;                                                          \
+        if (sse_vec_compare64(env, rel, v, s, 1 << SHIFT)) {            \
+            uint64_t *m = SSE_LANES(d, _q_ZMMReg, 1 << SHIFT);          \
+            for (i = 0; i < 1 << SHIFT; i++) {                          \
+                m[i] = C(rel[i]) ? -1 : 0;                              \
+            }                                                           \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < 1 << SHIFT; i++) {                              \
             d->ZMM_Q(i) = C(F(64, v->ZMM_D(i), s->ZMM_D(i))) ? -1 : 0;  \
         }                                                               \
@@ -2511,11 +2548,14 @@ void helper_vpermd_ymm(Reg *d, Reg *v, Reg *s)
     {                                                                          \
         d->elem(0) = F(a->elem(0), b->elem(0), c->elem(0), flags, &env->sse_status); \
     }
-#define SSE_HELPER_FMAP(name, elem, num, F)                                    \
+#define SSE_HELPER_FMAP(name, elem, num, F, VEC)                               \
     void glue(name, SUFFIX)(CPUX86State *env, Reg *d, Reg *a, Reg *b, Reg *c,  \
                             int flags, int flip)                               \
     {                                                                          \
         int i;                                                                 \
+        if (!flip && VEC(env, d, a, b, c, num, flags)) {                       \
+            return;                                                            \
+        }                                                                      \
         for (i = 0; i < num; i++) {                                            \
             d->elem(i) = F(a->elem(i), b->elem(i), c->elem(i), flags, &env->sse_status); \
             flags ^= flip;                                                     \
@@ -2527,8 +2567,10 @@ SSE_HELPER_FMAS(helper_fma4sd,  ZMM_D, float64_muladd)
 #endif
 
 #if SHIFT >= 1
-SSE_HELPER_FMAP(helper_fma4ps,  ZMM_S, 2 << SHIFT, float32_muladd)
-SSE_HELPER_FMAP(helper_fma4pd,  ZMM_D, 1 << SHIFT, float64_muladd)
+SSE_HELPER_FMAP(helper_fma4ps,  ZMM_S, 2 << SHIFT, float32_muladd,
+                sse_vec_muladd32)
+SSE_HELPER_FMAP(helper_fma4pd,  ZMM_D, 1 << SHIFT, float64_muladd,
+                sse_vec_muladd64)
 #endif
 
 #if SHIFT == 1

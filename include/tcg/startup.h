@@ -25,6 +25,12 @@
 #ifndef TCG_STARTUP_H
 #define TCG_STARTUP_H
 
+/*
+ * Target SIMD floating-point helpers try the softfloat vector fast paths
+ * (float32_add_vec etc.) before computing lane by lane.
+ */
+extern bool tcg_ssefp_vec;
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size
