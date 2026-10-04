@@ -31,6 +31,7 @@
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
 #include "helper-tcg.h"
+#include "tcg/startup.h"
 #include "decode-new.h"
 
 #include "exec/log.h"
@@ -117,6 +118,12 @@ typedef struct DisasContext {
     bool cc_op_dirty;
 
     CCOp cc_op;  /* current CC operation */
+    /*
+     * With tcg_flags_guess, the CC operation the block was entered with
+     * when it was translated, while cc_op is still that dynamic state;
+     * else CC_OP_DYNAMIC.
+     */
+    CCOp cc_op_guess;
     int mem_index; /* select memory access functions */
     uint32_t flags; /* all execution flags */
     int cpuid_features;
@@ -350,6 +357,7 @@ static void set_cc_op_1(DisasContext *s, CCOp op, bool dirty)
     }
     s->cc_op_dirty = dirty;
     s->cc_op = op;
+    s->cc_op_guess = CC_OP_DYNAMIC;
 }
 
 static void set_cc_op(DisasContext *s, CCOp op)
@@ -868,6 +876,92 @@ static CCPrepare gen_prepare_val_nz(TCGv src, MemOp size, bool eqz)
 }
 
 /* compute eflags.C, trying to store it in reg if not NULL */
+/*
+ * CF from a dynamic CC operation, inline for the one the block was entered
+ * with when it was translated (s->cc_op_guess), and through the helper for
+ * any other.  Only operations whose CF is a simple function of CC_DST and
+ * CC_SRC are guessed; returns false, with nothing emitted, for the others.
+ */
+static bool gen_compute_c_guess(DisasContext *s, TCGv reg)
+{
+    CCOp op = s->cc_op_guess;
+    TCGLabel *slow, *done;
+    TCGv t;
+    MemOp size;
+
+    switch (op) {
+    case CC_OP_LOGICB ... CC_OP_LOGICQ:
+    case CC_OP_POPCNT:
+    case CC_OP_EFLAGS:
+    case CC_OP_SARB ... CC_OP_SARQ:
+    case CC_OP_ADDB ... CC_OP_ADDQ:
+    case CC_OP_SUBB ... CC_OP_SUBQ:
+    case CC_OP_INCB ... CC_OP_INCQ:
+    case CC_OP_DECB ... CC_OP_DECQ:
+    case CC_OP_SHLB ... CC_OP_SHLQ:
+    case CC_OP_MULB ... CC_OP_MULQ:
+    case CC_OP_SBB_SELF:
+    case CC_OP_ADCX:
+    case CC_OP_ADCOX:
+        break;
+    default:
+        return false;
+    }
+
+    slow = gen_new_label();
+    done = gen_new_label();
+    tcg_gen_brcondi_i32(TCG_COND_NE, cpu_cc_op, op, slow);
+    switch (op) {
+    case CC_OP_LOGICB ... CC_OP_LOGICQ:
+    case CC_OP_POPCNT:
+        tcg_gen_movi_tl(reg, 0);
+        break;
+    case CC_OP_EFLAGS:
+    case CC_OP_SARB ... CC_OP_SARQ:
+        tcg_gen_andi_tl(reg, cpu_cc_src, CC_C);
+        break;
+    case CC_OP_ADDB ... CC_OP_ADDQ:
+        /* (DATA_TYPE)CC_DST < (DATA_TYPE)CC_SRC */
+        size = cc_op_size(op);
+        t = tcg_temp_new();
+        tcg_gen_ext_tl(reg, cpu_cc_dst, size);
+        tcg_gen_ext_tl(t, cpu_cc_src, size);
+        tcg_gen_setcond_tl(TCG_COND_LTU, reg, reg, t);
+        break;
+    case CC_OP_SUBB ... CC_OP_SUBQ:
+        /* (DATA_TYPE)(CC_DST + CC_SRC) < (DATA_TYPE)CC_SRC */
+        size = cc_op_size(op);
+        t = tcg_temp_new();
+        tcg_gen_add_tl(reg, cpu_cc_dst, cpu_cc_src);
+        tcg_gen_ext_tl(reg, reg, size);
+        tcg_gen_ext_tl(t, cpu_cc_src, size);
+        tcg_gen_setcond_tl(TCG_COND_LTU, reg, reg, t);
+        break;
+    case CC_OP_INCB ... CC_OP_INCQ:
+    case CC_OP_DECB ... CC_OP_DECQ:
+        tcg_gen_mov_tl(reg, cpu_cc_src);
+        break;
+    case CC_OP_SHLB ... CC_OP_SHLQ:
+        tcg_gen_extract_tl(reg, cpu_cc_src, (8 << cc_op_size(op)) - 1, 1);
+        break;
+    case CC_OP_MULB ... CC_OP_MULQ:
+        tcg_gen_setcondi_tl(TCG_COND_NE, reg, cpu_cc_src, 0);
+        break;
+    case CC_OP_SBB_SELF:
+        tcg_gen_andi_tl(reg, cpu_cc_dst, 1);
+        break;
+    default: /* CC_OP_ADCX, CC_OP_ADCOX */
+        tcg_gen_mov_tl(reg, cpu_cc_dst);
+        break;
+    }
+    tcg_gen_br(done);
+    gen_set_label(slow);
+    gen_helper_cc_compute_c(reg, cpu_cc_dst, cpu_cc_src,
+                            cpu_cc_src2, cpu_cc_op);
+    gen_set_label(done);
+    return true;
+}
+
 static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
 {
     MemOp size;
@@ -930,16 +1024,20 @@ static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
                              .reg = cpu_cc_src, .imm = CC_C };
 
     default:
-       /* The need to compute only C from CC_OP_DYNAMIC is important
-          in efficiently implementing e.g. INC at the start of a TB.  */
-       gen_update_cc_op(s);
-       if (!reg) {
-           reg = tcg_temp_new();
-       }
-       gen_helper_cc_compute_c(reg, cpu_cc_dst, cpu_cc_src,
-                               cpu_cc_src2, cpu_cc_op);
-       return (CCPrepare) { .cond = TCG_COND_NE, .reg = reg,
-                            .rhs_type = CC_PREPARE_DIRECT };
+        /*
+         * The need to compute only C from CC_OP_DYNAMIC is important
+         * in efficiently implementing e.g. INC at the start of a TB.
+         */
+        gen_update_cc_op(s);
+        if (!reg) {
+            reg = tcg_temp_new();
+        }
+        if (s->cc_op != CC_OP_DYNAMIC || !gen_compute_c_guess(s, reg)) {
+            gen_helper_cc_compute_c(reg, cpu_cc_dst, cpu_cc_src,
+                                    cpu_cc_src2, cpu_cc_op);
+        }
+        return (CCPrepare) { .cond = TCG_COND_NE, .reg = reg,
+                             .rhs_type = CC_PREPARE_DIRECT };
     }
 }
 
@@ -3454,6 +3552,8 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
 
     dc->cc_op = CC_OP_DYNAMIC;
     dc->cc_op_dirty = false;
+    /* The block is translated when it is first entered. */
+    dc->cc_op_guess = tcg_flags_guess ? env->cc_op : CC_OP_DYNAMIC;
     /* select memory access functions */
     dc->mem_index = cpu_mmu_index(cpu, false);
     dc->cpuid_features = env->features[FEAT_1_EDX];
