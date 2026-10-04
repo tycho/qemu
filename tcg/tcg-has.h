@@ -66,6 +66,15 @@
 #ifndef TCG_TARGET_HAS_narrow_vec
 #define TCG_TARGET_HAS_narrow_vec       0
 #endif
+#ifndef TCG_TARGET_HAS_abd_vec
+#define TCG_TARGET_HAS_abd_vec          0
+#endif
+#ifndef TCG_TARGET_HAS_addlp_vec
+#define TCG_TARGET_HAS_addlp_vec        0
+#endif
+#ifndef TCG_TARGET_HAS_avgr_vec
+#define TCG_TARGET_HAS_avgr_vec         0
+#endif
 #ifndef TCG_TARGET_HAS_v64
 #define TCG_TARGET_HAS_v64              0
 #endif
