@@ -813,6 +813,12 @@ specifies the length of the element (if applicable) in log2 8-bit units.
          ``TCGOP_VECE`` (MO_16, MO_32 or MO_64) in 128 bits.  The pattern
          is a constant, so a backend can pick the instructions for it.
 
+   * - tbl_vec *v0*, *v1*, *v2*
+
+     - | Table lookup: byte *i* of *v0* is the byte of *v1* that byte *i*
+         of *v2* indexes, or 0 if that index is 16 or more (128-bit
+         vectors, ``TCGOP_VECE`` = MO_8).
+
    * - dupi_vec *v0*, *c*
 
      - | Similarly, for a constant.
