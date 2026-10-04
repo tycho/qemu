@@ -124,6 +124,7 @@ typedef struct DisasContext {
     TCGOp *fp_entry_and;
     uint32_t fp_entry_mask;
     bool jmp_opt; /* use direct block chaining for direct jumps */
+    bool jmp_direct; /* the TB ends in a direct jump to another page */
     bool cc_op_dirty;
 
     CCOp cc_op;  /* current CC operation */
@@ -178,6 +179,12 @@ typedef struct DisasContext {
  * EFLAGS.TF to determine singlestep trap (SYSCALL/SYSRET).
  */
 #define DISAS_EOB_RECHECK_TF   DISAS_TARGET_4
+
+/*
+ * EIP has already been updated.  Like DISAS_JUMP, for a far jump that
+ * may also have changed CS and the hflags.
+ */
+#define DISAS_JUMP_FAR         DISAS_TARGET_5
 
 /* The environment in which user-only runs is constrained. */
 #ifdef CONFIG_USER_ONLY
@@ -1861,7 +1868,7 @@ static void gen_far_call(DisasContext *s)
                               tcg_constant_i32(s->dflag - 1),
                               eip_next_i32(s));
     }
-    s->base.is_jmp = DISAS_JUMP;
+    s->base.is_jmp = DISAS_JUMP_FAR;
 }
 
 static void gen_far_jmp(DisasContext *s)
@@ -1875,7 +1882,7 @@ static void gen_far_jmp(DisasContext *s)
         gen_op_movl_seg_real(s, R_CS, s->T1);
         gen_op_jmp_v(s, s->T0);
     }
-    s->base.is_jmp = DISAS_JUMP;
+    s->base.is_jmp = DISAS_JUMP_FAR;
 }
 
 static void gen_svm_check_intercept(DisasContext *s, uint32_t type)
@@ -2073,6 +2080,40 @@ static void gen_bnd_jmp(DisasContext *s)
 }
 
 /*
+ * Look up the next TB after a near jump.  The CPU state is then the one
+ * this TB was translated for: an insn that changes the hflags or CS ends
+ * the TB by returning to the main loop, or updates s->flags.  The
+ * exceptions are RF, which gen_eob clears, and BND JMP, which may clear
+ * HF_MPX_IU; with those, and after a far jump, use the helper.
+ */
+static void gen_lookup_and_goto_ptr(DisasContext *s, int mode)
+{
+    TCGv_i64 pc;
+
+    if (mode != DISAS_JUMP ||
+        s->flags != s->base.tb->flags ||
+        (s->flags & (HF_RF_MASK | HF_MPX_IU_MASK)) ||
+        !translator_use_inline_lookup(&s->base)) {
+        tcg_gen_lookup_and_goto_ptr();
+        return;
+    }
+
+    /* As x86_get_tb_cpu_state computes the pc. */
+    pc = tcg_temp_new_i64();
+    if (CODE64(s)) {
+        tcg_gen_extu_tl_i64(pc, cpu_eip);
+    } else {
+        TCGv t = tcg_temp_new();
+
+        tcg_gen_addi_tl(t, cpu_eip, s->cs_base);
+        tcg_gen_ext32u_tl(t, t);
+        tcg_gen_extu_tl_i64(pc, t);
+    }
+    translator_lookup_and_goto_ptr(&s->base, pc, s->cs_base, s->flags,
+                                   s->jmp_direct);
+}
+
+/*
  * Generate an end of block, including common tasks such as generating
  * single step traps, resetting the RF flag, and handling the interrupt
  * shadow.
@@ -2101,10 +2142,10 @@ gen_eob(DisasContext *s, int mode)
         tcg_gen_exit_tb(NULL, 0);
     } else if (s->flags & HF_TF_MASK) {
         gen_helper_single_step(tcg_env);
-    } else if (mode == DISAS_JUMP &&
+    } else if ((mode == DISAS_JUMP || mode == DISAS_JUMP_FAR) &&
                /* give irqs a chance to happen */
                !inhibit_reset) {
-        tcg_gen_lookup_and_goto_ptr();
+        gen_lookup_and_goto_ptr(s, mode);
     } else {
         tcg_gen_exit_tb(NULL, 0);
     }
@@ -2170,6 +2211,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
             tcg_gen_movi_tl(cpu_eip, new_eip);
         }
         if (s->jmp_opt) {
+            s->jmp_direct = true;
             gen_eob(s, DISAS_JUMP);   /* jump to another page */
         } else {
             gen_eob(s, DISAS_EOB_ONLY);  /* exit to main loop */
@@ -3756,6 +3798,7 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->cpuid_7_0_ecx_features = env->features[FEAT_7_0_ECX];
     dc->cpuid_7_1_eax_features = env->features[FEAT_7_1_EAX];
     dc->cpuid_xsave_features = env->features[FEAT_XSAVE];
+    dc->jmp_direct = false;
     dc->jmp_opt = !((cflags & CF_NO_GOTO_TB) ||
                     (flags & (HF_RF_MASK | HF_TF_MASK | HF_INHIBIT_IRQ_MASK)));
 
@@ -3890,6 +3933,7 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     case DISAS_EOB_ONLY:
     case DISAS_EOB_RECHECK_TF:
     case DISAS_JUMP:
+    case DISAS_JUMP_FAR:
         gen_eob(dc, dc->base.is_jmp);
         break;
     default:

@@ -320,6 +320,8 @@ bool tcg_ymmglobal;
 
 bool tcg_region;
 
+bool tcg_tbpack;
+
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
@@ -1931,16 +1933,21 @@ void tcg_init(size_t tb_size, int splitwx, unsigned max_threads)
     tcg_region_init(tb_size, splitwx, max_threads);
 }
 
+/* tcg_tbpack: the alignment of a packed TB struct and of its code. */
+#define TCG_TBPACK_ALIGN 16
+
 /*
- * Allocate TBs right before their corresponding translated code, making
- * sure that TBs and code are on different cache lines.
+ * Allocate TBs right before their corresponding translated code.  By
+ * default TBs and code are on different cache lines; tcg_tbpack packs
+ * them.
  */
 TranslationBlock *tcg_tb_alloc(TCGContext *s)
 {
-    uintptr_t align = qemu_icache_linesize;
+    uintptr_t align = tcg_tbpack ? TCG_TBPACK_ALIGN : qemu_icache_linesize;
     TranslationBlock *tb;
     void *next;
 
+    QEMU_BUILD_BUG_ON(TCG_TBPACK_ALIGN < __alignof__(TranslationBlock));
     while (1) {
         tb = (void *)ROUND_UP((uintptr_t)s->code_gen_ptr, align);
 

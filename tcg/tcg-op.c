@@ -2727,6 +2727,25 @@ void tcg_gen_lookup_and_goto_ptr(void)
     plugin_gen_disable_mem_helpers();
     ptr = tcg_temp_ebb_new_ptr();
     gen_helper_lookup_tb_ptr(ptr, tcg_env);
-    tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
+    tcg_gen_goto_ptr(ptr);
     tcg_temp_free_ptr(ptr);
+}
+
+void tcg_gen_lookup_jc_and_goto_ptr(TCGv_i64 pc, uint64_t cs_base,
+                                    uint32_t flags)
+{
+    TCGv_ptr ptr;
+
+    tcg_debug_assert(!(tcg_ctx->gen_tb->cflags & CF_NO_GOTO_PTR));
+    plugin_gen_disable_mem_helpers();
+    ptr = tcg_temp_ebb_new_ptr();
+    gen_helper_lookup_tb_ptr_jc(ptr, tcg_env, pc, tcg_constant_i64(cs_base),
+                                tcg_constant_i32(flags));
+    tcg_gen_goto_ptr(ptr);
+    tcg_temp_free_ptr(ptr);
+}
+
+void tcg_gen_goto_ptr(TCGv_ptr ptr)
+{
+    tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
 }
