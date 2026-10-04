@@ -256,6 +256,37 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
     qatomic_set(&one_insn_per_tb, value);
 }
 
+static const char * const tcg_tso_names[] = {
+    [TCG_TSO_BARRIER] = "barrier",
+    [TCG_TSO_ACQREL] = "acqrel",
+    [TCG_TSO_NONE] = "none",
+};
+
+static char *tcg_get_tso(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_tso_names[tcg_tso_mode]);
+}
+
+static void tcg_set_tso(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "auto")) {
+        tcg_tso_mode = tcg_can_ldst_acqrel() ? TCG_TSO_ACQREL
+                                             : TCG_TSO_BARRIER;
+        return;
+    }
+    for (int i = 0; i < ARRAY_SIZE(tcg_tso_names); i++) {
+        if (tcg_tso_names[i] && !strcmp(value, tcg_tso_names[i])) {
+            if (i == TCG_TSO_ACQREL && !tcg_can_ldst_acqrel()) {
+                error_setg(errp, "x-tso=acqrel is not supported on this host");
+                return;
+            }
+            tcg_tso_mode = i;
+            return;
+        }
+    }
+    error_setg(errp, "Invalid 'x-tso' value: %s", value);
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -286,6 +317,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                    tcg_set_one_insn_per_tb);
     object_class_property_set_description(oc, "one-insn-per-tb",
         "Only put one guest insn in each translation block");
+
+    object_class_property_add_str(oc, "x-tso", tcg_get_tso, tcg_set_tso);
+    object_class_property_set_description(oc, "x-tso",
+        "Guest memory ordering: barrier (default), "
+        "acqrel (load-acquire/store-release accesses), "
+        "auto (acqrel where the host supports it, else barrier), "
+        "none (no barriers: unsafe, for measurement)");
 }
 
 static const TypeInfo tcg_accel_type = {
