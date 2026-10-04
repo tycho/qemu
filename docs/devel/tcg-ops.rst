@@ -813,6 +813,18 @@ specifies the length of the element (if applicable) in log2 8-bit units.
          ``TCGOP_VECE`` (MO_16, MO_32 or MO_64) in 128 bits.  The pattern
          is a constant, so a backend can pick the instructions for it.
 
+   * - zip_vec *v0*, *v1*, *v2*, *high*
+
+     - | Interleave: *v0* holds the elements of the low halves of *v1* and
+         *v2* (the high halves if *high* is 1), alternately from *v1* and
+         *v2*, starting with *v1*'s (128-bit vectors, elements of
+         ``TCGOP_VECE``).
+
+   * - ext_vec *v0*, *v1*, *v2*, *n*
+
+     - | Extract: bytes *n* to *n* + 15 of the concatenation *v1*:*v2*,
+         whose bytes 0 to 15 are *v1*'s (128-bit vectors, 0 <= *n* <= 15).
+
    * - tbl_vec *v0*, *v1*, *v2*
 
      - | Table lookup: byte *i* of *v0* is the byte of *v1* that byte *i*
