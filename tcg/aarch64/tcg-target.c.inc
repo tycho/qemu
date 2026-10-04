@@ -705,6 +705,12 @@ typedef enum {
     Ifp_rrr_FMAX      = 0x1e204800,
     Ifp_rrr_FMIN      = 0x1e205800,
     Ifp_rr_FSQRT      = 0x1e21c000,
+    Ifp_rr_FRINTN     = 0x1e244000,
+    Ifp_rr_FRINTP     = 0x1e24c000,
+    Ifp_rr_FRINTM     = 0x1e254000,
+    Ifp_rr_FRINTZ     = 0x1e25c000,
+    Ifp_rr_FRINTX     = 0x1e274000,
+    Ifp_rr_FRINTI     = 0x1e27c000,
     Ifp_rr_FCVT_SD    = 0x1e22c000,     /* single to double */
     Ifp_rr_FCVT_DS    = 0x1e624000,     /* double to single */
     /* Advanced SIMD scalar, with the size in the same bit as the type. */
@@ -3619,6 +3625,21 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_fsqrts_vec:
         tcg_out_insn(s, fp_rr, FSQRT, fsz, a0, a2);
         break;
+    case INDEX_op_frintxs_vec:
+        tcg_out_insn(s, fp_rr, FRINTX, fsz, a0, a2);
+        break;
+    case INDEX_op_frints_vec:
+        {
+            static const AArch64Insn frint[] = {
+                [TCG_FRINT_NEAREST] = Ifp_rr_FRINTN,
+                [TCG_FRINT_DOWN] = Ifp_rr_FRINTM,
+                [TCG_FRINT_UP] = Ifp_rr_FRINTP,
+                [TCG_FRINT_ZERO] = Ifp_rr_FRINTZ,
+                [TCG_FRINT_CURRENT] = Ifp_rr_FRINTI,
+            };
+            tcg_out_insn_fp_rr(s, frint[args[3]], fsz, a0, a2);
+        }
+        break;
     case INDEX_op_frecpes_vec:
         tcg_out_insn(s, fp_rr, FRECPE, fsz, a0, a2);
         break;
@@ -3756,6 +3777,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_fmins_vec:
     case INDEX_op_fmaxs_vec:
     case INDEX_op_fsqrts_vec:
+    case INDEX_op_frintxs_vec:
+    case INDEX_op_frints_vec:
     case INDEX_op_fmadds_vec:
     case INDEX_op_fmsubs_vec:
     case INDEX_op_fnmadds_vec:
@@ -3904,6 +3927,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fnmsubs_vec:
         return C_O1_I3(w, w, w, w);
     case INDEX_op_fsqrts_vec:
+    case INDEX_op_frintxs_vec:
+    case INDEX_op_frints_vec:
     case INDEX_op_frecpes_vec:
     case INDEX_op_frsqrtes_vec:
     case INDEX_op_fcvts_vec:
