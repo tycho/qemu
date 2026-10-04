@@ -75,8 +75,8 @@ extern bool tcg_vecmem;
 extern bool tcg_vperm;
 
 /*
- * tcg_vpermvar: permutes by indices in a register (x86 vpermd/vpermps)
- * as host table lookups (tbl_vec) instead of helper calls.
+ * tcg_vpermvar: permutes by indices in a register (x86 vpermd, vpermps,
+ * pshufb) as host table lookups (tbl_vec) instead of helper calls.
  */
 extern bool tcg_vpermvar;
 
