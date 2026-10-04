@@ -115,8 +115,51 @@ static void gen_st_i64(TCGv_i64 v, TCGTemp *addr, MemOpIdx oi)
     gen_ldst1(INDEX_op_qemu_st, TCG_TYPE_I64, tcgv_i64_temp(v), addr, oi);
 }
 
+/*
+ * Guest accesses that get no memory-order constraint:
+ *
+ *   - x-tso-stack (qemu-user): accesses the front end marks thread-private
+ *     (TCGContext.ldst_private, an x86 stack slot).  Another thread that
+ *     reaches that memory through a pointer keeps its own ordering, and a
+ *     release by this thread still orders these accesses before it; what
+ *     is lost is the order of this thread's own stack accesses against its
+ *     other accesses, as other threads would see it.
+ */
+static bool tcg_ldst_unordered_class(MemOp memop)
+{
+#ifdef CONFIG_USER_ONLY
+    if (tcg_tso_stack && tcg_ctx->ldst_private) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+/* The guest access being generated gets no memory-order constraint. */
+static bool tcg_ldst_private(void)
+{
+    return tcg_ctx->ldst_unordered;
+}
+
+/*
+ * Bracket the generation of one guest access.  An unordered access neither
+ * joins nor ends a run of grouped accesses (tcg_emit_op, tcg_tso_run_end).
+ */
+static void ldst_begin(MemOp memop)
+{
+    tcg_ctx->ldst_unordered = tcg_ldst_unordered_class(memop);
+}
+
+static void ldst_end(void)
+{
+    tcg_ctx->ldst_unordered = false;
+}
+
 static void tcg_gen_req_mo(TCGBar type)
 {
+    if (tcg_ldst_private()) {
+        return;
+    }
     type &= tcg_ctx->guest_mo;
     type &= ~TCG_TARGET_DEFAULT_MO;
     if (type && tcg_tso_mode != TCG_TSO_NONE) {
@@ -152,6 +195,9 @@ static bool tcg_mb_emitted(void)
  */
 static MemOp tcg_gen_ldst_order(TCGBar type)
 {
+    if (tcg_ldst_private()) {
+        return 0;
+    }
     type &= tcg_ctx->guest_mo;
     type &= ~TCG_TARGET_DEFAULT_MO;
     if (!type || tcg_tso_mode == TCG_TSO_NONE) {
@@ -362,7 +408,9 @@ void tcg_gen_qemu_ld_i32_chk(TCGv_i32 val, TCGTemp *addr, TCGArg idx,
 {
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & MO_SIZE) <= MO_32);
+    ldst_begin(memop);
     tcg_gen_qemu_ld_i32_int(val, addr, idx, memop);
+    ldst_end();
 }
 
 static void tcg_gen_qemu_st_i32_int(TCGv_i32 orig_val, TCGTemp *addr,
@@ -411,7 +459,9 @@ void tcg_gen_qemu_st_i32_chk(TCGv_i32 val, TCGTemp *addr, TCGArg idx,
 {
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & MO_SIZE) <= MO_32);
+    ldst_begin(memop);
     tcg_gen_qemu_st_i32_int(val, addr, idx, memop);
+    ldst_end();
 }
 
 static void tcg_gen_qemu_ld_i64_int(TCGv_i64 val, TCGTemp *addr,
@@ -482,7 +532,9 @@ void tcg_gen_qemu_ld_i64_chk(TCGv_i64 val, TCGTemp *addr, TCGArg idx,
 {
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & MO_SIZE) <= MO_64);
+    ldst_begin(memop);
     tcg_gen_qemu_ld_i64_int(val, addr, idx, memop);
+    ldst_end();
 }
 
 static void tcg_gen_qemu_st_i64_int(TCGv_i64 orig_val, TCGTemp *addr,
@@ -534,7 +586,9 @@ void tcg_gen_qemu_st_i64_chk(TCGv_i64 val, TCGTemp *addr, TCGArg idx,
 {
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & MO_SIZE) <= MO_64);
+    ldst_begin(memop);
     tcg_gen_qemu_st_i64_int(val, addr, idx, memop);
+    ldst_end();
 }
 
 /*
@@ -682,6 +736,10 @@ void tcg_tso_run_end(void)
 {
     bool ld = tcg_ctx->tso_run_ld;
 
+    if (tcg_ctx->ldst_unordered) {
+        return;
+    }
+
     tcg_ctx->tso_run_ld = false;
     tcg_ctx->tso_run_st = false;
     if (ld) {
@@ -828,7 +886,9 @@ void tcg_gen_qemu_ld_i128_chk(TCGv_i128 val, TCGTemp *addr, TCGArg idx,
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & MO_SIZE) == MO_128);
     tcg_debug_assert((memop & MO_SIGN) == 0);
+    ldst_begin(memop);
     tcg_gen_qemu_ld_i128_int(val, addr, idx, memop);
+    ldst_end();
 }
 
 static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
@@ -958,7 +1018,9 @@ void tcg_gen_qemu_st_i128_chk(TCGv_i128 val, TCGTemp *addr, TCGArg idx,
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert((memop & MO_SIZE) == MO_128);
     tcg_debug_assert((memop & MO_SIGN) == 0);
+    ldst_begin(memop);
     tcg_gen_qemu_st_i128_int(val, addr, idx, memop);
+    ldst_end();
 }
 
 void tcg_gen_ext_i32(TCGv_i32 ret, TCGv_i32 val, MemOp opc)
