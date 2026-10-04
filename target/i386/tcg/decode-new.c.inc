@@ -3232,6 +3232,7 @@ static bool validate_cr0_exceptions(DisasContext *s, X86DecodedInsn *decode)
         gen_NM_exception(s);
         return false;
     }
+    decode->cr0_check = true;
     return true;
 }
 
@@ -3596,6 +3597,7 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         get_modrm(s, env);
     }
 
+    decode.cr0_check = false;
     if (decode.e.vex_class == 0) {
         if (s->prefix & (PREFIX_VEX | PREFIX_EVEX)) {
             goto illegal_op;
@@ -3662,6 +3664,15 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
 
     if ((s->prefix & PREFIX_LOCK) && !accept_lock) {
         goto illegal_op;
+    }
+
+    /* After all of the insn's bytes are fetched: no restart past here. */
+    if (decode.cr0_check) {
+        /* As in validate_cr0_exceptions: EM first, not for VEX insns. */
+        if (!(s->prefix & PREFIX_VEX)) {
+            gen_check_cr0_fp(s, HF_EM_MASK, false, EXCP06_ILLOP);
+        }
+        gen_check_cr0_fp(s, HF_TS_MASK, false, EXCP07_PREX);
     }
 
     /*
