@@ -792,6 +792,99 @@ static bool gen_vperm_unpck(DisasContext *s, X86DecodedInsn *decode,
     return gen_vperm(s, decode, vece, 1, 2, pat);
 }
 
+/*
+ * With tcg_vint, an integer vector operation on each 128-bit lane: lane l
+ * of operand 0 is fn(lane l of operands src1 and src2).  src2 < 0 passes
+ * a zero vector.  All lanes are read before any is written, so operand 0
+ * may also be a source.  The caller checks that the backend has the ops
+ * fn uses.
+ */
+typedef void VIntLaneFn(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t c);
+
+static bool gen_vint_lanes(DisasContext *s, X86DecodedInsn *decode,
+                           int src1, int src2, VIntLaneFn *fn, int64_t c)
+{
+    int lanes = vector_len(s, decode) / 16;
+    TCGv_vec r[2], zero = NULL;
+
+    if (!tcg_vint || decode->op[0].unit != X86_OP_SSE) {
+        return false;
+    }
+    if (src2 < 0) {
+        zero = tcg_constant_vec(TCG_TYPE_V128, MO_64, 0);
+    }
+    for (int l = 0; l < lanes; l++) {
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec b = zero;
+
+        tcg_gen_ld_vec(a, tcg_env, decode->op[src1].offset + 16 * l);
+        if (src2 >= 0 && decode->op[src2].offset == decode->op[src1].offset) {
+            b = a;
+        } else if (src2 >= 0) {
+            b = tcg_temp_new_vec(TCG_TYPE_V128);
+            tcg_gen_ld_vec(b, tcg_env, decode->op[src2].offset + 16 * l);
+        }
+        r[l] = tcg_temp_new_vec(TCG_TYPE_V128);
+        fn(r[l], a, b, c);
+    }
+    for (int l = 0; l < lanes; l++) {
+        tcg_gen_st_vec(r[l], tcg_env, decode->op[0].offset + 16 * l);
+    }
+    return true;
+}
+
+static bool vint_can(TCGOpcode opc, unsigned vece)
+{
+    return tcg_vint && tcg_can_emit_vec_op(opc, TCG_TYPE_V128, vece) > 0;
+}
+
+static void vint_zip_b(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t high)
+{
+    tcg_gen_zip_vec(MO_8, r, a, b, high);
+}
+
+/* Bytes n to n + 15 of b:a, for 0 <= n < 32 (b's bytes come first). */
+static void vint_align(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t n)
+{
+    if (n == 0) {
+        tcg_gen_mov_vec(r, b);
+    } else if (n < 16) {
+        tcg_gen_ext_vec(r, b, a, n);
+    } else if (n == 16) {
+        tcg_gen_mov_vec(r, a);
+    } else {
+        tcg_gen_ext_vec(r, a, tcg_constant_vec(TCG_TYPE_V128, MO_64, 0),
+                        n - 16);
+    }
+}
+
+/* Byte shifts of a by n: left for n < 0, right for n > 0. */
+static void vint_byteshift(TCGv_vec r, TCGv_vec a, TCGv_vec zero, int64_t n)
+{
+    if (n == 0) {
+        tcg_gen_mov_vec(r, a);
+    } else if (n <= -16 || n >= 16) {
+        tcg_gen_mov_vec(r, zero);
+    } else if (n < 0) {
+        tcg_gen_ext_vec(r, zero, a, 16 + n);
+    } else {
+        tcg_gen_ext_vec(r, a, zero, n);
+    }
+}
+
+#define PUNPCK_BYTES(uname, lname, high)                                      \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    if ((s->prefix & PREFIX_DATA) && vint_can(INDEX_op_zip_vec, MO_8)         \
+        && gen_vint_lanes(s, decode, 1, 2, vint_zip_b, high)) {               \
+        return;                                                               \
+    }                                                                         \
+    gen_binary_int_sse(s, decode,                                             \
+                          gen_helper_##lname##_mmx,                           \
+                          gen_helper_##lname##_xmm,                           \
+                          gen_helper_##lname##_ymm);                          \
+}
+
 #define FP_UNPACK_SSE(uname, lname, high)                                     \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
 {                                                                             \
@@ -1070,12 +1163,12 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
                           gen_helper_##lname##_xmm,                           \
                           gen_helper_##lname##_ymm);                          \
 }
-BINARY_INT_MMX(PUNPCKLBW,  punpcklbw)
+PUNPCK_BYTES(PUNPCKLBW,  punpcklbw, false)
 PUNPCK_INT_MMX(PUNPCKLWD,  punpcklwd, MO_16, false)
 PUNPCK_INT_MMX(PUNPCKLDQ,  punpckldq, MO_32, false)
 BINARY_INT_MMX(PACKSSWB,   packsswb)
 BINARY_INT_MMX(PACKUSWB,   packuswb)
-BINARY_INT_MMX(PUNPCKHBW,  punpckhbw)
+PUNPCK_BYTES(PUNPCKHBW,  punpckhbw, true)
 PUNPCK_INT_MMX(PUNPCKHWD,  punpckhwd, MO_16, true)
 PUNPCK_INT_MMX(PUNPCKHDQ,  punpckhdq, MO_32, true)
 BINARY_INT_MMX(PACKSSDW,   packssdw)
@@ -3074,7 +3167,23 @@ static void gen_OUTS(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_PALIGNR(DisasContext *s, X86DecodedInsn *decode)
 {
-    TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
+    TCGv_i32 imm;
+
+    /* Bytes imm to imm + 15 of op2:op1 (op2's bytes come first). */
+    if ((s->prefix & PREFIX_DATA) && vint_can(INDEX_op_ext_vec, MO_8)) {
+        if ((uint8_t)decode->immediate >= 32) {
+            int vec_len = vector_len(s, decode);
+
+            tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset,
+                                 vec_len, vec_len, 0);
+            return;
+        }
+        if (gen_vint_lanes(s, decode, 1, 2, vint_align,
+                           (uint8_t)decode->immediate)) {
+            return;
+        }
+    }
+    imm = tcg_constant8u_i32(decode->immediate);
     if (!(s->prefix & PREFIX_DATA)) {
         gen_helper_palignr_mmx(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2, imm);
     } else if (!s->vex_l) {
@@ -3500,7 +3609,14 @@ static TCGv_ptr make_imm8u_xmm_vec(uint8_t imm, int vec_len)
 static void gen_PSRLDQ_i(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
-    TCGv_ptr imm_vec = make_imm8u_xmm_vec(decode->immediate, vec_len);
+    TCGv_ptr imm_vec;
+
+    if (vint_can(INDEX_op_ext_vec, MO_8)
+        && gen_vint_lanes(s, decode, 1, -1, vint_byteshift,
+                          (int64_t)MIN((uint8_t)decode->immediate, 16))) {
+        return;
+    }
+    imm_vec = make_imm8u_xmm_vec(decode->immediate, vec_len);
 
     if (s->vex_l) {
         gen_helper_psrldq_ymm(tcg_env, OP_PTR0, OP_PTR1, imm_vec);
@@ -3512,7 +3628,14 @@ static void gen_PSRLDQ_i(DisasContext *s, X86DecodedInsn *decode)
 static void gen_PSLLDQ_i(DisasContext *s, X86DecodedInsn *decode)
 {
     int vec_len = vector_len(s, decode);
-    TCGv_ptr imm_vec = make_imm8u_xmm_vec(decode->immediate, vec_len);
+    TCGv_ptr imm_vec;
+
+    if (vint_can(INDEX_op_ext_vec, MO_8)
+        && gen_vint_lanes(s, decode, 1, -1, vint_byteshift,
+                          -(int64_t)MIN((uint8_t)decode->immediate, 16))) {
+        return;
+    }
+    imm_vec = make_imm8u_xmm_vec(decode->immediate, vec_len);
 
     if (s->vex_l) {
         gen_helper_pslldq_ymm(tcg_env, OP_PTR0, OP_PTR1, imm_vec);

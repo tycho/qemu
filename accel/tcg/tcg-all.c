@@ -258,7 +258,7 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
 
 static bool tcg_get_simd(Object *obj, Error **errp)
 {
-    return tcg_vecld && tcg_vecmem && tcg_vperm && tcg_vpermvar;
+    return tcg_vecld && tcg_vecmem && tcg_vperm && tcg_vpermvar && tcg_vint;
 }
 
 static void tcg_set_simd(Object *obj, bool value, Error **errp)
@@ -267,6 +267,7 @@ static void tcg_set_simd(Object *obj, bool value, Error **errp)
     tcg_vecmem = value;
     tcg_vperm = value;
     tcg_vpermvar = value;
+    tcg_vint = value;
 }
 
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
@@ -304,7 +305,8 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-simd",
         "Keep guest vector code in host vector registers where the host "
         "backend can: vector loads and stores as host vector accesses, "
-        "permutes and element inserts as host permutes and table lookups");
+        "permutes and element inserts as host permutes and table lookups, "
+        "integer vector operations as host vector operations");
 }
 
 static const TypeInfo tcg_accel_type = {
