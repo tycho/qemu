@@ -797,6 +797,14 @@ specifies the length of the element (if applicable) in log2 8-bit units.
      - | A 128-bit vector from two 64-bit integers: element 0 is *r1*,
          element 1 is *r2* (elements of ``TCGOP_VECE`` = MO_64).
 
+   * - qemu_ld_vec *v0*, *t1*, *flags*, *memidx*
+
+       qemu_st_vec *v0*, *t1*, *flags*, *memidx*
+
+     - | As qemu_ld/st_i128, with the 128-bit value in the vector *v0*.
+         Only for accesses that need at most two single-copy atomic 64-bit
+         halves, with no byte swap: check with tcg_can_qemu_ldst_vec().
+
    * - dupi_vec *v0*, *c*
 
      - | Similarly, for a constant.
