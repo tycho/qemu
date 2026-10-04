@@ -256,6 +256,22 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
     qatomic_set(&one_insn_per_tb, value);
 }
 
+static char *tcg_get_flags(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_flags_guess ? "guess" : "off");
+}
+
+static void tcg_set_flags(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "guess")) {
+        tcg_flags_guess = true;
+    } else if (!strcmp(value, "off")) {
+        tcg_flags_guess = false;
+    } else {
+        error_setg(errp, "Invalid 'x-flags' value: %s", value);
+    }
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -286,6 +302,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                    tcg_set_one_insn_per_tb);
     object_class_property_set_description(oc, "one-insn-per-tb",
         "Only put one guest insn in each translation block");
+
+    object_class_property_add_str(oc, "x-flags", tcg_get_flags,
+                                  tcg_set_flags);
+    object_class_property_set_description(oc, "x-flags",
+        "Guest condition codes at block entry: off (compute them with the "
+        "front end's helper) or guess (inline code for the state the "
+        "block was translated in, tested at run time)");
 }
 
 static const TypeInfo tcg_accel_type = {
