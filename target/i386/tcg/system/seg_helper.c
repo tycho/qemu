@@ -225,9 +225,9 @@ bool x86_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 }
 
 /* check if Port I/O is allowed in TSS */
-void helper_check_io(CPUX86State *env, uint32_t addr, uint32_t size)
+static void check_io(CPUX86State *env, uint32_t addr, uint32_t size,
+                     uintptr_t retaddr)
 {
-    uintptr_t retaddr = GETPC();
     uint32_t io_offset, val, mask;
 
     /* TSS must be a valid 32 bit one */
@@ -249,5 +249,18 @@ void helper_check_io(CPUX86State *env, uint32_t addr, uint32_t size)
     if ((val & mask) != 0) {
     fail:
         raise_exception_err_ra(env, EXCP0D_GPF, 0, retaddr);
+    }
+}
+
+void helper_check_io(CPUX86State *env, uint32_t addr, uint32_t size)
+{
+    check_io(env, addr, size, GETPC());
+}
+
+/* tcg_iopl_runtime, CPL > 0: the TSS check applies only if CPL > IOPL. */
+void helper_check_io_iopl(CPUX86State *env, uint32_t addr, uint32_t size)
+{
+    if ((env->hflags & HF_CPL_MASK) > ((env->eflags >> IOPL_SHIFT) & 3)) {
+        check_io(env, addr, size, GETPC());
     }
 }

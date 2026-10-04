@@ -31,6 +31,12 @@
  */
 extern bool tcg_fpcheck_runtime;
 
+/*
+ * x86 guests outside virtual-8086 mode: EFLAGS.IOPL is not part of the TB
+ * flags; the instructions that depend on it test it at run time.
+ */
+extern bool tcg_iopl_runtime;
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size
