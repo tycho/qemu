@@ -2059,9 +2059,82 @@ BINARY_INT_SSE(VAESDECLAST, aesdeclast)
 BINARY_INT_SSE(VAESENC, aesenc)
 BINARY_INT_SSE(VAESENCLAST, aesenclast)
 
-#define UNARY_CMP_SSE(uname, lname)                                                \
+/* The OR of the two 64-bit halves of @v, as an integer. */
+static TCGv_i64 vint_or_halves(TCGv_vec v)
+{
+    TCGv_i64 lo = tcg_temp_new_i64(), hi = tcg_temp_new_i64();
+
+    tcg_gen_extract_vec_i64(MO_64, lo, v, 0);
+    tcg_gen_extract_vec_i64(MO_64, hi, v, 1);
+    tcg_gen_or_i64(lo, lo, hi);
+    return lo;
+}
+
+/*
+ * With tcg_vint, PTEST/VPTEST and VTESTPS/VTESTPD: ZF if op2 & op1 is zero,
+ * CF if op2 & ~op1 is zero (for VTESTP*, in the sign bits of elements of
+ * sign_vece only; sign_vece < 0 for all bits); the other flags clear.
+ */
+static bool gen_vint_ptest(DisasContext *s, X86DecodedInsn *decode,
+                           int sign_vece)
+{
+    int lanes = vector_len(s, decode) / 16;
+    TCGv_vec z = NULL, c = NULL;
+    TCGv_i64 zx, cx;
+    TCGv t;
+
+    if (!tcg_vint || !vint_can(INDEX_op_extract_vec, MO_64)
+        || !vint_can(INDEX_op_andc_vec, MO_64)) {
+        return false;
+    }
+    for (int l = 0; l < lanes; l++) {
+        TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec zl = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec cl = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(d, tcg_env, decode->op[1].offset + 16 * l);
+        tcg_gen_ld_vec(v, tcg_env, decode->op[2].offset + 16 * l);
+        tcg_gen_and_vec(MO_64, zl, v, d);
+        tcg_gen_andc_vec(MO_64, cl, v, d);
+        if (sign_vece >= 0) {
+            TCGv_vec m = tcg_constant_vec(TCG_TYPE_V128, sign_vece,
+                                          1ull << ((8 << sign_vece) - 1));
+
+            tcg_gen_and_vec(MO_64, zl, zl, m);
+            tcg_gen_and_vec(MO_64, cl, cl, m);
+        }
+        if (l) {
+            tcg_gen_or_vec(MO_64, z, z, zl);
+            tcg_gen_or_vec(MO_64, c, c, cl);
+        } else {
+            z = zl;
+            c = cl;
+        }
+    }
+    zx = vint_or_halves(z);
+    cx = vint_or_halves(c);
+    tcg_gen_setcondi_i64(TCG_COND_EQ, zx, zx, 0);
+    tcg_gen_setcondi_i64(TCG_COND_EQ, cx, cx, 0);
+    tcg_gen_shli_i64(zx, zx, ctz32(CC_Z));
+    tcg_gen_or_i64(zx, zx, cx);
+    t = tcg_temp_new();
+#ifdef TARGET_X86_64
+    tcg_gen_mov_i64(t, zx);
+#else
+    tcg_gen_extrl_i64_i32(t, zx);
+#endif
+    decode->cc_src = t;
+    decode->cc_op = CC_OP_EFLAGS;
+    return true;
+}
+
+#define UNARY_CMP_SSE(uname, lname, sign_vece)                                     \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
 {                                                                                  \
+    if (gen_vint_ptest(s, decode, sign_vece)) {                                    \
+        return;                                                                    \
+    }                                                                              \
     if (!s->vex_l) {                                                               \
         gen_helper_##lname##_xmm(tcg_env, OP_PTR1, OP_PTR2);                       \
     } else {                                                                       \
@@ -2069,9 +2142,9 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
     }                                                                              \
     assume_cc_op(s, CC_OP_EFLAGS);                                                  \
 }
-UNARY_CMP_SSE(VPTEST,     ptest)
-UNARY_CMP_SSE(VTESTPS,    vtestps)
-UNARY_CMP_SSE(VTESTPD,    vtestpd)
+UNARY_CMP_SSE(VPTEST,     ptest, -1)
+UNARY_CMP_SSE(VTESTPS,    vtestps, MO_32)
+UNARY_CMP_SSE(VTESTPD,    vtestpd, MO_64)
 
 static inline void gen_unary_int_sse(DisasContext *s, X86DecodedInsn *decode,
                                      SSEFunc_0_epp xmm, SSEFunc_0_epp ymm)
@@ -3871,10 +3944,98 @@ static void gen_MOVDQ(DisasContext *s, X86DecodedInsn *decode)
     gen_store_sse(s, decode, decode->op[2].offset);
 }
 
+/*
+ * With tcg_vint, PMOVMSKB/MOVMSKPS/MOVMSKPD: the sign bits of op2's elements
+ * of size vece into T0.  Per 128-bit lane: bytes or dwords become 0/-1
+ * masks, take a weight bit each from a 64-bit pattern repeated across the
+ * vector, and pairwise adds gather them; qwords are extracted.
+ */
+static bool gen_vint_movmsk(DisasContext *s, X86DecodedInsn *decode,
+                            unsigned vece)
+{
+    int lanes = vector_len(s, decode) / 16;
+    TCGv_i64 acc, x;
+
+    if (!tcg_vint || decode->op[2].unit != X86_OP_SSE
+        || !vint_can(INDEX_op_extract_vec, MO_64)
+        || (vece == MO_8 && !(vint_can(INDEX_op_addp_vec, MO_8)
+                              && vint_can(INDEX_op_cmp_vec, MO_8)))
+        || (vece == MO_32 && !(vint_can(INDEX_op_addp_vec, MO_32)
+                               && vint_can(INDEX_op_sari_vec, MO_32)))
+        || (vece == MO_64 && !vint_can(INDEX_op_shri_vec, MO_64))) {
+        return false;
+    }
+    acc = tcg_temp_new_i64();
+    x = tcg_temp_new_i64();
+    tcg_gen_movi_i64(acc, 0);
+    for (int l = 0; l < lanes; l++) {
+        TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec m = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(v, tcg_env, decode->op[2].offset + 16 * l);
+        switch (vece) {
+        case MO_8:
+            tcg_gen_cmp_vec(TCG_COND_LT, MO_8, m, v,
+                            tcg_constant_vec(TCG_TYPE_V128, MO_8, 0));
+            tcg_gen_and_vec(MO_64, m, m,
+                            tcg_constant_vec(TCG_TYPE_V128, MO_64,
+                                             0x8040201008040201ull));
+            for (int k = 0; k < 3; k++) {
+                tcg_gen_addp_vec(MO_8, m, m, m);
+            }
+            /* bytes 0 and 1: the masks of bytes 0-7 and 8-15 */
+            tcg_gen_extract_vec_i64(MO_16, x, m, 0);
+            tcg_gen_shli_i64(x, x, 16 * l);
+            break;
+        case MO_32:
+            tcg_gen_sari_vec(MO_32, m, v, 31);
+            tcg_gen_and_vec(MO_64, m, m,
+                            tcg_constant_vec(TCG_TYPE_V128, MO_64,
+                                             0x0000000200000001ull));
+            tcg_gen_addp_vec(MO_32, m, m, m);
+            /* dwords 0 and 1: the masks of elements 0-1 and 2-3 */
+            tcg_gen_extract_vec_i64(MO_64, x, m, 0);
+            {
+                TCGv_i64 hi = tcg_temp_new_i64();
+
+                tcg_gen_shri_i64(hi, x, 30);
+                tcg_gen_or_i64(x, x, hi);
+            }
+            tcg_gen_andi_i64(x, x, 0xf);
+            tcg_gen_shli_i64(x, x, 4 * l);
+            break;
+        default:
+            tcg_gen_shri_vec(MO_64, m, v, 63);
+            {
+                TCGv_i64 hi = tcg_temp_new_i64();
+
+                tcg_gen_extract_vec_i64(MO_64, x, m, 0);
+                tcg_gen_extract_vec_i64(MO_64, hi, m, 1);
+                tcg_gen_shli_i64(hi, hi, 1);
+                tcg_gen_or_i64(x, x, hi);
+            }
+            tcg_gen_shli_i64(x, x, 2 * l);
+            break;
+        }
+        tcg_gen_or_i64(acc, acc, x);
+    }
+#ifdef TARGET_X86_64
+    tcg_gen_mov_i64(s->T0, acc);
+#else
+    tcg_gen_extrl_i64_i32(s->T0, acc);
+#endif
+    return true;
+}
+
 static void gen_MOVMSK(DisasContext *s, X86DecodedInsn *decode)
 {
     typeof(gen_helper_movmskps_ymm) *ps, *pd, *fn;
-    TCGv_i32 tmp = tcg_temp_new_i32();
+    TCGv_i32 tmp;
+
+    if (gen_vint_movmsk(s, decode, s->prefix & PREFIX_DATA ? MO_64 : MO_32)) {
+        return;
+    }
+    tmp = tcg_temp_new_i32();
 
     ps = s->vex_l ? gen_helper_movmskps_ymm : gen_helper_movmskps_xmm;
     pd = s->vex_l ? gen_helper_movmskpd_ymm : gen_helper_movmskpd_xmm;
@@ -4330,8 +4491,12 @@ static void gen_PMOVMSKB(DisasContext *s, X86DecodedInsn *decode)
     };
     MemOp ot = decode->op[2].ot;
     int vec_len = vector_len(s, decode);
-    TCGv t = tcg_temp_new();
+    TCGv t;
 
+    if (gen_vint_movmsk(s, decode, MO_8)) {
+        return;
+    }
+    t = tcg_temp_new();
     tcg_gen_gvec_2(offsetof(CPUX86State, xmm_t0) + xmm_offset(ot), decode->op[2].offset,
                    vec_len, vec_len, &g);
     tcg_gen_ld8u_tl(s->T0, tcg_env, offsetof(CPUX86State, xmm_t0.ZMM_B(vec_len - 1)));
