@@ -104,10 +104,10 @@ static void tcg_vm_change_state(void *opaque, bool running, RunState state)
 static int tcg_init_machine(AccelState *as, MachineState *ms)
 {
     TCGState *s = TCG_STATE(as);
+    CPUClass *cc = CPU_CLASS(object_class_by_name(target_cpu_type()));
     unsigned max_threads = 1;
 
 #ifndef CONFIG_USER_ONLY
-    CPUClass *cc = CPU_CLASS(object_class_by_name(target_cpu_type()));
     bool mttcg_supported = cc->tcg_ops->mttcg_supported;
 
     switch (s->mttcg_enabled) {
@@ -163,6 +163,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
         as->gdbstub.can_reverse = true;
     }
 
+    tcg_jcgen = cc->tcg_ops->jmp_cache_salt;
     page_init();
     tb_htable_init();
     tcg_init(s->tb_size * MiB, s->splitwx_enabled, max_threads);
@@ -267,7 +268,6 @@ static bool tcg_get_tblookup(Object *obj, Error **errp)
 static void tcg_set_tblookup(Object *obj, bool value, Error **errp)
 {
     tcg_ijmp_inline = value;
-    tcg_jcgen = value;
     tcg_tbpack = value;
 }
 
@@ -307,8 +307,8 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-tblookup",
         "Find the next TB from generated code: probe the jump cache at "
         "indirect jumps (in a short helper call at direct jumps to "
-        "another page), flush the jump cache in O(1), and pack TB "
-        "structs next to their code (x86 guests)");
+        "another page), and pack TB structs next to their code (x86 "
+        "guests)");
 }
 
 static const TypeInfo tcg_accel_type = {
