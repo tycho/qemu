@@ -24,6 +24,7 @@
 #include "exec/translation-block.h"
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-op-gvec.h"
+#include "tcg/startup.h"
 #include "exec/translator.h"
 #include "exec/target_page.h"
 #include "fpu/softfloat.h"
@@ -3612,6 +3613,53 @@ void tcg_x86_init(void)
                                      offsetof(CPUX86State, bnd_regs[i].ub),
                                      bnd_regu_names[i]);
     }
+
+    /*
+     * With tcg_vecglobal, the low 128 bits of each xmm register as a
+     * vector global; whole-register loads and stores become moves of it.
+     */
+    if (tcg_vecglobal) {
+        static const char xmm_names[CPU_NB_REGS][6] = {
+            "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+#ifdef TARGET_X86_64
+            "xmm8", "xmm9", "xmm10", "xmm11",
+            "xmm12", "xmm13", "xmm14", "xmm15",
+#endif
+        };
+
+        for (i = 0; i < CPU_NB_REGS; ++i) {
+            tcg_global_mem_new_vec(tcg_env,
+                                   offsetof(CPUX86State, xmm_regs[i].ZMM_X(0)),
+                                   TCG_TYPE_V128, xmm_names[i]);
+        }
+    }
+
+    /*
+     * With tcg_ymmglobal, the upper 128 bits of each ymm register too, so
+     * that 256-bit AVX code, which hosts without 256-bit vectors run as
+     * two 128-bit halves, keeps both halves in host registers.
+     */
+    if (tcg_vecglobal && tcg_ymmglobal) {
+        static const char ymmh_names[CPU_NB_REGS][7] = {
+            "ymm0h", "ymm1h", "ymm2h", "ymm3h",
+            "ymm4h", "ymm5h", "ymm6h", "ymm7h",
+#ifdef TARGET_X86_64
+            "ymm8h", "ymm9h", "ymm10h", "ymm11h",
+            "ymm12h", "ymm13h", "ymm14h", "ymm15h",
+#endif
+        };
+
+        for (i = 0; i < CPU_NB_REGS; ++i) {
+            tcg_global_mem_new_vec(tcg_env,
+                                   offsetof(CPUX86State, xmm_regs[i].ZMM_X(1)),
+                                   TCG_TYPE_V128, ymmh_names[i]);
+        }
+    }
+
+    /* xmm_t0 and mmx_t0 hold an operand only within one instruction. */
+    tcg_set_env_scratch(offsetof(CPUX86State, xmm_t0),
+                        offsetof(CPUX86State, mmx_t0) + sizeof(MMXReg)
+                        - offsetof(CPUX86State, xmm_t0));
 }
 
 static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)

@@ -373,6 +373,21 @@ static void tcg_set_ssefp(Object *obj, const char *value, Error **errp)
     tcg_ssefp_vec = vec;
 }
 
+static bool tcg_get_regcache(Object *obj, Error **errp)
+{
+    return tcg_dse && tcg_ldstkeep && tcg_lazysync
+           && tcg_vecglobal && tcg_ymmglobal;
+}
+
+static void tcg_set_regcache(Object *obj, bool value, Error **errp)
+{
+    tcg_dse = value;
+    tcg_ldstkeep = value;
+    tcg_lazysync = value;
+    tcg_vecglobal = value;
+    tcg_ymmglobal = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -440,6 +455,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "and flags), native (run with the guest's FP mode in the host "
         "FPU; needs a host that can express it) or auto (native where "
         "possible, else vec on AArch64 hosts and soft elsewhere)");
+}
+
+    object_class_property_add_bool(oc, "x-regcache",
+                                   tcg_get_regcache, tcg_set_regcache);
+    object_class_property_set_description(oc, "x-regcache",
+        "Keep guest registers in host registers: remove dead stores to CPU "
+        "state, keep dirty and vector values in registers across guest "
+        "memory accesses, and the x86 vector registers as TCG globals");
 }
 
 static const TypeInfo tcg_accel_type = {

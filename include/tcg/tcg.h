@@ -120,6 +120,7 @@ typedef struct TCGPool {
 
 #define TCG_MAX_TEMPS 512
 #define TCG_MAX_INSNS 512
+#define TCG_MAX_ALIAS 32
 
 /* when the size of the arguments of a called function is smaller than
    this value, they are statically allocated in the TB stack frame */
@@ -279,6 +280,12 @@ typedef struct TCGTemp {
     unsigned int mem_allocated:1;
     unsigned int temp_allocated:1;
     unsigned int temp_subindex:2;
+    /*
+     * A global that the code also reaches through its memory: by loads
+     * and stores of env other than its own, and by helpers given
+     * pointers into env (tcg_global_mem_new_vec).
+     */
+    unsigned int env_alias:1;
 
     int64_t val;
     struct TCGTemp *mem_base;
@@ -343,6 +350,26 @@ static inline TCGRegSet output_pref(const TCGOp *op, unsigned i)
     return i < ARRAY_SIZE(op->output_pref) ? op->output_pref[i] : 0;
 }
 
+/* tcg_lazysync: a dirty global at a guest access, in a register or constant. */
+typedef struct TCGLdstWriteback {
+    TCGType type;
+    TCGReg reg;             /* the register holding the global's value */
+    TCGReg base;            /* its canonical location: base + offset */
+    intptr_t offset;
+    bool is_const;          /* the value is @val, in no register */
+    int64_t val;
+} TCGLdstWriteback;
+
+/*
+ * tcg_lazysync in user mode: a guest access's code, [start, end) from the
+ * start of the TB, and the dirty globals a fault there must store.
+ */
+typedef struct TCGLazyMap {
+    uint32_t start, end;
+    const TCGLdstWriteback *wb;
+    unsigned nb_wb;
+} TCGLazyMap;
+
 struct TCGContext {
     uintptr_t pool_cur, pool_end;
     TCGPool *pool_first, *pool_current, *pool_first_large;
@@ -350,11 +377,24 @@ struct TCGContext {
     int nb_globals;
     int nb_temps;
     int nb_indirects;
+    uint16_t *la_globals;       /* liveness: the globals the ops use */
+    int nb_la_globals;
+    int nb_alias;                         /* env_alias globals */
+    uint16_t alias_temp[TCG_MAX_ALIAS];   /* their temp indices */
+    TCGTemp *alias_base;                  /* their base, and the span */
+    intptr_t alias_lo, alias_hi;          /* of their memory */
     int nb_ops;
     TCGType addr_type;            /* TCG_TYPE_I32 or TCG_TYPE_I64 */
     TCGBar guest_mo;
 
     TCGRegSet reserved_regs;
+    TCGRegSet ldst_save_regs;   /* for the next guest access label */
+    TCGLdstWriteback *ldst_wb;  /* likewise, tcg_lazysync */
+    unsigned ldst_nb_wb;
+    struct TCGLazyDead *lazy_dead;  /* tcg_lazysync, from liveness */
+    int nb_lazy_dead;
+    TCGLazyMap *lazy_map;       /* tcg_lazysync, user mode: per access */
+    int nb_lazy_map;
     intptr_t current_frame_offset;
     intptr_t frame_start;
     intptr_t frame_end;
