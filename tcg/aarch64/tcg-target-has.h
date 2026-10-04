@@ -13,12 +13,19 @@
 #define have_lse2   (cpuinfo & CPUINFO_LSE2)
 #define have_lrcpc  (cpuinfo & CPUINFO_LRCPC)
 #define have_lrcpc2 (cpuinfo & CPUINFO_LRCPC2)
+#define have_lrcpc3 (cpuinfo & CPUINFO_LRCPC3)
 
 /*
  * MO_ACQ_REL guest accesses: LDAPR/STLR.  Unaligned ones rely on FEAT_LSE2
  * (they must not cross 16 bytes; the backend checks).
  */
 #define TCG_TARGET_HAS_qemu_ldst_acqrel (have_lrcpc && have_lse2)
+/* 16-byte aligned, single-copy atomic acquire/release: LDIAPP/STILP */
+/* 16-byte aligned vector load-acquire/store-release: LDAPUR/STLUR (Q) */
+#define TCG_TARGET_HAS_qemu_ldst_vec_acqrel \
+    (TCG_TARGET_HAS_qemu_ldst_acqrel && have_lrcpc3)
+#define TCG_TARGET_HAS_qemu_ldst_i128_acqrel \
+    (TCG_TARGET_HAS_qemu_ldst_acqrel && have_lrcpc3)
 
 /* optional instructions */
 #define TCG_TARGET_HAS_extr_i64_i32     0
