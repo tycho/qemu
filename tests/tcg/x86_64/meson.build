@@ -63,6 +63,7 @@ tests += {
   'fma.c': {},
   'noexec.c': {},
   'segment-prefixes.c': {},
+  'sse-scalar-mem.c': {},
   'test-1648.c': {},
   'test-2175.c': {},
   'test-2413.c': {},
