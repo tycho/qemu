@@ -832,6 +832,19 @@ specifies the length of the element (if applicable) in log2 8-bit units.
          zero-extended, from ``TCGOP_VECE`` (MO_8, MO_16 or MO_32) to twice
          that size (128-bit vectors).
 
+   * - mulw_vec *v0*, *v1*, *v2*, *k*
+
+     - | Widening multiply: element *i* of *v0* is the exact product of
+         elements *i* of the low halves of *v1* and *v2* (the high halves if
+         bit 1 of *k* is set), signed if bit 0 of *k* is set, at twice the
+         element size ``TCGOP_VECE`` (MO_8, MO_16 or MO_32) of the inputs.
+
+   * - addp_vec *v0*, *v1*, *v2*
+
+     - | Pairwise add: element *i* of *v0* is the sum, modulo 2 to the
+         element size, of elements 2 * *i* and 2 * *i* + 1 of the
+         concatenation *v1*:*v2* (128-bit vectors).
+
    * - tbl_vec *v0*, *v1*, *v2*
 
      - | Table lookup: byte *i* of *v0* is the byte of *v1* that byte *i*
