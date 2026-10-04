@@ -436,6 +436,16 @@ struct TCGContext {
     uint16_t gen_insn_end_off[TCG_MAX_INSNS];
     uint64_t *gen_insn_data;
 
+    /*
+     * The guest pc of each insn, as the translator saw it (insn_pc is the
+     * one being translated), and during code generation the index of the
+     * insn being emitted: backends use gen_insn_pc[gen_cur_insn] to name
+     * the guest insn of an op.
+     */
+    uint64_t insn_pc;
+    uint64_t gen_insn_pc[TCG_MAX_INSNS];
+    int gen_cur_insn;
+
     /* Exit to translator on overflow. */
     sigjmp_buf jmp_trans;
 };
