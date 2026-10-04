@@ -794,6 +794,23 @@ static MemOp qemu_ldst_vec_memop(MemOp memop)
     return memop;
 }
 
+/*
+ * x-tso=acqrel: whether a vector access can itself be a load-acquire or
+ * store-release (aarch64: FEAT_LRCPC3 LDAPUR/STLUR of a Q register, which
+ * fault when crossing 16 bytes: aligned accesses only).
+ */
+bool tcg_can_qemu_ldst_vec_acqrel(void)
+{
+    return TCG_TARGET_HAS_qemu_ldst_vec_acqrel &&
+           tcg_tso_mode == TCG_TSO_ACQREL;
+}
+
+static bool tcg_ldst_vec_acqrel(MemOp memop)
+{
+    return tcg_can_qemu_ldst_vec_acqrel() &&
+           memop_alignment_bits(memop) >= MO_128;
+}
+
 bool tcg_can_qemu_ldst_vec(MemOp memop)
 {
     MemOp atom = qemu_ldst_vec_memop(memop) & MO_ATOM_MASK;
@@ -829,6 +846,10 @@ void tcg_gen_qemu_ld_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
      * so a barrier follows it instead.
      */
     after = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
+    if (after && tcg_ldst_vec_acqrel(memop)) {
+        memop |= MO_ACQ_REL;
+        after = false;
+    }
 
     addr_new = tci_extend_addr(addr);
     gen_ldst1(INDEX_op_qemu_ld_vec, TCG_TYPE_V128, tcgv_vec_temp(val),
@@ -848,7 +869,12 @@ void tcg_gen_qemu_st_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert(tcg_can_qemu_ldst_vec(memop));
     check_max_alignment(memop_alignment_bits(memop));
-    tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
+    if (tcg_ldst_vec_acqrel(memop)) {
+        /* A store-release orders earlier loads and stores before it. */
+        memop |= tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST);
+    } else {
+        tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
+    }
 
     addr_new = tci_extend_addr(addr);
     gen_ldst1(INDEX_op_qemu_st_vec, TCG_TYPE_V128, tcgv_vec_temp(val),
