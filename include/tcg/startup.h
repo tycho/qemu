@@ -50,6 +50,13 @@ typedef enum TCGTsoMode {
 extern TCGTsoMode tcg_tso_mode;
 
 /*
+ * In qemu-user, guest accesses the front end marks as thread-private
+ * (TCGContext.ldst_private: x86 RSP-based and implicit stack accesses)
+ * get no memory-order constraint (accel property x-tso-stack).
+ */
+extern bool tcg_tso_stack;
+
+/*
  * With TCG_TSO_ACQREL, a guest insn whose MO_ACQ_REL accesses have crossed
  * a 16-byte boundary is promoted: retranslated with MO_ACQ_REL_CROSS, a
  * form that handles any alignment without a data-dependent branch.
