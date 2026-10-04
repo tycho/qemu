@@ -238,6 +238,7 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 
 TCGContext tcg_init_ctx;
 bool tcg_ssefp_vec;
+bool tcg_ssefp_native;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
