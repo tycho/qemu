@@ -474,6 +474,11 @@ void tcg_gen_stl_vec(TCGv_vec r, TCGv_ptr b, TCGArg o, TCGType low_type)
 
     tcg_debug_assert(low_type >= TCG_TYPE_V64);
     tcg_debug_assert(low_type <= type);
+    /* A whole vector: as tcg_gen_st_vec, which may write an alias global. */
+    if (low_type == type) {
+        tcg_gen_st_vec(r, b, o);
+        return;
+    }
     vec_gen_3(INDEX_op_st_vec, low_type, 0, ri, bi, o);
 }
 
