@@ -3583,6 +3583,14 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_tbl_vec:
         tcg_out_insn(s, qrrr_e, TBL, 1, 0, a0, a1, a2);
         break;
+    case INDEX_op_zip_vec:
+        tcg_out_insn_qrrr_e(s, args[3] ? Iqrrr_e_ZIP2 : Iqrrr_e_ZIP1, 1,
+                            vece, a0, a1, a2);
+        break;
+    case INDEX_op_ext_vec:
+        tcg_out32(s, Iqrrr_e_EXT | 1 << 30 | (a2 & 0x1f) << 16
+                  | (args[3] & 15) << 11 | (a1 & 0x1f) << 5 | (a0 & 0x1f));
+        break;
     case INDEX_op_qemu_ld_vec:
         tcg_out_qemu_ldst_vec(s, a0, a1, args[2], true);
         break;
@@ -3920,7 +3928,10 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_perm_vec:
         return type == TCG_TYPE_V128 && vece >= MO_16 && vece <= MO_64;
     case INDEX_op_tbl_vec:
+    case INDEX_op_ext_vec:
         return type == TCG_TYPE_V128 && vece == MO_8;
+    case INDEX_op_zip_vec:
+        return type == TCG_TYPE_V128;
 
     default:
         return 0;
@@ -4039,6 +4050,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O0_I2(w, r);
     case INDEX_op_perm_vec:
     case INDEX_op_tbl_vec:
+    case INDEX_op_zip_vec:
+    case INDEX_op_ext_vec:
         return C_O1_I2(w, w, w);
     case INDEX_op_dup_vec:
         return C_O1_I1(w, wr);
