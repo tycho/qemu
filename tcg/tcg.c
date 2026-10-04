@@ -2495,6 +2495,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_qemu_ldst_vec;
     case INDEX_op_perm_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_perm_vec;
+    case INDEX_op_extract_vec:
+        return has_type && TCG_TARGET_HAS_extract_vec;
 
     default:
         if (op < INDEX_op_last_generic) {
