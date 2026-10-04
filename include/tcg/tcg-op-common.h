@@ -500,6 +500,27 @@ void tcg_gen_mulw_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
  * tcg_can_emit_vec_op() first.
  */
 void tcg_gen_addp_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+/*
+ * How narrow_vec fits a wide element into a narrow one: keep its low bits,
+ * or saturate signed to signed, signed to unsigned, or unsigned to
+ * unsigned.
+ */
+typedef enum {
+    TCG_NARROW_TRUNC,
+    TCG_NARROW_SAT_S,
+    TCG_NARROW_SAT_SU,
+    TCG_NARROW_SAT_U,
+} TCGNarrow;
+/*
+ * Narrow: r is the elements of a, then those of b, each shifted right by
+ * @shift (0 <= shift <= the narrow element size; arithmetically for the
+ * signed saturations, else logically, which for TCG_NARROW_TRUNC gives the
+ * same bits; with @round, after adding 1 << (shift - 1) at full
+ * precision), then fitted by @kind into vece (MO_8, MO_16 or MO_32) from
+ * vece + 1.  No fallback: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_narrow_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                        TCGNarrow kind, unsigned shift, bool round);
 void tcg_gen_dup_mem_vec(unsigned vece, TCGv_vec, TCGv_ptr, tcg_target_long);
 void tcg_gen_dupi_vec(unsigned vece, TCGv_vec, uint64_t);
 void tcg_gen_add_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);

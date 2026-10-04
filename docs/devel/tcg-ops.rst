@@ -845,6 +845,18 @@ specifies the length of the element (if applicable) in log2 8-bit units.
          element size, of elements 2 * *i* and 2 * *i* + 1 of the
          concatenation *v1*:*v2* (128-bit vectors).
 
+   * - narrow_vec *v0*, *v1*, *v2*, *k*
+
+     - | Narrow: *v0* holds the elements of *v1*, then those of *v2*, each
+         shifted right by *k* & 0xff (0 to the narrow element size;
+         arithmetically for the signed saturations, else logically; if bit 12
+         of *k* is set, rounding: 1 << (shift - 1) is added first, at full
+         precision), then fitted into ``TCGOP_VECE`` (MO_8, MO_16 or
+         MO_32) from twice that size by (*k* >> 8) & 15: keep the low
+         bits (``TCG_NARROW_TRUNC``), or saturate signed to signed
+         (``TCG_NARROW_SAT_S``), signed to unsigned (``TCG_NARROW_SAT_SU``)
+         or unsigned to unsigned (``TCG_NARROW_SAT_U``).
+
    * - tbl_vec *v0*, *v1*, *v2*
 
      - | Table lookup: byte *i* of *v0* is the byte of *v1* that byte *i*

@@ -151,6 +151,7 @@ DEF(ext_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(widen_vec, 1, 1, 1, TCG_OPF_VECTOR)
 DEF(mulw_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(addp_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(narrow_vec, 1, 2, 1, TCG_OPF_VECTOR)
 
 DEF(add_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(sub_vec, 1, 2, 0, TCG_OPF_VECTOR)
