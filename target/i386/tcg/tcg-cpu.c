@@ -62,6 +62,10 @@ static TCGTBCPUState x86_get_tb_cpu_state(CPUState *cs)
         /* The translator checks them at run time: gen_check_cr0_fp. */
         flags &= ~(HF_MP_MASK | HF_EM_MASK | HF_TS_MASK);
     }
+    if (tcg_iopl_runtime && !(env->eflags & VM_MASK)) {
+        /* The translator tests it at run time: gen_check_iopl. */
+        flags &= ~IOPL_MASK;
+    }
 #endif
     if (env->hflags & HF_CS64_MASK) {
         cs_base = 0;
