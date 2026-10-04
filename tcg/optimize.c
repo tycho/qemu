@@ -1602,9 +1602,18 @@ static bool fold_call(OptContext *ctx, TCGOp *op)
 
 static bool fold_cmp_vec(OptContext *ctx, TCGOp *op)
 {
+    int i;
+
     /* Canonicalize the comparison to put immediate second. */
     if (swap_commutative(NO_DEST, &op->args[1], &op->args[2])) {
         op->args[3] = tcg_swap_cond(op->args[3]);
+    }
+
+    /* A result known for every element: all ones or all zeros. */
+    i = do_constant_folding_cond(ctx->type, op->args[1], op->args[2],
+                                 op->args[3]);
+    if (i >= 0) {
+        return tcg_opt_gen_movi(ctx, op, op->args[0], -i);
     }
     return finish_folding(ctx, op);
 }
