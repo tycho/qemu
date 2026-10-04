@@ -32,10 +32,8 @@
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
 #include "helper-tcg.h"
-#include "tcg/startup.h"
 #include "host/counter.h"
 #include "decode-new.h"
-#include "tcg/startup.h"
 
 #include "exec/log.h"
 
