@@ -54,6 +54,7 @@ struct TCGState {
     bool one_insn_per_tb;
     int splitwx_enabled;
     unsigned long tb_size;
+    bool iofast;
 };
 typedef struct TCGState TCGState;
 
@@ -145,6 +146,34 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     }
 
     qemu_add_vm_change_state_handler(tcg_vm_change_state, NULL);
+
+    /*
+     * x-iofast: TBs end after instructions known to do I/O; MMIO from
+     * generated code to lockless_io regions skips the BQL; the x86 local
+     * APIC serves a vCPU's own TPR accesses and the MC146818 RTC its
+     * index writes and update-in-progress polls without the BQL; and the
+     * local APIC has no kvmvapic option ROM, which patches a guest's TPR
+     * accesses into port I/O so that KVM avoids an exit per access, but
+     * under TCG makes each one an I/O exit and invalidates code on its
+     * ROM page.  The device settings are accelerator compat properties,
+     * so an explicit -global still wins.
+     */
+    if (s->iofast) {
+        static GlobalProperty iofast_props[] = {
+            { "apic", "x-lockless-tpr", "on" },
+            { "apic", "vapic", "off" },
+            { "mc146818rtc", "x-lockless-uip", "on" },
+        };
+        AccelClass *ac = ACCEL_GET_CLASS(as);
+
+        tcg_iolast = true;
+        tcg_mmio_lockless = true;
+        if (!ac->compat_props) {
+            ac->compat_props = g_ptr_array_new();
+        }
+        compat_props_add(ac->compat_props, iofast_props,
+                         G_N_ELEMENTS(iofast_props));
+    }
 #endif
 
     tcg_allowed = true;
@@ -259,6 +288,16 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
     qatomic_set(&one_insn_per_tb, value);
 }
 
+static bool tcg_get_iofast(Object *obj, Error **errp)
+{
+    return TCG_STATE(obj)->iofast;
+}
+
+static void tcg_set_iofast(Object *obj, bool value, Error **errp)
+{
+    TCG_STATE(obj)->iofast = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -289,6 +328,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                    tcg_set_one_insn_per_tb);
     object_class_property_set_description(oc, "one-insn-per-tb",
         "Only put one guest insn in each translation block");
+
+    object_class_property_add_bool(oc, "x-iofast",
+                                   tcg_get_iofast, tcg_set_iofast);
+    object_class_property_set_description(oc, "x-iofast",
+        "System mode: end TBs after instructions known to do I/O (not "
+        "with icount), MMIO to lockless_io regions without the BQL, the "
+        "x86 APIC's TPR and the RTC's update polls without the BQL, and "
+        "no kvmvapic option ROM");
 }
 
 static const TypeInfo tcg_accel_type = {
