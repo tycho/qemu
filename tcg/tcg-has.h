@@ -48,6 +48,12 @@
 #ifndef TCG_TARGET_HAS_tbl_vec
 #define TCG_TARGET_HAS_tbl_vec          0
 #endif
+#ifndef TCG_TARGET_HAS_zip_vec
+#define TCG_TARGET_HAS_zip_vec          0
+#endif
+#ifndef TCG_TARGET_HAS_ext_vec
+#define TCG_TARGET_HAS_ext_vec          0
+#endif
 #ifndef TCG_TARGET_HAS_v64
 #define TCG_TARGET_HAS_v64              0
 #endif
