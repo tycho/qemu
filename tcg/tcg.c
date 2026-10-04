@@ -106,6 +106,8 @@ struct TCGLabelQemuLdst {
     TCGReg datahi_reg;      /* reg index for high word to be loaded or stored */
     const tcg_insn_unit *raddr;   /* addr of the next IR of qemu_ld/st IR */
     tcg_insn_unit *label_ptr[2]; /* label pointers to be updated */
+    bool fallback;          /* backend-specific out-of-line code, no helper */
+    uint64_t site;          /* fallback: guest pc of the access's insn */
     QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 };
 
@@ -239,6 +241,53 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 TCGContext tcg_init_ctx;
 bool tcg_fpcheck_runtime;
 bool tcg_iopl_runtime;
+
+TCGTsoMode tcg_tso_mode;
+
+/*
+ * A guest insn is promoted (see tcg_tso_cross_count) once its MO_ACQ_REL
+ * accesses have crossed a 16-byte boundary this many times.
+ */
+#define TSO_PROMOTE_THRESHOLD 1
+
+/* Crossings seen per guest insn pc (all vCPUs). */
+static QemuMutex tso_cross_lock;
+static GHashTable *tso_cross_counts;
+
+bool tcg_tso_cross_count(uint64_t pc)
+{
+    gpointer key = &pc, orig, val;
+    unsigned n;
+
+    qemu_mutex_lock(&tso_cross_lock);
+    if (g_hash_table_lookup_extended(tso_cross_counts, key, &orig, &val)) {
+        n = GPOINTER_TO_UINT(val) + 1;
+        if (n <= TSO_PROMOTE_THRESHOLD) {
+            g_hash_table_insert(tso_cross_counts, orig, GUINT_TO_POINTER(n));
+        }
+    } else {
+        n = 1;
+        g_hash_table_insert(tso_cross_counts, g_memdup2(&pc, sizeof(pc)),
+                            GUINT_TO_POINTER(n));
+    }
+    qemu_mutex_unlock(&tso_cross_lock);
+    return n >= TSO_PROMOTE_THRESHOLD;
+}
+
+bool tcg_tso_cross_promoted(uint64_t pc)
+{
+    unsigned n;
+
+    qemu_mutex_lock(&tso_cross_lock);
+    n = GPOINTER_TO_UINT(g_hash_table_lookup(tso_cross_counts, &pc));
+    qemu_mutex_unlock(&tso_cross_lock);
+    return n && n >= TSO_PROMOTE_THRESHOLD;
+}
+
+bool tcg_can_ldst_acqrel(void)
+{
+    return TCG_TARGET_HAS_qemu_ldst_acqrel;
+}
 
 __thread TCGContext *tcg_ctx;
 
@@ -1776,6 +1825,10 @@ static void tcg_context_init(unsigned max_threads)
 
     memset(s, 0, sizeof(*s));
     s->nb_globals = 0;
+
+    qemu_mutex_init(&tso_cross_lock);
+    tso_cross_counts = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                             g_free, NULL);
 
     init_call_layout(&info_helper_ld32_mmu);
     init_call_layout(&info_helper_ld64_mmu);
@@ -6674,6 +6727,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     tcg_out_tb_start(s);
 
     num_insns = -1;
+    s->gen_cur_insn = -1;
     s->carry_live = false;
     QTAILQ_FOREACH(op, &s->ops, link) {
         TCGOpcode opc = op->opc;
@@ -6710,6 +6764,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
                 assert(s->gen_insn_end_off[num_insns] == off);
             }
             num_insns++;
+            s->gen_cur_insn = num_insns;
             for (i = 0; i < INSN_START_WORDS; ++i) {
                 s->gen_insn_data[num_insns * INSN_START_WORDS + i] =
                     tcg_get_insn_start_param(op, i);
