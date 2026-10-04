@@ -655,7 +655,7 @@ static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
     TCGTemp *addr_new;
 
     check_max_alignment(memop_alignment_bits(memop));
-    tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
+    tcg_gen_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
 
     /* In serial mode, reduce atomicity. */
     if (!(tcg_ctx->gen_tb->cflags & CF_PARALLEL)) {

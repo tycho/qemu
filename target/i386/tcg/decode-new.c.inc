@@ -2743,11 +2743,12 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
         goto illegal;
     }
 
+    /* EM comes first, and does not apply to VEX instructions. */
+    if (!(s->prefix & PREFIX_VEX) && (s->flags & HF_EM_MASK)) {
+        goto illegal;
+    }
     if (s->flags & HF_TS_MASK) {
         goto nm_exception;
-    }
-    if (s->flags & HF_EM_MASK) {
-        goto illegal;
     }
     return true;
 
@@ -3093,6 +3094,17 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
 
     if ((s->prefix & PREFIX_LOCK) && !accept_lock) {
         goto illegal_op;
+    }
+
+    /*
+     * A memory destination that is also a source (2op), or an insn that
+     * accepts LOCK, is a read-modify-write: x86 faults on it as a write.
+     * Not an X86_TYPE_nop operand: x87, NOP and the opcodes left to the
+     * old decoder only use it for the address, and may just read.
+     */
+    if (decode.op[0].has_ea && decode.e.op0 != X86_TYPE_nop &&
+        (decode.op[1].has_ea || accept_lock)) {
+        tcg_set_insn_start_param(s->base.insn_start, 2, X86_INSN_RMW);
     }
 
     /*
