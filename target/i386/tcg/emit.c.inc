@@ -1691,9 +1691,76 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
 BLEND_SSE(VBLENDPD,   blendpd, MO_64, false)
 BLEND_SSE(VBLENDPS,   blendps, MO_32, false)
 BLEND_SSE(VPBLENDW,   pblendw, MO_16, true)
-BINARY_IMM_SSE(VDPPS,      dpps)
+/*
+ * DPPS and DPPD with x-ssefp=native, per 128-bit lane: the lanes the high
+ * immediate bits leave out become +0.0 (a permute with a zero vector, so
+ * they raise nothing), the products, then x86's order of additions,
+ * (p0 + p1) + (p2 + p3), each step an fadd with a permuted copy (the
+ * other lanes compute the same sums, so the same flags), and the sum to
+ * the lanes the low bits select, +0.0 elsewhere.
+ */
+static bool gen_dp_native(DisasContext *s, X86DecodedInsn *decode,
+                          unsigned vece)
+{
+    static const TCGOpcode list[] = {
+        INDEX_op_fmul_vec, INDEX_op_fadd_vec, INDEX_op_perm_vec, 0
+    };
+    unsigned imm = decode->immediate & 0xff, n = 16 >> vece;
+    int lanes = vector_len(s, decode) / 16;
+    uint32_t in = 0, out = 0;
+    TCGv_vec zero, r[2];
+
+    if (!fp_native(list, vece)) {
+        return false;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        in |= ((imm >> (4 + i)) & 1 ? i : n) << (4 * i);
+        out |= ((imm >> i) & 1 ? 0 : n) << (4 * i);
+    }
+    zero = tcg_constant_vec(TCG_TYPE_V128, vece, 0);
+    for (int l = 0; l < lanes; l++) {
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(a, tcg_env, decode->op[1].offset + 16 * l);
+        tcg_gen_ld_vec(b, tcg_env, decode->op[2].offset + 16 * l);
+        tcg_gen_perm_vec(vece, a, a, zero, in);
+        tcg_gen_perm_vec(vece, b, b, zero, in);
+        tcg_gen_fmul_vec(vece, a, a, b);
+        if (vece == MO_32) {
+            tcg_gen_perm_vec(vece, t, a, a, PERM4(1, 0, 3, 2));
+            tcg_gen_fadd_vec(vece, a, a, t);
+            tcg_gen_perm_vec(vece, t, a, a, PERM4(2, 3, 0, 1));
+        } else {
+            tcg_gen_perm_vec(vece, t, a, a, PERM2(1, 0));
+        }
+        tcg_gen_fadd_vec(vece, a, a, t);
+        r[l] = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_perm_vec(vece, r[l], a, zero, out);
+    }
+    for (int l = 0; l < lanes; l++) {
+        tcg_gen_st_vec(r[l], tcg_env, decode->op[0].offset + 16 * l);
+    }
+    return true;
+}
+
+static void gen_VDPPS(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (gen_dp_native(s, decode, MO_32)) {
+        return;
+    }
+    gen_binary_imm_sse(s, decode, gen_helper_dpps_xmm, gen_helper_dpps_ymm);
+}
 #define gen_helper_dppd_ymm NULL
-BINARY_IMM_SSE(VDPPD,      dppd)
+
+static void gen_VDPPD(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (gen_dp_native(s, decode, MO_64)) {
+        return;
+    }
+    gen_binary_imm_sse(s, decode, gen_helper_dppd_xmm, gen_helper_dppd_ymm);
+}
 BINARY_IMM_SSE(VMPSADBW,   mpsadbw)
 BINARY_IMM_SSE(PCLMULQDQ,  pclmulqdq)
 
