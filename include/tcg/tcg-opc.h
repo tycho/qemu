@@ -201,6 +201,7 @@ DEF(fcmp_vec, 1, 2, 1, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
 DEF(scvtf_vec, 1, 1, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
 DEF(fcvtzs_vec, 1, 1, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
 DEF(frintx_vec, 1, 1, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
+DEF(frint_vec, 1, 1, 1, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
 
 /* The same on element 0; the other elements come from the first input. */
 DEF(fadds_vec, 1, 2, 0, TCG_OPF_VECTOR | TCG_OPF_FP_STATUS)
