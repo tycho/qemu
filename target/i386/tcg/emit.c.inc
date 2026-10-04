@@ -833,9 +833,10 @@ static bool gen_vint_lanes(DisasContext *s, X86DecodedInsn *decode,
     return true;
 }
 
+/* The backend can emit opc, directly or by its own expansion. */
 static bool vint_can(TCGOpcode opc, unsigned vece)
 {
-    return tcg_vint && tcg_can_emit_vec_op(opc, TCG_TYPE_V128, vece) > 0;
+    return tcg_vint && tcg_can_emit_vec_op(opc, TCG_TYPE_V128, vece) != 0;
 }
 
 static void vint_zip_b(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t high)
@@ -973,6 +974,130 @@ static void vint_pmulh(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t c)
                        c >> 6);
 }
 
+/* PSIGN: a negated where b < 0, zeroed where b = 0, else a. */
+static void vint_psign(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t vece)
+{
+    TCGv_vec zero = tcg_constant_vec(TCG_TYPE_V128, vece, 0);
+    TCGv_vec neg = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec lt = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec eq = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    tcg_gen_neg_vec(vece, neg, a);
+    tcg_gen_cmp_vec(TCG_COND_LT, vece, lt, b, zero);
+    tcg_gen_cmp_vec(TCG_COND_EQ, vece, eq, b, zero);
+    tcg_gen_bitsel_vec(vece, r, lt, neg, a);
+    tcg_gen_andc_vec(vece, r, r, eq);
+}
+
+static bool vint_psign_ok(unsigned vece)
+{
+    return vint_can(INDEX_op_neg_vec, vece) && vint_can(INDEX_op_cmp_vec, vece)
+           && vint_can(INDEX_op_bitsel_vec, vece)
+           && vint_can(INDEX_op_andc_vec, vece);
+}
+
+/*
+ * VPSLLV/VPSRLV/VPSRAV: each element of a shifted by the unsigned count in
+ * the same element of b.  TCG leaves shifts by the element size or more
+ * undefined, so: logical shifts by the count's low bits, zeroed where the
+ * count is too large; arithmetic shifts by min(count, size - 1).
+ * c = vece | opcode << 8.
+ */
+static void vint_shiftv(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t c)
+{
+    unsigned vece = c & 0xff, width = 8 << vece;
+    TCGOpcode opc = c >> 8;
+    TCGv_vec in = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec cnt = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec max = tcg_constant_vec(TCG_TYPE_V128, vece, width - 1);
+
+    tcg_gen_cmp_vec(TCG_COND_LTU, vece, in, b,
+                    tcg_constant_vec(TCG_TYPE_V128, vece, width));
+    if (opc == INDEX_op_sarv_vec) {
+        tcg_gen_bitsel_vec(vece, cnt, in, b, max);
+        tcg_gen_sarv_vec(vece, r, a, cnt);
+        return;
+    }
+    tcg_gen_and_vec(vece, cnt, b, max);
+    if (opc == INDEX_op_shlv_vec) {
+        tcg_gen_shlv_vec(vece, r, a, cnt);
+    } else {
+        tcg_gen_shrv_vec(vece, r, a, cnt);
+    }
+    tcg_gen_and_vec(vece, r, r, in);
+}
+
+static bool vint_shiftv_ok(TCGOpcode opc, unsigned vece)
+{
+    return vint_can(opc, vece) && vint_can(INDEX_op_cmp_vec, vece)
+           && vint_can(INDEX_op_bitsel_vec, vece);
+}
+
+/*
+ * With tcg_vint, PSLL/PSRL/PSRA by a register or memory count: every
+ * element of op1 shifted by the unsigned 64-bit count in op2's low qword.
+ * Counts of the element size or more give zeros for the logical shifts
+ * and the sign for PSRA.
+ */
+static bool gen_vint_shift_xmm(DisasContext *s, X86DecodedInsn *decode,
+                               unsigned vece, TCGOpcode opc)
+{
+    int lanes = vector_len(s, decode) / 16;
+    unsigned width = 8 << vece;
+    TCGv_i64 cnt, in;
+    TCGv_vec cv, mask = NULL, r[2];
+
+    if (!vint_can(opc, vece) || decode->op[0].unit != X86_OP_SSE) {
+        return false;
+    }
+    cnt = tcg_temp_new_i64();
+    tcg_gen_ld_i64(cnt, tcg_env, decode->op[2].offset);
+    if (opc == INDEX_op_sarv_vec) {
+        tcg_gen_umin_i64(cnt, cnt, tcg_constant_i64(width - 1));
+    } else {
+        in = tcg_temp_new_i64();
+        tcg_gen_negsetcond_i64(TCG_COND_LTU, in, cnt,
+                               tcg_constant_i64(width));
+        mask = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_dup_i64_vec(MO_64, mask, in);
+        tcg_gen_andi_i64(cnt, cnt, width - 1);
+    }
+    cv = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_dup_i64_vec(vece, cv, cnt);
+    for (int l = 0; l < lanes; l++) {
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(a, tcg_env, decode->op[1].offset + 16 * l);
+        r[l] = tcg_temp_new_vec(TCG_TYPE_V128);
+        if (opc == INDEX_op_shlv_vec) {
+            tcg_gen_shlv_vec(vece, r[l], a, cv);
+        } else if (opc == INDEX_op_shrv_vec) {
+            tcg_gen_shrv_vec(vece, r[l], a, cv);
+        } else {
+            tcg_gen_sarv_vec(vece, r[l], a, cv);
+        }
+        if (mask) {
+            tcg_gen_and_vec(vece, r[l], r[l], mask);
+        }
+    }
+    for (int l = 0; l < lanes; l++) {
+        tcg_gen_st_vec(r[l], tcg_env, decode->op[0].offset + 16 * l);
+    }
+    return true;
+}
+
+#define SHIFT_XMM(uname, lname, vece, opc)                                    \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    if (gen_vint_shift_xmm(s, decode, vece, opc)) {                           \
+        return;                                                               \
+    }                                                                         \
+    gen_binary_int_sse(s, decode,                                             \
+                          gen_helper_##lname##_mmx,                           \
+                          gen_helper_##lname##_xmm,                           \
+                          gen_helper_##lname##_ymm);                          \
+}
+
 /* An SSE/AVX integer op with a tcg_vint lowering, else its helpers. */
 #define VINT_BINARY(uname, lname, mmx, cond, fn, c)                           \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
@@ -1078,20 +1203,59 @@ static inline void gen_ternary_sse(DisasContext *s, X86DecodedInsn *decode,
     tcg_gen_addi_ptr(ptr3, tcg_env, ZMM_OFFSET(op3));
     fn(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2, ptr3);
 }
-#define TERNARY_SSE(uname, uvname, lname)                                          \
-static void gen_##uvname(DisasContext *s, X86DecodedInsn *decode)                  \
-{                                                                                  \
-    gen_ternary_sse(s, decode, (uint8_t)decode->immediate >> 4,                    \
-                    gen_helper_##lname##_xmm, gen_helper_##lname##_ymm);           \
-}                                                                                  \
-static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
-{                                                                                  \
-    gen_ternary_sse(s, decode, 0,                                                  \
-                  gen_helper_##lname##_xmm, gen_helper_##lname##_ymm);             \
+/*
+ * With tcg_vint, BLENDVPS/BLENDVPD/PBLENDVB: op2's element where the sign
+ * bit of the mask's (register maskreg) is set, else op1's.
+ */
+static bool gen_vint_blendv(DisasContext *s, X86DecodedInsn *decode,
+                            unsigned vece, int maskreg)
+{
+    int lanes = vector_len(s, decode) / 16;
+    TCGv_vec r[2];
+
+    if (!vint_can(INDEX_op_sari_vec, vece)
+        || !vint_can(INDEX_op_bitsel_vec, vece)
+        || decode->op[0].unit != X86_OP_SSE) {
+        return false;
+    }
+    for (int l = 0; l < lanes; l++) {
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec m = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(a, tcg_env, decode->op[1].offset + 16 * l);
+        tcg_gen_ld_vec(b, tcg_env, decode->op[2].offset + 16 * l);
+        tcg_gen_ld_vec(m, tcg_env, ZMM_OFFSET(maskreg) + 16 * l);
+        tcg_gen_sari_vec(vece, m, m, (8 << vece) - 1);
+        r[l] = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_bitsel_vec(vece, r[l], m, b, a);
+    }
+    for (int l = 0; l < lanes; l++) {
+        tcg_gen_st_vec(r[l], tcg_env, decode->op[0].offset + 16 * l);
+    }
+    return true;
 }
-TERNARY_SSE(BLENDVPS, VBLENDVPS, blendvps)
-TERNARY_SSE(BLENDVPD, VBLENDVPD, blendvpd)
-TERNARY_SSE(PBLENDVB, VPBLENDVB, pblendvb)
+
+#define BLENDV_SSE(uname, uvname, lname, vece)                                \
+static void gen_##uvname(DisasContext *s, X86DecodedInsn *decode)             \
+{                                                                             \
+    int maskreg = (uint8_t)decode->immediate >> 4;                            \
+                                                                              \
+    if (!gen_vint_blendv(s, decode, vece, maskreg)) {                         \
+        gen_ternary_sse(s, decode, maskreg,                                   \
+                        gen_helper_##lname##_xmm, gen_helper_##lname##_ymm);  \
+    }                                                                         \
+}                                                                             \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    if (!gen_vint_blendv(s, decode, vece, 0)) {                               \
+        gen_ternary_sse(s, decode, 0,                                         \
+                        gen_helper_##lname##_xmm, gen_helper_##lname##_ymm);  \
+    }                                                                         \
+}
+BLENDV_SSE(BLENDVPS, VBLENDVPS, blendvps, MO_32)
+BLENDV_SSE(BLENDVPD, VBLENDVPD, blendvpd, MO_64)
+BLENDV_SSE(PBLENDVB, VPBLENDVB, pblendvb, MO_8)
 
 static inline void gen_binary_imm_sse(DisasContext *s, X86DecodedInsn *decode,
                                       SSEFunc_0_epppi xmm, SSEFunc_0_epppi ymm)
@@ -1299,14 +1463,14 @@ VINT_BINARY(PMULUDQ, pmuludq, gen_helper_pmuludq_mmx,
             vint_pmul_even, false)
 BINARY_INT_MMX(PSADBW,  psadbw)
 
-BINARY_INT_MMX(PSLLW_r, psllw)
-BINARY_INT_MMX(PSLLD_r, pslld)
-BINARY_INT_MMX(PSLLQ_r, psllq)
-BINARY_INT_MMX(PSRLW_r, psrlw)
-BINARY_INT_MMX(PSRLD_r, psrld)
-BINARY_INT_MMX(PSRLQ_r, psrlq)
-BINARY_INT_MMX(PSRAW_r, psraw)
-BINARY_INT_MMX(PSRAD_r, psrad)
+SHIFT_XMM(PSLLW_r, psllw, MO_16, INDEX_op_shlv_vec)
+SHIFT_XMM(PSLLD_r, pslld, MO_32, INDEX_op_shlv_vec)
+SHIFT_XMM(PSLLQ_r, psllq, MO_64, INDEX_op_shlv_vec)
+SHIFT_XMM(PSRLW_r, psrlw, MO_16, INDEX_op_shrv_vec)
+SHIFT_XMM(PSRLD_r, psrld, MO_32, INDEX_op_shrv_vec)
+SHIFT_XMM(PSRLQ_r, psrlq, MO_64, INDEX_op_shrv_vec)
+SHIFT_XMM(PSRAW_r, psraw, MO_16, INDEX_op_sarv_vec)
+SHIFT_XMM(PSRAD_r, psrad, MO_32, INDEX_op_sarv_vec)
 
 VINT_BINARY(PHADDW, phaddw, gen_helper_phaddw_mmx,
             vint_can(INDEX_op_addp_vec, MO_16), vint_phadd, MO_16)
@@ -1368,9 +1532,12 @@ static void gen_PSHUFB(DisasContext *s, X86DecodedInsn *decode)
                        gen_helper_pshufb_xmm,
                        gen_helper_pshufb_ymm);
 }
-BINARY_INT_MMX(PSIGNB,    psignb)
-BINARY_INT_MMX(PSIGNW,    psignw)
-BINARY_INT_MMX(PSIGND,    psignd)
+VINT_BINARY(PSIGNB, psignb, gen_helper_psignb_mmx, vint_psign_ok(MO_8),
+            vint_psign, MO_8)
+VINT_BINARY(PSIGNW, psignw, gen_helper_psignw_mmx, vint_psign_ok(MO_16),
+            vint_psign, MO_16)
+VINT_BINARY(PSIGND, psignd, gen_helper_psignd_mmx, vint_psign_ok(MO_32),
+            vint_psign, MO_32)
 VINT_BINARY(PMULHRSW, pmulhrsw, gen_helper_pmulhrsw_mmx,
             vint_can(INDEX_op_mulw_vec, MO_16)
             && vint_can(INDEX_op_narrow_vec, MO_16),
@@ -1671,9 +1838,22 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                  gen_helper_##lname##d_xmm, gen_helper_##lname##q_xmm,             \
                  gen_helper_##lname##d_ymm, gen_helper_##lname##q_ymm);            \
 }
-VEXW_AVX(VPSLLV,    vpsllv)
-VEXW_AVX(VPSRLV,    vpsrlv)
-VEXW_AVX(VPSRAV,    vpsrav)
+#define VINT_SHIFTV(uname, lname, opc)                                        \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    unsigned vece = s->vex_w ? MO_64 : MO_32;                                 \
+                                                                              \
+    if (vint_shiftv_ok(opc, vece)                                             \
+        && gen_vint_lanes(s, decode, 1, 2, vint_shiftv, vece | opc << 8)) {   \
+        return;                                                               \
+    }                                                                         \
+    gen_vexw_avx(s, decode,                                                   \
+                 gen_helper_##lname##d_xmm, gen_helper_##lname##q_xmm,        \
+                 gen_helper_##lname##d_ymm, gen_helper_##lname##q_ymm);       \
+}
+VINT_SHIFTV(VPSLLV, vpsllv, INDEX_op_shlv_vec)
+VINT_SHIFTV(VPSRLV, vpsrlv, INDEX_op_shrv_vec)
+VINT_SHIFTV(VPSRAV, vpsrav, INDEX_op_sarv_vec)
 VEXW_AVX(VPMASKMOV, vpmaskmov)
 
 /* Same as above, but with extra arguments to the helper.  */
