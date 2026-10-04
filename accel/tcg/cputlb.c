@@ -2831,7 +2831,7 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
 #define ATOMIC_NAME(X) \
     glue(glue(glue(cpu_atomic_ ## X, SUFFIX), END), _mmu)
 
-#define ATOMIC_MMU_CLEANUP
+#define ATOMIC_MMU_CLEANUP cpu_tso_atomic_fence()
 
 #include "atomic_common.c.inc"
 
