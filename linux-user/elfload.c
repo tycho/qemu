@@ -766,6 +766,7 @@ void linux_probe_guest_base(const char *image_name,
 #endif
 
     probe_guest_base(image_name, image_range, commpage_range);
+    mmap_check_host_va();
 
     /* Reserve and initialize the commpage. */
 #if defined(COMMPAGE) || defined(HAVE_GUEST_COMMPAGE)
