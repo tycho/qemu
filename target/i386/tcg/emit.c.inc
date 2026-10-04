@@ -1407,26 +1407,36 @@ static void gen_frint_vec(unsigned vece, TCGv_vec d, TCGv_vec a,
 }
 
 /*
- * With x-ssefp=native, ROUNDPS/ROUNDPD on the host FPU, which runs in the
- * guest's MXCSR mode: imm8 bit 2 rounds in that mode (signaling inexact
- * unless bit 3 is set), else bits 1:0 give the mode, with bit 3 set only;
- * a given mode that signals inexact keeps the helper.
+ * With x-ssefp=native, ROUND* on the host FPU, which runs in the guest's
+ * MXCSR mode: imm8 bit 2 rounds in that mode (signaling inexact unless
+ * bit 3 is set), else bits 1:0 give the mode, with bit 3 set only; a given
+ * mode that signals inexact keeps the helper.  *mode is the frint_vec
+ * mode, or -1 for frintx_vec.
  */
+static bool fp_native_round_mode(X86DecodedInsn *decode, int64_t *mode)
+{
+    uint8_t imm = decode->immediate;
+
+    if (imm & 4) {
+        *mode = imm & 8 ? TCG_FRINT_CURRENT : -1;
+    } else if (imm & 8) {
+        *mode = imm & 3;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 static bool gen_fp_native_round(DisasContext *s, X86DecodedInsn *decode,
                                 unsigned vece)
 {
     static const TCGOpcode frint[] = { INDEX_op_frint_vec, 0 };
     static const TCGOpcode frintx[] = { INDEX_op_frintx_vec, 0 };
-    uint8_t imm = decode->immediate;
     int vec_len = vector_len(s, decode);
     int64_t mode;
     GVecGen2i g = { .fniv = gen_frint_vec, .vece = vece };
 
-    if (imm & 4) {
-        mode = imm & 8 ? TCG_FRINT_CURRENT : -1;
-    } else if (imm & 8) {
-        mode = imm & 3;
-    } else {
+    if (!fp_native_round_mode(decode, &mode)) {
         return false;
     }
     g.opt_opc = mode < 0 ? frintx : frint;
@@ -1435,6 +1445,30 @@ static bool gen_fp_native_round(DisasContext *s, X86DecodedInsn *decode,
     }
     tcg_gen_gvec_2i(decode->op[0].offset, decode->op[1].offset,
                     vec_len, vec_len, mode, &g);
+    return true;
+}
+
+/* ROUNDSS/ROUNDSD: operand 0 = operand 1 with element 0 rounded. */
+static bool gen_fp_native_round_s(DisasContext *s, X86DecodedInsn *decode,
+                                  unsigned vece)
+{
+    int64_t mode;
+    TCGv_vec a, b, d;
+
+    if (!fp_native_round_mode(decode, &mode) ||
+        !fp_native_s(mode < 0 ? INDEX_op_frintxs_vec : INDEX_op_frints_vec,
+                     vece)) {
+        return false;
+    }
+    a = fp_scalar_operand(decode, 1, vece);
+    b = fp_scalar_operand(decode, 2, vece);
+    d = tcg_temp_new_vec(TCG_TYPE_V128);
+    if (mode < 0) {
+        tcg_gen_frintxs_vec(vece, d, a, b);
+    } else {
+        tcg_gen_frints_vec(vece, d, a, b, mode);
+    }
+    fp_scalar_store(decode, d);
     return true;
 }
 
@@ -5381,15 +5415,25 @@ static void gen_VPHMINPOSUW(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VROUNDSD(DisasContext *s, X86DecodedInsn *decode)
 {
-    TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
+    TCGv_i32 imm;
+
     assert(!s->vex_l);
+    if (gen_fp_native_round_s(s, decode, MO_64)) {
+        return;
+    }
+    imm = tcg_constant8u_i32(decode->immediate);
     gen_helper_roundsd_xmm(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2, imm);
 }
 
 static void gen_VROUNDSS(DisasContext *s, X86DecodedInsn *decode)
 {
-    TCGv_i32 imm = tcg_constant8u_i32(decode->immediate);
+    TCGv_i32 imm;
+
     assert(!s->vex_l);
+    if (gen_fp_native_round_s(s, decode, MO_32)) {
+        return;
+    }
+    imm = tcg_constant8u_i32(decode->immediate);
     gen_helper_roundss_xmm(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2, imm);
 }
 
