@@ -31,10 +31,14 @@
  */
 typedef enum TCGTsoMode {
     TCG_TSO_BARRIER,    /* a barrier before each access (default) */
+    TCG_TSO_ACQREL,     /* load-acquire / store-release accesses */
     TCG_TSO_NONE,       /* no barriers at all: UNSAFE, for measurement */
 } TCGTsoMode;
 
 extern TCGTsoMode tcg_tso_mode;
+
+/* True if the host backend can emit MO_ACQ_REL accesses. */
+bool tcg_can_ldst_acqrel(void);
 
 /**
  * tcg_init: Initialize the TCG runtime
