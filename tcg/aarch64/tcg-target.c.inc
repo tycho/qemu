@@ -745,6 +745,11 @@ typedef enum {
     Iqrr_e_SCVTF      = 0x0e21d800,
     Iqrr_e_FCVTZS     = 0x0ea1b800,
     Iqrr_e_FRINTX     = 0x2e219800,
+    Iqrr_e_FRINTN     = 0x0e218800,
+    Iqrr_e_FRINTM     = 0x0e219800,
+    Iqrr_e_FRINTP     = 0x0ea18800,
+    Iqrr_e_FRINTZ     = 0x0ea19800,
+    Iqrr_e_FRINTI     = 0x2ea19800,
 
     /*
      * Floating-point data processing, scalar: two sources, one source,
@@ -757,6 +762,12 @@ typedef enum {
     Ifp_rrr_FMAX      = 0x1e204800,
     Ifp_rrr_FMIN      = 0x1e205800,
     Ifp_rr_FSQRT      = 0x1e21c000,
+    Ifp_rr_FRINTN     = 0x1e244000,
+    Ifp_rr_FRINTP     = 0x1e24c000,
+    Ifp_rr_FRINTM     = 0x1e254000,
+    Ifp_rr_FRINTZ     = 0x1e25c000,
+    Ifp_rr_FRINTX     = 0x1e274000,
+    Ifp_rr_FRINTI     = 0x1e27c000,
     Ifp_rr_FCVT_SD    = 0x1e22c000,     /* single to double */
     Ifp_rr_FCVT_DS    = 0x1e624000,     /* double to single */
     /* Advanced SIMD scalar, with the size in the same bit as the type. */
@@ -4577,6 +4588,18 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_frintx_vec:
         tcg_out_insn(s, qrr_e, FRINTX, is_q, fsz, a0, a1);
         break;
+    case INDEX_op_frint_vec:
+        {
+            static const AArch64Insn frint[] = {
+                [TCG_FRINT_NEAREST] = Iqrr_e_FRINTN,
+                [TCG_FRINT_DOWN] = Iqrr_e_FRINTM,
+                [TCG_FRINT_UP] = Iqrr_e_FRINTP,
+                [TCG_FRINT_ZERO] = Iqrr_e_FRINTZ,
+                [TCG_FRINT_CURRENT] = Iqrr_e_FRINTI,
+            };
+            tcg_out_insn_qrr_e(s, frint[a2], is_q, fsz, a0, a1);
+        }
+        break;
     case INDEX_op_fmla_vec:
         /* The accumulator is both the first input and the output. */
         tcg_out_insn(s, qrrr_e, FMLA, is_q, fsz, a0, a2, args[3]);
@@ -4632,6 +4655,21 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         break;
     case INDEX_op_fsqrts_vec:
         tcg_out_insn(s, fp_rr, FSQRT, fsz, a0, a2);
+        break;
+    case INDEX_op_frintxs_vec:
+        tcg_out_insn(s, fp_rr, FRINTX, fsz, a0, a2);
+        break;
+    case INDEX_op_frints_vec:
+        {
+            static const AArch64Insn frint[] = {
+                [TCG_FRINT_NEAREST] = Ifp_rr_FRINTN,
+                [TCG_FRINT_DOWN] = Ifp_rr_FRINTM,
+                [TCG_FRINT_UP] = Ifp_rr_FRINTP,
+                [TCG_FRINT_ZERO] = Ifp_rr_FRINTZ,
+                [TCG_FRINT_CURRENT] = Ifp_rr_FRINTI,
+            };
+            tcg_out_insn_fp_rr(s, frint[args[3]], fsz, a0, a2);
+        }
         break;
     case INDEX_op_frecpes_vec:
         tcg_out_insn(s, fp_rr, FRECPE, fsz, a0, a2);
@@ -4770,6 +4808,7 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_scvtf_vec:
     case INDEX_op_fcvtzs_vec:
     case INDEX_op_frintx_vec:
+    case INDEX_op_frint_vec:
     case INDEX_op_fadds_vec:
     case INDEX_op_fsubs_vec:
     case INDEX_op_fmuls_vec:
@@ -4777,6 +4816,8 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_fmins_vec:
     case INDEX_op_fmaxs_vec:
     case INDEX_op_fsqrts_vec:
+    case INDEX_op_frintxs_vec:
+    case INDEX_op_frints_vec:
     case INDEX_op_fmadds_vec:
     case INDEX_op_fmsubs_vec:
     case INDEX_op_fnmadds_vec:
@@ -4937,6 +4978,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fnmsubs_vec:
         return C_O1_I3(w, w, w, w);
     case INDEX_op_fsqrts_vec:
+    case INDEX_op_frintxs_vec:
+    case INDEX_op_frints_vec:
     case INDEX_op_frecpes_vec:
     case INDEX_op_frsqrtes_vec:
     case INDEX_op_fcvts_vec:
@@ -4955,6 +4998,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_scvtf_vec:
     case INDEX_op_fcvtzs_vec:
     case INDEX_op_frintx_vec:
+    case INDEX_op_frint_vec:
     case INDEX_op_not_vec:
     case INDEX_op_neg_vec:
     case INDEX_op_abs_vec:

@@ -2716,6 +2716,7 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_scvtf_vec:
     case INDEX_op_fcvtzs_vec:
     case INDEX_op_frintx_vec:
+    case INDEX_op_frint_vec:
     case INDEX_op_fadds_vec:
     case INDEX_op_fsubs_vec:
     case INDEX_op_fmuls_vec:
@@ -2723,6 +2724,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fmins_vec:
     case INDEX_op_fmaxs_vec:
     case INDEX_op_fsqrts_vec:
+    case INDEX_op_frintxs_vec:
+    case INDEX_op_frints_vec:
     case INDEX_op_fmadds_vec:
     case INDEX_op_fmsubs_vec:
     case INDEX_op_fnmadds_vec:
