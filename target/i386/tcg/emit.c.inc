@@ -64,6 +64,24 @@ static void gen_NM_exception(DisasContext *s)
     gen_exception(s, EXCP07_PREX);
 }
 
+/*
+ * The CR0 checks of an MMX or 3DNow! instruction that validate_vex
+ * doesn't see: #UD with EM, else #NM with TS.  Return false if the
+ * instruction raises one.
+ */
+static bool gen_check_cr0_mmx(DisasContext *s)
+{
+    if (s->flags & HF_EM_MASK) {
+        gen_illegal_opcode(s);
+        return false;
+    }
+    if (s->flags & HF_TS_MASK) {
+        gen_NM_exception(s);
+        return false;
+    }
+    return true;
+}
+
 static void gen_lea_modrm(DisasContext *s, X86DecodedInsn *decode)
 {
     AddressParts *mem = &decode->mem;
@@ -510,12 +528,7 @@ static void gen_3dnow(DisasContext *s, X86DecodedInsn *decode)
         gen_illegal_opcode(s);
         return;
     }
-    if (s->flags & HF_TS_MASK) {
-        gen_NM_exception(s);
-        return;
-    }
-    if (s->flags & HF_EM_MASK) {
-        gen_illegal_opcode(s);
+    if (!gen_check_cr0_mmx(s)) {
         return;
     }
 
@@ -2008,6 +2021,9 @@ static void gen_DIV(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_EMMS(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (!gen_check_cr0_mmx(s)) {
+        return;
+    }
     gen_helper_emms(tcg_env);
 }
 
