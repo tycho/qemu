@@ -906,6 +906,10 @@ int main(int argc, char **argv, char **envp)
     } else {
         guest_addr_max = ~0ul;
     }
+    guest_user_max = guest_addr_max;
+    if (reserved_va == 0 && max_reserved_va != 0) {
+        guest_user_max = MIN(guest_user_max, max_reserved_va);
+    }
 
     /*
      * Temporarily disable
