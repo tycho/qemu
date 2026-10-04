@@ -411,6 +411,20 @@ void tcg_gen_extract_vec_i64(unsigned vece, TCGv_i64 r, TCGv_vec a,
               temp_arg(at), idx);
 }
 
+void tcg_gen_insert_vec_i64(unsigned vece, TCGv_vec r, TCGv_vec a,
+                            TCGv_i64 b, unsigned idx)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+    TCGTemp *at = tcgv_vec_temp(a);
+
+    tcg_debug_assert(at->base_type == rt->base_type);
+    tcg_debug_assert(idx < tcg_type_size(rt->base_type) >> vece);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_insert_vec,
+                                         rt->base_type, vece) > 0);
+    vec_gen_4(INDEX_op_insert_vec, rt->base_type, vece, temp_arg(rt),
+              temp_arg(at), tcgv_i64_arg(b), idx);
+}
+
 void tcg_gen_dup_i32_vec(unsigned vece, TCGv_vec r, TCGv_i32 a)
 {
     TCGArg ri = tcgv_vec_arg(r);
