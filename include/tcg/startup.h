@@ -55,4 +55,11 @@ void tcg_register_thread(void);
  */
 void tcg_prologue_init(void);
 
+/*
+ * tcg_vecld: a guest vector load puts the loaded value in a host vector
+ * register (when the backend can build one from general registers), so
+ * that it is stored to CPU state in one piece.
+ */
+extern bool tcg_vecld;
+
 #endif
