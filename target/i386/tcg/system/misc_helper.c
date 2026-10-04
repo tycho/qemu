@@ -23,6 +23,7 @@
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
 #include "accel/tcg/cpu-loop.h"
+#include "accel/tcg/host-fp.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "exec/cputlb.h"
@@ -31,36 +32,48 @@
 
 void HELPER(outb)(CPUX86State *env, uint32_t port, uint32_t data)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     address_space_stb(&address_space_io, port, data,
                       cpu_get_mem_attrs(env), NULL);
 }
 
 target_ulong HELPER(inb)(CPUX86State *env, uint32_t port)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     return address_space_ldub(&address_space_io, port,
                               cpu_get_mem_attrs(env), NULL);
 }
 
 void HELPER(outw)(CPUX86State *env, uint32_t port, uint32_t data)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     address_space_stw_le(&address_space_io, port, data,
                          cpu_get_mem_attrs(env), NULL);
 }
 
 target_ulong HELPER(inw)(CPUX86State *env, uint32_t port)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     return address_space_lduw_le(&address_space_io, port,
                                  cpu_get_mem_attrs(env), NULL);
 }
 
 void HELPER(outl)(CPUX86State *env, uint32_t port, uint32_t data)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     address_space_stl_le(&address_space_io, port, data,
                          cpu_get_mem_attrs(env), NULL);
 }
 
 target_ulong HELPER(inl)(CPUX86State *env, uint32_t port)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     return address_space_ldl_le(&address_space_io, port,
                                 cpu_get_mem_attrs(env), NULL);
 }

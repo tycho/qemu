@@ -12,5 +12,9 @@ i386_ss.add(when: 'CONFIG_TCG', if_true: files(
   'tcg-cpu.c',
   'translate.c'), if_false: files('tcg-stub.c'))
 
+if host_arch == 'aarch64'
+  i386_ss.add(when: 'CONFIG_TCG', if_true: files('host-fpenv-aarch64.c'))
+endif
+
 subdir('system')
 subdir('user')
