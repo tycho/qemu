@@ -2561,9 +2561,12 @@ static void gen_LEAVE(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp d_ot = mo_pushpop(s, s->dflag);
     MemOp a_ot = mo_stacksize(s);
+    bool old;
 
     gen_lea_ss_ofs(s, s->A0, cpu_regs[R_EBP], 0);
+    old = gen_stack_private(true);
     gen_op_ld_v(s, d_ot, s->T0, s->A0);
+    gen_stack_private(old);
 
     tcg_gen_addi_tl(s->T1, cpu_regs[R_EBP], 1 << d_ot);
 
