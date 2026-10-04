@@ -885,6 +885,83 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
                           gen_helper_##lname##_ymm);                          \
 }
 
+/* perm_vec pattern of the even (or odd) elements of a:b, for n = 16 >> vece. */
+static uint32_t vint_uzp_pat(unsigned vece, bool odd)
+{
+    uint32_t pat = 0;
+
+    for (int i = 0; i < 16 >> vece; i++) {
+        pat |= (2 * i + odd) << (4 * i);
+    }
+    return pat;
+}
+
+static void vint_pmaddwd(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t c)
+{
+    TCGv_vec lo = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec hi = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    tcg_gen_mulw_vec(MO_16, lo, a, b, true, false);
+    tcg_gen_mulw_vec(MO_16, hi, a, b, true, true);
+    tcg_gen_addp_vec(MO_32, r, lo, hi);
+}
+
+/* PMULUDQ/PMULDQ: the even dwords of a and b into qword products. */
+static void vint_pmul_even(TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                           int64_t is_signed)
+{
+    TCGv_vec ea = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec eb = tcg_temp_new_vec(TCG_TYPE_V128);
+    uint32_t pat = vint_uzp_pat(MO_32, false);
+
+    tcg_gen_perm_vec(MO_32, ea, a, a, pat);
+    tcg_gen_perm_vec(MO_32, eb, b, b, pat);
+    tcg_gen_mulw_vec(MO_32, r, ea, eb, is_signed, false);
+}
+
+static void vint_phadd(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t vece)
+{
+    tcg_gen_addp_vec(vece, r, a, b);
+}
+
+/* Horizontal ops on the even and odd elements of a:b: c = kind | vece << 8. */
+enum { VINT_PHSUB, VINT_PHADDS, VINT_PHSUBS };
+
+static void vint_phop(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t c)
+{
+    unsigned vece = c >> 8;
+    TCGv_vec ev = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec od = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    tcg_gen_perm_vec(vece, ev, a, b, vint_uzp_pat(vece, false));
+    tcg_gen_perm_vec(vece, od, a, b, vint_uzp_pat(vece, true));
+    switch (c & 0xff) {
+    case VINT_PHSUB:
+        tcg_gen_sub_vec(vece, r, ev, od);
+        break;
+    case VINT_PHADDS:
+        tcg_gen_ssadd_vec(vece, r, ev, od);
+        break;
+    case VINT_PHSUBS:
+        tcg_gen_sssub_vec(vece, r, ev, od);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+/* An SSE/AVX integer op with a tcg_vint lowering, else its helpers. */
+#define VINT_BINARY(uname, lname, mmx, cond, fn, c)                           \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    if ((cond) && gen_vint_lanes(s, decode, 1, 2, fn, c)) {                   \
+        return;                                                               \
+    }                                                                         \
+    gen_binary_int_sse(s, decode, mmx,                                        \
+                          gen_helper_##lname##_xmm,                           \
+                          gen_helper_##lname##_ymm);                          \
+}
+
 #define FP_UNPACK_SSE(uname, lname, high)                                     \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
 {                                                                             \
@@ -1175,10 +1252,16 @@ BINARY_INT_MMX(PACKSSDW,   packssdw)
 
 BINARY_INT_MMX(PAVGB,   pavgb)
 BINARY_INT_MMX(PAVGW,   pavgw)
-BINARY_INT_MMX(PMADDWD, pmaddwd)
+VINT_BINARY(PMADDWD, pmaddwd, gen_helper_pmaddwd_mmx,
+            vint_can(INDEX_op_mulw_vec, MO_16)
+            && vint_can(INDEX_op_addp_vec, MO_32),
+            vint_pmaddwd, 0)
 BINARY_INT_MMX(PMULHUW, pmulhuw)
 BINARY_INT_MMX(PMULHW,  pmulhw)
-BINARY_INT_MMX(PMULUDQ, pmuludq)
+VINT_BINARY(PMULUDQ, pmuludq, gen_helper_pmuludq_mmx,
+            vint_can(INDEX_op_mulw_vec, MO_32)
+            && vint_can(INDEX_op_perm_vec, MO_32),
+            vint_pmul_even, false)
 BINARY_INT_MMX(PSADBW,  psadbw)
 
 BINARY_INT_MMX(PSLLW_r, psllw)
@@ -1190,12 +1273,24 @@ BINARY_INT_MMX(PSRLQ_r, psrlq)
 BINARY_INT_MMX(PSRAW_r, psraw)
 BINARY_INT_MMX(PSRAD_r, psrad)
 
-BINARY_INT_MMX(PHADDW,    phaddw)
-BINARY_INT_MMX(PHADDSW,   phaddsw)
-BINARY_INT_MMX(PHADDD,    phaddd)
-BINARY_INT_MMX(PHSUBW,    phsubw)
-BINARY_INT_MMX(PHSUBSW,   phsubsw)
-BINARY_INT_MMX(PHSUBD,    phsubd)
+VINT_BINARY(PHADDW, phaddw, gen_helper_phaddw_mmx,
+            vint_can(INDEX_op_addp_vec, MO_16), vint_phadd, MO_16)
+VINT_BINARY(PHADDD, phaddd, gen_helper_phaddd_mmx,
+            vint_can(INDEX_op_addp_vec, MO_32), vint_phadd, MO_32)
+VINT_BINARY(PHADDSW, phaddsw, gen_helper_phaddsw_mmx,
+            vint_can(INDEX_op_perm_vec, MO_16)
+            && vint_can(INDEX_op_ssadd_vec, MO_16),
+            vint_phop, VINT_PHADDS | MO_16 << 8)
+VINT_BINARY(PHSUBW, phsubw, gen_helper_phsubw_mmx,
+            vint_can(INDEX_op_perm_vec, MO_16),
+            vint_phop, VINT_PHSUB | MO_16 << 8)
+VINT_BINARY(PHSUBD, phsubd, gen_helper_phsubd_mmx,
+            vint_can(INDEX_op_perm_vec, MO_32),
+            vint_phop, VINT_PHSUB | MO_32 << 8)
+VINT_BINARY(PHSUBSW, phsubsw, gen_helper_phsubsw_mmx,
+            vint_can(INDEX_op_perm_vec, MO_16)
+            && vint_can(INDEX_op_sssub_vec, MO_16),
+            vint_phop, VINT_PHSUBS | MO_16 << 8)
 BINARY_INT_MMX(PMADDUBSW, pmaddubsw)
 /*
  * tcg_vpermvar: pshufb as table lookups, one per 128-bit lane.  A byte
@@ -1273,7 +1368,10 @@ BINARY_INT_SSE(VPERMILPD,  vpermilpd)
 BINARY_INT_SSE(VMASKMOVPS, vpmaskmovd)
 BINARY_INT_SSE(VMASKMOVPD, vpmaskmovq)
 
-BINARY_INT_SSE(PMULDQ,    pmuldq)
+VINT_BINARY(PMULDQ, pmuldq, NULL,
+            vint_can(INDEX_op_mulw_vec, MO_32)
+            && vint_can(INDEX_op_perm_vec, MO_32),
+            vint_pmul_even, true)
 
 BINARY_INT_SSE(VAESDEC, aesdec)
 BINARY_INT_SSE(VAESDECLAST, aesdeclast)
