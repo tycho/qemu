@@ -2533,8 +2533,107 @@ VINT_SHIFTV(VPSRLV, vpsrlv, INDEX_op_shrv_vec)
 VINT_SHIFTV(VPSRAV, vpsrav, INDEX_op_sarv_vec)
 VEXW_AVX(VPMASKMOV, vpmaskmov)
 
+/*
+ * With tcg_vint, the gathers' elements as guest loads in order, when every
+ * mask element's sign bit is set (as after PCMPEQ of the mask register with
+ * itself, which the optimizer folds, removing the test).  Operand 0 gets
+ * each element, and the element of the mask (operand 1) is cleared, before
+ * the next load, so a fault leaves the elements before it loaded and
+ * their mask cleared, as on x86.  Any other mask falls through to the
+ * code that follows (the helper), and the returned label is to be set
+ * after it; NULL, with nothing emitted, when the host can't insert
+ * elements.  qidx: 64-bit indices.
+ */
+static TCGLabel *gen_vint_gather(DisasContext *s, X86DecodedInsn *decode,
+                                 bool qidx)
+{
+    MemOp esz = s->vex_w ? MO_64 : MO_32;
+    MemOp isz = qidx ? MO_64 : MO_32;
+    int vec_len = vector_len(s, decode);
+    int n = vec_len >> MAX(esz, isz);
+    int per_half = 16 >> esz;
+    int halves = DIV_ROUND_UP(n, per_half);
+    int index_ofs = ZMM_OFFSET(decode->mem.index);
+    uint64_t signs = esz == MO_32 ? 0x8000000080000000ull : INT64_MIN;
+    TCGv_vec d[2], m[2];
+    int d_ofs[2], m_ofs[2];
+    TCGv_i64 t, all;
+    TCGv addr;
+    TCGLabel *slow, *done;
+
+    if (!vint_can(INDEX_op_insert_vec, esz)) {
+        return NULL;
+    }
+    t = tcg_temp_new_i64();
+    all = tcg_temp_new_i64();
+    addr = tcg_temp_new();
+    slow = gen_new_label();
+    done = gen_new_label();
+
+    /* The sign bits of the n mask elements, 8 bytes at a time. */
+    tcg_gen_movi_i64(all, -1);
+    for (int k = 0; k < MAX(1, (n << esz) / 8); k++) {
+        tcg_gen_ld_i64(t, tcg_env,
+                       vector_elem_offset(&decode->op[1], MO_64, k));
+        tcg_gen_and_i64(all, all, t);
+    }
+    tcg_gen_andi_i64(all, all, signs);
+    tcg_gen_brcondi_i64(TCG_COND_NE, all, signs, slow);
+
+    for (int h = 0; h < halves; h++) {
+        d[h] = tcg_temp_new_vec(TCG_TYPE_V128);
+        m[h] = tcg_temp_new_vec(TCG_TYPE_V128);
+        d_ofs[h] = vector_elem_offset(&decode->op[0], MO_128, h);
+        m_ofs[h] = vector_elem_offset(&decode->op[1], MO_128, h);
+        tcg_gen_ld_vec(d[h], tcg_env, d_ofs[h]);
+        tcg_gen_ld_vec(m[h], tcg_env, m_ofs[h]);
+    }
+    for (int i = 0; i < n; i++) {
+        int h = i / per_half, j = i % per_half;
+
+        if (isz == MO_32) {
+            tcg_gen_ld32s_i64(t, tcg_env,
+                              index_ofs + offsetof(ZMMReg, ZMM_L(i)));
+        } else {
+            tcg_gen_ld_i64(t, tcg_env, index_ofs + offsetof(ZMMReg, ZMM_Q(i)));
+        }
+        tcg_gen_trunc_i64_tl(addr, t);
+        tcg_gen_shli_tl(addr, addr, decode->mem.scale);
+        tcg_gen_add_tl(addr, addr, s->A0);
+        if (s->aflag != MO_64) {
+            tcg_gen_ext32u_tl(addr, addr);
+        }
+        tcg_gen_qemu_ld_i64(t, addr, s->mem_index, esz | MO_LE);
+        tcg_gen_insert_vec_i64(esz, d[h], d[h], t, j);
+        tcg_gen_st_vec(d[h], tcg_env, d_ofs[h]);
+        tcg_gen_insert_vec_i64(esz, m[h], m[h], tcg_constant_i64(0), j);
+        tcg_gen_st_vec(m[h], tcg_env, m_ofs[h]);
+    }
+
+    /* 64-bit indices, 32-bit elements: the rest of both registers is zero. */
+    if (qidx && esz == MO_32) {
+        if (s->vex_l) {
+            tcg_gen_gvec_dup_imm(MO_64, vector_elem_offset(&decode->op[0],
+                                                           MO_128, 1),
+                                 16, 16, 0);
+            tcg_gen_gvec_dup_imm(MO_64, vector_elem_offset(&decode->op[1],
+                                                           MO_128, 1),
+                                 16, 16, 0);
+        } else {
+            tcg_gen_insert_vec_i64(MO_64, d[0], d[0], tcg_constant_i64(0), 1);
+            tcg_gen_st_vec(d[0], tcg_env, d_ofs[0]);
+            tcg_gen_insert_vec_i64(MO_64, m[0], m[0], tcg_constant_i64(0), 1);
+            tcg_gen_st_vec(m[0], tcg_env, m_ofs[0]);
+        }
+    }
+    tcg_gen_br(done);
+    gen_set_label(slow);
+    return done;
+}
+
 /* Same as above, but with extra arguments to the helper.  */
 static inline void gen_vsib_avx(DisasContext *s, X86DecodedInsn *decode,
+                                bool qidx,
                                 SSEFunc_0_eppptit d_xmm, SSEFunc_0_eppptit q_xmm,
                                 SSEFunc_0_eppptit d_ymm, SSEFunc_0_eppptit q_ymm)
 {
@@ -2544,10 +2643,14 @@ static inline void gen_vsib_avx(DisasContext *s, X86DecodedInsn *decode,
     TCGv_i32 scale = tcg_constant_i32(decode->mem.scale);
     TCGv_ptr index = tcg_temp_new_ptr();
     TCGv mask = tcg_constant_tl(MAKE_64BIT_MASK(0, 8 << s->aflag));
+    TCGLabel *done = gen_vint_gather(s, decode, qidx);
 
     /* Pass third input as (index, base, scale) */
     tcg_gen_addi_ptr(index, tcg_env, ZMM_OFFSET(decode->mem.index));
     fn(tcg_env, OP_PTR0, OP_PTR1, index, s->A0, scale, mask);
+    if (done) {
+        gen_set_label(done);
+    }
 
     /*
      * There are two output operands, so zero OP1's high 128 bits
@@ -2558,15 +2661,15 @@ static inline void gen_vsib_avx(DisasContext *s, X86DecodedInsn *decode,
         tcg_gen_gvec_dup_imm(MO_64, ymmh_ofs, 16, 16, 0);
     }
 }
-#define VSIB_AVX(uname, lname)                                                     \
+#define VSIB_AVX(uname, lname, qidx)                                               \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
 {                                                                                  \
-    gen_vsib_avx(s, decode,                                                        \
+    gen_vsib_avx(s, decode, qidx,                                                  \
                  gen_helper_##lname##d_xmm, gen_helper_##lname##q_xmm,             \
                  gen_helper_##lname##d_ymm, gen_helper_##lname##q_ymm);            \
 }
-VSIB_AVX(VPGATHERD, vpgatherd)
-VSIB_AVX(VPGATHERQ, vpgatherq)
+VSIB_AVX(VPGATHERD, vpgatherd, false)
+VSIB_AVX(VPGATHERQ, vpgatherq, true)
 
 static void gen_AAA(DisasContext *s, X86DecodedInsn *decode)
 {
