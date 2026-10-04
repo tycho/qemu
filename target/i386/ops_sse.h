@@ -863,6 +863,8 @@ int64_t helper_cvttsd2sq(CPUX86State *env, ZMMReg *s)
 
 void glue(helper_rsqrtps, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 {
+    /* No exceptions: the host's flags are discarded with QEMU's. */
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     int old_flags = get_float_exception_flags(&env->sse_status);
     int i;
     for (i = 0; i < 2 << SHIFT; i++) {
@@ -876,6 +878,8 @@ void glue(helper_rsqrtps, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 #if SHIFT == 1
 void helper_rsqrtss(CPUX86State *env, ZMMReg *d, ZMMReg *v, ZMMReg *s)
 {
+    /* No exceptions: the host's flags are discarded with QEMU's. */
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     int old_flags = get_float_exception_flags(&env->sse_status);
     int i;
     d->ZMM_S(0) = float32_div(float32_one,
@@ -890,6 +894,8 @@ void helper_rsqrtss(CPUX86State *env, ZMMReg *d, ZMMReg *v, ZMMReg *s)
 
 void glue(helper_rcpps, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 {
+    /* No exceptions: the host's flags are discarded with QEMU's. */
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     int old_flags = get_float_exception_flags(&env->sse_status);
     int i;
     for (i = 0; i < 2 << SHIFT; i++) {
@@ -901,6 +907,8 @@ void glue(helper_rcpps, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 #if SHIFT == 1
 void helper_rcpss(CPUX86State *env, ZMMReg *d, ZMMReg *v, ZMMReg *s)
 {
+    /* No exceptions: the host's flags are discarded with QEMU's. */
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     int old_flags = get_float_exception_flags(&env->sse_status);
     int i;
     d->ZMM_S(0) = float32_div(float32_one, s->ZMM_S(0), &env->sse_status);
@@ -1338,24 +1346,32 @@ UNPCK_OP(h, 1)
 #if SHIFT == 0
 void helper_pi2fd(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = int32_to_float32(s->MMX_L(0), &env->mmx_status);
     d->MMX_S(1) = int32_to_float32(s->MMX_L(1), &env->mmx_status);
 }
 
 void helper_pi2fw(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = int32_to_float32((int16_t)s->MMX_W(0), &env->mmx_status);
     d->MMX_S(1) = int32_to_float32((int16_t)s->MMX_W(2), &env->mmx_status);
 }
 
 void helper_pf2id(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_L(0) = float32_to_int32_round_to_zero(s->MMX_S(0), &env->mmx_status);
     d->MMX_L(1) = float32_to_int32_round_to_zero(s->MMX_S(1), &env->mmx_status);
 }
 
 void helper_pf2iw(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_L(0) = satsw(float32_to_int32_round_to_zero(s->MMX_S(0),
                                                        &env->mmx_status));
     d->MMX_L(1) = satsw(float32_to_int32_round_to_zero(s->MMX_S(1),
@@ -1364,6 +1380,7 @@ void helper_pf2iw(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfacc(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     float32 r;
 
     r = float32_add(d->MMX_S(0), d->MMX_S(1), &env->mmx_status);
@@ -1373,12 +1390,16 @@ void helper_pfacc(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfadd(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = float32_add(d->MMX_S(0), s->MMX_S(0), &env->mmx_status);
     d->MMX_S(1) = float32_add(d->MMX_S(1), s->MMX_S(1), &env->mmx_status);
 }
 
 void helper_pfcmpeq(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_L(0) = float32_eq_quiet(d->MMX_S(0), s->MMX_S(0),
                                    &env->mmx_status) ? -1 : 0;
     d->MMX_L(1) = float32_eq_quiet(d->MMX_S(1), s->MMX_S(1),
@@ -1387,6 +1408,8 @@ void helper_pfcmpeq(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfcmpge(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_L(0) = float32_le(s->MMX_S(0), d->MMX_S(0),
                              &env->mmx_status) ? -1 : 0;
     d->MMX_L(1) = float32_le(s->MMX_S(1), d->MMX_S(1),
@@ -1395,6 +1418,8 @@ void helper_pfcmpge(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfcmpgt(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_L(0) = float32_lt(s->MMX_S(0), d->MMX_S(0),
                              &env->mmx_status) ? -1 : 0;
     d->MMX_L(1) = float32_lt(s->MMX_S(1), d->MMX_S(1),
@@ -1403,6 +1428,8 @@ void helper_pfcmpgt(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfmax(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     if (float32_lt(d->MMX_S(0), s->MMX_S(0), &env->mmx_status)) {
         d->MMX_S(0) = s->MMX_S(0);
     }
@@ -1413,6 +1440,8 @@ void helper_pfmax(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfmin(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     if (float32_lt(s->MMX_S(0), d->MMX_S(0), &env->mmx_status)) {
         d->MMX_S(0) = s->MMX_S(0);
     }
@@ -1423,12 +1452,15 @@ void helper_pfmin(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfmul(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = float32_mul(d->MMX_S(0), s->MMX_S(0), &env->mmx_status);
     d->MMX_S(1) = float32_mul(d->MMX_S(1), s->MMX_S(1), &env->mmx_status);
 }
 
 void helper_pfnacc(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     float32 r;
 
     r = float32_sub(d->MMX_S(0), d->MMX_S(1), &env->mmx_status);
@@ -1438,6 +1470,7 @@ void helper_pfnacc(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfpnacc(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
     float32 r;
 
     r = float32_sub(d->MMX_S(0), d->MMX_S(1), &env->mmx_status);
@@ -1447,12 +1480,16 @@ void helper_pfpnacc(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfrcp(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = float32_div(float32_one, s->MMX_S(0), &env->mmx_status);
     d->MMX_S(1) = d->MMX_S(0);
 }
 
 void helper_pfrsqrt(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_L(1) = s->MMX_L(0) & 0x7fffffff;
     d->MMX_S(1) = float32_div(float32_one,
                               float32_sqrt(d->MMX_S(1), &env->mmx_status),
@@ -1463,12 +1500,16 @@ void helper_pfrsqrt(CPUX86State *env, MMXReg *d, MMXReg *s)
 
 void helper_pfsub(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = float32_sub(d->MMX_S(0), s->MMX_S(0), &env->mmx_status);
     d->MMX_S(1) = float32_sub(d->MMX_S(1), s->MMX_S(1), &env->mmx_status);
 }
 
 void helper_pfsubr(CPUX86State *env, MMXReg *d, MMXReg *s)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(env_cpu(env));
+
     d->MMX_S(0) = float32_sub(s->MMX_S(0), d->MMX_S(0), &env->mmx_status);
     d->MMX_S(1) = float32_sub(s->MMX_S(1), d->MMX_S(1), &env->mmx_status);
 }
