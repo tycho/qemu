@@ -3985,6 +3985,8 @@ dead_env_store_pass(TCGContext *s)
         case INDEX_op_qemu_st:
         case INDEX_op_qemu_ld2:
         case INDEX_op_qemu_st2:
+        case INDEX_op_qemu_ld_vec:
+        case INDEX_op_qemu_st_vec:
             dse_keep_only(&dead, dse_scratch_lo, dse_scratch_hi);
             break;
         case INDEX_op_exit_tb:
@@ -4772,6 +4774,8 @@ static bool op_is_guest_access(TCGOpcode opc)
     case INDEX_op_qemu_st:
     case INDEX_op_qemu_ld2:
     case INDEX_op_qemu_st2:
+    case INDEX_op_qemu_ld_vec:
+    case INDEX_op_qemu_st_vec:
         return true;
     default:
         return false;
