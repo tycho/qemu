@@ -2342,10 +2342,27 @@ static bool gen_st_vec_env(DisasContext *s, TCGv addr, int offset, MemOp mop)
     return true;
 }
 
+/*
+ * Single-copy atomicity of a 16-byte SSE/AVX access.  CPUs with AVX make
+ * aligned 16-byte accesses atomic, and libatomic relies on it for its
+ * 16-byte atomics, with VEX-encoded VMOVDQA.  With x-sse-atom=vex128,
+ * only aligned VEX-encoded accesses get it; the others are atomic per
+ * 8 bytes, as before AVX, so that they can be ordered without a barrier.
+ */
+static MemOp gen_sse_atom(DisasContext *s, bool align)
+{
+    if (!(s->cpuid_ext_features & CPUID_EXT_AVX)) {
+        return MO_ATOM_IFALIGN_PAIR;
+    }
+    if (tcg_sse_atom_vex128 && !(align && (s->prefix & PREFIX_VEX))) {
+        return MO_ATOM_IFALIGN_PAIR;
+    }
+    return MO_ATOM_IFALIGN;
+}
+
 static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align)
 {
-    MemOp atom = (s->cpuid_ext_features & CPUID_EXT_AVX
-                  ? MO_ATOM_IFALIGN : MO_ATOM_IFALIGN_PAIR);
+    MemOp atom = gen_sse_atom(s, align);
     MemOp mop = MO_128 | MO_LE | atom | (align ? MO_ALIGN_16 : 0);
     int mem_index = s->mem_index;
     TCGv_i128 t;
@@ -2360,8 +2377,7 @@ static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align)
 
 static inline void gen_sto_env_A0(DisasContext *s, int offset, bool align)
 {
-    MemOp atom = (s->cpuid_ext_features & CPUID_EXT_AVX
-                  ? MO_ATOM_IFALIGN : MO_ATOM_IFALIGN_PAIR);
+    MemOp atom = gen_sse_atom(s, align);
     MemOp mop = MO_128 | MO_LE | atom | (align ? MO_ALIGN_16 : 0);
     int mem_index = s->mem_index;
     TCGv_i128 t;

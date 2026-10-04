@@ -603,6 +603,16 @@ static void tcg_set_jitwx(Object *obj, const char *value, Error **errp)
 #endif
 }
 
+static bool tcg_get_sse_atom(Object *obj, Error **errp)
+{
+    return tcg_sse_atom_vex128;
+}
+
+static void tcg_set_sse_atom(Object *obj, bool value, Error **errp)
+{
+    tcg_sse_atom_vex128 = value;
+}
+
 static bool tcg_get_tso_vecld(Object *obj, Error **errp)
 {
     return tcg_tso_vecld_pair;
@@ -1113,6 +1123,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-pferr-hw",
         "Report page-fault error codes as hardware does (x86: a "
         "read-modify-write faults as a write)");
+
+    object_class_property_add_bool(oc, "x-sse-atom",
+                                   tcg_get_sse_atom, tcg_set_sse_atom);
+    object_class_property_set_description(oc, "x-sse-atom",
+        "Temporary: 16-byte atomicity only for aligned VEX-encoded SSE/AVX "
+        "accesses (libatomic's), 8-byte for the others");
 
     object_class_property_add_bool(oc, "x-tso-vecld",
                                    tcg_get_tso_vecld, tcg_set_tso_vecld);
