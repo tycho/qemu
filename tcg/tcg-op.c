@@ -143,9 +143,71 @@ static void DNI tcg_gen_op3i_i64(TCGOpcode opc, TCGv_i64 a1,
     tcg_gen_op3(opc, TCG_TYPE_I64, tcgv_i64_arg(a1), tcgv_i64_arg(a2), a3);
 }
 
+/*
+ * A load of an element of an env_alias vector global: extract it from the
+ * global, which would otherwise have to be stored to its memory first.
+ */
+static bool ld_alias_element(TCGOpcode opc, TCGType type, TCGTemp *val,
+                             TCGTemp *base, TCGArg offset)
+{
+    TCGContext *s = tcg_ctx;
+    MemOp mop;
+    TCGTemp *g;
+    TCGv_i64 t;
+    unsigned idx;
+
+    if (!s->nb_alias || (type != TCG_TYPE_I32 && type != TCG_TYPE_I64)) {
+        return false;
+    }
+    switch (opc) {
+    case INDEX_op_ld8u:
+        mop = MO_UB;
+        break;
+    case INDEX_op_ld8s:
+        mop = MO_SB;
+        break;
+    case INDEX_op_ld16u:
+        mop = MO_UW;
+        break;
+    case INDEX_op_ld16s:
+        mop = MO_SW;
+        break;
+    case INDEX_op_ld32u:
+        mop = MO_UL;
+        break;
+    case INDEX_op_ld32s:
+        mop = MO_SL;
+        break;
+    case INDEX_op_ld:
+        mop = type == TCG_TYPE_I32 ? MO_UL : MO_UQ;
+        break;
+    default:
+        return false;
+    }
+    g = tcg_alias_element(s, base, offset, mop & MO_SIZE, &idx);
+    if (!g || tcg_can_emit_vec_op(INDEX_op_extract_vec, g->base_type,
+                                  mop & MO_SIZE) <= 0) {
+        return false;
+    }
+    t = type == TCG_TYPE_I64 ? temp_tcgv_i64(val) : tcg_temp_ebb_new_i64();
+    tcg_gen_extract_vec_i64(mop & MO_SIZE, t, temp_tcgv_vec(g), idx);
+    if (mop & MO_SIGN) {
+        tcg_gen_ext_i64(t, t, mop);
+    }
+    if (type == TCG_TYPE_I32) {
+        tcg_gen_extrl_i64_i32(temp_tcgv_i32(val), t);
+        tcg_temp_free_i64(t);
+    }
+    return true;
+}
+
 static void DNI tcg_gen_ldst_op_i64(TCGOpcode opc, TCGv_i64 val,
                                     TCGv_ptr base, TCGArg offset)
 {
+    if (ld_alias_element(opc, TCG_TYPE_I64, tcgv_i64_temp(val),
+                         tcgv_ptr_temp(base), offset)) {
+        return;
+    }
     tcg_gen_op3(opc, TCG_TYPE_I64, tcgv_i64_arg(val),
                 tcgv_ptr_arg(base), offset);
 }
@@ -793,30 +855,45 @@ void tcg_gen_extract2(TCGType type, TCGTemp *dst, TCGTemp *lo, TCGTemp *hi,
 
 void tcg_gen_ld(TCGType type, TCGTemp *dst, TCGTemp *base, tcg_target_long ofs)
 {
+    if (ld_alias_element(INDEX_op_ld, type, dst, base, ofs)) {
+        return;
+    }
     tcg_gen_op_tti(INDEX_op_ld, type, dst, base, ofs);
 }
 
 void tcg_gen_ld8s(TCGType type, TCGTemp *dst,
                   TCGTemp *base, tcg_target_long ofs)
 {
+    if (ld_alias_element(INDEX_op_ld8s, type, dst, base, ofs)) {
+        return;
+    }
     tcg_gen_op_tti(INDEX_op_ld8s, type, dst, base, ofs);
 }
 
 void tcg_gen_ld8u(TCGType type, TCGTemp *dst,
                   TCGTemp *base, tcg_target_long ofs)
 {
+    if (ld_alias_element(INDEX_op_ld8u, type, dst, base, ofs)) {
+        return;
+    }
     tcg_gen_op_tti(INDEX_op_ld8u, type, dst, base, ofs);
 }
 
 void tcg_gen_ld16s(TCGType type, TCGTemp *dst,
                    TCGTemp *base, tcg_target_long ofs)
 {
+    if (ld_alias_element(INDEX_op_ld16s, type, dst, base, ofs)) {
+        return;
+    }
     tcg_gen_op_tti(INDEX_op_ld16s, type, dst, base, ofs);
 }
 
 void tcg_gen_ld16u(TCGType type, TCGTemp *dst,
                    TCGTemp *base, tcg_target_long ofs)
 {
+    if (ld_alias_element(INDEX_op_ld16u, type, dst, base, ofs)) {
+        return;
+    }
     tcg_gen_op_tti(INDEX_op_ld16u, type, dst, base, ofs);
 }
 
