@@ -57,6 +57,12 @@
 #ifndef TCG_TARGET_HAS_widen_vec
 #define TCG_TARGET_HAS_widen_vec        0
 #endif
+#ifndef TCG_TARGET_HAS_mulw_vec
+#define TCG_TARGET_HAS_mulw_vec         0
+#endif
+#ifndef TCG_TARGET_HAS_addp_vec
+#define TCG_TARGET_HAS_addp_vec         0
+#endif
 #ifndef TCG_TARGET_HAS_v64
 #define TCG_TARGET_HAS_v64              0
 #endif

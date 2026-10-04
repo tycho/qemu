@@ -485,6 +485,21 @@ void tcg_gen_ext_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, unsigned n);
  */
 void tcg_gen_widen_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
                        bool is_signed, bool high);
+/*
+ * Widening multiply: r[i] = a[k + i] * b[k + i] at twice the element size,
+ * exact, for the elements of the low halves (k = 0) or, with @high, the
+ * high halves (k = n / 2) of a and b; signed or unsigned.  vece is the
+ * inputs' element size (MO_8, MO_16 or MO_32).  No fallback: check
+ * tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_mulw_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                      bool is_signed, bool high);
+/*
+ * Pairwise add: element i of r is the sum (modulo 2^size) of elements
+ * 2 * i and 2 * i + 1 of the concatenation a:b.  No fallback: check
+ * tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_addp_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_dup_mem_vec(unsigned vece, TCGv_vec, TCGv_ptr, tcg_target_long);
 void tcg_gen_dupi_vec(unsigned vece, TCGv_vec, uint64_t);
 void tcg_gen_add_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
