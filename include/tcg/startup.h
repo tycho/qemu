@@ -62,4 +62,10 @@ void tcg_prologue_init(void);
  */
 extern bool tcg_vecld;
 
+/*
+ * tcg_vecmem: 128-bit guest vector loads and stores use qemu_ld_vec and
+ * qemu_st_vec where tcg_can_qemu_ldst_vec() allows.
+ */
+extern bool tcg_vecmem;
+
 #endif
