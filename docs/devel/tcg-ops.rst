@@ -996,6 +996,13 @@ result of each operation must be used.
      - | Round to an integral value in floating-point format, in the
          current rounding mode, signaling inexact.
 
+   * - frint_vec *v0*, *v1*, *mode*
+
+     - | Round to an integral value in floating-point format, without
+         signaling inexact: to nearest even, down, up or toward zero
+         (``TCG_FRINT_NEAREST`` ... ``TCG_FRINT_ZERO``), or in the current
+         rounding mode (``TCG_FRINT_CURRENT``).
+
 The scalar operations work on element 0 of a 128-bit vector.  The other
 elements of *v0* are those of *v1*.
 

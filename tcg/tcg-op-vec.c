@@ -856,6 +856,17 @@ void tcg_gen_frintx_vec(unsigned vece, TCGv_vec r, TCGv_vec a)
     do_op2_nofail(vece, r, a, INDEX_op_frintx_vec);
 }
 
+void tcg_gen_frint_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGFrint mode)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_assert_listed_vecop(INDEX_op_frint_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_frint_vec,
+                                         rt->base_type, vece) > 0);
+    vec_gen_3(INDEX_op_frint_vec, rt->base_type, vece, temp_arg(rt),
+              tcgv_vec_arg(a), mode);
+}
+
 static void do_op4_nofail(unsigned vece, TCGv_vec r, TCGv_vec a,
                           TCGv_vec b, TCGArg c, TCGOpcode opc)
 {
