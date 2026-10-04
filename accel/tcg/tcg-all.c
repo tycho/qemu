@@ -77,6 +77,41 @@ bool qemu_tcg_mttcg_enabled(void)
 }
 #endif /* !CONFIG_USER_ONLY */
 
+/*
+ * [DEV] The fork's defaults: on aarch64 hosts, every adopted setting is
+ * on, host-aware ("auto" where a setting has it).  Applied through the
+ * properties, so a default behaves exactly as the same setting given on
+ * the command line or in QEMU_XTCG, which can still override it.
+ */
+static void xtcg_fork_defaults(Object *obj)
+{
+#if defined(__aarch64__)
+    static const char *const defaults[][2] = {
+        { "x-tso", "auto" },
+        { "x-ssefp", "auto" },
+        { "x-simd", "on" },
+        { "x-regcache", "on" },
+        { "x-pin", "on" },
+        { "x-region", "on" },
+        { "x-tblookup", "on" },
+        { "x-i386-runtime", "on" },
+        { "x-addr32", "on" },
+        { "x-iofast", "on" },
+        { "x-hosttime", "on" },
+        { "x-tlb-grow", "1" },
+        { "x-pause", "hint" },
+#ifdef CONFIG_DARWIN
+        { "x-jitwx", "lazy" },
+#endif
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(defaults); i++) {
+        object_property_parse(obj, defaults[i][0], defaults[i][1],
+                              &error_abort);
+    }
+#endif
+}
+
 static void tcg_accel_instance_init(Object *obj)
 {
     TCGState *s = TCG_STATE(obj);
@@ -87,6 +122,7 @@ static void tcg_accel_instance_init(Object *obj)
 #else
     s->splitwx_enabled = 0;
 #endif
+    xtcg_fork_defaults(obj);
 }
 
 bool one_insn_per_tb;
