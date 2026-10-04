@@ -275,6 +275,7 @@ void tcg_gen_concat_i64_vec(TCGv_vec r, TCGv_i64 lo, TCGv_i64 hi);
  */
 void tcg_gen_perm_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
                       uint32_t pattern);
+void tcg_gen_tbl_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b);
 QEMU_ARG_NONNULL
 void tcg_gen_dup_mem_vec(unsigned vece, TCGv_vec, TCGv_ptr, tcg_target_long);
 QEMU_ARG_NONNULL
