@@ -655,14 +655,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-tso-stack",
         "qemu-user: guest accesses to the thread's own stack (x86: RSP-based, "
         "push/pop/call/ret) get no memory-order constraint");
-}
 
     object_class_property_add_bool(oc, "x-simd", tcg_get_simd, tcg_set_simd);
     object_class_property_set_description(oc, "x-simd",
         "Keep guest vector code in host vector registers where the host "
         "backend can: vector loads and stores as host vector accesses, "
         "permutes and element inserts as host permutes and table lookups");
-}
 
     object_class_property_add_str(oc, "x-ssefp", tcg_get_ssefp, tcg_set_ssefp);
     object_class_property_set_description(oc, "x-ssefp",
@@ -671,7 +669,6 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "and flags), native (run with the guest's FP mode in the host "
         "FPU; needs a host that can express it) or auto (native where "
         "possible, else vec on AArch64 hosts and soft elsewhere)");
-}
 
     object_class_property_add_bool(oc, "x-regcache",
                                    tcg_get_regcache, tcg_set_regcache);
@@ -679,7 +676,6 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Keep guest registers in host registers: remove dead stores to CPU "
         "state, keep dirty and vector values in registers across guest "
         "memory accesses, and the x86 vector registers as TCG globals");
-}
 
     object_class_property_add_bool(oc, "x-region",
                                    tcg_get_region, tcg_set_region);
@@ -687,7 +683,6 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Let a translation block loop back to its own start instead of "
         "chaining to itself, keeping the loop's guest registers in host "
         "registers (not with plugins or icount)");
-}
 
     object_class_property_add_bool(oc, "x-tblookup",
                                    tcg_get_tblookup, tcg_set_tblookup);
@@ -696,14 +691,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "indirect jumps (in a short helper call at direct jumps to "
         "another page), flush the jump cache in O(1), and pack TB "
         "structs next to their code (x86 guests)");
-}
 
     object_class_property_add_bool(oc, "x-addr32",
                                    tcg_get_addr32, tcg_set_addr32);
     object_class_property_set_description(oc, "x-addr32",
         "Translate with 32-bit guest addresses where the target allows "
         "(x86 outside long mode): no zero-extension per access");
-}
 
     object_class_property_add_bool(oc, "x-iofast",
                                    tcg_get_iofast, tcg_set_iofast);
@@ -712,7 +705,6 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "with icount), MMIO to lockless_io regions without the BQL, the "
         "x86 APIC's TPR and the RTC's update polls without the BQL, and "
         "no kvmvapic option ROM");
-}
 
     object_class_property_add_bool(oc, "x-hosttime",
                                    tcg_get_hosttime, tcg_set_hosttime);
