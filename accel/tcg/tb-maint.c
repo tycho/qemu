@@ -28,6 +28,7 @@
 #include "exec/target_page.h"
 #include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/cpu-ops.h"
+#include "accel/tcg/host-fp.h"
 #include "tb-internal.h"
 #include "system/tcg.h"
 #include "tcg/tcg.h"
@@ -1334,8 +1335,12 @@ static void tso_cross_note(CPUState *cpu, uint64_t addr, MemOpIdx oi,
     TranslationBlock *tb;
 
     /* In system mode, a TLB miss comes here too. */
-    if ((addr & 15) + memop_size(get_memop(oi)) <= 16 ||
-        !tcg_tso_cross_count(site)) {
+    if ((addr & 15) + memop_size(get_memop(oi)) <= 16) {
+        return;
+    }
+    /* The site table is a GHashTable, which uses host floating point. */
+    TCG_HOST_FP_SUSPEND_GUARD(cpu);
+    if (!tcg_tso_cross_count(site)) {
         return;
     }
     tb = tcg_tb_lookup(retaddr);
