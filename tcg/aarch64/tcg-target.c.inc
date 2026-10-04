@@ -645,6 +645,9 @@ typedef enum {
     Iqrrr_e_TRN2      = 0x0e006800,
     Iqrrr_e_ZIP2      = 0x0e007800,
     Iqrrr_e_ADDP      = 0x0e20bc00,
+    Iqrrr_e_SABD      = 0x0e207400,
+    Iqrrr_e_UABD      = 0x2e207400,
+    Iqrrr_e_URHADD    = 0x2e201400,
     Iqrrr_e_SMULL     = 0x0e20c000,      /* three different */
     Iqrrr_e_UMULL     = 0x2e20c000,
     Iqrrr_e_TBL       = 0x0e000000,      /* one table register */
@@ -680,6 +683,8 @@ typedef enum {
     /* AdvSIMD two-reg misc.  */
     Iqrr_e_REV64      = 0x0e200800,
     Iqrr_e_XTN        = 0x0e212800,
+    Iqrr_e_SADDLP     = 0x0e202800,
+    Iqrr_e_UADDLP     = 0x2e202800,
     Iqrr_e_SQXTN      = 0x0e214800,
     Iqrr_e_SQXTUN     = 0x2e212800,
     Iqrr_e_UQXTN      = 0x2e214800,
@@ -3661,6 +3666,17 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_narrow_vec:
         tcg_out_narrow_vec(s, vece, a0, a1, a2, args[3]);
         break;
+    case INDEX_op_abd_vec:
+        tcg_out_insn_qrrr_e(s, args[3] ? Iqrrr_e_SABD : Iqrrr_e_UABD, 1,
+                            vece, a0, a1, a2);
+        break;
+    case INDEX_op_addlp_vec:
+        tcg_out_insn_qrr_e(s, a2 ? Iqrr_e_SADDLP : Iqrr_e_UADDLP, 1,
+                           vece, a0, a1);
+        break;
+    case INDEX_op_avgr_vec:
+        tcg_out_insn_qrrr_e(s, Iqrrr_e_URHADD, 1, vece, a0, a1, a2);
+        break;
     case INDEX_op_widen_vec:
         /* SXTL/UXTL{,2}: SSHLL/USHLL by 0; Q selects the high half. */
         tcg_out_insn_simd_shift_imm(s, a2 & 1 ? Isimd_shift_imm_SSHLL
@@ -4011,6 +4027,9 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_widen_vec:
     case INDEX_op_mulw_vec:
     case INDEX_op_narrow_vec:
+    case INDEX_op_abd_vec:
+    case INDEX_op_addlp_vec:
+    case INDEX_op_avgr_vec:
         return type == TCG_TYPE_V128 && vece <= MO_32;
     case INDEX_op_addp_vec:
         return type == TCG_TYPE_V128;
@@ -4137,8 +4156,11 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_mulw_vec:
     case INDEX_op_addp_vec:
     case INDEX_op_narrow_vec:
+    case INDEX_op_abd_vec:
+    case INDEX_op_avgr_vec:
         return C_O1_I2(w, w, w);
     case INDEX_op_widen_vec:
+    case INDEX_op_addlp_vec:
         return C_O1_I1(w, w);
     case INDEX_op_dup_vec:
         return C_O1_I1(w, wr);
