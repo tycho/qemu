@@ -58,6 +58,7 @@
 #define TCG_TARGET_HAS_tbl_vec          1
 #define TCG_TARGET_HAS_zip_vec          1
 #define TCG_TARGET_HAS_ext_vec          1
+#define TCG_TARGET_HAS_widen_vec        1
 
 #define TCG_TARGET_extract_valid(type, ofs, len)   1
 #define TCG_TARGET_sextract_valid(type, ofs, len)  1
