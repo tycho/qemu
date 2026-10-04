@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 #include "tcg/tcg-temp-internal.h"
 #include "tcg/tcg-op-common.h"
 #include "tcg/tcg-mo.h"
@@ -118,7 +119,7 @@ static void tcg_gen_req_mo(TCGBar type)
 {
     type &= tcg_ctx->guest_mo;
     type &= ~TCG_TARGET_DEFAULT_MO;
-    if (type) {
+    if (type && tcg_tso_mode != TCG_TSO_NONE) {
         tcg_gen_mb(type | TCG_BAR_SC);
     }
 }
