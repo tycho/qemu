@@ -2483,8 +2483,17 @@ static void tcg_out_qemu_ldst_vec(TCGContext *s, TCGReg data,
     HostAddress h;
 
     ldst = prepare_host_addr(s, &h, addr_reg, oi, is_ld, false);
-    tcg_out_insn_ldst_reg(s, is_ld ? Ildst_imm_LDRVQ : Ildst_imm_STRVQ,
-                          data, h.base, h.index_ext, h.index);
+    if (get_memop(oi) & MO_ACQ_REL) {
+        /* FEAT_LRCPC3 LDAPUR / STLUR (SIMD&FP, Q): no barrier. */
+        TCGReg base = tcg_out_host_addr_reg(s, h);
+
+        tcg_debug_assert(have_lrcpc3);
+        tcg_out32(s, (is_ld ? 0x1dc00800 : 0x1d800800)
+                  | base << 5 | (data & 31));
+    } else {
+        tcg_out_insn_ldst_reg(s, is_ld ? Ildst_imm_LDRVQ : Ildst_imm_STRVQ,
+                              data, h.base, h.index_ext, h.index);
+    }
     if (ldst) {
         ldst->type = TCG_TYPE_V128;
         ldst->datalo_reg = data;
