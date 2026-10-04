@@ -259,6 +259,18 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
     qatomic_set(&one_insn_per_tb, value);
 }
 
+static bool tcg_get_tblookup(Object *obj, Error **errp)
+{
+    return tcg_ijmp_inline;
+}
+
+static void tcg_set_tblookup(Object *obj, bool value, Error **errp)
+{
+    tcg_ijmp_inline = value;
+    tcg_jcgen = value;
+    tcg_tbpack = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -289,6 +301,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                    tcg_set_one_insn_per_tb);
     object_class_property_set_description(oc, "one-insn-per-tb",
         "Only put one guest insn in each translation block");
+
+    object_class_property_add_bool(oc, "x-tblookup",
+                                   tcg_get_tblookup, tcg_set_tblookup);
+    object_class_property_set_description(oc, "x-tblookup",
+        "Find the next TB from generated code: probe the jump cache at "
+        "indirect jumps (in a short helper call at direct jumps to "
+        "another page), flush the jump cache in O(1), and pack TB "
+        "structs next to their code (x86 guests)");
 }
 
 static const TypeInfo tcg_accel_type = {
