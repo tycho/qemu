@@ -3096,6 +3096,17 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
     }
 
     /*
+     * A memory destination that is also a source (2op), or an insn that
+     * accepts LOCK, is a read-modify-write: x86 faults on it as a write.
+     * Not an X86_TYPE_nop operand: x87, NOP and the opcodes left to the
+     * old decoder only use it for the address, and may just read.
+     */
+    if (decode.op[0].has_ea && decode.e.op0 != X86_TYPE_nop &&
+        (decode.op[1].has_ea || accept_lock)) {
+        tcg_set_insn_start_param(s->base.insn_start, 2, X86_INSN_RMW);
+    }
+
+    /*
      * Checks that result in #GP or VMEXIT come second.  Intercepts are
      * generally checked after non-memory exceptions (i.e. after all
      * exceptions if there is no memory operand).  Exceptions are
