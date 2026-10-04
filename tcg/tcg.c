@@ -240,6 +240,7 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 
 TCGContext tcg_init_ctx;
 TCGTsoMode tcg_tso_mode;
+bool tcg_tso_stack;
 bool tcg_tso_vec_group;
 
 /*
@@ -3586,7 +3587,8 @@ TCGOp *tcg_emit_op(TCGOpcode opc, unsigned nargs)
      * guest memory otherwise, call out or leave the straight-line code.
      */
     if (unlikely(tcg_ctx->tso_run_ld || tcg_ctx->tso_run_st) &&
-        !tcg_ctx->tso_run_emit && !tcg_ctx->emit_before_op &&
+        !tcg_ctx->tso_run_emit && !tcg_ctx->ldst_unordered &&
+        !tcg_ctx->emit_before_op &&
         opc != INDEX_op_mb &&
         (tcg_op_defs[opc].flags &
          (TCG_OPF_BB_END | TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS))) {
