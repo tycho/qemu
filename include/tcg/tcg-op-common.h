@@ -507,6 +507,15 @@ void tcg_gen_fcmp_vec(TCGCond cond, unsigned vece, TCGv_vec r,
 void tcg_gen_scvtf_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
 void tcg_gen_fcvtzs_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
 void tcg_gen_frintx_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
+/* How frint_vec rounds: to nearest even, down, up, toward zero, or as set. */
+typedef enum {
+    TCG_FRINT_NEAREST,
+    TCG_FRINT_DOWN,
+    TCG_FRINT_UP,
+    TCG_FRINT_ZERO,
+    TCG_FRINT_CURRENT,
+} TCGFrint;
+void tcg_gen_frint_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGFrint mode);
 /*
  * The same on element 0 of 128-bit vectors.  The result's other elements
  * are those of the first input.
