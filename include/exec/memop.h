@@ -132,6 +132,12 @@ typedef enum MemOp {
      * for x-tso=acqrel, only if TCG_TARGET_HAS_qemu_ldst_acqrel.
      */
     MO_ACQ_REL = 1 << 12,
+    /*
+     * MO_ACQ_REL_CROSS: with MO_ACQ_REL, this guest instruction has been
+     * seen to cross a 16-byte boundary (tcg_tso_cross_count): use a form
+     * that handles any alignment without a data-dependent branch.
+     */
+    MO_ACQ_REL_CROSS = 1 << 13,
 
     /* Combinations of the above, for ease of use.  */
     MO_UB    = MO_8,
