@@ -384,6 +384,12 @@ void tcg_gen_qemu_st_i128_chk(TCGv_i128, TCGTemp *, TCGArg, MemOp, TCGType);
  * tcg_can_qemu_ldst_vec() first.
  */
 bool tcg_can_qemu_ldst_vec(MemOp);
+/*
+ * Whether 16-byte aligned qemu_ld_vec/qemu_st_vec are ordered accesses
+ * themselves under x-tso=acqrel (no barrier): a front end may then say
+ * that an access it knows to be aligned is.
+ */
+bool tcg_can_qemu_ldst_vec_acqrel(void);
 void tcg_gen_qemu_ld_vec_chk(TCGv_vec, TCGTemp *, TCGArg, MemOp, TCGType);
 void tcg_gen_qemu_st_vec_chk(TCGv_vec, TCGTemp *, TCGArg, MemOp, TCGType);
 

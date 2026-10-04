@@ -2483,8 +2483,17 @@ static void tcg_out_qemu_ldst_vec(TCGContext *s, TCGReg data,
     HostAddress h;
 
     ldst = prepare_host_addr(s, &h, addr_reg, oi, is_ld, false);
-    tcg_out_insn_ldst_reg(s, is_ld ? Ildst_imm_LDRVQ : Ildst_imm_STRVQ,
-                          data, h.base, h.index_ext, h.index);
+    if (get_memop(oi) & MO_ACQ_REL) {
+        /* FEAT_LRCPC3 LDAPUR / STLUR (SIMD&FP, Q): no barrier. */
+        TCGReg base = tcg_out_host_addr_reg(s, h);
+
+        tcg_debug_assert(have_lrcpc3);
+        tcg_out32(s, (is_ld ? 0x1dc00800 : 0x1d800800)
+                  | base << 5 | (data & 31));
+    } else {
+        tcg_out_insn_ldst_reg(s, is_ld ? Ildst_imm_LDRVQ : Ildst_imm_STRVQ,
+                              data, h.base, h.index_ext, h.index);
+    }
     if (ldst) {
         ldst->type = TCG_TYPE_V128;
         ldst->datalo_reg = data;
@@ -2515,6 +2524,18 @@ static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
             /* add base, base, index */
             tcg_out_insn(s, addsub_shift, ADD, 1, base, h.base, h.index);
         }
+    }
+
+    if (get_memop(oi) & MO_ACQ_REL) {
+        /*
+         * x-tso=acqrel, 16-byte aligned (tcg_ldst_i128_acqrel): FEAT_LRCPC3
+         * LDIAPP / STILP, a load-acquire / store-release pair that is
+         * single-copy atomic with FEAT_LSE2.  No barrier.
+         */
+        tcg_debug_assert(have_lrcpc3 && have_lse2);
+        tcg_out32(s, (is_ld ? 0xd9401800 : 0xd9001800)
+                  | datahi << 16 | base << 5 | datalo);
+        goto done;
     }
 
     use_pair = h.aa.atom < MO_128 || have_lse2;
@@ -2582,6 +2603,7 @@ static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
         }
     }
 
+ done:
     if (ldst) {
         ldst->type = TCG_TYPE_I128;
         ldst->datalo_reg = datalo;

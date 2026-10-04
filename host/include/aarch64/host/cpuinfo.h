@@ -17,6 +17,7 @@
 #define CPUINFO_LRCPC2          (1u << 8)
 #define CPUINFO_AFP             (1u << 9)
 #define CPUINFO_RPRES           (1u << 10)
+#define CPUINFO_LRCPC3          (1u << 11)
 
 /* Initialized with a constructor. */
 extern unsigned cpuinfo;

@@ -12,6 +12,12 @@
 #ifndef TCG_TARGET_HAS_qemu_ldst_acqrel
 #define TCG_TARGET_HAS_qemu_ldst_acqrel 0
 #endif
+#ifndef TCG_TARGET_HAS_qemu_ldst_i128_acqrel
+#define TCG_TARGET_HAS_qemu_ldst_i128_acqrel 0
+#endif
+#ifndef TCG_TARGET_HAS_qemu_ldst_vec_acqrel
+#define TCG_TARGET_HAS_qemu_ldst_vec_acqrel 0
+#endif
 
 #if !defined(TCG_TARGET_HAS_v64) \
     && !defined(TCG_TARGET_HAS_v128) \
