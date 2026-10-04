@@ -54,6 +54,7 @@ struct TCGState {
     bool one_insn_per_tb;
     int splitwx_enabled;
     unsigned long tb_size;
+    bool pause_hint;
 };
 typedef struct TCGState TCGState;
 
@@ -145,6 +146,18 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     }
 
     qemu_add_vm_change_state_handler(tcg_vm_change_state, NULL);
+#endif
+
+    /*
+     * x-pause=hint: only where no other vCPU shares the thread (with
+     * round-robin TCG the exit is how the others get to run).
+     */
+#ifdef CONFIG_USER_ONLY
+    tcg_pause_hint = s->pause_hint;
+#else
+    tcg_pause_hint = s->pause_hint &&
+                     (s->mttcg_enabled == ON_OFF_AUTO_ON ||
+                      ms->smp.max_cpus == 1);
 #endif
 
     tcg_allowed = true;
@@ -256,6 +269,24 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
     qatomic_set(&one_insn_per_tb, value);
 }
 
+static char *tcg_get_pause(Object *obj, Error **errp)
+{
+    return g_strdup(TCG_STATE(obj)->pause_hint ? "hint" : "exit");
+}
+
+static void tcg_set_pause(Object *obj, const char *value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+
+    if (strcmp(value, "hint") == 0) {
+        s->pause_hint = true;
+    } else if (strcmp(value, "exit") == 0) {
+        s->pause_hint = false;
+    } else {
+        error_setg(errp, "Invalid 'x-pause' value: %s (exit, hint)", value);
+    }
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -286,6 +317,11 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                    tcg_set_one_insn_per_tb);
     object_class_property_set_description(oc, "one-insn-per-tb",
         "Only put one guest insn in each translation block");
+
+    object_class_property_add_str(oc, "x-pause", tcg_get_pause, tcg_set_pause);
+    object_class_property_set_description(oc, "x-pause",
+        "x86 PAUSE: leave the execution loop (exit, QEMU's) or a host "
+        "spin hint inline (hint; with a thread per vCPU)");
 }
 
 static const TypeInfo tcg_accel_type = {
