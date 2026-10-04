@@ -31,6 +31,15 @@
  */
 extern bool tcg_ssefp_vec;
 
+/*
+ * On hosts whose FPU can take the guest's FP mode (host_fpenv_native()),
+ * the vCPU thread runs with it while in cpu_exec, so generated code can
+ * use host FP instructions for guest FP.  Never set together with
+ * tcg_ssefp_vec, as the vector fast paths run host FP on unvalidated
+ * values.
+ */
+extern bool tcg_ssefp_native;
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size
