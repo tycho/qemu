@@ -68,4 +68,10 @@ extern bool tcg_vecld;
  */
 extern bool tcg_vecmem;
 
+/*
+ * tcg_vperm: guest permutes by a constant (shuffles, unpacks, blends,
+ * element inserts) are generated with perm_vec where the backend has it.
+ */
+extern bool tcg_vperm;
+
 #endif
