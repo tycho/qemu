@@ -1312,19 +1312,76 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                       gen_helper_##lname##_ymm);                                   \
 }
 
-UNARY_INT_SSE(VPMOVSXBW,    pmovsxbw)
-UNARY_INT_SSE(VPMOVSXBD,    pmovsxbd)
-UNARY_INT_SSE(VPMOVSXBQ,    pmovsxbq)
-UNARY_INT_SSE(VPMOVSXWD,    pmovsxwd)
-UNARY_INT_SSE(VPMOVSXWQ,    pmovsxwq)
-UNARY_INT_SSE(VPMOVSXDQ,    pmovsxdq)
+/*
+ * With tcg_vint, PMOVSX/PMOVZX: the elements of op2 (vece svece) extended
+ * to dvece.  Lane l of operand 0 holds op2's elements l * m to l * m + m - 1
+ * (m per lane); each widen_vec step takes the half of the vector that
+ * holds them.
+ */
+static bool gen_vint_movx(DisasContext *s, X86DecodedInsn *decode,
+                          unsigned svece, unsigned dvece, bool is_signed)
+{
+    int lanes = vector_len(s, decode) / 16;
+    unsigned m = 16 >> dvece;
+    TCGv_vec src, r[2];
 
-UNARY_INT_SSE(VPMOVZXBW,    pmovzxbw)
-UNARY_INT_SSE(VPMOVZXBD,    pmovzxbd)
-UNARY_INT_SSE(VPMOVZXBQ,    pmovzxbq)
-UNARY_INT_SSE(VPMOVZXWD,    pmovzxwd)
-UNARY_INT_SSE(VPMOVZXWQ,    pmovzxwq)
-UNARY_INT_SSE(VPMOVZXDQ,    pmovzxdq)
+    for (unsigned e = svece; e < dvece; e++) {
+        if (!vint_can(INDEX_op_widen_vec, e)) {
+            return false;
+        }
+    }
+    if (decode->op[0].unit != X86_OP_SSE) {
+        return false;
+    }
+    src = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(src, tcg_env, decode->op[2].offset);
+    for (int l = 0; l < lanes; l++) {
+        unsigned idx = l * m;
+        TCGv_vec v = src;
+
+        for (unsigned e = svece; e < dvece; e++) {
+            unsigned half = (16 >> e) / 2;
+            bool high = idx >= half;
+            TCGv_vec w = tcg_temp_new_vec(TCG_TYPE_V128);
+
+            if (high) {
+                idx -= half;
+            }
+            tcg_gen_widen_vec(e, w, v, is_signed, high);
+            v = w;
+        }
+        r[l] = v;
+    }
+    for (int l = 0; l < lanes; l++) {
+        tcg_gen_st_vec(r[l], tcg_env, decode->op[0].offset + 16 * l);
+    }
+    return true;
+}
+
+#define PMOVX_SSE(uname, lname, svece, dvece, is_signed)                      \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    if (gen_vint_movx(s, decode, svece, dvece, is_signed)) {                  \
+        return;                                                               \
+    }                                                                         \
+    gen_unary_int_sse(s, decode,                                              \
+                      gen_helper_##lname##_xmm,                               \
+                      gen_helper_##lname##_ymm);                              \
+}
+
+PMOVX_SSE(VPMOVSXBW,    pmovsxbw, MO_8,  MO_16, true)
+PMOVX_SSE(VPMOVSXBD,    pmovsxbd, MO_8,  MO_32, true)
+PMOVX_SSE(VPMOVSXBQ,    pmovsxbq, MO_8,  MO_64, true)
+PMOVX_SSE(VPMOVSXWD,    pmovsxwd, MO_16, MO_32, true)
+PMOVX_SSE(VPMOVSXWQ,    pmovsxwq, MO_16, MO_64, true)
+PMOVX_SSE(VPMOVSXDQ,    pmovsxdq, MO_32, MO_64, true)
+
+PMOVX_SSE(VPMOVZXBW,    pmovzxbw, MO_8,  MO_16, false)
+PMOVX_SSE(VPMOVZXBD,    pmovzxbd, MO_8,  MO_32, false)
+PMOVX_SSE(VPMOVZXBQ,    pmovzxbq, MO_8,  MO_64, false)
+PMOVX_SSE(VPMOVZXWD,    pmovzxwd, MO_16, MO_32, false)
+PMOVX_SSE(VPMOVZXWQ,    pmovzxwq, MO_16, MO_64, false)
+PMOVX_SSE(VPMOVZXDQ,    pmovzxdq, MO_32, MO_64, false)
 
 #define DUP_SSE(uname, lname, vece, pattern)                                  \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
