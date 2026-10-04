@@ -25,6 +25,12 @@
 #ifndef TCG_STARTUP_H
 #define TCG_STARTUP_H
 
+/*
+ * x86 guests: CR0.MP, EM and TS are not part of the TB flags; the first
+ * instruction in a TB that depends on them checks them at run time.
+ */
+extern bool tcg_fpcheck_runtime;
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size
