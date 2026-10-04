@@ -2039,6 +2039,12 @@ static bool fold_extract(OptContext *ctx, TCGOp *op)
     return fold_masks_zosa(ctx, op, z_mask, o_mask, 0, a_mask);
 }
 
+/* The element is zero-extended into the integer output. */
+static bool fold_extract_vec(OptContext *ctx, TCGOp *op)
+{
+    return fold_masks_z(ctx, op, MAKE_64BIT_MASK(0, 8 << TCGOP_VECE(op)));
+}
+
 static bool fold_extract2(OptContext *ctx, TCGOp *op)
 {
     TempOptInfo *t1 = arg_info(op->args[1]);
@@ -3251,6 +3257,9 @@ void tcg_optimize(TCGContext *s)
             break;
         case INDEX_op_extract2:
             done = fold_extract2(&ctx, op);
+            break;
+        case INDEX_op_extract_vec:
+            done = fold_extract_vec(&ctx, op);
             break;
         case INDEX_op_ext_i32_i64:
             done = fold_exts(&ctx, op);
