@@ -286,6 +286,27 @@ bool tcg_jcgen;
 bool tcg_iolast;
 bool tcg_mmio_lockless;
 
+unsigned tcg_tlb_grow;
+
+static void tcg_get_tlb_grow(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    uint32_t value = tcg_tlb_grow;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void tcg_set_tlb_grow(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    tcg_tlb_grow = value;
+}
+
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
@@ -612,6 +633,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "finer than 1 us), and the x86 TSC from the host's constant-rate "
         "counter, read inline, invariant, with IA32_TSC_ADJUST (not with "
         "icount)");
+
+    object_class_property_add(oc, "x-tlb-grow", "uint32",
+        tcg_get_tlb_grow, tcg_set_tlb_grow, NULL, NULL);
+    object_class_property_set_description(oc, "x-tlb-grow",
+        "Grow a softmmu TLB between flushes once it has had this many "
+        "times its size in fills within 100 ms while over 70% used "
+        "(0: resize only at flushes, the default)");
 }
 
 static const TypeInfo tcg_accel_type = {

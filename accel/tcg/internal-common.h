@@ -46,6 +46,13 @@ bool tb_io_insn_known(vaddr pc);
  */
 extern bool tcg_mmio_lockless;
 
+/*
+ * x-tlb-grow: grow a softmmu TLB between flushes once it has had this
+ * many times its size in fills within 100 ms while over 70% used (0: only
+ * resize at flushes).
+ */
+extern unsigned tcg_tlb_grow;
+
 extern bool icount_align_option;
 
 /*
