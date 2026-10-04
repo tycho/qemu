@@ -297,6 +297,15 @@ void tcg_gen_host_counter_i64(TCGv_i64 ret, bool ordered)
                 ordered);
 }
 
+/*
+ * A hint that the guest is spinning (x86 PAUSE, Arm YIELD): the host's
+ * own spin-wait hint, or nothing.  No effect on guest state.
+ */
+void tcg_gen_spin_hint(void)
+{
+    tcg_emit_op(INDEX_op_spin_hint, 0);
+}
+
 void tcg_gen_mb(TCGBar mb_type)
 {
 #ifdef CONFIG_USER_ONLY

@@ -326,6 +326,8 @@ bool tcg_addr32;
 
 bool tcg_tsc_counter;
 
+bool tcg_pause_hint;
+
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
@@ -1215,6 +1217,12 @@ typedef struct TCGOutOpSubtract {
 static const TCGOutOpHostCounter outop_host_counter = {
     .base.static_constraint = C_NotImplemented,
 };
+#endif
+
+#ifndef TCG_TARGET_HAS_SPIN_HINT
+static void tcg_out_spin_hint(TCGContext *s)
+{
+}
 #endif
 
 #ifndef CONFIG_TCG_INTERPRETER
@@ -2534,6 +2542,7 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_call:
     case INDEX_op_br:
     case INDEX_op_mb:
+    case INDEX_op_spin_hint:
     case INDEX_op_insn_start:
     case INDEX_op_exit_tb:
     case INDEX_op_goto_tb:
@@ -8205,6 +8214,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             break;
         case INDEX_op_mb:
             tcg_out_mb(s, op->args[0]);
+            break;
+        case INDEX_op_spin_hint:
+            tcg_out_spin_hint(s);
             break;
         default:
         do_default:
