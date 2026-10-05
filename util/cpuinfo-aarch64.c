@@ -87,6 +87,7 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= (hwcap & HWCAP_USCAT ? CPUINFO_LSE2 : 0);
     info |= (hwcap & HWCAP_AES ? CPUINFO_AES : 0);
     info |= (hwcap & HWCAP_PMULL ? CPUINFO_PMULL : 0);
+    info |= (hwcap & HWCAP_SHA1 ? CPUINFO_SHA1 : 0);
     info |= (hwcap & HWCAP_LRCPC ? CPUINFO_LRCPC : 0);
     info |= (hwcap & HWCAP_ILRCPC ? CPUINFO_LRCPC2 : 0);
 
@@ -102,6 +103,7 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= sysctl_for_bool("hw.optional.arm.FEAT_LSE2") * CPUINFO_LSE2;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_AES") * CPUINFO_AES;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_PMULL") * CPUINFO_PMULL;
+    info |= sysctl_for_bool("hw.optional.arm.FEAT_SHA1") * CPUINFO_SHA1;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_BTI") * CPUINFO_BTI;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_CSSC") * CPUINFO_CSSC;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_LRCPC") * CPUINFO_LRCPC;
