@@ -317,6 +317,7 @@ bool tcg_ldstkeep;
 bool tcg_lazysync;
 bool tcg_vecglobal;
 bool tcg_ymmglobal;
+bool tcg_vregs_all;
 
 bool tcg_region;
 
