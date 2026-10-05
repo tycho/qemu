@@ -2573,6 +2573,7 @@ config_host_data.set('QEMU_VERSION', '"@0@"'.format(meson.project_version()))
 config_host_data.set('QEMU_VERSION_MAJOR', meson.project_version().split('.')[0])
 config_host_data.set('QEMU_VERSION_MINOR', meson.project_version().split('.')[1])
 config_host_data.set('QEMU_VERSION_MICRO', meson.project_version().split('.')[2])
+config_host_data.set('CONFIG_SHARED_LIBRARY_BUILD', get_option('shared_lib'))
 
 config_host_data.set_quoted('CONFIG_HOST_DSOSUF', host_dsosuf)
 config_host_data.set('HAVE_HOST_BLOCK_DEVICE', have_host_block_device)
@@ -4414,16 +4415,33 @@ foreach target : target_dirs
     lib_deps += dep.partial_dependency(compile_args: true, includes: true)
   endforeach
 
-  lib = static_library('qemu-' + target,
+  if get_option('shared_lib')
+    build_lib_args = {
+      'target_type': 'shared_library',
+      'install': true,
+      'dependencies': arch_deps + [target_stubs],
+      'link_depends': [block_syms, qemu_syms],
+      'link_args': link_args,
+      'gnu_symbol_visibility': 'default'
+    }
+  else
+    build_lib_args = {
+      'target_type': 'static_library',
+      'install': false,
+      'dependencies': lib_deps
+    }
+  endif
+
+  lib = build_target('qemu-' + target,
                  sources: arch_srcs + genh,
-                 dependencies: lib_deps,
                  objects: objects,
                  include_directories: target_inc,
                  c_args: c_args,
-                 build_by_default: false)
+                 build_by_default: false,
+                 kwargs: build_lib_args)
 
   if target.endswith('-softmmu')
-    if target in multi_target_supported_targets
+    if target in multi_target_supported_targets and not get_option('shared_lib')
       multi_target_libs += lib
       multi_target_deps += arch_deps
       multi_target_deps += target_stubs
@@ -4433,7 +4451,7 @@ foreach target : target_dirs
       'name': 'qemu-system-' + target_name,
       'win_subsystem': 'console',
       'sources': [main_rs, files('system/main.c')],
-      'dependencies': [sdl, target_stubs],
+      'dependencies': [sdl, target_stubs, coref],
     }]
     if host_os == 'windows' and (sdl.found() or gtk.found())
       execs += [{
@@ -4466,11 +4484,19 @@ foreach target : target_dirs
       exe_name += '-unsigned'
     endif
 
+    if get_option('shared_lib')
+      exe_deps = lib_deps + [declare_dependency(link_with: lib)]
+      exe_objs = []
+    else
+      exe_deps = arch_deps
+      exe_objs = lib.extract_all_objects(recursive: true)
+    endif
+
     emulator = executable(exe_name, exe['sources'],
                install: true,
                c_args: c_args,
-               dependencies: arch_deps + exe['dependencies'],
-               objects: lib.extract_all_objects(recursive: true),
+               dependencies: exe_deps + exe['dependencies'],
+               objects: exe_objs,
                link_depends: [block_syms, qemu_syms],
                link_args: link_args,
                win_subsystem: exe['win_subsystem'])
@@ -4541,6 +4567,10 @@ endif
 
 if have_tools
   tools_link_args = enable_modules ? ['@block.syms'] : []
+  if get_option('shared_lib')
+    qemu_img_lib = shared_library('qemu-img', [files('qemu-img.c'), hxdep],
+             dependencies: [authz, block, crypto, io, qom, qemuutil], install: true)
+  endif
   qemu_img = executable('qemu-img', [files('qemu-img.c'), hxdep],
              link_args: tools_link_args, link_depends: block_syms,
              dependencies: [authz, block, crypto, io, qom, qemuutil], install: true)
@@ -4705,6 +4735,7 @@ summary(summary_info, bool_yn: true, section: 'Directories')
 
 # Host binaries
 summary_info = {}
+summary_info += {'build shared lib':  get_option('shared_lib')}
 summary_info += {'python':            '@0@ (version: @1@)'.format(python.full_path(), python.language_version())}
 summary_info += {'sphinx-build':      sphinx_build}
 
