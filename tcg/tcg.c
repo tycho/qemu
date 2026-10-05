@@ -6572,6 +6572,43 @@ static void tcg_reg_alloc_dup(TCGContext *s, const TCGOp *op)
     }
 }
 
+/*
+ * extract_vec of a 64-bit element of a vector that is only in memory (a
+ * global this block has not loaded): load the element itself, instead of
+ * the whole vector and then the element.  Returns false to allocate the
+ * op as usual.
+ */
+static bool tcg_reg_alloc_extract_mem(TCGContext *s, const TCGOp *op)
+{
+    const TCGLifeData arg_life = op->life;
+    TCGTemp *ots = arg_temp(op->args[0]);
+    TCGTemp *its = arg_temp(op->args[1]);
+
+    if (HOST_BIG_ENDIAN || TCGOP_VECE(op) != MO_64
+        || its->val_type != TEMP_VAL_MEM) {
+        return false;
+    }
+    if (ots->val_type != TEMP_VAL_REG) {
+        set_temp_val_reg(s, ots,
+                         tcg_reg_alloc(s, tcg_target_available_regs[ots->type],
+                                       s->reserved_regs, output_pref(op, 0),
+                                       ots->indirect_base));
+    }
+    tcg_out_ld(s, TCG_TYPE_I64, ots->reg, its->mem_base->reg,
+               its->mem_offset + op->args[2] * 8);
+    ots->mem_coherent = 0;
+    if (IS_DEAD_ARG(1)) {
+        temp_dead(s, its);
+    }
+    if (NEED_SYNC_ARG(0)) {
+        temp_sync(s, ots, s->reserved_regs, 0, 0);
+    }
+    if (IS_DEAD_ARG(0)) {
+        temp_dead(s, ots);
+    }
+    return true;
+}
+
 static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
 {
     const TCGLifeData arg_life = op->life;
@@ -8223,6 +8260,11 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             break;
         case INDEX_op_dup_vec:
             tcg_reg_alloc_dup(s, op);
+            break;
+        case INDEX_op_extract_vec:
+            if (!tcg_reg_alloc_extract_mem(s, op)) {
+                goto do_default;
+            }
             break;
         case INDEX_op_insn_start:
             assert_carry_dead(s);
