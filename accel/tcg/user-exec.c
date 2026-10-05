@@ -1251,7 +1251,8 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
 
 #define ATOMIC_NAME(X) \
     glue(glue(glue(cpu_atomic_ ## X, SUFFIX), END), _mmu)
-#define ATOMIC_MMU_CLEANUP do { clear_helper_retaddr(); } while (0)
+#define ATOMIC_MMU_CLEANUP \
+    do { clear_helper_retaddr(); cpu_tso_atomic_fence(); } while (0)
 
 #define DATA_SIZE 1
 #include "atomic_template.h"
