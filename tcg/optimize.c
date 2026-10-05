@@ -2159,8 +2159,11 @@ static void note_shl(OptContext *ctx, TCGOp *op)
     di->shl_amt = amt;
 }
 
-/* An add of a value shifted by a constant: one addshl, where supported. */
-static void fuse_addshl(OptContext *ctx, TCGOp *op)
+/*
+ * An add of a value shifted by a constant: one addshl, where supported.
+ * Before folding the add, which forgets what its output held.
+ */
+static bool fuse_addshl(OptContext *ctx, TCGOp *op)
 {
     TempOptInfo *si;
     TCGArg other;
@@ -2168,7 +2171,7 @@ static void fuse_addshl(OptContext *ctx, TCGOp *op)
     if (op->opc != INDEX_op_add || arg_is_const(op->args[1]) ||
         arg_is_const(op->args[2]) ||
         !tcg_op_supported(INDEX_op_addshl, TCGOP_TYPE(op), 0)) {
-        return;
+        return false;
     }
     si = shl_info(ctx, arg_temp(op->args[2]));
     other = op->args[1];
@@ -2177,12 +2180,13 @@ static void fuse_addshl(OptContext *ctx, TCGOp *op)
         other = op->args[2];
     }
     if (!si || TCGOP_TYPE(op) != si->shl_src->base_type) {
-        return;
+        return false;
     }
     op->opc = INDEX_op_addshl;
     op->args[1] = other;
     op->args[2] = temp_arg(si->shl_src);
     op->args[3] = si->shl_amt;
+    return true;
 }
 
 /* After an i64 add or sub of a constant: record value = source + offset. */
@@ -3441,9 +3445,12 @@ void tcg_optimize(TCGContext *s)
          */
         switch (opc) {
         case INDEX_op_add:
+            if (fuse_addshl(&ctx, op)) {
+                done = finish_folding(&ctx, op);
+                break;
+            }
             done = fold_add(&ctx, op);
             note_add(&ctx, op);
-            fuse_addshl(&ctx, op);
             break;
         case INDEX_op_add_vec:
             done = fold_add_vec(&ctx, op);
