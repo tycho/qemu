@@ -71,6 +71,21 @@ bool tcg_tso_cross_promoted(uint64_t pc);
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);
 
+/*
+ * Target SIMD floating-point helpers try the softfloat vector fast paths
+ * (float32_add_vec etc.) before computing lane by lane.
+ */
+extern bool tcg_ssefp_vec;
+
+/*
+ * On hosts whose FPU can take the guest's FP mode (host_fpenv_native()),
+ * the vCPU thread runs with it while in cpu_exec, so generated code can
+ * use host FP instructions for guest FP.  Never set together with
+ * tcg_ssefp_vec, as the vector fast paths run host FP on unvalidated
+ * values.
+ */
+extern bool tcg_ssefp_native;
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size

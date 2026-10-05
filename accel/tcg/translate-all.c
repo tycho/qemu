@@ -31,6 +31,7 @@
 #include "exec/icount.h"
 #include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/cpu-ops.h"
+#include "accel/tcg/host-fp.h"
 #include "tb-jmp-cache.h"
 #include "tb-hash.h"
 #include "tb-context.h"
@@ -270,6 +271,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 
     assert_memory_lock();
     qemu_thread_jit_write();
+    TCG_HOST_FP_SUSPEND_GUARD(cpu);
 
     phys_pc = get_page_addr_code_hostp(env, s.pc, &host_pc);
 
