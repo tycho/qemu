@@ -286,6 +286,8 @@ typedef struct TCGTemp {
      * pointers into env (tcg_global_mem_new_vec).
      */
     unsigned int env_alias:1;
+    /* A global held in a fixed host register across TBs (tcg_temp_pin). */
+    unsigned int pinned:1;
 
     int64_t val;
     struct TCGTemp *mem_base;
@@ -388,6 +390,9 @@ struct TCGContext {
     TCGBar guest_mo;
 
     TCGRegSet reserved_regs;
+    /* Pinned globals (tcg_temp_pin), in the order of their registers. */
+    int nb_pinned;
+    TCGTemp *pinned[16];
     TCGRegSet ldst_save_regs;   /* for the next guest access label */
     TCGLdstWriteback *ldst_wb;  /* likewise, tcg_lazysync */
     unsigned ldst_nb_wb;
@@ -484,6 +489,29 @@ static inline bool temp_readonly(TCGTemp *ts)
 {
     return ts->kind >= TEMP_FIXED;
 }
+
+/* Whether an op may write @ts: any temp but env and constants. */
+static inline bool temp_writable(TCGTemp *ts)
+{
+    return !temp_readonly(ts) || ts->pinned;
+}
+
+/*
+ * tcg_temp_pin: hold the global @ts in a host register of its own for as
+ * long as generated code runs, across TBs, instead of in its env slot.
+ * The slot is current outside generated code, around helpers that may
+ * read globals, and after a host signal in generated code
+ * (tcg_pinned_unwind).  User mode only, with tcg_pin_user; returns false
+ * if the backend has no register left, and @ts stays an ordinary global.
+ */
+bool tcg_temp_pin(TCGTemp *ts);
+
+/*
+ * tcg_pinned_unwind: after a host signal in generated code, store the
+ * pinned globals from @regs, the host's registers at the signal,
+ * numbered as TCGReg.
+ */
+void tcg_pinned_unwind(const uint64_t (*regs)[2], int nregs);
 
 extern __thread TCGContext *tcg_ctx;
 extern const void *tcg_code_gen_epilogue;
