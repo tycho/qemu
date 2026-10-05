@@ -1179,6 +1179,12 @@ typedef struct TCGOutOpQemuLdSt2 {
                 TCGReg addr, MemOpIdx oi);
 } TCGOutOpQemuLdSt2;
 
+typedef struct TCGOutOpAddShl {
+    TCGOutOp base;
+    void (*out_rrr)(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                    TCGReg a2, unsigned shift);
+} TCGOutOpAddShl;
+
 typedef struct TCGOutOpHostCounter {
     TCGOutOp base;
     void (*out_r)(TCGContext *s, TCGReg a0, bool ordered);
@@ -1214,6 +1220,12 @@ typedef struct TCGOutOpSubtract {
 } TCGOutOpSubtract;
 
 #include "tcg-target.c.inc"
+
+#ifndef TCG_TARGET_HAS_addshl
+static const TCGOutOpAddShl outop_addshl = {
+    .base.static_constraint = C_NotImplemented,
+};
+#endif
 
 #ifndef TCG_TARGET_HAS_host_counter
 static const TCGOutOpHostCounter outop_host_counter = {
@@ -1288,6 +1300,7 @@ static const TCGOutOpLoad outop_ld = {
 /* Register allocation descriptions for every TCGOpcode. */
 static const TCGOutOp * const all_outop[NB_OPS] = {
     OUTOP(INDEX_op_add, TCGOutOpBinary, outop_add),
+    OUTOP(INDEX_op_addshl, TCGOutOpAddShl, outop_addshl),
     /* addc1o is implemented with set_carry + addcio */
     OUTOP(INDEX_op_addc1o, TCGOutOpBinary, outop_addcio),
     OUTOP(INDEX_op_addci, TCGOutOpAddSubCarry, outop_addci),
@@ -7102,6 +7115,15 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             } else {
                 out->out_rrr(s, type, new_args[0], new_args[1], new_args[2]);
             }
+        }
+        break;
+
+    case INDEX_op_addshl:
+        {
+            const TCGOutOpAddShl *out = &outop_addshl;
+
+            out->out_rrr(s, type, new_args[0], new_args[1], new_args[2],
+                         new_args[3]);
         }
         break;
 

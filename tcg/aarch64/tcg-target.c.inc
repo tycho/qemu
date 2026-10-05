@@ -2819,6 +2819,18 @@ static void tgen_addi(TCGContext *s, TCGType type,
     }
 }
 
+#define TCG_TARGET_HAS_addshl
+static void tgen_addshl(TCGContext *s, TCGType type, TCGReg a0,
+                        TCGReg a1, TCGReg a2, unsigned shift)
+{
+    tcg_out_insn(s, addsub_realshift, ADD_LSL, type, a0, a1, a2, shift);
+}
+
+static const TCGOutOpAddShl outop_addshl = {
+    .base.static_constraint = C_O1_I2(r, r, r),
+    .out_rrr = tgen_addshl,
+};
+
 static const TCGOutOpBinary outop_add = {
     .base.static_constraint = C_O1_I2(r, r, rA),
     .out_rrr = tgen_add,

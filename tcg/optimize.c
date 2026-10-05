@@ -62,6 +62,10 @@ typedef struct TempOptInfo {
     TCGTemp *add_src;
     unsigned add_gen;
     int64_t add_off;
+    /* The value is shl_src, as it was at generation shl_gen, << shl_amt. */
+    TCGTemp *shl_src;
+    unsigned shl_gen;
+    unsigned shl_amt;
     unsigned gen;     /* bumped whenever the temp gets a new value */
 } TempOptInfo;
 
@@ -161,6 +165,7 @@ static void init_ts_info(OptContext *ctx, TCGTemp *ts)
     }
     ti->low32_src = NULL;
     ti->add_src = NULL;
+    ti->shl_src = NULL;
 
     ti->next_copy = ts;
     ti->prev_copy = ts;
@@ -259,6 +264,7 @@ static void reset_ts(OptContext *ctx, TCGTemp *ts)
     ti->prev_copy = ts;
     ti->low32_src = NULL;
     ti->add_src = NULL;
+    ti->shl_src = NULL;
     ti->gen++;
     ti->z_mask = -1;
     ti->o_mask = 0;
@@ -2114,6 +2120,71 @@ static TempOptInfo *add_info(OptContext *ctx, TCGTemp *ts)
     return NULL;
 }
 
+/* The shl info of ts, or of a copy of it, while still valid. */
+static TempOptInfo *shl_info(OptContext *ctx, TCGTemp *ts)
+{
+    TCGTemp *i = ts;
+
+    do {
+        TempOptInfo *ti = ts_info(i);
+        TCGTemp *src = ti->shl_src;
+
+        if (src && test_bit(temp_idx(src), ctx->temps_used.l) &&
+            ts_info(src)->gen == ti->shl_gen) {
+            return ti;
+        }
+        i = ti->next_copy;
+    } while (i != ts);
+    return NULL;
+}
+
+/* After a shl by a constant 1-3: record value = source << amount. */
+static void note_shl(OptContext *ctx, TCGOp *op)
+{
+    TempOptInfo *di;
+    TCGTemp *src;
+    uint64_t amt;
+
+    if (op->opc != INDEX_op_shl || !arg_is_const(op->args[2])) {
+        return;
+    }
+    amt = arg_const_val(op->args[2]);
+    src = arg_temp(op->args[1]);
+    if (amt < 1 || amt > 3 || src == arg_temp(op->args[0])) {
+        return;
+    }
+    di = arg_info(op->args[0]);
+    di->shl_src = src;
+    di->shl_gen = ts_info(src)->gen;
+    di->shl_amt = amt;
+}
+
+/* An add of a value shifted by a constant: one addshl, where supported. */
+static void fuse_addshl(OptContext *ctx, TCGOp *op)
+{
+    TempOptInfo *si;
+    TCGArg other;
+
+    if (op->opc != INDEX_op_add || arg_is_const(op->args[1]) ||
+        arg_is_const(op->args[2]) ||
+        !tcg_op_supported(INDEX_op_addshl, TCGOP_TYPE(op), 0)) {
+        return;
+    }
+    si = shl_info(ctx, arg_temp(op->args[2]));
+    other = op->args[1];
+    if (!si) {
+        si = shl_info(ctx, arg_temp(op->args[1]));
+        other = op->args[2];
+    }
+    if (!si || TCGOP_TYPE(op) != si->shl_src->base_type) {
+        return;
+    }
+    op->opc = INDEX_op_addshl;
+    op->args[1] = other;
+    op->args[2] = temp_arg(si->shl_src);
+    op->args[3] = si->shl_amt;
+}
+
 /* After an i64 add or sub of a constant: record value = source + offset. */
 static void note_add(OptContext *ctx, TCGOp *op)
 {
@@ -3372,6 +3443,7 @@ void tcg_optimize(TCGContext *s)
         case INDEX_op_add:
             done = fold_add(&ctx, op);
             note_add(&ctx, op);
+            fuse_addshl(&ctx, op);
             break;
         case INDEX_op_add_vec:
             done = fold_add_vec(&ctx, op);
@@ -3542,6 +3614,7 @@ void tcg_optimize(TCGContext *s)
         case INDEX_op_shl:
         case INDEX_op_shr:
             done = fold_shift(&ctx, op);
+            note_shl(&ctx, op);
             break;
         case INDEX_op_setcond:
             done = fold_setcond(&ctx, op);

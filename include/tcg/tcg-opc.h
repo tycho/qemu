@@ -43,6 +43,8 @@ DEF(spin_hint, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 DEF(mov, 1, 1, 0, TCG_OPF_INT | TCG_OPF_NOT_PRESENT)
 
 DEF(add, 1, 2, 0, TCG_OPF_INT)
+/* addshl: a0 = a1 + (a2 << c0) */
+DEF(addshl, 1, 2, 1, TCG_OPF_INT)
 DEF(and, 1, 2, 0, TCG_OPF_INT)
 DEF(andc, 1, 2, 0, TCG_OPF_INT)
 DEF(bswap16, 1, 1, 1, TCG_OPF_INT)
