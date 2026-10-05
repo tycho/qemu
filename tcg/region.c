@@ -488,9 +488,13 @@ static size_t tcg_n_regions(size_t tb_size, unsigned max_threads)
 /*
  * As user-mode emulation typically means running multiple instances
  * of the translator don't go too nuts with our default code gen
- * buffer lest we make things too hard for the OS.
+ * buffer lest we make things too hard for the OS.  [DEV] The fork's
+ * default is 512 MiB: a large program (GCC's cc1, ~300k blocks, each
+ * translated again when the process turns multi-threaded) overflows
+ * 128 MiB, and the flush retranslates its whole working set.  Only the
+ * pages used are touched; still capped at an eighth of host memory.
  */
-#define DEFAULT_CODE_GEN_BUFFER_SIZE_1 (128 * MiB)
+#define DEFAULT_CODE_GEN_BUFFER_SIZE_1 (512 * MiB)
 #else
 /*
  * We expect most system emulation to run one or two guests per host.
