@@ -170,9 +170,14 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #if defined(CONFIG_SOFTMMU)
     /*
      * There's no guest base to take into account, so go ahead and
-     * initialize the prologue now.
+     * initialize the prologue now; or, where guest registers may be
+     * pinned, once the front end has pinned them (tcg_exec_realizefn).
      */
-    tcg_prologue_init();
+    if (tcg_pin && tcg_pin_system_ok()) {
+        tcg_prologue_deferred = true;
+    } else {
+        tcg_prologue_init();
+    }
 #endif
 
 #ifdef CONFIG_USER_ONLY
@@ -181,6 +186,8 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 
     return 0;
 }
+
+bool tcg_prologue_deferred;
 
 static char *tcg_get_thread(Object *obj, Error **errp)
 {
@@ -272,6 +279,16 @@ static void tcg_set_regcache(Object *obj, bool value, Error **errp)
     tcg_vregs_all = value;
 }
 
+static bool tcg_get_pin(Object *obj, Error **errp)
+{
+    return tcg_pin;
+}
+
+static void tcg_set_pin(Object *obj, bool value, Error **errp)
+{
+    tcg_pin = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -309,6 +326,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Keep guest registers in host registers: remove dead stores to CPU "
         "state, keep dirty and vector values in registers across guest "
         "memory accesses, and the x86 vector registers as TCG globals");
+
+    object_class_property_add_bool(oc, "x-pin", tcg_get_pin, tcg_set_pin);
+    object_class_property_set_description(oc, "x-pin",
+        "Keep the guest's most used registers in host registers across "
+        "TBs (user mode where the host signal handler can store them; system "
+        "mode where the backend has callee-saved registers for them)");
 }
 
 static const TypeInfo tcg_accel_type = {
