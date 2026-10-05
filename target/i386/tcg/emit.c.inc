@@ -5632,19 +5632,20 @@ static void gen_SFENCE(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_SHA1NEXTE(DisasContext *s, X86DecodedInsn *decode)
 {
-    if (tcg_vint) {
-        /* b, with a's element 3 rotated left by 30 added to element 3. */
+    if (vint_can(INDEX_op_ext_vec, MO_8) &&
+        vint_can(INDEX_op_rotli_vec, MO_32)) {
+        /* b + { 0, 0, 0, rol(a[3], 30) } */
+        TCGv_vec zero = tcg_constant_vec(TCG_TYPE_V128, MO_64, 0);
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
         TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
-        TCGv_i32 x = tcg_temp_new_i32();
-        TCGv_i32 y = tcg_temp_new_i32();
 
-        tcg_gen_ld_i32(x, tcg_env, vector_elem_offset(&decode->op[1], MO_32, 3));
-        tcg_gen_ld_i32(y, tcg_env, vector_elem_offset(&decode->op[2], MO_32, 3));
+        tcg_gen_ld_vec(a, tcg_env, decode->op[1].offset);
         tcg_gen_ld_vec(b, tcg_env, decode->op[2].offset);
-        tcg_gen_rotli_i32(x, x, 30);
-        tcg_gen_add_i32(x, x, y);
-        tcg_gen_st_vec(b, tcg_env, decode->op[0].offset);
-        tcg_gen_st_i32(x, tcg_env, vector_elem_offset(&decode->op[0], MO_32, 3));
+        tcg_gen_rotli_vec(MO_32, a, a, 30);
+        tcg_gen_ext_vec(a, a, zero, 12);
+        tcg_gen_ext_vec(a, zero, a, 4);
+        tcg_gen_add_vec(MO_32, a, a, b);
+        tcg_gen_st_vec(a, tcg_env, decode->op[0].offset);
         return;
     }
     gen_helper_sha1nexte(OP_PTR0, OP_PTR1, OP_PTR2);
