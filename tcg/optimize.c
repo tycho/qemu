@@ -3416,16 +3416,19 @@ void tcg_optimize(TCGContext *s)
             done = fold_qemu_ld_1reg(&ctx, op);
             break;
         case INDEX_op_qemu_ld2:
-        case INDEX_op_qemu_ld_vec:
             fold_addr_low32(&ctx, op, 2);
             done = fold_qemu_ld_2reg(&ctx, op);
             break;
+        case INDEX_op_qemu_ld_vec:
+            fold_addr_low32(&ctx, op, 1);
+            done = fold_qemu_ld_2reg(&ctx, op);
+            break;
         case INDEX_op_qemu_st:
+        case INDEX_op_qemu_st_vec:
             fold_addr_low32(&ctx, op, 1);
             done = fold_qemu_st(&ctx, op);
             break;
         case INDEX_op_qemu_st2:
-        case INDEX_op_qemu_st_vec:
             fold_addr_low32(&ctx, op, 2);
             done = fold_qemu_st(&ctx, op);
             break;
