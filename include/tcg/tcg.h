@@ -108,6 +108,18 @@ struct TCGLabel {
     QSIMPLEQ_HEAD(, TCGLabelUse) branches;
     QSIMPLEQ_HEAD(, TCGRelocation) relocs;
     QSIMPLEQ_ENTRY(TCGLabel) next;
+
+    /* Cross-block register allocation (tcg_region; tcg.c, XLBL_*) */
+    bool loop;                  /* a loop header, set by the translator */
+    bool xseen, xfwd, xfalls;   /* classification scratch */
+    uint8_t xkind;
+    struct TCGOp *xbranch;      /* the label's one branch */
+    struct TCGOp *xset;         /* its set_label */
+    uint8_t *live_in;           /* liveness state of each temp at the label */
+    uint8_t *ft_state;          /* ...and after its branch's fall-through */
+    void *snap;                 /* the allocator's state at the branch */
+    void *loopregs;             /* XLBL_LOOP: the globals kept in registers */
+    int nb_loopregs;
 };
 
 typedef struct TCGPool {
@@ -385,6 +397,9 @@ struct TCGContext {
     uint16_t alias_temp[TCG_MAX_ALIAS];   /* their temp indices */
     TCGTemp *alias_base;                  /* their base, and the span */
     intptr_t alias_lo, alias_hi;          /* of their memory */
+    bool xblk;                  /* some label keeps registers */
+    int xblk_pass;              /* liveness pass, 1 or 2 with a loop */
+    int8_t *xblk_home;          /* each temp's loop register */
     int nb_ops;
     TCGType addr_type;            /* TCG_TYPE_I32 or TCG_TYPE_I64 */
     TCGBar guest_mo;

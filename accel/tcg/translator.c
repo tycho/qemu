@@ -15,6 +15,7 @@
 #include "accel/tcg/cpu-mmu-index.h"
 #include "exec/target_page.h"
 #include "exec/translator.h"
+#include "tcg/startup.h"
 #ifdef CONFIG_USER_ONLY
 #include "gdbstub/user.h"
 #endif
@@ -108,6 +109,30 @@ static void gen_tb_end(const TranslationBlock *tb, uint32_t cflags,
     }
 }
 
+bool translator_loop_back(DisasContextBase *db, vaddr dest)
+{
+    TCGLabel *exit;
+    TCGv_i32 count;
+
+    if (!db->loop_label || dest != db->pc_first) {
+        return false;
+    }
+    /*
+     * The exit path has a label of its own, reached only from here, so the
+     * register allocator can store guest state on that path alone.
+     */
+    exit = gen_new_label();
+    count = tcg_temp_new_i32();
+    tcg_gen_ld_i32(count, tcg_env,
+                   offsetof(CPUState, neg.icount_decr.u32) - sizeof(CPUState));
+    tcg_gen_brcondi_i32(TCG_COND_LT, count, 0, exit);
+    tcg_gen_br(db->loop_label);
+    db->tb->loops = true;
+    gen_set_label(exit);
+    tcg_gen_exit_tb(db->tb, TB_EXIT_REQUESTED);
+    return true;
+}
+
 bool translator_is_same_page(const DisasContextBase *db, vaddr addr)
 {
     return ((addr ^ db->pc_first) & TARGET_PAGE_MASK) == 0;
@@ -191,6 +216,20 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
     plugin_enabled = plugin_gen_tb_start(cpu, db);
     db->plugin_enabled = plugin_enabled;
+
+    /*
+     * With tcg_region, a TB may branch back to its first insn instead
+     * of chaining to itself.  Not with icount (the budget is charged per
+     * TB entry), plugins (they count TB executions) or without an exit
+     * check.
+     */
+    db->loop_label = NULL;
+    if (tcg_region && !plugin_enabled && tcg_ctx->exitreq_label
+        && !(cflags & CF_USE_ICOUNT)) {
+        db->loop_label = gen_new_label();
+        db->loop_label->loop = true;
+        gen_set_label(db->loop_label);
+    }
 
     while (true) {
         *max_insns = ++db->num_insns;

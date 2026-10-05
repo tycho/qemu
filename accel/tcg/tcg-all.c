@@ -400,6 +400,16 @@ static void tcg_set_pin(Object *obj, bool value, Error **errp)
     tcg_pin = value;
 }
 
+static bool tcg_get_region(Object *obj, Error **errp)
+{
+    return tcg_region;
+}
+
+static void tcg_set_region(Object *obj, bool value, Error **errp)
+{
+    tcg_region = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -479,6 +489,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-pin",
         "Keep the guest's most used registers in host registers across "
         "TBs (user mode, where the host supports it)");
+}
+
+    object_class_property_add_bool(oc, "x-region",
+                                   tcg_get_region, tcg_set_region);
+    object_class_property_set_description(oc, "x-region",
+        "Let a translation block loop back to its own start instead of "
+        "chaining to itself, keeping the loop's guest registers in host "
+        "registers (not with plugins or icount)");
 }
 
 static const TypeInfo tcg_accel_type = {

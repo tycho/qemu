@@ -2150,7 +2150,14 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
         new_pc = (uint32_t)(new_eip + s->cs_base);
     }
 
-    if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)) {
+    if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)
+        && translator_loop_back(&s->base, new_pc)) {
+        /*
+         * A loop within the TB (tcg_region): the exit path takes the pc
+         * from the TB, or, with CF_PCREL, from cpu_eip, already updated.
+         */
+        s->base.is_jmp = DISAS_NORETURN;
+    } else if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)) {
         /* jump to same page: we can use a direct jump */
         tcg_gen_goto_tb(tb_num);
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
@@ -2168,6 +2175,41 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
             gen_eob(s, DISAS_EOB_ONLY);  /* exit to main loop */
         }
     }
+}
+
+/*
+ * Whether gen_jmp_rel(s, ot, diff, ...) would branch back within the TB
+ * (tcg_region), from the same conditions it uses.
+ */
+static bool gen_jmp_rel_loops(DisasContext *s, MemOp ot, int diff)
+{
+    target_ulong mask = -1;
+    target_ulong new_pc = s->pc + diff;
+    target_ulong new_eip = new_pc - s->cs_base;
+
+    if (!s->jmp_opt || !s->base.loop_label) {
+        return false;
+    }
+    if (!CODE64(s)) {
+        if (ot == MO_16) {
+            mask = 0xffff;
+            if (tb_cflags(s->base.tb) & CF_PCREL && CODE32(s)) {
+                return false;
+            }
+        } else {
+            mask = 0xffffffff;
+        }
+    }
+    new_eip &= mask;
+    if (tb_cflags(s->base.tb) & CF_PCREL) {
+        if (!translator_is_same_page(&s->base, new_pc)) {
+            return false;
+        }
+    } else if (!CODE64(s)) {
+        new_pc = (uint32_t)(new_eip + s->cs_base);
+    }
+    return new_pc == s->base.pc_first
+           && translator_use_goto_tb(&s->base, new_pc);
 }
 
 /* Jump to eip+diff, truncating to the current code size. */
