@@ -3404,6 +3404,26 @@ void tcg_x86_init(void)
                                          reg_names[i]);
     }
 
+    /*
+     * With tcg_pin_user, as many general registers as the backend allows
+     * stay in host registers across TBs, the most used first: summed over
+     * compilers, an interpreter and image code, these load and store most
+     * at block boundaries.  A 32-bit guest has only the first eight.
+     */
+    if (tcg_pin_user) {
+        static const int pin_order[] = {
+            R_ESP, R_EAX, R_EDI, R_EBX, R_EDX, R_ECX, 12, R_ESI,
+            14, R_EBP, 15, 13, 9, 10, 8, 11,
+        };
+
+        for (i = 0; i < ARRAY_SIZE(pin_order); ++i) {
+            if (pin_order[i] < CPU_NB_REGS &&
+                !tcg_temp_pin(tcgv_tl_temp(cpu_regs[pin_order[i]]))) {
+                break;
+            }
+        }
+    }
+
     for (i = 0; i < 6; ++i) {
         cpu_seg_base[i]
             = tcg_global_mem_new(tcg_env,
