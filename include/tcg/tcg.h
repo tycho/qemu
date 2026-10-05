@@ -405,6 +405,8 @@ struct TCGContext {
     TCGBar guest_mo;
 
     TCGRegSet reserved_regs;
+    /* The out-of-line unchained exit of each goto_tb (tcg_exit_cold). */
+    TCGLabel *cold_exit[2];
     /* Pinned globals (tcg_temp_pin), in the order of their registers. */
     int nb_pinned;
     TCGTemp *pinned[16];

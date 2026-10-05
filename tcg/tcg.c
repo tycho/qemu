@@ -8247,6 +8247,74 @@ static void tcg_out_st_helper_args(TCGContext *s, const TCGLabelQemuLdst *ldst,
     tcg_out_helper_load_common_args(s, ldst, parm, info, next_arg);
 }
 
+/*
+ * Move the unchained path of each goto_tb, the ops that follow it up to
+ * their exit_tb, to the end of the TB.  Those ops run until the TB is
+ * chained and never again; laid out at the end, they no longer sit between
+ * the instructions that keep running.  The goto_tb's reset target becomes
+ * the moved path.
+ */
+static bool tcg_exit_cold_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        enabled = getenv("XTCG_EXITCOLD") != NULL;
+    }
+    return enabled;
+}
+
+static void cold_exit_pass(TCGContext *s)
+{
+    TCGOp *op, *end = QTAILQ_LAST(&s->ops), *stop = NULL;
+
+    s->cold_exit[0] = s->cold_exit[1] = NULL;
+    for (op = QTAILQ_FIRST(&s->ops); op && op != stop; ) {
+        TCGOp *first, *last, *after, *lbl;
+        TCGLabel *l;
+        int which;
+
+        if (op->opc != INDEX_op_goto_tb || op == end) {
+            op = QTAILQ_NEXT(op, link);
+            continue;
+        }
+        which = op->args[0];
+        first = QTAILQ_NEXT(op, link);
+        for (last = first; last; last = QTAILQ_NEXT(last, link)) {
+            const TCGOpDef *def = &tcg_op_defs[last->opc];
+
+            if (last->opc == INDEX_op_exit_tb ||
+                (def->flags & (TCG_OPF_BB_END | TCG_OPF_COND_BRANCH)) ||
+                last->opc == INDEX_op_call || last == end) {
+                break;
+            }
+        }
+        if (!last || last->opc != INDEX_op_exit_tb || last == end ||
+            s->cold_exit[which]) {
+            op = first;
+            continue;
+        }
+        after = QTAILQ_NEXT(last, link);
+        l = gen_new_label();
+        lbl = tcg_op_insert_after(s, QTAILQ_LAST(&s->ops),
+                                  INDEX_op_set_label, 0, 1);
+        lbl->args[0] = label_arg(l);
+        if (!stop) {
+            stop = lbl;
+        }
+        for (TCGOp *m = first, *n; ; m = n) {
+            n = QTAILQ_NEXT(m, link);
+            QTAILQ_REMOVE(&s->ops, m, link);
+            QTAILQ_INSERT_TAIL(&s->ops, m, link);
+            if (m == last) {
+                break;
+            }
+        }
+        s->cold_exit[which] = l;
+        op = after;
+    }
+}
+
 int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 {
     int i, num_insns;
@@ -8291,6 +8359,10 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     reachable_code_pass(s);
     liveness_pass_0(s);
     s->xblk = tcg_region && xblk_classify(s);
+    s->cold_exit[0] = s->cold_exit[1] = NULL;
+    if (tcg_exit_cold_enabled() && !s->xblk) {
+        cold_exit_pass(s);
+    }
     s->xblk_pass = 1;
     liveness_pass_1(s);
     s->xblk_home = NULL;
@@ -8428,6 +8500,11 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
                     xblk_loop_entry(s, l);
                 }
                 tcg_out_label(s, l);
+                for (int w = 0; w < 2; w++) {
+                    if (l == s->cold_exit[w]) {
+                        set_jmp_reset_offset(s, w);
+                    }
+                }
             }
             break;
         case INDEX_op_call:
