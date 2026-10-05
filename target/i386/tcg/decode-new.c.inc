@@ -3168,15 +3168,22 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         if (decode.cc_src2) {
             tcg_gen_mov_tl(cpu_cc_src2, decode.cc_src2);
         }
-        if (decode.cc_op == CC_OP_DYNAMIC) {
+        if (decode.cc_dst2) {
+            tcg_gen_mov_tl(cpu_cc_dst2, decode.cc_dst2);
+        }
+        if (decode.cc_op == CC_OP_DYNAMIC || cc_op_lazy(decode.cc_op)) {
             tcg_gen_mov_i32(cpu_cc_op, decode.cc_op_dynamic);
         }
-        set_cc_op(s, decode.cc_op);
+        if (cc_op_lazy(decode.cc_op)) {
+            assume_cc_op(s, decode.cc_op);
+        } else {
+            set_cc_op(s, decode.cc_op);
+        }
         cc_live = cc_op_live(decode.cc_op);
     } else {
         cc_live = 0;
     }
-    if (decode.cc_op != CC_OP_DYNAMIC) {
+    if (decode.cc_op != CC_OP_DYNAMIC && !cc_op_lazy(decode.cc_op)) {
         assert(!decode.cc_op_dynamic);
         assert(!!decode.cc_dst == !!(cc_live & USES_CC_DST));
         assert(!!decode.cc_src == !!(cc_live & USES_CC_SRC));

@@ -402,8 +402,58 @@ static void prepare_update2_cc(X86DecodedInsn *decode, DisasContext *s, CCOp op)
     decode->cc_op = op;
 }
 
+/*
+ * INC/DEC keep CF.  After an unknown flags state, with tcg_lazy_incdec,
+ * don't compute it: leave CC_SRC and CC_SRC2 alone, copy CC_DST to CC_DST2
+ * and keep the earlier operation in CC_OP's upper bits, so that CF can
+ * still be computed if something reads it.  After another lazy INC/DEC,
+ * that earlier state is already in place.  The new state is committed
+ * with the other flags, after the instruction's memory accesses.
+ */
+static void prepare_update_cc_incdec_lazy(X86DecodedInsn *decode,
+                                          DisasContext *s, CCOp op)
+{
+    CCOp lazy = op >= CC_OP_DECB ? CC_OP_DECLB + (op - CC_OP_DECB)
+                                 : CC_OP_INCLB + (op - CC_OP_INCB);
+    TCGv_i32 cc_op = tcg_temp_new_i32();
+
+    if (s->cc_op == CC_OP_DYNAMIC) {
+        TCGv_i32 low = tcg_temp_new_i32();
+        TCGv_i32 shifted = tcg_temp_new_i32();
+        TCGv low_tl = tcg_temp_new();
+
+        /* Whether CC_OP is already a lazy INC/DEC: low byte in range. */
+        tcg_gen_andi_i32(low, cpu_cc_op, 0xff);
+        tcg_gen_subi_i32(low, low, CC_OP_INCLB);
+        tcg_gen_shli_i32(shifted, cpu_cc_op, 8);
+        tcg_gen_andi_i32(cc_op, cpu_cc_op, ~0xff);
+        tcg_gen_movcond_i32(TCG_COND_LTU, cc_op, low,
+                            tcg_constant_i32(CC_OP_DECLQ - CC_OP_INCLB + 1),
+                            cc_op, shifted);
+        tcg_gen_extu_i32_tl(low_tl, low);
+        decode->cc_dst2 = tcg_temp_new();
+        tcg_gen_movcond_tl(TCG_COND_LTU, decode->cc_dst2, low_tl,
+                           tcg_constant_tl(CC_OP_DECLQ - CC_OP_INCLB + 1),
+                           cpu_cc_dst2, cpu_cc_dst);
+    } else {
+        tcg_gen_andi_i32(cc_op, cpu_cc_op, ~0xff);
+    }
+    tcg_gen_ori_i32(cc_op, cc_op, lazy);
+
+    decode->cc_dst = s->T0;
+    decode->cc_src = cpu_cc_src;
+    decode->cc_src2 = cpu_cc_src2;
+    decode->cc_op = lazy;
+    decode->cc_op_dynamic = cc_op;
+}
+
 static void prepare_update_cc_incdec(X86DecodedInsn *decode, DisasContext *s, CCOp op)
 {
+    if (tcg_lazy_incdec &&
+        (s->cc_op == CC_OP_DYNAMIC || cc_op_lazy(s->cc_op))) {
+        prepare_update_cc_incdec_lazy(decode, s, op);
+        return;
+    }
     gen_compute_eflags_c(s, s->T1);
     prepare_update2_cc(decode, s, op);
 }
@@ -3814,7 +3864,7 @@ static void gen_shift_dynamic_flags(DisasContext *s, X86DecodedInsn *decode, TCG
     }
 
     tcg_gen_trunc_tl_i32(count32, count);
-    if (s->cc_op == CC_OP_DYNAMIC) {
+    if (s->cc_op == CC_OP_DYNAMIC || cc_op_lazy(s->cc_op)) {
         old_cc_op = cpu_cc_op;
     } else {
         old_cc_op = tcg_constant_i32(s->cc_op);
