@@ -7407,7 +7407,7 @@ static void max_x86_cpu_initfn(Object *obj)
     }
     if (!env->cpuid_model[0]) {
         object_property_set_str(OBJECT(cpu), "model-id",
-                                "QEMU TCG CPU version " QEMU_HW_VERSION,
+                                "QEMU XTCG CPU version " QEMU_HW_VERSION,
                                 &error_abort);
     }
 }
