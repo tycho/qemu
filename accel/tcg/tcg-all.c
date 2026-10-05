@@ -259,7 +259,7 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
 static bool tcg_get_regcache(Object *obj, Error **errp)
 {
     return tcg_dse && tcg_ldstkeep && tcg_lazysync
-           && tcg_vecglobal && tcg_ymmglobal;
+           && tcg_vecglobal && tcg_ymmglobal && tcg_vregs_all;
 }
 
 static void tcg_set_regcache(Object *obj, bool value, Error **errp)
@@ -269,6 +269,7 @@ static void tcg_set_regcache(Object *obj, bool value, Error **errp)
     tcg_lazysync = value;
     tcg_vecglobal = value;
     tcg_ymmglobal = value;
+    tcg_vregs_all = value;
 }
 
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
