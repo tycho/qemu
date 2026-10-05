@@ -76,7 +76,7 @@
 //#define MACRO_TEST   1
 
 /* global register indexes */
-static TCGv cpu_cc_dst, cpu_cc_src, cpu_cc_src2;
+static TCGv cpu_cc_dst, cpu_cc_src, cpu_cc_src2, cpu_cc_dst2;
 static TCGv cpu_eip;
 static TCGv_i32 cpu_cc_op;
 static TCGv cpu_regs[CPU_NB_REGS];
@@ -300,6 +300,7 @@ enum {
     USES_CC_SRC  = 2,
     USES_CC_SRC2 = 4,
     USES_CC_SRCT = 8,
+    USES_CC_DST2 = 16,
 };
 
 /* Bit set if the global variable is live after setting CC_OP to X.  */
@@ -323,7 +324,15 @@ static const uint8_t cc_op_live_[] = {
     [CC_OP_ADCOX] = USES_CC_DST | USES_CC_SRC | USES_CC_SRC2,
     [CC_OP_POPCNT] = USES_CC_DST,
     [CC_OP_SBB_SELF] = USES_CC_DST,
+    [CC_OP_INCLB ... CC_OP_DECLQ] =
+        USES_CC_DST | USES_CC_SRC | USES_CC_SRC2 | USES_CC_DST2,
 };
+
+/* A lazy INC/DEC: CC_OP holds the earlier operation too (cpu.h). */
+static bool cc_op_lazy(CCOp op)
+{
+    return op >= CC_OP_INCLB && op <= CC_OP_DECLQ;
+}
 
 static uint8_t cc_op_live(CCOp op)
 {
@@ -337,6 +346,9 @@ static uint8_t cc_op_live(CCOp op)
      */
     result = cc_op_live_[op];
     assert(result);
+    if (op == CC_OP_DYNAMIC && tcg_lazy_incdec) {
+        result |= USES_CC_DST2;
+    }
     return result;
 }
 
@@ -362,7 +374,12 @@ static void set_cc_op_1(DisasContext *s, CCOp op, bool dirty)
     if (dead & USES_CC_SRCT) {
         s->cc_srcT = NULL;
     }
+    if (dead & USES_CC_DST2) {
+        tcg_gen_discard_tl(cpu_cc_dst2);
+    }
 
+    /* A lazy INC/DEC's CC_OP is only ever set at run time. */
+    assert(!dirty || !cc_op_lazy(op));
     if (dirty && s->cc_op == CC_OP_DYNAMIC) {
         tcg_gen_discard_i32(cpu_cc_op);
     }
@@ -830,7 +847,7 @@ static void gen_mov_eflags(DisasContext *s, TCGv reg)
     src2 = cpu_cc_src2;
 
     /* Take care to not read values that are not live.  */
-    live = cc_op_live(s->cc_op) & ~USES_CC_SRCT;
+    live = cc_op_live(s->cc_op) & ~(USES_CC_SRCT | USES_CC_DST2);
     dead = live ^ (USES_CC_DST | USES_CC_SRC | USES_CC_SRC2);
     if (dead) {
         TCGv zero = tcg_constant_tl(0);
@@ -845,6 +862,12 @@ static void gen_mov_eflags(DisasContext *s, TCGv reg)
         }
     }
 
+    if (cc_op_lazy(s->cc_op) ||
+        (s->cc_op == CC_OP_DYNAMIC && tcg_lazy_incdec)) {
+        gen_helper_cc_compute_all2(reg, dst, src1, src2, cpu_cc_dst2,
+                                   cpu_cc_op);
+        return;
+    }
     if (s->cc_op != CC_OP_DYNAMIC) {
         cc_op = tcg_constant_i32(s->cc_op);
     } else {
@@ -962,16 +985,23 @@ static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
                              .reg = cpu_cc_src, .imm = CC_C };
 
     default:
-       /* The need to compute only C from CC_OP_DYNAMIC is important
-          in efficiently implementing e.g. INC at the start of a TB.  */
-       gen_update_cc_op(s);
-       if (!reg) {
-           reg = tcg_temp_new();
-       }
-       gen_helper_cc_compute_c(reg, cpu_cc_dst, cpu_cc_src,
-                               cpu_cc_src2, cpu_cc_op);
-       return (CCPrepare) { .cond = TCG_COND_NE, .reg = reg,
-                            .rhs_type = CC_PREPARE_DIRECT };
+        /*
+         * The need to compute only C from CC_OP_DYNAMIC is important
+         * in efficiently implementing e.g. INC at the start of a TB.
+         */
+        gen_update_cc_op(s);
+        if (!reg) {
+            reg = tcg_temp_new();
+        }
+        if (tcg_lazy_incdec) {
+            gen_helper_cc_compute_c2(reg, cpu_cc_dst, cpu_cc_src,
+                                     cpu_cc_src2, cpu_cc_dst2, cpu_cc_op);
+        } else {
+            gen_helper_cc_compute_c(reg, cpu_cc_dst, cpu_cc_src,
+                                    cpu_cc_src2, cpu_cc_op);
+        }
+        return (CCPrepare) { .cond = TCG_COND_NE, .reg = reg,
+                             .rhs_type = CC_PREPARE_DIRECT };
     }
 }
 
@@ -3752,6 +3782,8 @@ void tcg_x86_init(void)
                                     "cc_src");
     cpu_cc_src2 = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, cc_src2),
                                      "cc_src2");
+    cpu_cc_dst2 = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, cc_dst2),
+                                     "cc_dst2");
     cpu_eip = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, eip), eip_name);
 
     for (i = 0; i < CPU_NB_REGS; ++i) {
@@ -3940,7 +3972,9 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     if (tb_cflags(dcbase->tb) & CF_PCREL) {
         pc_arg &= ~TARGET_PAGE_MASK;
     }
-    tcg_gen_insn_start(pc_arg, dc->cc_op, 0);
+    /* A lazy INC/DEC's CC_OP is already in env, set at run time. */
+    tcg_gen_insn_start(pc_arg,
+                       cc_op_lazy(dc->cc_op) ? CC_OP_DYNAMIC : dc->cc_op, 0);
 }
 
 static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)

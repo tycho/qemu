@@ -56,6 +56,7 @@ struct TCGState {
     OnOffAuto mttcg_enabled;
     bool one_insn_per_tb;
     bool i386_runtime;
+    bool lazy_incdec;
     int splitwx_enabled;
     unsigned long tb_size;
     bool iofast;
@@ -261,6 +262,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 
     tcg_fpcheck_runtime = s->i386_runtime;
     tcg_iopl_runtime = s->i386_runtime;
+    tcg_lazy_incdec = s->lazy_incdec;
 
     tcg_jcgen = cc->tcg_ops->jmp_cache_salt;
     page_init();
@@ -413,6 +415,16 @@ static bool tcg_get_i386_runtime(Object *obj, Error **errp)
 static void tcg_set_i386_runtime(Object *obj, bool value, Error **errp)
 {
     TCG_STATE(obj)->i386_runtime = value;
+}
+
+static bool tcg_get_lazy_incdec(Object *obj, Error **errp)
+{
+    return TCG_STATE(obj)->lazy_incdec;
+}
+
+static void tcg_set_lazy_incdec(Object *obj, bool value, Error **errp)
+{
+    TCG_STATE(obj)->lazy_incdec = value;
 }
 
 static const char * const tcg_tso_names[] = {
@@ -655,6 +667,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "x86 system mode: leave CR0.MP/EM/TS and EFLAGS.IOPL out of the "
         "TB flags and check them at run time, so one translation serves "
         "every FPU and IOPL state");
+
+    object_class_property_add_bool(oc, "x-lazyinc",
+                                   tcg_get_lazy_incdec,
+                                   tcg_set_lazy_incdec);
+    object_class_property_set_description(oc, "x-lazyinc",
+        "x86: INC and DEC after an unknown flags state keep that state "
+        "for CF rather than computing it");
 
     object_class_property_add_str(oc, "x-tso", tcg_get_tso, tcg_set_tso);
     object_class_property_set_description(oc, "x-tso",

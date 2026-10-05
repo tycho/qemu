@@ -38,6 +38,12 @@ extern bool tcg_fpcheck_runtime;
 extern bool tcg_iopl_runtime;
 
 /*
+ * x86 guests: INC and DEC after an unknown flags state (a TB's first
+ * flag producer) keep the earlier state for CF instead of computing it.
+ */
+extern bool tcg_lazy_incdec;
+
+/*
  * How guest memory ordering is implemented for ordinary guest loads and
  * stores (accel property x-tso).
  */
