@@ -64,4 +64,10 @@ void tcg_prologue_init(void);
  */
 extern bool tcg_flags_guess;
 
+/*
+ * x86 guests: INC and DEC after an unknown flags state (a TB's first
+ * flag producer) keep the earlier state for CF instead of computing it.
+ */
+extern bool tcg_lazy_incdec;
+
 #endif
