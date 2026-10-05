@@ -1811,6 +1811,18 @@ static const TCGOutOpHostCounter outop_host_counter = {
     .out_r = tgen_host_counter,
 };
 
+
+/*
+ * ISB rather than YIELD: on current Apple cores YIELD costs no more than
+ * a NOP, while ISB holds the core for some tens of cycles, as x86 PAUSE
+ * does.
+ */
+#define TCG_TARGET_HAS_SPIN_HINT
+static void tcg_out_spin_hint(TCGContext *s)
+{
+    tcg_out32(s, 0xd5033fdf); /* isb */
+}
+
 static void tcg_out_mb(TCGContext *s, unsigned a0)
 {
     static const uint32_t sync[] = {

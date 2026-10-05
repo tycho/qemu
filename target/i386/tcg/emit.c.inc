@@ -4405,6 +4405,15 @@ static void gen_PANDN(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_PAUSE(DisasContext *s, X86DecodedInsn *decode)
 {
+    /*
+     * The helper leaves the execution loop so that round-robin TCG can
+     * run another vCPU; with a thread per vCPU there is no one to yield
+     * to, and the host's own hint is the closer match.
+     */
+    if (tcg_pause_hint) {
+        tcg_gen_spin_hint();
+        return;
+    }
     gen_update_cc_op(s);
     gen_update_eip_next(s);
     gen_helper_pause(tcg_env);
