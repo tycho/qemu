@@ -3168,6 +3168,10 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         gen_helper_enter_mmx(tcg_env);
     }
 
+    if (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea) {
+        /* An RSP-based operand is in this thread's stack (x-tso-stack). */
+        tcg_ctx->ldst_private = decode.mem.base == R_ESP;
+    }
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&
         (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea)) {
         gen_lea_modrm(s, &decode);

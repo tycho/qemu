@@ -243,6 +243,7 @@ bool tcg_fpcheck_runtime;
 bool tcg_iopl_runtime;
 
 TCGTsoMode tcg_tso_mode;
+bool tcg_tso_stack;
 
 /*
  * A guest insn is promoted (see tcg_tso_cross_count) once its MO_ACQ_REL
