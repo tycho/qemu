@@ -69,6 +69,13 @@ extern bool tcg_vecglobal;
 extern bool tcg_ymmglobal;
 
 /*
+ * Let the register allocator use the host vector registers whose low
+ * halves the host ABI makes callee-saved (AArch64 v8-v15): the prologue
+ * then saves and restores them for its caller.
+ */
+extern bool tcg_vregs_all;
+
+/*
  * The front end's scratch area in env, [ofs, ofs + size): values there
  * live only within one guest instruction, so a fault or an exit never
  * observes them (tcg_dse may remove stores to it across guest memory
