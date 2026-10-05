@@ -129,6 +129,10 @@ DEF(qemu_ld, 1, 1, 1, TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_INT)
 DEF(qemu_st, 0, 2, 1, TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_INT)
 DEF(qemu_ld2, 2, 1, 1, TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_INT)
 DEF(qemu_st2, 0, 3, 1, TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_INT)
+DEF(qemu_ld_vec, 1, 1, 1,
+    TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_VECTOR)
+DEF(qemu_st_vec, 0, 2, 1,
+    TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_VECTOR)
 
 /* Host vector support.  */
 
@@ -139,6 +143,20 @@ DEF(dup_vec, 1, 1, 0, TCG_OPF_VECTOR)
 DEF(ld_vec, 1, 1, 1, TCG_OPF_VECTOR)
 DEF(st_vec, 0, 2, 1, TCG_OPF_VECTOR)
 DEF(dupm_vec, 1, 1, 1, TCG_OPF_VECTOR)
+DEF(concat_i64_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(perm_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(tbl_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(zip_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(ext_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(widen_vec, 1, 1, 1, TCG_OPF_VECTOR)
+DEF(mulw_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(addp_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(narrow_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(abd_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(addlp_vec, 1, 1, 1, TCG_OPF_VECTOR)
+DEF(avgr_vec, 1, 2, 0, TCG_OPF_VECTOR)
+DEF(extract_vec, 1, 1, 1, TCG_OPF_VECTOR)
+DEF(insert_vec, 1, 2, 1, TCG_OPF_VECTOR)
 
 DEF(add_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(sub_vec, 1, 2, 0, TCG_OPF_VECTOR)

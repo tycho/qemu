@@ -311,6 +311,20 @@ static void tcg_set_tso_stack(Object *obj, bool value, Error **errp)
     tcg_tso_stack = value;
 }
 
+static bool tcg_get_simd(Object *obj, Error **errp)
+{
+    return tcg_vecld && tcg_vecmem && tcg_vperm && tcg_vpermvar && tcg_vint;
+}
+
+static void tcg_set_simd(Object *obj, bool value, Error **errp)
+{
+    tcg_vecld = value;
+    tcg_vecmem = value;
+    tcg_vperm = value;
+    tcg_vpermvar = value;
+    tcg_vint = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -362,6 +376,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-tso-stack",
         "qemu-user: guest accesses to the thread's own stack (x86: RSP-based, "
         "push/pop/call/ret) get no memory-order constraint");
+
+    object_class_property_add_bool(oc, "x-simd", tcg_get_simd, tcg_set_simd);
+    object_class_property_set_description(oc, "x-simd",
+        "Keep guest vector code in host vector registers where the host "
+        "backend can: vector loads and stores as host vector accesses, "
+        "permutes and element inserts as host permutes and table lookups, "
+        "integer vector operations as host vector operations");
 }
 
 static const TypeInfo tcg_accel_type = {

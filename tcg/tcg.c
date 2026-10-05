@@ -290,6 +290,11 @@ bool tcg_can_ldst_acqrel(void)
     return TCG_TARGET_HAS_qemu_ldst_acqrel;
 }
 
+bool tcg_vecld;
+bool tcg_vecmem;
+bool tcg_vperm;
+bool tcg_vpermvar;
+bool tcg_vint;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
@@ -2520,6 +2525,37 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return has_type && TCG_TARGET_HAS_bitsel_vec;
     case INDEX_op_cmpsel_vec:
         return has_type && TCG_TARGET_HAS_cmpsel_vec;
+    case INDEX_op_concat_i64_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_concat_vec;
+    case INDEX_op_tbl_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_tbl_vec;
+    case INDEX_op_zip_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_zip_vec;
+    case INDEX_op_ext_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_ext_vec;
+    case INDEX_op_widen_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_widen_vec;
+    case INDEX_op_mulw_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_mulw_vec;
+    case INDEX_op_addp_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_addp_vec;
+    case INDEX_op_narrow_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_narrow_vec;
+    case INDEX_op_abd_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_abd_vec;
+    case INDEX_op_addlp_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_addlp_vec;
+    case INDEX_op_avgr_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_avgr_vec;
+    case INDEX_op_qemu_ld_vec:
+    case INDEX_op_qemu_st_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_qemu_ldst_vec;
+    case INDEX_op_perm_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_perm_vec;
+    case INDEX_op_extract_vec:
+        return has_type && TCG_TARGET_HAS_extract_vec;
+    case INDEX_op_insert_vec:
+        return has_type && TCG_TARGET_HAS_insert_vec;
 
     default:
         if (op < INDEX_op_last_generic) {
@@ -2986,6 +3022,8 @@ void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs)
             case INDEX_op_qemu_st:
             case INDEX_op_qemu_ld2:
             case INDEX_op_qemu_st2:
+            case INDEX_op_qemu_ld_vec:
+            case INDEX_op_qemu_st_vec:
                 {
                     const char *s_al, *s_tlb, *s_op, *s_at;
                     MemOpIdx oi = op->args[k++];

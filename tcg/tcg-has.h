@@ -43,11 +43,56 @@
 #else
 #define TCG_TARGET_MAYBE_vec            1
 #endif
+#ifndef TCG_TARGET_HAS_concat_vec
+#define TCG_TARGET_HAS_concat_vec       0
+#endif
+#ifndef TCG_TARGET_HAS_qemu_ldst_vec
+#define TCG_TARGET_HAS_qemu_ldst_vec    0
+#endif
+#ifndef TCG_TARGET_HAS_perm_vec
+#define TCG_TARGET_HAS_perm_vec         0
+#endif
+#ifndef TCG_TARGET_HAS_tbl_vec
+#define TCG_TARGET_HAS_tbl_vec          0
+#endif
+#ifndef TCG_TARGET_HAS_zip_vec
+#define TCG_TARGET_HAS_zip_vec          0
+#endif
+#ifndef TCG_TARGET_HAS_ext_vec
+#define TCG_TARGET_HAS_ext_vec          0
+#endif
+#ifndef TCG_TARGET_HAS_widen_vec
+#define TCG_TARGET_HAS_widen_vec        0
+#endif
+#ifndef TCG_TARGET_HAS_mulw_vec
+#define TCG_TARGET_HAS_mulw_vec         0
+#endif
+#ifndef TCG_TARGET_HAS_addp_vec
+#define TCG_TARGET_HAS_addp_vec         0
+#endif
+#ifndef TCG_TARGET_HAS_narrow_vec
+#define TCG_TARGET_HAS_narrow_vec       0
+#endif
+#ifndef TCG_TARGET_HAS_abd_vec
+#define TCG_TARGET_HAS_abd_vec          0
+#endif
+#ifndef TCG_TARGET_HAS_addlp_vec
+#define TCG_TARGET_HAS_addlp_vec        0
+#endif
+#ifndef TCG_TARGET_HAS_avgr_vec
+#define TCG_TARGET_HAS_avgr_vec         0
+#endif
 #ifndef TCG_TARGET_HAS_v64
 #define TCG_TARGET_HAS_v64              0
 #endif
 #ifndef TCG_TARGET_HAS_v128
 #define TCG_TARGET_HAS_v128             0
+#endif
+#ifndef TCG_TARGET_HAS_extract_vec
+#define TCG_TARGET_HAS_extract_vec      0
+#endif
+#ifndef TCG_TARGET_HAS_insert_vec
+#define TCG_TARGET_HAS_insert_vec       0
 #endif
 #ifndef TCG_TARGET_HAS_v256
 #define TCG_TARGET_HAS_v256             0

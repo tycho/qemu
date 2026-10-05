@@ -101,4 +101,37 @@ void tcg_register_thread(void);
  */
 void tcg_prologue_init(void);
 
+/*
+ * tcg_vecld: a guest vector load puts the loaded value in a host vector
+ * register (when the backend can build one from general registers), so
+ * that it is stored to CPU state in one piece.
+ */
+extern bool tcg_vecld;
+
+/*
+ * tcg_vecmem: 128-bit guest vector loads and stores use qemu_ld_vec and
+ * qemu_st_vec where tcg_can_qemu_ldst_vec() allows.
+ */
+extern bool tcg_vecmem;
+
+/*
+ * tcg_vperm: guest permutes by a constant (shuffles, unpacks, blends,
+ * element inserts) are generated with perm_vec where the backend has it.
+ */
+extern bool tcg_vperm;
+
+/*
+ * tcg_vpermvar: permutes by indices in a register (x86 vpermd, vpermps,
+ * pshufb) as host table lookups (tbl_vec) instead of helper calls.
+ */
+extern bool tcg_vpermvar;
+
+/*
+ * tcg_vint: guest integer vector operations that TCG has no single op for
+ * (unpacks of bytes, byte shifts and aligns, widening and narrowing,
+ * pairwise sums, ...) as sequences of host vector ops instead of helper
+ * calls, where the backend has them.
+ */
+extern bool tcg_vint;
+
 #endif
