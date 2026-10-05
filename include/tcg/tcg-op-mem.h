@@ -31,37 +31,55 @@ typedef TCGv_i64 TCGv_va;
 static inline void
 tcg_gen_qemu_ld_i32(TCGv_i32 v, TCGv_va a, TCGArg i, MemOp m)
 {
-    tcg_gen_qemu_ld_i32_chk(v, tcgv_va_temp(a), i, m, TCG_TYPE_VA);
+    TCGType t = TCG_TYPE_VA;
+    TCGTemp *x = tcg_gen_addr_va(tcgv_va_temp(a), &t);
+
+    tcg_gen_qemu_ld_i32_chk(v, x, i, m, t);
 }
 
 static inline void
 tcg_gen_qemu_st_i32(TCGv_i32 v, TCGv_va a, TCGArg i, MemOp m)
 {
-    tcg_gen_qemu_st_i32_chk(v, tcgv_va_temp(a), i, m, TCG_TYPE_VA);
+    TCGType t = TCG_TYPE_VA;
+    TCGTemp *x = tcg_gen_addr_va(tcgv_va_temp(a), &t);
+
+    tcg_gen_qemu_st_i32_chk(v, x, i, m, t);
 }
 
 static inline void
 tcg_gen_qemu_ld_i64(TCGv_i64 v, TCGv_va a, TCGArg i, MemOp m)
 {
-    tcg_gen_qemu_ld_i64_chk(v, tcgv_va_temp(a), i, m, TCG_TYPE_VA);
+    TCGType t = TCG_TYPE_VA;
+    TCGTemp *x = tcg_gen_addr_va(tcgv_va_temp(a), &t);
+
+    tcg_gen_qemu_ld_i64_chk(v, x, i, m, t);
 }
 
 static inline void
 tcg_gen_qemu_st_i64(TCGv_i64 v, TCGv_va a, TCGArg i, MemOp m)
 {
-    tcg_gen_qemu_st_i64_chk(v, tcgv_va_temp(a), i, m, TCG_TYPE_VA);
+    TCGType t = TCG_TYPE_VA;
+    TCGTemp *x = tcg_gen_addr_va(tcgv_va_temp(a), &t);
+
+    tcg_gen_qemu_st_i64_chk(v, x, i, m, t);
 }
 
 static inline void
 tcg_gen_qemu_ld_i128(TCGv_i128 v, TCGv_va a, TCGArg i, MemOp m)
 {
-    tcg_gen_qemu_ld_i128_chk(v, tcgv_va_temp(a), i, m, TCG_TYPE_VA);
+    TCGType t = TCG_TYPE_VA;
+    TCGTemp *x = tcg_gen_addr_va(tcgv_va_temp(a), &t);
+
+    tcg_gen_qemu_ld_i128_chk(v, x, i, m, t);
 }
 
 static inline void
 tcg_gen_qemu_st_i128(TCGv_i128 v, TCGv_va a, TCGArg i, MemOp m)
 {
-    tcg_gen_qemu_st_i128_chk(v, tcgv_va_temp(a), i, m, TCG_TYPE_VA);
+    TCGType t = TCG_TYPE_VA;
+    TCGTemp *x = tcg_gen_addr_va(tcgv_va_temp(a), &t);
+
+    tcg_gen_qemu_st_i128_chk(v, x, i, m, t);
 }
 
 static inline void
@@ -79,12 +97,20 @@ tcg_gen_qemu_st_vec(TCGv_vec v, TCGv_va a, TCGArg i, MemOp m)
 #define DEF_ATOMIC2(N, S)                                               \
     static inline void N##_##S(TCGv_##S r, TCGv_va a, TCGv_##S v,       \
                                TCGArg i, MemOp m)                       \
-    { N##_##S##_chk(r, tcgv_va_temp(a), v, i, m, TCG_TYPE_VA); }
+    {                                                                   \
+        TCGType t = TCG_TYPE_VA;                                        \
+        TCGTemp *x = tcg_gen_addr_va(tcgv_va_temp(a), &t);              \
+        N##_##S##_chk(r, x, v, i, m, t);                                \
+    }
 
 #define DEF_ATOMIC3(N, S)                                               \
     static inline void N##_##S(TCGv_##S r, TCGv_va a, TCGv_##S o,       \
                                TCGv_##S n, TCGArg i, MemOp m)           \
-    { N##_##S##_chk(r, tcgv_va_temp(a), o, n, i, m, TCG_TYPE_VA); }
+    {                                                                   \
+        TCGType t = TCG_TYPE_VA;                                        \
+        TCGTemp *x = tcg_gen_addr_va(tcgv_va_temp(a), &t);              \
+        N##_##S##_chk(r, x, o, n, i, m, t);                             \
+    }
 
 DEF_ATOMIC3(tcg_gen_atomic_cmpxchg, i32)
 DEF_ATOMIC3(tcg_gen_atomic_cmpxchg, i64)

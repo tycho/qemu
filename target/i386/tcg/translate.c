@@ -638,6 +638,16 @@ static void gen_lea_v_seg_dest(DisasContext *s, MemOp aflag, TCGv dest, TCGv a0,
         easize = aflag;
     }
 
+    if (easize == MO_32 && a0 == dest &&
+        tcg_ctx->addr_type == TCG_TYPE_I32 && TCG_TYPE_VA == TCG_TYPE_I64) {
+        /*
+         * Keep the unextended address in a temp of its own: an access
+         * reads only its low 32 bits, so the optimizer can give it that
+         * temp and drop the extension when nothing else reads dest.
+         */
+        a0 = tcg_temp_new();
+        tcg_gen_mov_tl(a0, dest);
+    }
     tcg_gen_ext_tl(dest, a0, easize);
 }
 
@@ -3982,7 +3992,17 @@ void x86_translate_code(CPUState *cpu, TranslationBlock *tb,
                         int *max_insns, vaddr pc, void *host_pc)
 {
     DisasContext dc;
+    TCGType addr_type = TCG_TYPE_VA;
 
+#ifdef TARGET_X86_64
+    /*
+     * Outside long mode every linear address, and every TLB entry's, fits
+     * in 32 bits (the TLB is flushed when long mode is entered or left).
+     */
+    if (tcg_addr32 && !(tb->flags & HF_LMA_MASK)) {
+        addr_type = TCG_TYPE_I32;
+    }
+#endif
     translator_loop(cpu, tb, max_insns, pc, host_pc, &i386_tr_ops, &dc.base,
-                    TCG_TYPE_VA);
+                    addr_type);
 }

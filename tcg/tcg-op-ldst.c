@@ -598,6 +598,24 @@ static void canonicalize_memop_i128_as_i64(MemOp ret[2], MemOp orig)
     ret[1] = mop_2;
 }
 
+/*
+ * A target with 64-bit addresses may translate a TB with 32-bit ones
+ * (translator_loop's addr_type): its accesses then take the low 32 bits
+ * of the address.  The i64 temp serves as the 32-bit address as it is:
+ * on a 64-bit host, an i32 value's register bits above 31 are undefined,
+ * and every consumer of a 32-bit address (the backend's fast path, the
+ * slow path's helper arguments, extu_i32_i64 for the atomic helpers)
+ * ignores or clears them.
+ */
+TCGTemp *tcg_gen_addr_va(TCGTemp *addr, TCGType *type)
+{
+    if (TCG_TARGET_REG_BITS == 64 && *type == TCG_TYPE_I64 &&
+        tcg_ctx->addr_type == TCG_TYPE_I32) {
+        *type = TCG_TYPE_I32;
+    }
+    return addr;
+}
+
 static TCGv_i64 maybe_extend_addr64(TCGTemp *addr)
 {
     if (tcg_ctx->addr_type == TCG_TYPE_I32) {
