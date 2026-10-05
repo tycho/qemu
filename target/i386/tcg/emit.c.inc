@@ -1825,7 +1825,12 @@ static bool gen_vint_movx(DisasContext *s, X86DecodedInsn *decode,
     }
     src = tcg_temp_new_vec(TCG_TYPE_V128);
     tcg_gen_ld_vec(src, tcg_env, decode->op[2].offset);
-    for (int l = 0; l < lanes; l++) {
+    /*
+     * The high lane first: when operand 0 is the source register, the low
+     * lane's result can then take the source's host register, where it
+     * dies, instead of the one the high lane's result wants.
+     */
+    for (int l = lanes - 1; l >= 0; l--) {
         unsigned idx = l * m;
         TCGv_vec v = src;
 
