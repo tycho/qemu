@@ -86,6 +86,73 @@ extern bool tcg_ssefp_vec;
  */
 extern bool tcg_ssefp_native;
 
+/*
+ * Before liveness, remove stores to CPUArchState that are overwritten
+ * later in the same extended basic block before any operation could
+ * read them.
+ */
+extern bool tcg_dse;
+
+/*
+ * Values stay in the registers that a guest memory access's slow path
+ * saves, instead of being spilled around every access (where the
+ * backend's slow path saves them).
+ */
+extern bool tcg_ldstkeep;
+
+/*
+ * Guest memory accesses leave dirty globals in registers; their slow
+ * paths store them before anything can observe env, and save the
+ * call-clobbered registers in use, where the backend supports it.
+ * In user mode, where an access faults on its fast path, also where the
+ * host signal handler supports it (tcg_lazysync_user).
+ */
+extern bool tcg_lazysync;
+
+/*
+ * User mode: the host signal handler stores the dirty globals a faulting
+ * guest access had in registers (tb_lazysync_unwind), so tcg_lazysync
+ * can apply.
+ */
+extern bool tcg_lazysync_user;
+
+/*
+ * tcg_pin: a front end pins its most used guest registers (tcg_temp_pin).
+ * tcg_pin_user: user mode sets it where the host signal handler can store
+ * pinned globals (tcg_pinned_unwind) and no plugin reads guest registers;
+ * pinning applies only then.
+ */
+extern bool tcg_pin;
+extern bool tcg_pin_user;
+
+/*
+ * Front ends keep vector registers in env_alias vector
+ * globals (tcg_global_mem_new_vec), so TCG holds them in host registers
+ * within a TB.
+ */
+extern bool tcg_vecglobal;
+
+/*
+ * With tcg_vecglobal, the upper 128 bits of each ymm register as
+ * vector globals too.
+ */
+extern bool tcg_ymmglobal;
+
+/*
+ * Let the register allocator use the host vector registers whose low
+ * halves the host ABI makes callee-saved (AArch64 v8-v15): the prologue
+ * then saves and restores them for its caller.
+ */
+extern bool tcg_vregs_all;
+
+/*
+ * The front end's scratch area in env, [ofs, ofs + size): values there
+ * live only within one guest instruction, so a fault or an exit never
+ * observes them (tcg_dse may remove stores to it across guest memory
+ * accesses and before exits).
+ */
+void tcg_set_env_scratch(intptr_t ofs, intptr_t size);
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size

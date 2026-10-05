@@ -64,11 +64,16 @@ static const int tcg_target_reg_alloc_order[] = {
 
     TCG_REG_V0, TCG_REG_V1, TCG_REG_V2, TCG_REG_V3,
     TCG_REG_V4, TCG_REG_V5, TCG_REG_V6, TCG_REG_V7,
-    /* V8 - V15 are call-saved, and skipped.  */
     TCG_REG_V16, TCG_REG_V17, TCG_REG_V18, TCG_REG_V19,
     TCG_REG_V20, TCG_REG_V21, TCG_REG_V22, TCG_REG_V23,
     TCG_REG_V24, TCG_REG_V25, TCG_REG_V26, TCG_REG_V27,
     TCG_REG_V28, TCG_REG_V29, TCG_REG_V30, TCG_REG_V31,
+    /*
+     * V8 - V15 last, and only with tcg_vregs_all: the prologue then saves
+     * their call-saved low halves (d8-d15).
+     */
+    TCG_REG_V8, TCG_REG_V9, TCG_REG_V10, TCG_REG_V11,
+    TCG_REG_V12, TCG_REG_V13, TCG_REG_V14, TCG_REG_V15,
 };
 
 static const int tcg_target_call_iarg_regs[8] = {
@@ -1887,6 +1892,99 @@ static void tcg_out_qemu_ld_acquire_any(TCGContext *s, MemOp memop,
 }
 
 /*
+ * Around a guest access slow path's helper call: save @regs below SP, or
+ * restore them except @keep (the access's outputs) and release the area.
+ */
+static void tcg_out_ldst_save(TCGContext *s, TCGRegSet regs, bool restore,
+                              TCGRegSet keep)
+{
+    unsigned nv = 0, nx = 0, size, off = 0;
+
+    for (TCGReg r = TCG_REG_X0; r <= TCG_REG_V31; r++) {
+        if (tcg_regset_test_reg(regs, r)) {
+            if (r >= TCG_REG_V0) {
+                nv++;
+            } else {
+                nx++;
+            }
+        }
+    }
+    size = nv * 16 + ROUND_UP(nx * 8, 16);
+    if (size == 0) {
+        return;
+    }
+    if (!restore) {
+        tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64,
+                     TCG_REG_SP, TCG_REG_SP, size);
+    }
+    for (TCGReg r = TCG_REG_V0; r <= TCG_REG_V31; r++) {
+        if (tcg_regset_test_reg(regs, r)) {
+            if (!restore) {
+                tcg_out_st(s, TCG_TYPE_V128, r, TCG_REG_SP, off);
+            } else if (!tcg_regset_test_reg(keep, r)) {
+                tcg_out_ld(s, TCG_TYPE_V128, r, TCG_REG_SP, off);
+            }
+            off += 16;
+        }
+    }
+    for (TCGReg r = TCG_REG_X0; r < TCG_REG_V0; r++) {
+        if (tcg_regset_test_reg(regs, r)) {
+            if (!restore) {
+                tcg_out_st(s, TCG_TYPE_I64, r, TCG_REG_SP, off);
+            } else if (!tcg_regset_test_reg(keep, r)) {
+                tcg_out_ld(s, TCG_TYPE_I64, r, TCG_REG_SP, off);
+            }
+            off += 8;
+        }
+    }
+    if (restore) {
+        tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64,
+                     TCG_REG_SP, TCG_REG_SP, size);
+    }
+}
+
+/* tcg_lazysync: store the dirty globals before the slow path's call. */
+/*
+ * Registers for pinned globals (tcg_temp_pin): callee-saved, so helpers
+ * keep them, and not otherwise reserved (x28 holds guest_base).
+ */
+#define TCG_TARGET_NB_PIN_REGS 8
+static const TCGReg tcg_target_pin_regs[TCG_TARGET_NB_PIN_REGS] = {
+    TCG_REG_X20, TCG_REG_X21, TCG_REG_X22, TCG_REG_X23,
+    TCG_REG_X24, TCG_REG_X25, TCG_REG_X26, TCG_REG_X27,
+};
+
+static void tcg_out_ldst_writeback(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    /* The helper may leave generated code: the pinned globals first. */
+    tcg_out_pinned_st(s);
+    for (unsigned i = 0; i < lb->nb_wb; i++) {
+        const TCGLdstWriteback *wb = &lb->wb[i];
+
+        if (wb->is_const) {
+            tcg_out_movi(s, wb->type, TCG_REG_TMP0, wb->val);
+            tcg_out_st(s, wb->type, TCG_REG_TMP0, wb->base, wb->offset);
+        } else {
+            tcg_out_st(s, wb->type, wb->reg, wb->base, wb->offset);
+        }
+    }
+}
+
+/* The registers a load's slow path sets, not to be restored over. */
+static TCGRegSet ldst_outputs(TCGLabelQemuLdst *lb)
+{
+    TCGRegSet set = 0;
+
+    if (lb->is_ld) {
+        tcg_regset_set_reg(set, lb->datalo_reg);
+        if (lb->type == TCG_TYPE_I128) {
+            tcg_regset_set_reg(set, lb->datahi_reg);
+        }
+    }
+    return set;
+}
+
+/*
  * The out-of-line path of an MO_ACQ_REL access that crosses a 16-byte
  * boundary (see tcg_out_acqrel_check), and in system mode also of its
  * TLB miss (see prepare_host_addr): call helper_tso_cross_ld/st, which
@@ -1904,6 +2002,8 @@ static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
     if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
         return false;
     }
+    tcg_out_ldst_writeback(s, lb);
+    tcg_out_ldst_save(s, lb->save_regs, false, 0);
     if (lb->is_ld) {
         tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X4, lb->site);
@@ -1914,6 +2014,7 @@ static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X5, lb->site);
         tcg_out_call_int(s, (const void *)helper_tso_cross_st);
     }
+    tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
     tcg_out_goto(s, lb->raddr);
     return true;
 }
@@ -1929,6 +2030,8 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
         return false;
     }
 
+    tcg_out_ldst_writeback(s, lb);
+    tcg_out_ldst_save(s, lb->save_regs, false, 0);
     tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
     if (lb->type == TCG_TYPE_V128) {
@@ -1938,6 +2041,7 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     } else {
         tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
     }
+    tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
     tcg_out_goto(s, lb->raddr);
     return true;
 }
@@ -1953,6 +2057,8 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
         return false;
     }
 
+    tcg_out_ldst_writeback(s, lb);
+    tcg_out_ldst_save(s, lb->save_regs, false, 0);
     if (lb->type == TCG_TYPE_V128) {
         /* The vector as an Int128 argument, by way of two scratch registers. */
         TCGLabelQemuLdst l = *lb;
@@ -1969,6 +2075,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
         tcg_out_st_helper_args(s, lb, &ldst_helper_param);
     }
     tcg_out_call_int(s, qemu_st_helpers[opc & MO_SIZE]);
+    tcg_out_ldst_save(s, lb->save_regs, true, 0);
     tcg_out_goto(s, lb->raddr);
     return true;
 }
@@ -4952,14 +5059,14 @@ static void tcg_target_init(TCGContext *s)
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X27);
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X28);
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X29);
-    tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_V8);
-    tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_V9);
-    tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_V10);
-    tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_V11);
-    tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_V12);
-    tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_V13);
-    tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_V14);
-    tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_V15);
+
+    /* The guest access slow paths save the vector registers themselves. */
+    tcg_target_ldst_clobber_regs = tcg_target_call_clobber_regs;
+    for (TCGReg r = TCG_REG_V0; r <= TCG_REG_V31; r++) {
+        tcg_regset_reset_reg(tcg_target_ldst_clobber_regs, r);
+    }
+    /* They also save the integer registers, and store dirty globals. */
+    tcg_target_ldst_writeback = true;
 
     s->reserved_regs = 0;
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_SP);
@@ -4969,10 +5076,17 @@ static void tcg_target_init(TCGContext *s)
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_TMP1);
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_TMP2);
     tcg_regset_set_reg(s->reserved_regs, TCG_VEC_TMP0);
+    if (!tcg_vregs_all) {
+        for (TCGReg r = TCG_REG_V8; r <= TCG_REG_V15; r++) {
+            tcg_regset_set_reg(s->reserved_regs, r);
+        }
+    }
 }
 
 /* Saving pairs: (X19, X20) .. (X27, X28), (X29(fp), X30(lr)).  */
-#define PUSH_SIZE  ((30 - 19 + 1) * 8)
+/* FP, LR, x19..x28, then d8..d15 (saved with tcg_vregs_all). */
+#define PUSH_SIZE  ((30 - 19 + 1) * 8 + 8 * 8)
+#define PUSH_D8    ((30 - 19 + 1) * 8)
 
 #define FRAME_SIZE \
     ((PUSH_SIZE \
@@ -4986,6 +5100,17 @@ QEMU_BUILD_BUG_ON(FRAME_SIZE >= (1 << 14));
 
 /* We're expecting to use a single ADDI insn.  */
 QEMU_BUILD_BUG_ON(FRAME_SIZE - PUSH_SIZE > 0xfff);
+
+/* STP or LDP (SIMD&FP, 64-bit, signed offset) of d8..d15 at PUSH_D8. */
+static void tcg_out_ld_st_d8_d15(TCGContext *s, bool load)
+{
+    for (int r = 8; r <= 14; r += 2) {
+        int ofs = PUSH_D8 + (r - 8) * 8;
+
+        tcg_out32(s, (load ? 0x6d400000 : 0x6d000000) | (ofs / 8) << 15
+                  | (r + 1) << 10 | TCG_REG_SP << 5 | r);
+    }
+}
 
 static void tcg_target_qemu_prologue(TCGContext *s)
 {
@@ -5004,6 +5129,9 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     for (r = TCG_REG_X19; r <= TCG_REG_X27; r += 2) {
         int ofs = (r - TCG_REG_X19 + 2) * 8;
         tcg_out_insn(s, ldstpair, STP, r, r + 1, TCG_REG_SP, ofs, 1, 0);
+    }
+    if (tcg_vregs_all) {
+        tcg_out_ld_st_d8_d15(s, false);
     }
 
     /* Make stack space for TCG locals.  */
@@ -5026,6 +5154,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     }
 
     tcg_out_mov(s, TCG_TYPE_PTR, TCG_AREG0, tcg_target_call_iarg_regs[0]);
+    tcg_out_pinned_ld(s);
     tcg_out_insn(s, bcond_reg, BR, tcg_target_call_iarg_regs[1]);
 
     /*
@@ -5039,6 +5168,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     /* TB epilogue */
     tb_ret_addr = tcg_splitwx_to_rx(s->code_ptr);
     tcg_out_bti(s, BTI_J);
+    tcg_out_pinned_st(s);
 
     /* Remove TCG locals stack space.  */
     tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,
@@ -5048,6 +5178,9 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     for (r = TCG_REG_X19; r <= TCG_REG_X27; r += 2) {
         int ofs = (r - TCG_REG_X19 + 2) * 8;
         tcg_out_insn(s, ldstpair, LDP, r, r + 1, TCG_REG_SP, ofs, 1, 0);
+    }
+    if (tcg_vregs_all) {
+        tcg_out_ld_st_d8_d15(s, true);
     }
 
     /* Pop (FP, LR), restore SP to previous frame.  */
@@ -5094,18 +5227,18 @@ static const DebugFrame debug_frame = {
         (FRAME_SIZE >> 7)
     },
     .fde_reg_ofs = {
-        0x80 + 28, 1,                   /* DW_CFA_offset, x28,  -8 */
-        0x80 + 27, 2,                   /* DW_CFA_offset, x27, -16 */
-        0x80 + 26, 3,                   /* DW_CFA_offset, x26, -24 */
-        0x80 + 25, 4,                   /* DW_CFA_offset, x25, -32 */
-        0x80 + 24, 5,                   /* DW_CFA_offset, x24, -40 */
-        0x80 + 23, 6,                   /* DW_CFA_offset, x23, -48 */
-        0x80 + 22, 7,                   /* DW_CFA_offset, x22, -56 */
-        0x80 + 21, 8,                   /* DW_CFA_offset, x21, -64 */
-        0x80 + 20, 9,                   /* DW_CFA_offset, x20, -72 */
-        0x80 + 19, 10,                  /* DW_CFA_offset, x1p, -80 */
-        0x80 + 30, 11,                  /* DW_CFA_offset,  lr, -88 */
-        0x80 + 29, 12,                  /* DW_CFA_offset,  fp, -96 */
+        0x80 + 28, 9,           /* DW_CFA_offset, x28, -72 */
+        0x80 + 27, 10,          /* DW_CFA_offset, x27, -80 */
+        0x80 + 26, 11,          /* DW_CFA_offset, x26, -88 */
+        0x80 + 25, 12,          /* DW_CFA_offset, x25, -96 */
+        0x80 + 24, 13,          /* DW_CFA_offset, x24, -104 */
+        0x80 + 23, 14,          /* DW_CFA_offset, x23, -112 */
+        0x80 + 22, 15,          /* DW_CFA_offset, x22, -120 */
+        0x80 + 21, 16,          /* DW_CFA_offset, x21, -128 */
+        0x80 + 20, 17,          /* DW_CFA_offset, x20, -136 */
+        0x80 + 19, 18,          /* DW_CFA_offset, x1p, -144 */
+        0x80 + 30, 19,          /* DW_CFA_offset, lr, -152 */
+        0x80 + 29, 20,          /* DW_CFA_offset, fp, -160 */
     }
 };
 

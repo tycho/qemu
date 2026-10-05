@@ -38,6 +38,7 @@
 #include "user/safe-syscall.h"
 #include "user/signal.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 
 /* target_siginfo_t must fit in gdbstub's siginfo save area. */
 QEMU_BUILD_BUG_ON(sizeof(target_siginfo_t) > MAX_SIGINFO_LENGTH);
@@ -959,6 +960,36 @@ void die_from_signal(siginfo_t *info)
     die_with_signal(info->si_signo);
 }
 
+bool host_signal_lazysync_ok(void)
+{
+#ifdef HOST_SIGNAL_TCG_REGS
+    return true;
+#else
+    return false;
+#endif
+}
+
+/*
+ * A fault in generated code: store the pinned globals (tcg_pin_user) and
+ * the dirty globals a guest access left in host registers (tcg_lazysync),
+ * before anything reads env.
+ */
+static void host_signal_lazysync(host_sigcontext *uc)
+{
+#ifdef HOST_SIGNAL_TCG_REGS
+    uintptr_t pc = host_signal_pc(uc);
+
+    if ((tcg_lazysync_user || tcg_pin_user)
+        && in_code_gen_buffer((void *)(pc - tcg_splitwx_diff))) {
+        uint64_t regs[HOST_SIGNAL_TCG_REGS][2];
+
+        host_signal_tcg_regs(uc, regs);
+        tcg_pinned_unwind(regs, HOST_SIGNAL_TCG_REGS);
+        tb_lazysync_unwind(pc, regs, HOST_SIGNAL_TCG_REGS);
+    }
+#endif
+}
+
 static void host_sigsegv_handler(CPUState *cpu, siginfo_t *info,
                                  host_sigcontext *uc)
 {
@@ -973,6 +1004,8 @@ static void host_sigsegv_handler(CPUState *cpu, siginfo_t *info,
     bool is_write = host_signal_write(info, uc);
     MMUAccessType access_type = adjust_signal_pc(&pc, is_write);
     bool maperr;
+
+    host_signal_lazysync(uc);
 
     /* If this was a write to a TB protected page, restart. */
     if (is_write
@@ -1015,6 +1048,8 @@ static uintptr_t host_sigbus_handler(CPUState *cpu, siginfo_t *info,
     uintptr_t pc = host_signal_pc(uc);
     bool is_write = host_signal_write(info, uc);
     MMUAccessType access_type = adjust_signal_pc(&pc, is_write);
+
+    host_signal_lazysync(uc);
 
     /*
      * If the access was not on behalf of the guest, within the executable
