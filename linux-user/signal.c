@@ -970,19 +970,21 @@ bool host_signal_lazysync_ok(void)
 }
 
 /*
- * A fault in generated code: store the dirty globals a guest access left
- * in host registers (tcg_lazysync), before anything reads env.
+ * A fault in generated code: store the pinned globals (tcg_pin_user) and
+ * the dirty globals a guest access left in host registers (tcg_lazysync),
+ * before anything reads env.
  */
 static void host_signal_lazysync(host_sigcontext *uc)
 {
 #ifdef HOST_SIGNAL_TCG_REGS
     uintptr_t pc = host_signal_pc(uc);
 
-    if (tcg_lazysync_user
+    if ((tcg_lazysync_user || tcg_pin_user)
         && in_code_gen_buffer((void *)(pc - tcg_splitwx_diff))) {
         uint64_t regs[HOST_SIGNAL_TCG_REGS][2];
 
         host_signal_tcg_regs(uc, regs);
+        tcg_pinned_unwind(regs, HOST_SIGNAL_TCG_REGS);
         tb_lazysync_unwind(pc, regs, HOST_SIGNAL_TCG_REGS);
     }
 #endif

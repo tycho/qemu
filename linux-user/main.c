@@ -681,6 +681,7 @@ static int parse_args(int argc, char **argv)
 
 int main(int argc, char **argv, char **envp)
 {
+    bool have_plugins;
     struct image_info info1, *info = &info1;
     struct linux_binprm bprm;
     TaskState *ts;
@@ -744,6 +745,8 @@ int main(int argc, char **argv, char **envp)
         exit(1);
     }
     trace_init_file();
+    /* Plugins read guest registers from env: no pinned globals then. */
+    have_plugins = !QTAILQ_EMPTY(&plugins);
     qemu_plugin_load_list(&plugins, &error_fatal);
 
     /* Zero out image_info */
@@ -806,6 +809,7 @@ int main(int argc, char **argv, char **envp)
         object_property_set_int(OBJECT(accel), "tb-size",
                                 opt_tb_size, &error_abort);
         tcg_lazysync_user = tcg_lazysync && host_signal_lazysync_ok();
+        tcg_pin_user = tcg_pin && host_signal_lazysync_ok() && !have_plugins;
         ac->init_machine(accel, NULL);
     }
 
