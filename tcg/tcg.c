@@ -4055,6 +4055,7 @@ static bool xblk_select_loops(TCGContext *s)
     QSIMPLEQ_FOREACH(l, &s->labels, next) {
         XblkLoopReg *lr;
         uint8_t *used;
+        bool *wfirst;
         uint16_t *uses;
         int *order, vec_budget;
         TCGRegSet taken, vregs;
@@ -4073,6 +4074,8 @@ static bool xblk_select_loops(TCGContext *s)
         memset(used, 0, s->nb_globals);
         uses = tcg_malloc(s->nb_globals * sizeof(*uses));
         memset(uses, 0, s->nb_globals * sizeof(*uses));
+        wfirst = tcg_malloc(s->nb_globals);
+        memset(wfirst, 0, s->nb_globals);
         QTAILQ_FOREACH(op, &s->ops, link) {
             int no, ni;
 
@@ -4094,11 +4097,16 @@ static bool xblk_select_loops(TCGContext *s)
                 no = tcg_op_defs[op->opc].nb_oargs;
                 ni = tcg_op_defs[op->opc].nb_iargs;
             }
-            for (int k = 0; k < no + ni; k++) {
+            /* Inputs before outputs: an op reads before it writes. */
+            for (int j = 0; j < no + ni; j++) {
+                int k = j < ni ? no + j : j - ni;
                 TCGTemp *ts = arg_temp(op->args[k]);
                 size_t idx = ts ? temp_idx(ts) : SIZE_MAX;
 
                 if (idx < s->nb_globals) {
+                    if (!used[idx] && k < no) {
+                        wfirst[idx] = true;
+                    }
                     used[idx] |= k < no ? 3 : 1;
                     uses[idx] += uses[idx] < UINT16_MAX;
                 }
@@ -4119,7 +4127,14 @@ static bool xblk_select_loops(TCGContext *s)
         for (int i = 0; i < s->nb_globals; i++) {
             int j = i;
 
-            while (j > 0 && uses[order[j - 1]] < uses[i]) {
+            /*
+             * Globals the loop reads before it writes them first: one the
+             * loop overwrites first is live at the label only for a fault,
+             * and costs a store at the back edge without a register.
+             */
+            while (j > 0 && (wfirst[order[j - 1]] > wfirst[i]
+                             || (wfirst[order[j - 1]] == wfirst[i]
+                                 && uses[order[j - 1]] < uses[i]))) {
                 order[j] = order[j - 1];
                 j--;
             }
