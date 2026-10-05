@@ -683,7 +683,6 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "and flags), native (run with the guest's FP mode in the host "
         "FPU; needs a host that can express it) or auto (native where "
         "possible, else vec on AArch64 hosts and soft elsewhere)");
-}
 
     object_class_property_add_bool(oc, "x-regcache",
                                    tcg_get_regcache, tcg_set_regcache);
@@ -696,7 +695,6 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-pin",
         "Keep the guest's most used registers in host registers across "
         "TBs (user mode, where the host supports it)");
-}
 
     object_class_property_add_bool(oc, "x-region",
                                    tcg_get_region, tcg_set_region);
@@ -705,7 +703,6 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "chaining to itself, keeping the loop's guest registers in host "
         "registers (not with plugins or icount)");
 
-
     object_class_property_add_bool(oc, "x-tblookup",
                                    tcg_get_tblookup, tcg_set_tblookup);
     object_class_property_set_description(oc, "x-tblookup",
@@ -713,14 +710,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "indirect jumps (in a short helper call at direct jumps to "
         "another page), and pack TB structs next to their code (x86 "
         "guests)");
-}
 
     object_class_property_add_bool(oc, "x-addr32",
                                    tcg_get_addr32, tcg_set_addr32);
     object_class_property_set_description(oc, "x-addr32",
         "Translate with 32-bit guest addresses where the target allows "
         "(x86 outside long mode): no zero-extension per access");
-}
 
     object_class_property_add_bool(oc, "x-iofast",
                                    tcg_get_iofast, tcg_set_iofast);
@@ -729,7 +724,6 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "with icount), MMIO to lockless_io regions without the BQL, the "
         "x86 APIC's TPR and the RTC's update polls without the BQL, and "
         "no kvmvapic option ROM");
-}
 
     object_class_property_add_bool(oc, "x-hosttime",
                                    tcg_get_hosttime, tcg_set_hosttime);
