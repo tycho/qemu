@@ -1970,8 +1970,20 @@ static void tcg_out_ldst_save(TCGContext *s, TCGRegSet regs, bool restore,
 }
 
 /* tcg_lazysync: store the dirty globals before the slow path's call. */
+/*
+ * Registers for pinned globals (tcg_temp_pin): callee-saved, so that helper
+ * calls keep them, and not otherwise reserved (x28 holds guest_base).
+ */
+#define TCG_TARGET_NB_PIN_REGS 8
+static const TCGReg tcg_target_pin_regs[TCG_TARGET_NB_PIN_REGS] = {
+    TCG_REG_X20, TCG_REG_X21, TCG_REG_X22, TCG_REG_X23,
+    TCG_REG_X24, TCG_REG_X25, TCG_REG_X26, TCG_REG_X27,
+};
+
 static void tcg_out_ldst_writeback(TCGContext *s, TCGLabelQemuLdst *lb)
 {
+    /* The helper may fault and leave generated code: env first. */
+    tcg_out_pinned_st(s);
     for (unsigned i = 0; i < lb->nb_wb; i++) {
         const TCGLdstWriteback *wb = &lb->wb[i];
 
@@ -5181,6 +5193,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     }
 
     tcg_out_mov(s, TCG_TYPE_PTR, TCG_AREG0, tcg_target_call_iarg_regs[0]);
+    tcg_out_pinned_ld(s);
     tcg_out_insn(s, bcond_reg, BR, tcg_target_call_iarg_regs[1]);
 
     /*
@@ -5194,6 +5207,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     /* TB epilogue */
     tb_ret_addr = tcg_splitwx_to_rx(s->code_ptr);
     tcg_out_bti(s, BTI_J);
+    tcg_out_pinned_st(s);
 
     /* Remove TCG locals stack space.  */
     tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,

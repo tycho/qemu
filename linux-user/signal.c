@@ -978,11 +978,12 @@ static void host_signal_lazysync(host_sigcontext *uc)
 #ifdef HOST_SIGNAL_TCG_REGS
     uintptr_t pc = host_signal_pc(uc);
 
-    if (tcg_lazysync_user
+    if ((tcg_lazysync_user || tcg_ctx->nb_pinned)
         && in_code_gen_buffer((void *)(pc - tcg_splitwx_diff))) {
         uint64_t regs[HOST_SIGNAL_TCG_REGS][2];
 
         host_signal_tcg_regs(uc, regs);
+        tcg_pinned_unwind(regs, HOST_SIGNAL_TCG_REGS);
         tb_lazysync_unwind(pc, regs, HOST_SIGNAL_TCG_REGS);
     }
 #endif

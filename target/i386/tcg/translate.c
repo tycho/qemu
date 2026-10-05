@@ -3824,6 +3824,27 @@ void tcg_x86_init(void)
     tcg_set_env_scratch(offsetof(CPUX86State, xmm_t0),
                         offsetof(CPUX86State, mmx_t0) + sizeof(MMXReg)
                         - offsetof(CPUX86State, xmm_t0));
+
+    /*
+     * Experiment: XTCG_PIN lists guest registers (0 = rax ... 15 = r15) to
+     * keep in host registers across TBs, in priority order.
+     */
+    {
+        const char *pin = getenv("XTCG_PIN");
+
+        while (pin && *pin) {
+            char *end;
+            long r = strtol(pin, &end, 10);
+
+            if (end == pin) {
+                break;
+            }
+            if (r >= 0 && r < CPU_NB_REGS) {
+                tcg_temp_pin(tcgv_tl_temp(cpu_regs[r]));
+            }
+            pin = *end ? end + 1 : end;
+        }
+    }
 }
 
 static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
