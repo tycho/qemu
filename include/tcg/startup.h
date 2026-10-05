@@ -191,6 +191,12 @@ void tcg_register_thread(void);
 void tcg_prologue_init(void);
 
 /*
+ * tcg_tbpack: tcg_tb_alloc puts a TB's struct right below its code, both
+ * 16-byte aligned, instead of each in its own instruction-cache lines.
+ */
+extern bool tcg_tbpack;
+
+/*
  * tcg_vecld: a guest vector load puts the loaded value in a host vector
  * register (when the backend can build one from general registers), so
  * that it is stored to CPU state in one piece.
