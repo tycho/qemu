@@ -56,6 +56,15 @@ extern bool tcg_lazysync;
 extern bool tcg_lazysync_user;
 
 /*
+ * tcg_pin: a front end pins its most used guest registers (tcg_temp_pin).
+ * tcg_pin_user: user mode sets it where the host signal handler can store
+ * pinned globals (tcg_pinned_unwind) and no plugin reads guest registers;
+ * pinning applies only then.
+ */
+extern bool tcg_pin;
+extern bool tcg_pin_user;
+
+/*
  * Front ends keep vector registers in env_alias vector
  * globals (tcg_global_mem_new_vec), so TCG holds them in host registers
  * within a TB.
