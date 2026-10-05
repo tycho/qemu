@@ -6331,23 +6331,36 @@ static inline void gen_VCVTtSx2SI(DisasContext *s, X86DecodedInsn *decode,
 #define gen_helper_cvttsd2sq NULL
 #endif
 
+static bool gen_cvtsx2si_native(DisasContext *s, X86DecodedInsn *decode,
+                                bool round);
+
 static void gen_VCVTSx2SI(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (gen_cvtsx2si_native(s, decode, true)) {
+        return;
+    }
     gen_VCVTtSx2SI(s, decode,
                    gen_helper_cvtss2si, gen_helper_cvtss2sq,
                    gen_helper_cvtsd2si, gen_helper_cvtsd2sq);
 }
 
 /*
- * CVTTSS2SI/CVTTSD2SI with x-ssefp=native: the host's conversion rounds
- * toward zero too.  x86 returns the "integer indefinite" (the most
- * negative value) where the input is a NaN or out of range; the host gives
- * 0 or saturates.  So take the indefinite value wherever the input's
+ * CVTSS2SI/CVTSD2SI and the truncating CVTTSS2SI/CVTTSD2SI with
+ * x-ssefp=native.  The rounding forms first round to an integer in the
+ * current rounding mode (the host's follows MXCSR), which raises inexact
+ * as x86 does; then both convert with the host's conversion, which rounds
+ * toward zero.  x86 returns the "integer indefinite" (the most negative
+ * value) where the input is a NaN or out of range; the host gives 0 or
+ * saturates.  So take the indefinite value wherever the input's
  * magnitude, tested as an integer, is at least 2^31 (2^63): that is every
  * NaN, infinity and overflow, and -2^31 (-2^63), whose result is the same
- * value anyway.
+ * value anyway.  Rounding can still carry a double just below 2^31 in
+ * magnitude to 2^31: for a 32-bit result from a double, also convert the
+ * rounded value to 64 bits and take the indefinite value where that is out
+ * of the 32-bit range.
  */
-static bool gen_cvttsx2si_native(DisasContext *s, X86DecodedInsn *decode)
+static bool gen_cvtsx2si_native(DisasContext *s, X86DecodedInsn *decode,
+                                bool round)
 {
     unsigned vece = s->prefix & PREFIX_REPNZ ? MO_64 : MO_32;
     X86DecodedOp *op = &decode->op[2];
@@ -6360,14 +6373,29 @@ static bool gen_cvttsx2si_native(DisasContext *s, X86DecodedInsn *decode)
 #ifdef TARGET_X86_64
     is64 = decode->op[0].ot == MO_64;
 #endif
-    if (!fp_native_s(INDEX_op_fcvtzsi_vec, vece)) {
+    if (!fp_native_s(INDEX_op_fcvtzsi_vec, vece) ||
+        (round && !fp_native_s(INDEX_op_frintx_vec, vece))) {
         return false;
     }
     a = fp_scalar_operand(decode, 2, vece);
+    if (round) {
+        TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_frintx_vec(vece, t, a);
+        a = t;
+    }
     bits = tcg_temp_new_i64();
     r = tcg_temp_new_i64();
     if (is64) {
         tcg_gen_fcvtzsi_i64_vec(vece, r, a);
+    } else if (round && vece == MO_64) {
+        TCGv_i64 lo = tcg_temp_new_i64();
+
+        tcg_gen_fcvtzsi_i64_vec(vece, r, a);
+        tcg_gen_ext32s_i64(lo, r);
+        tcg_gen_movcond_i64(TCG_COND_NE, r, lo, r,
+                            tcg_constant_i64(0x80000000u), r);
+        tcg_gen_ext32u_i64(r, r);
     } else {
         TCGv_i32 t = tcg_temp_new_i32();
 
@@ -6393,7 +6421,7 @@ static bool gen_cvttsx2si_native(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_VCVTTSx2SI(DisasContext *s, X86DecodedInsn *decode)
 {
-    if (gen_cvttsx2si_native(s, decode)) {
+    if (gen_cvtsx2si_native(s, decode, false)) {
         return;
     }
     gen_VCVTtSx2SI(s, decode,
