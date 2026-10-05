@@ -272,6 +272,16 @@ static void tcg_set_flags(Object *obj, const char *value, Error **errp)
     }
 }
 
+static bool tcg_get_lazy_incdec(Object *obj, Error **errp)
+{
+    return tcg_lazy_incdec;
+}
+
+static void tcg_set_lazy_incdec(Object *obj, bool value, Error **errp)
+{
+    tcg_lazy_incdec = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -309,6 +319,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Guest condition codes at block entry: off (compute them with the "
         "front end's helper) or guess (inline code for the state the "
         "block was translated in, tested at run time)");
+
+    object_class_property_add_bool(oc, "x-lazyinc",
+                                   tcg_get_lazy_incdec,
+                                   tcg_set_lazy_incdec);
+    object_class_property_set_description(oc, "x-lazyinc",
+        "x86: INC and DEC after an unknown flags state keep that state "
+        "for CF rather than computing it");
 }
 
 static const TypeInfo tcg_accel_type = {

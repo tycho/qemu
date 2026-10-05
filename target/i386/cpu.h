@@ -1625,20 +1625,41 @@ typedef enum {
     CC_OP_SBB_SELFL__,
     CC_OP_SBB_SELFQ__,
     CC_OP_SBB_SELF = sizeof(target_ulong) == 8 ? CC_OP_SBB_SELFQ__ : CC_OP_SBB_SELFL__,
+
 #define CC_OP_LAST_BWLQ CC_OP_SBB_SELFQ__
 
     CC_OP_DYNAMIC, /* must use dynamic code to get cc_op */
+
+    /*
+     * INC and DEC with a lazy CF (tcg_lazy_incdec): CC_DST = res, and CF
+     * is that of the earlier operation whose number is in bits 8 and up
+     * of CC_OP, with CC_DST2, CC_SRC and CC_SRC2 as its CC_DST, CC_SRC
+     * and CC_SRC2.  The earlier operation is never one of these.
+     * They come after CC_OP_DYNAMIC so that the values above don't move;
+     * a group must start at a multiple of 4 (cc_op_size).
+     */
+    CC_OP_INCLB = (CC_OP_DYNAMIC + 4) & ~3,
+    CC_OP_INCLW,
+    CC_OP_INCLL,
+    CC_OP_INCLQ,
+
+    CC_OP_DECLB,
+    CC_OP_DECLW,
+    CC_OP_DECLL,
+    CC_OP_DECLQ,
 } CCOp;
 
 /* See X86DecodedInsn.cc_op, using int8_t. */
-QEMU_BUILD_BUG_ON(CC_OP_DYNAMIC > INT8_MAX);
+QEMU_BUILD_BUG_ON(CC_OP_DECLQ > INT8_MAX);
 
 static inline MemOp cc_op_size(CCOp op)
 {
     MemOp size = op & 3;
 
     QEMU_BUILD_BUG_ON(CC_OP_FIRST_BWLQ & 3);
-    assert(op >= CC_OP_FIRST_BWLQ && op <= CC_OP_LAST_BWLQ);
+    QEMU_BUILD_BUG_ON(CC_OP_INCLB & 3);
+    assert((op >= CC_OP_FIRST_BWLQ && op <= CC_OP_LAST_BWLQ) ||
+           (op >= CC_OP_INCLB && op <= CC_OP_DECLQ));
     assert(size <= MO_TL);
 
     return size;
@@ -2342,6 +2363,9 @@ typedef struct CPUArchState {
 
     /* Bitmap of available CPU topology levels for this CPU. */
     DECLARE_BITMAP(avail_cpu_topo, CPU_TOPOLOGY_LEVEL__MAX);
+
+    /* The earlier operation's CC_DST, for CC_OP_INCL* and CC_OP_DECL*. */
+    target_ulong cc_dst2;
 } CPUX86State;
 
 /**
