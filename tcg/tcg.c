@@ -6634,6 +6634,18 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
     nb_oargs = def->nb_oargs;
     nb_iargs = def->nb_iargs;
 
+    switch (op->opc) {
+    case INDEX_op_qemu_ld:
+    case INDEX_op_qemu_st:
+    case INDEX_op_qemu_ld_vec:
+    case INDEX_op_qemu_st_vec:
+        s->ldst_disp = op->args[nb_oargs + nb_iargs + 1];
+        break;
+    default:
+        s->ldst_disp = 0;
+        break;
+    }
+
     /* copy constants */
     memcpy(new_args + nb_oargs + nb_iargs,
            op->args + nb_oargs + nb_iargs,

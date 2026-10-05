@@ -1848,9 +1848,11 @@ bool tcg_target_has_memory_bswap(MemOp memop)
 }
 
 static void tcg_out_qemu_ld_direct(TCGContext *s, MemOp memop, TCGType ext,
-                                   TCGReg data_r, HostAddress h);
+                                   TCGReg data_r, HostAddress h,
+                                   intptr_t disp);
 static void tcg_out_qemu_st_direct(TCGContext *s, MemOp memop,
-                                   TCGReg data_r, HostAddress h);
+                                   TCGReg data_r, HostAddress h,
+                                   intptr_t disp);
 
 static const TCGLdstHelperParam ldst_helper_param = {
     .ntmp = 1, .tmp = { TCG_REG_TMP0 }
@@ -2360,37 +2362,50 @@ static void tcg_out_qemu_st_release(TCGContext *s, MemOp memop,
     tcg_out32(s, insn[memop & MO_SIZE] | base << 5 | data_r);
 }
 
-static void tcg_out_qemu_ld_direct(TCGContext *s, MemOp memop, TCGType ext,
-                                   TCGReg data_r, HostAddress h)
+/*
+ * A guest access at h, plus disp: an immediate offset, used only when h has
+ * no index (user mode without guest_base; see ldst_whole_addr).
+ */
+static void tcg_out_ldst_host(TCGContext *s, AArch64Insn insn, TCGReg rd,
+                              HostAddress h, intptr_t disp, int lgsize)
 {
+    if (disp) {
+        tcg_debug_assert(h.index == TCG_REG_XZR);
+        tcg_out_ldst(s, insn, rd, h.base, disp, lgsize);
+    } else {
+        tcg_out_insn_ldst_reg(s, insn, rd, h.base, h.index_ext, h.index);
+    }
+}
+
+static void tcg_out_qemu_ld_direct(TCGContext *s, MemOp memop, TCGType ext,
+                                   TCGReg data_r, HostAddress h,
+                                   intptr_t disp)
+{
+    int lg = memop & MO_SIZE;
+
     switch (memop & MO_SSIZE) {
     case MO_UB:
-        tcg_out_insn_ldst_reg(s, Ildst_imm_LDRB, data_r, h.base,
-                              h.index_ext, h.index);
+        tcg_out_ldst_host(s, Ildst_imm_LDRB, data_r, h, disp, lg);
         break;
     case MO_SB:
-        tcg_out_insn_ldst_reg(s, ext ? Ildst_imm_LDRSBX : Ildst_imm_LDRSBW,
-                              data_r, h.base, h.index_ext, h.index);
+        tcg_out_ldst_host(s, ext ? Ildst_imm_LDRSBX : Ildst_imm_LDRSBW,
+                          data_r, h, disp, lg);
         break;
     case MO_UW:
-        tcg_out_insn_ldst_reg(s, Ildst_imm_LDRH, data_r, h.base, h.index_ext,
-                              h.index);
+        tcg_out_ldst_host(s, Ildst_imm_LDRH, data_r, h, disp, lg);
         break;
     case MO_SW:
-        tcg_out_insn_ldst_reg(s, ext ? Ildst_imm_LDRSHX : Ildst_imm_LDRSHW,
-                              data_r, h.base, h.index_ext, h.index);
+        tcg_out_ldst_host(s, ext ? Ildst_imm_LDRSHX : Ildst_imm_LDRSHW,
+                          data_r, h, disp, lg);
         break;
     case MO_UL:
-        tcg_out_insn_ldst_reg(s, Ildst_imm_LDRW, data_r, h.base, h.index_ext,
-                              h.index);
+        tcg_out_ldst_host(s, Ildst_imm_LDRW, data_r, h, disp, lg);
         break;
     case MO_SL:
-        tcg_out_insn_ldst_reg(s, Ildst_imm_LDRSWX, data_r, h.base, h.index_ext,
-                              h.index);
+        tcg_out_ldst_host(s, Ildst_imm_LDRSWX, data_r, h, disp, lg);
         break;
     case MO_UQ:
-        tcg_out_insn_ldst_reg(s, Ildst_imm_LDRX, data_r, h.base, h.index_ext,
-                              h.index);
+        tcg_out_ldst_host(s, Ildst_imm_LDRX, data_r, h, disp, lg);
         break;
     default:
         g_assert_not_reached();
@@ -2398,28 +2413,65 @@ static void tcg_out_qemu_ld_direct(TCGContext *s, MemOp memop, TCGType ext,
 }
 
 static void tcg_out_qemu_st_direct(TCGContext *s, MemOp memop,
-                                   TCGReg data_r, HostAddress h)
+                                   TCGReg data_r, HostAddress h,
+                                   intptr_t disp)
 {
+    int lg = memop & MO_SIZE;
+
     switch (memop & MO_SIZE) {
     case MO_8:
-        tcg_out_insn_ldst_reg(s, Ildst_imm_STRB, data_r, h.base,
-                              h.index_ext, h.index);
+        tcg_out_ldst_host(s, Ildst_imm_STRB, data_r, h, disp, lg);
         break;
     case MO_16:
-        tcg_out_insn_ldst_reg(s, Ildst_imm_STRH, data_r, h.base,
-                              h.index_ext, h.index);
+        tcg_out_ldst_host(s, Ildst_imm_STRH, data_r, h, disp, lg);
         break;
     case MO_32:
-        tcg_out_insn_ldst_reg(s, Ildst_imm_STRW, data_r, h.base,
-                              h.index_ext, h.index);
+        tcg_out_ldst_host(s, Ildst_imm_STRW, data_r, h, disp, lg);
         break;
     case MO_64:
-        tcg_out_insn_ldst_reg(s, Ildst_imm_STRX, data_r, h.base,
-                              h.index_ext, h.index);
+        tcg_out_ldst_host(s, Ildst_imm_STRX, data_r, h, disp, lg);
         break;
     default:
         g_assert_not_reached();
     }
+}
+
+/*
+ * A guest access's displacement (TCG_TARGET_HAS_qemu_disp: user mode with
+ * 64-bit addresses and no guest_base, as the optimizer folds it). The plain
+ * access takes it as an immediate offset; the paths that need the whole
+ * address (an alignment check and its slow path, acquire/release) get it
+ * in TMP2 instead, and *disp becomes 0.
+ */
+static TCGReg ldst_whole_addr(TCGContext *s, TCGReg addr_reg, MemOpIdx oi,
+                              intptr_t *disp)
+{
+    MemOp opc = get_memop(oi);
+    TCGAtomAlign aa;
+
+    *disp = s->ldst_disp;
+    if (*disp == 0) {
+        return addr_reg;
+    }
+    tcg_debug_assert(!tcg_use_softmmu && !guest_base
+                     && s->addr_type == TCG_TYPE_I64
+                     && *disp > -4096 && *disp < 4096);
+    aa = atom_and_align_for_opc(s, opc,
+                                have_lse2 ? MO_ATOM_WITHIN16
+                                          : MO_ATOM_IFALIGN,
+                                (opc & MO_SIZE) == MO_128);
+    if (aa.align == 0 && !(opc & MO_ACQ_REL)) {
+        return addr_reg;
+    }
+    if (*disp >= 0) {
+        tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_TMP2,
+                     addr_reg, *disp);
+    } else {
+        tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64, TCG_REG_TMP2,
+                     addr_reg, -*disp);
+    }
+    *disp = 0;
+    return TCG_REG_TMP2;
 }
 
 /*
@@ -2436,6 +2488,9 @@ static void tgen_qemu_ld(TCGContext *s, TCGType data_type, TCGReg data_reg,
 {
     TCGLabelQemuLdst *ldst;
     HostAddress h;
+    intptr_t disp;
+
+    addr_reg = ldst_whole_addr(s, addr_reg, oi, &disp);
 
     ldst = prepare_host_addr(s, &h, addr_reg, oi, true,
                              acqrel_onepath(get_memop(oi)));
@@ -2453,7 +2508,7 @@ static void tgen_qemu_ld(TCGContext *s, TCGType data_type, TCGReg data_reg,
             fb->raddr = tcg_splitwx_to_rx(s->code_ptr);
         }
     } else {
-        tcg_out_qemu_ld_direct(s, get_memop(oi), data_type, data_reg, h);
+        tcg_out_qemu_ld_direct(s, get_memop(oi), data_type, data_reg, h, disp);
     }
 
     if (ldst) {
@@ -2473,13 +2528,16 @@ static void tgen_qemu_st(TCGContext *s, TCGType data_type, TCGReg data_reg,
 {
     TCGLabelQemuLdst *ldst;
     HostAddress h;
+    intptr_t disp;
+
+    addr_reg = ldst_whole_addr(s, addr_reg, oi, &disp);
 
     ldst = prepare_host_addr(s, &h, addr_reg, oi, false,
                              acqrel_onepath(get_memop(oi)));
     if (acqrel_cross(get_memop(oi))) {
         /* Any alignment: a plain store after a barrier. */
         tcg_out_mb(s, TCG_MO_LD_ST | TCG_MO_ST_ST);
-        tcg_out_qemu_st_direct(s, get_memop(oi), data_reg, h);
+        tcg_out_qemu_st_direct(s, get_memop(oi), data_reg, h, disp);
     } else if (get_memop(oi) & MO_ACQ_REL) {
         TCGReg host = tcg_out_host_addr_reg(s, h);
         TCGLabelQemuLdst *fb = tcg_out_acqrel_check(s, oi, addr_reg, false);
@@ -2491,7 +2549,7 @@ static void tgen_qemu_st(TCGContext *s, TCGType data_type, TCGReg data_reg,
             fb->raddr = tcg_splitwx_to_rx(s->code_ptr);
         }
     } else {
-        tcg_out_qemu_st_direct(s, get_memop(oi), data_reg, h);
+        tcg_out_qemu_st_direct(s, get_memop(oi), data_reg, h, disp);
     }
 
     if (ldst) {
@@ -2516,6 +2574,9 @@ static void tcg_out_qemu_ldst_vec(TCGContext *s, TCGReg data,
 {
     TCGLabelQemuLdst *ldst;
     HostAddress h;
+    intptr_t disp;
+
+    addr_reg = ldst_whole_addr(s, addr_reg, oi, &disp);
 
     ldst = prepare_host_addr(s, &h, addr_reg, oi, is_ld, false);
     if (get_memop(oi) & MO_ACQ_REL) {
@@ -2526,8 +2587,8 @@ static void tcg_out_qemu_ldst_vec(TCGContext *s, TCGReg data,
         tcg_out32(s, (is_ld ? 0x1dc00800 : 0x1d800800)
                   | base << 5 | (data & 31));
     } else {
-        tcg_out_insn_ldst_reg(s, is_ld ? Ildst_imm_LDRVQ : Ildst_imm_STRVQ,
-                              data, h.base, h.index_ext, h.index);
+        tcg_out_ldst_host(s, is_ld ? Ildst_imm_LDRVQ : Ildst_imm_STRVQ,
+                          data, h, disp, MO_128);
     }
     if (ldst) {
         ldst->type = TCG_TYPE_V128;

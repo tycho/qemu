@@ -400,6 +400,8 @@ struct TCGContext {
     int8_t *xblk_home;          /* each temp's loop register */
     int nb_ops;
     TCGType addr_type;            /* TCG_TYPE_I32 or TCG_TYPE_I64 */
+    /* The displacement of the guest access being emitted (qemu_ld/st). */
+    int64_t ldst_disp;
     TCGBar guest_mo;
 
     TCGRegSet reserved_regs;

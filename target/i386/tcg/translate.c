@@ -143,6 +143,8 @@ typedef struct DisasContext {
     /* TCG local temps */
     TCGv cc_srcT;
     TCGv A0;
+    /* gen_lea_modrm_1: base + index part, and that plus the displacement */
+    TCGv ea_bi, ea_disp;
     TCGv T0;
     TCGv T1;
 
@@ -1723,12 +1725,12 @@ static TCGv gen_lea_modrm_1(DisasContext *s, AddressParts a, bool is_vsib)
         if (a.scale == 0) {
             ea = cpu_regs[a.index];
         } else {
-            tcg_gen_shli_tl(s->A0, cpu_regs[a.index], a.scale);
-            ea = s->A0;
+            tcg_gen_shli_tl(s->ea_bi, cpu_regs[a.index], a.scale);
+            ea = s->ea_bi;
         }
         if (a.base >= 0) {
-            tcg_gen_add_tl(s->A0, ea, cpu_regs[a.base]);
-            ea = s->A0;
+            tcg_gen_add_tl(s->ea_bi, ea, cpu_regs[a.base]);
+            ea = s->ea_bi;
         }
     } else if (a.base >= 0) {
         ea = cpu_regs[a.base];
@@ -1742,8 +1744,13 @@ static TCGv gen_lea_modrm_1(DisasContext *s, AddressParts a, bool is_vsib)
         }
         ea = s->A0;
     } else if (a.disp != 0) {
-        tcg_gen_addi_tl(s->A0, ea, a.disp);
-        ea = s->A0;
+        /*
+         * The displacement in a temp of its own, so that base + index
+         * survives it: the optimizer may fold the displacement into the
+         * access.
+         */
+        tcg_gen_addi_tl(s->ea_disp, ea, a.disp);
+        ea = s->ea_disp;
     }
 
     return ea;
@@ -3886,6 +3893,8 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->T0 = tcg_temp_new();
     dc->T1 = tcg_temp_new();
     dc->A0 = tcg_temp_new();
+    dc->ea_bi = tcg_temp_new();
+    dc->ea_disp = tcg_temp_new();
 
     dc->cc_srcT = NULL;
 }

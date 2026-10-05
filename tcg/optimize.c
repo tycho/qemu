@@ -30,6 +30,9 @@
 #include "tcg-internal.h"
 #include "tcg-has.h"
 #include "tcg/startup.h"
+#ifdef CONFIG_USER_ONLY
+#include "user/guest-base.h"
+#endif
 
 
 typedef struct MemCopyInfo {
@@ -52,6 +55,13 @@ typedef struct TempOptInfo {
      */
     TCGTemp *low32_src;
     unsigned low32_gen;
+    /*
+     * The value is add_src, as it was at generation add_gen, plus add_off
+     * (an add or sub of a constant, or a chain of them).
+     */
+    TCGTemp *add_src;
+    unsigned add_gen;
+    int64_t add_off;
     unsigned gen;     /* bumped whenever the temp gets a new value */
 } TempOptInfo;
 
@@ -150,6 +160,7 @@ static void init_ts_info(OptContext *ctx, TCGTemp *ts)
         ti->gen++;
     }
     ti->low32_src = NULL;
+    ti->add_src = NULL;
 
     ti->next_copy = ts;
     ti->prev_copy = ts;
@@ -247,6 +258,7 @@ static void reset_ts(OptContext *ctx, TCGTemp *ts)
     ti->next_copy = ts;
     ti->prev_copy = ts;
     ti->low32_src = NULL;
+    ti->add_src = NULL;
     ti->gen++;
     ti->z_mask = -1;
     ti->o_mask = 0;
@@ -2084,6 +2096,90 @@ static void fold_addr_low32(OptContext *ctx, TCGOp *op, int i)
     }
 }
 
+/* The add info of ts, or of a copy of it, while still valid. */
+static TempOptInfo *add_info(OptContext *ctx, TCGTemp *ts)
+{
+    TCGTemp *i = ts;
+
+    do {
+        TempOptInfo *ti = ts_info(i);
+        TCGTemp *src = ti->add_src;
+
+        if (src && test_bit(temp_idx(src), ctx->temps_used.l) &&
+            ts_info(src)->gen == ti->add_gen) {
+            return ti;
+        }
+        i = ti->next_copy;
+    } while (i != ts);
+    return NULL;
+}
+
+/* After an i64 add or sub of a constant: record value = source + offset. */
+static void note_add(OptContext *ctx, TCGOp *op)
+{
+    TempOptInfo *di, *si;
+    TCGTemp *src;
+    int64_t off;
+
+    if ((op->opc != INDEX_op_add && op->opc != INDEX_op_sub) ||
+        TCGOP_TYPE(op) != TCG_TYPE_I64 || !arg_is_const(op->args[2])) {
+        return;
+    }
+    off = arg_const_val(op->args[2]);
+    if (op->opc == INDEX_op_sub) {
+        off = -off;
+    }
+    src = arg_temp(op->args[1]);
+    di = arg_info(op->args[0]);
+    if (src == arg_temp(op->args[0])) {
+        /* The source is gone; nothing to record. */
+        return;
+    }
+    si = add_info(ctx, src);
+    if (si) {
+        di->add_src = si->add_src;
+        di->add_gen = si->add_gen;
+        di->add_off = si->add_off + off;
+    } else {
+        di->add_src = src;
+        di->add_gen = ts_info(src)->gen;
+        di->add_off = off;
+    }
+}
+
+/*
+ * A guest access at an address that is another temp plus a constant (user
+ * mode, 64-bit addresses, no guest_base): take that temp and the constant
+ * as the access's displacement, which the backend folds into the access.
+ */
+static void fold_addr_disp(OptContext *ctx, TCGOp *op, int i)
+{
+#ifdef CONFIG_USER_ONLY
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+    int d = def->nb_oargs + def->nb_iargs + 1;
+    MemOp mop = get_memop(op->args[d - 1]);
+    TempOptInfo *ti;
+    int64_t disp;
+
+    if (!TCG_TARGET_HAS_qemu_disp || tcg_use_softmmu || guest_base ||
+        ctx->tcg->addr_type != TCG_TYPE_I64 ||
+        arg_temp(op->args[i])->base_type != TCG_TYPE_I64 ||
+        (mop & MO_ACQ_REL) || (mop & MO_AMASK) > MO_UNALN) {
+        return;
+    }
+    ti = add_info(ctx, arg_temp(op->args[i]));
+    if (!ti) {
+        return;
+    }
+    disp = op->args[d] + ti->add_off;
+    if (disp <= -4096 || disp >= 4096) {
+        return;
+    }
+    op->args[i] = temp_arg(ti->add_src);
+    op->args[d] = disp;
+#endif
+}
+
 static bool fold_extract(OptContext *ctx, TCGOp *op)
 {
     uint64_t z_mask, o_mask, a_mask;
@@ -3275,6 +3371,7 @@ void tcg_optimize(TCGContext *s)
         switch (opc) {
         case INDEX_op_add:
             done = fold_add(&ctx, op);
+            note_add(&ctx, op);
             break;
         case INDEX_op_add_vec:
             done = fold_add_vec(&ctx, op);
@@ -3413,6 +3510,7 @@ void tcg_optimize(TCGContext *s)
             break;
         case INDEX_op_qemu_ld:
             fold_addr_low32(&ctx, op, 1);
+            fold_addr_disp(&ctx, op, 1);
             done = fold_qemu_ld_1reg(&ctx, op);
             break;
         case INDEX_op_qemu_ld2:
@@ -3421,11 +3519,13 @@ void tcg_optimize(TCGContext *s)
             break;
         case INDEX_op_qemu_ld_vec:
             fold_addr_low32(&ctx, op, 1);
+            fold_addr_disp(&ctx, op, 1);
             done = fold_qemu_ld_2reg(&ctx, op);
             break;
         case INDEX_op_qemu_st:
         case INDEX_op_qemu_st_vec:
             fold_addr_low32(&ctx, op, 1);
+            fold_addr_disp(&ctx, op, 1);
             done = fold_qemu_st(&ctx, op);
             break;
         case INDEX_op_qemu_st2:
@@ -3472,6 +3572,7 @@ void tcg_optimize(TCGContext *s)
             break;
         case INDEX_op_sub:
             done = fold_sub(&ctx, op);
+            note_add(&ctx, op);
             break;
         case INDEX_op_subbi:
             done = fold_subbi(&ctx, op);
