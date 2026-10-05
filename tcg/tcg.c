@@ -7365,6 +7365,48 @@ static void tcg_out_st_helper_args(TCGContext *s, const TCGLabelQemuLdst *ldst,
     tcg_out_helper_load_common_args(s, ldst, parm, info, next_arg);
 }
 
+/*
+ * Compute values straight into the pinned globals they are moved to.
+ * Front ends compute into a temp and then move it to the guest register;
+ * for a pinned global that move is a host instruction.  When an op's only
+ * output is a temp that dies in a mov to a pinned global right after it,
+ * the op writes the pinned global instead and the mov goes.  Nothing runs
+ * between the two, so the global changes at the same point as before; an
+ * op that faults leaves its output register unwritten.  Runs after
+ * liveness, whose results it keeps up to date.
+ */
+static void pinned_fold_pass(TCGContext *s)
+{
+    TCGOp *op, *next;
+
+    for (op = QTAILQ_FIRST(&s->ops); op; op = QTAILQ_NEXT(op, link)) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        TCGTemp *t, *g;
+
+        next = QTAILQ_NEXT(op, link);
+        if (!next || next->opc != INDEX_op_mov ||
+            op->opc == INDEX_op_call || def->nb_oargs != 1 ||
+            (def->flags & TCG_OPF_VECTOR) ||
+            ((def->flags & TCG_OPF_SIDE_EFFECTS) &&
+             op->opc != INDEX_op_qemu_ld)) {
+            continue;
+        }
+        t = arg_temp(op->args[0]);
+        g = arg_temp(next->args[0]);
+        if (!g->pinned || arg_temp(next->args[1]) != t ||
+            (t->kind != TEMP_EBB && t->kind != TEMP_TB) ||
+            t->type != g->type || TCGOP_TYPE(next) != g->type ||
+            !(next->life & (DEAD_ARG << 1))) {
+            continue;
+        }
+        op->args[0] = next->args[0];
+        op->life = (op->life & ~(DEAD_ARG | SYNC_ARG))
+                   | (next->life & (DEAD_ARG | SYNC_ARG));
+        op->output_pref[0] = next->output_pref[0];
+        tcg_op_remove(s, next);
+    }
+}
+
 int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 {
     int i, num_insns;
@@ -7427,6 +7469,10 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             /* If changes were made, re-run liveness.  */
             liveness_pass_1(s);
         }
+    }
+
+    if (s->nb_pinned) {
+        pinned_fold_pass(s);
     }
 
     if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)
