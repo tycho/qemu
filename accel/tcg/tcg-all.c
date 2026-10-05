@@ -308,6 +308,28 @@ static void tcg_set_tlb_grow(Object *obj, Visitor *v, const char *name,
     tcg_tlb_grow = value;
 }
 
+static char *tcg_get_jitwx(Object *obj, Error **errp)
+{
+#ifdef CONFIG_DARWIN
+    return g_strdup(qemu_thread_jit_lazy ? "lazy" : "always");
+#else
+    return g_strdup("always");
+#endif
+}
+
+static void tcg_set_jitwx(Object *obj, const char *value, Error **errp)
+{
+    bool lazy = !strcmp(value, "lazy");
+
+    if (!lazy && strcmp(value, "always")) {
+        error_setg(errp, "Invalid 'x-jitwx' value: %s", value);
+        return;
+    }
+#ifdef CONFIG_DARWIN
+    qemu_thread_jit_lazy = lazy;
+#endif
+}
+
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
@@ -656,6 +678,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Grow a softmmu TLB between flushes once it has had this many "
         "times its size in fills within 100 ms while over 70% used "
         "(0: resize only at flushes, the default)");
+
+    object_class_property_add_str(oc, "x-jitwx", tcg_get_jitwx, tcg_set_jitwx);
+    object_class_property_set_description(oc, "x-jitwx",
+        "macOS MAP_JIT write/execute toggles: always (default) or lazy "
+        "(skip the calls that wouldn't change the thread's mode); "
+        "no effect on other hosts");
 }
 
 static const TypeInfo tcg_accel_type = {
