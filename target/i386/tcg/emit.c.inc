@@ -6354,10 +6354,11 @@ static void gen_VCVTSx2SI(DisasContext *s, X86DecodedInsn *decode)
  * saturates.  So take the indefinite value wherever the input's
  * magnitude, tested as an integer, is at least 2^31 (2^63): that is every
  * NaN, infinity and overflow, and -2^31 (-2^63), whose result is the same
- * value anyway.  Rounding can still carry a double just below 2^31 in
- * magnitude to 2^31: for a 32-bit result from a double, also convert the
- * rounded value to 64 bits and take the indefinite value where that is out
- * of the 32-bit range.
+ * value anyway.  Rounding can carry a double just below 2^31 in magnitude
+ * to 2^31, where x86 raises only invalid but the host's rounding has
+ * raised inexact: that conversion, CVTSD2SI to 32 bits, keeps the helper.
+ * Every float beyond the 32-bit range, and every double beyond the 64-bit
+ * range, is already an integer, so rounding raises nothing there.
  */
 static bool gen_cvtsx2si_native(DisasContext *s, X86DecodedInsn *decode,
                                 bool round)
@@ -6374,7 +6375,8 @@ static bool gen_cvtsx2si_native(DisasContext *s, X86DecodedInsn *decode,
     is64 = decode->op[0].ot == MO_64;
 #endif
     if (!fp_native_s(INDEX_op_fcvtzsi_vec, vece) ||
-        (round && !fp_native_s(INDEX_op_frintx_vec, vece))) {
+        (round && (!fp_native_s(INDEX_op_frintx_vec, vece) ||
+                   (vece == MO_64 && !is64)))) {
         return false;
     }
     a = fp_scalar_operand(decode, 2, vece);
@@ -6388,14 +6390,6 @@ static bool gen_cvtsx2si_native(DisasContext *s, X86DecodedInsn *decode,
     r = tcg_temp_new_i64();
     if (is64) {
         tcg_gen_fcvtzsi_i64_vec(vece, r, a);
-    } else if (round && vece == MO_64) {
-        TCGv_i64 lo = tcg_temp_new_i64();
-
-        tcg_gen_fcvtzsi_i64_vec(vece, r, a);
-        tcg_gen_ext32s_i64(lo, r);
-        tcg_gen_movcond_i64(TCG_COND_NE, r, lo, r,
-                            tcg_constant_i64(0x80000000u), r);
-        tcg_gen_ext32u_i64(r, r);
     } else {
         TCGv_i32 t = tcg_temp_new_i32();
 
