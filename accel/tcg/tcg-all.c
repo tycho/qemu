@@ -520,7 +520,7 @@ static void tcg_set_ssefp(Object *obj, const char *value, Error **errp)
 static bool tcg_get_regcache(Object *obj, Error **errp)
 {
     return tcg_dse && tcg_ldstkeep && tcg_lazysync
-           && tcg_vecglobal && tcg_ymmglobal;
+           && tcg_vecglobal && tcg_ymmglobal && tcg_vregs_all;
 }
 
 static void tcg_set_regcache(Object *obj, bool value, Error **errp)
@@ -530,6 +530,7 @@ static void tcg_set_regcache(Object *obj, bool value, Error **errp)
     tcg_lazysync = value;
     tcg_vecglobal = value;
     tcg_ymmglobal = value;
+    tcg_vregs_all = value;
 }
 
 static bool tcg_get_region(Object *obj, Error **errp)
