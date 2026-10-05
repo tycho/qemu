@@ -3889,6 +3889,7 @@ static void gen_LES(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_LFENCE(DisasContext *s, X86DecodedInsn *decode)
 {
+    s->fence_insn = true;
     tcg_gen_mb(TCG_MO_LD_LD | TCG_BAR_SC);
 }
 
@@ -3984,6 +3985,7 @@ static void gen_LZCNT(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_MFENCE(DisasContext *s, X86DecodedInsn *decode)
 {
+    s->fence_insn = true;
     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
 }
 
@@ -5215,6 +5217,10 @@ static void gen_RDTSC(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
+    /* LFENCE; RDTSC (or MFENCE) reads after earlier instructions complete. */
+    if (gen_tsc_counter(s, s->after_fence)) {
+        return;
+    }
     translator_io_start(&s->base);
     gen_helper_rdtsc(tcg_env);
 }
