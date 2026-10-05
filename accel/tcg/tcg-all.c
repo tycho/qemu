@@ -272,6 +272,16 @@ static void tcg_set_regcache(Object *obj, bool value, Error **errp)
     tcg_vregs_all = value;
 }
 
+static bool tcg_get_pin(Object *obj, Error **errp)
+{
+    return tcg_pin;
+}
+
+static void tcg_set_pin(Object *obj, bool value, Error **errp)
+{
+    tcg_pin = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -309,6 +319,11 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Keep guest registers in host registers: remove dead stores to CPU "
         "state, keep dirty and vector values in registers across guest "
         "memory accesses, and the x86 vector registers as TCG globals");
+
+    object_class_property_add_bool(oc, "x-pin", tcg_get_pin, tcg_set_pin);
+    object_class_property_set_description(oc, "x-pin",
+        "Keep the guest's most used registers in host registers across "
+        "TBs (user mode, where the host supports it)");
 }
 
 static const TypeInfo tcg_accel_type = {
