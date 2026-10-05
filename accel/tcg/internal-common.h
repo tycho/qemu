@@ -33,6 +33,20 @@ extern bool tcg_ijmp_inline;
  */
 extern bool tcg_jcgen;
 
+/*
+ * tcg_iolast: an instruction that did I/O from the middle of its TB is
+ * remembered, and translation ends TBs after it, so that its accesses
+ * no longer unwind the TB (cpu_io_recompile).  Not with icount.
+ */
+extern bool tcg_iolast;
+bool tb_io_insn_known(vaddr pc);
+
+/*
+ * tcg_mmio_lockless: MMIO from generated code to a lockless_io region
+ * doesn't take the BQL (the region's callbacks do their own locking).
+ */
+extern bool tcg_mmio_lockless;
+
 extern bool icount_align_option;
 
 /*
