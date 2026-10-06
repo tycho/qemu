@@ -92,6 +92,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-simd", "on" },
         { "x-regcache", "on" },
         { "x-pin", "on" },
+        { "x-lazyinc", "on" },
         { "x-region", "on" },
         { "x-tblookup", "on" },
         { "x-i386-runtime", "on" },
