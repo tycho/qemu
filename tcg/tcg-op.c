@@ -2686,7 +2686,7 @@ void tcg_gen_exit_tb(const TranslationBlock *tb, unsigned idx)
 
     if (tb == NULL) {
         tcg_debug_assert(idx == 0);
-    } else if (idx <= TB_EXIT_IDXMAX) {
+    } else if (idx <= TB_EXIT_IDXMAX && idx != TB_EXIT_REQUESTED) {
 #ifdef CONFIG_DEBUG_TCG
         /* This is an exit following a goto_tb.  Verify that we have
            seen this numbered exit before, via tcg_gen_goto_tb.  */
@@ -2704,8 +2704,7 @@ void tcg_gen_goto_tb(unsigned idx)
 {
     /* We tested CF_NO_GOTO_TB in translator_use_goto_tb. */
     tcg_debug_assert(!(tcg_ctx->gen_tb->cflags & CF_NO_GOTO_TB));
-    /* We only support two chained exits.  */
-    tcg_debug_assert(idx <= TB_EXIT_IDXMAX);
+    tcg_debug_assert(idx <= TB_EXIT_IDXMAX && idx != TB_EXIT_REQUESTED);
 #ifdef CONFIG_DEBUG_TCG
     /* Verify that we haven't seen this numbered exit before.  */
     tcg_debug_assert((tcg_ctx->goto_tb_issue_mask & (1 << idx)) == 0);
