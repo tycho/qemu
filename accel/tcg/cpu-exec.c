@@ -412,9 +412,9 @@ void HELPER(region_hot)(CPUArchState *env, uint64_t dest)
 }
 
 /*
- * x-superblock, sampling mode (debug env XTCG_REGION_SAMPLE=<period in
- * us>): a host thread raises every vCPU's exit request each period, and
- * the TB that leaves on it is the sample.  The sample counts for the loop
+ * x-superblock=K: a host thread raises every vCPU's exit request each
+ * period (1 ms; debug env XTCG_REGION_SAMPLE=<us>), and the TB that leaves
+ * on it is the sample.  The sample counts for the loop
  * head it belongs to: the TB itself if a chained jump enters it from a
  * higher address, else the lowest earlier TB it jumps back to.  A head with
  * x-superblock samples becomes a region; counts halve every
@@ -429,7 +429,8 @@ static QemuMutex region_sample_lock;
 
 static void *region_sampler(void *opaque)
 {
-    unsigned period = atoi(getenv("XTCG_REGION_SAMPLE"));
+    unsigned period = getenv("XTCG_REGION_SAMPLE")
+                      ? atoi(getenv("XTCG_REGION_SAMPLE")) : 1000;
 
     rcu_register_thread();
     for (;;) {
@@ -450,7 +451,8 @@ static gpointer region_sampling_init(gpointer opaque)
 {
     static QemuThread thread;
 
-    if (!getenv("XTCG_REGION_SAMPLE")) {
+    if (getenv("XTCG_REGION_COUNT")) {
+        /* Debug: heads from backward-jump counters instead. */
         return GINT_TO_POINTER(1);
     }
     qemu_mutex_init(&region_sample_lock);

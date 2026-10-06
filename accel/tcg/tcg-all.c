@@ -807,8 +807,8 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_add(oc, "x-superblock", "uint32",
         tcg_get_superblock, tcg_set_superblock, NULL, NULL);
     object_class_property_set_description(oc, "x-superblock",
-        "With x-region: after this many executions of a backward jump "
-        "between TBs, translate its destination's hot loop nest as one "
+        "With x-region: after this many profile samples (one per ms) "
+        "in a loop, translate the loop's blocks that have run as one "
         "multi-block region (0: never, the default)");
 
     object_class_property_add_bool(oc, "x-lazyinc",
