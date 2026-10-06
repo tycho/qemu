@@ -595,6 +595,9 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
                   (void *)retaddr);
     }
     cpu_restore_state_from_tb(cpu, tb, retaddr);
+    if (translator_region_io(tb)) {
+        tb_phys_invalidate(tb, -1);
+    }
 
     /*
      * Some guests must re-execute the branch when re-executing a delay
