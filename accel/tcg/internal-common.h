@@ -57,6 +57,18 @@ extern unsigned tcg_tlb_grow;
 /* x-region-hot: make @pc a region head; false if it already was one. */
 bool translator_region_promote(vaddr pc);
 
+/*
+ * x-region-hot: after a TB overflow, whether the TB was a region of more
+ * than one block (the retry then takes half as many blocks).
+ */
+bool translator_region_overflow(void);
+/* ... after a TB is generated: regions take their full size again. */
+void translator_region_reset(void);
+
+/* x-region-hot: whether a TB like @tb exists at @pc (its block has run). */
+bool translator_region_has_run(CPUState *cpu, const TranslationBlock *tb,
+                               vaddr pc);
+
 extern bool icount_align_option;
 
 /*

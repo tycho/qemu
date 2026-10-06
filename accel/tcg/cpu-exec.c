@@ -374,6 +374,19 @@ static inline bool check_for_breakpoints(CPUState *cpu, vaddr pc,
  * a multi-block region and drop its current TB, so that the next lookup
  * translates the region.
  */
+bool translator_region_has_run(CPUState *cpu, const TranslationBlock *tb,
+                                vaddr pc)
+{
+    TCGTBCPUState s = {
+        .pc = pc,
+        .cs_base = tb->cs_base,
+        .flags = tb->flags,
+        .cflags = tb_cflags(tb),
+    };
+
+    return tb_htable_lookup(cpu, s) != NULL;
+}
+
 void HELPER(region_hot)(CPUArchState *env, uint64_t dest)
 {
     CPUState *cpu = env_cpu(env);

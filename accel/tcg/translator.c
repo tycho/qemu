@@ -156,6 +156,7 @@ bool translator_loop_back(DisasContextBase *db, vaddr dest)
 #define REGION_COUNTS 4096
 
 typedef struct TranslatorRegion {
+    CPUState *cpu;
     int n;                      /* blocks so far */
     int next;                   /* the next block to translate */
     bool stubbing;              /* insn budget spent: blocks just exit */
@@ -166,6 +167,23 @@ typedef struct TranslatorRegion {
 } TranslatorRegion;
 
 static int32_t region_counts[REGION_COUNTS];
+static __thread int region_cap;         /* block limit after an overflow */
+static __thread int region_tried;       /* blocks of the region last tried */
+
+bool translator_region_overflow(void)
+{
+    if (region_tried > 1) {
+        region_cap = region_tried / 2;
+        return true;
+    }
+    return false;
+}
+
+void translator_region_reset(void)
+{
+    region_cap = 0;
+    region_tried = 0;
+}
 static GMutex region_lock;              /* static: needs no init */
 static GHashTable *region_heads;        /* promoted heads, under region_lock */
 
@@ -258,7 +276,9 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
             return r->label[i];
         }
     }
-    if (r->n == REGION_MAX_BLOCKS || !region_page_ok(db, dest)
+    if (r->n == (region_cap ? region_cap : REGION_MAX_BLOCKS)
+        || !region_page_ok(db, dest)
+        || !translator_region_has_run(r->cpu, db->tb, dest)
         || (getenv("XTCG_REGION_MAXB")
             && r->n >= atoi(getenv("XTCG_REGION_MAXB")))) {
         return NULL;
@@ -266,6 +286,7 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
     r->pc[r->n] = dest;
     r->label[r->n] = gen_new_label();
     r->label[r->n]->region = true;
+    region_tried = r->n + 1;
     return r->label[r->n++];
 }
 
@@ -549,7 +570,9 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     if (db->region_capable && tcg_region_hot && region_is_head(pc)) {
         TranslatorRegion *r = tcg_malloc(sizeof(*r));
 
+        r->cpu = cpu;
         r->n = r->next = 1;
+        region_tried = 1;
         r->stubbing = false;
         r->block_insns = 0;
         r->end = pc;
@@ -651,6 +674,11 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             goto next_block;
         }
         db->pc_next = r->end;
+        if (getenv("XTCG_REGION_DEBUG")) {
+            fprintf(stderr, "region %" PRIx64 ": %d blocks, %d insns%s\n",
+                    (uint64_t)db->pc_first, r->n, db->num_insns,
+                    r->stubbing ? ", stubbed" : "");
+        }
     }
     gen_tb_end(tb, cflags, icount_start_insn, db->num_insns);
 

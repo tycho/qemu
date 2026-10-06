@@ -2180,6 +2180,9 @@ static TCGTemp *tcg_temp_alloc(TCGContext *s)
     int n = s->nb_temps++;
 
     if (n >= TCG_MAX_TEMPS) {
+        if (getenv("XTCG_REGION_DEBUG")) {
+            fprintf(stderr, "tb overflow: temps\n");
+        }
         tcg_raise_tb_overflow(s);
     }
     return memset(&s->temps[n], 0, sizeof(TCGTemp));
@@ -5912,6 +5915,9 @@ static void temp_allocate_frame(TCGContext *s, TCGTemp *ts)
 
     /* If we've exhausted the stack frame, restart with a smaller TB. */
     if (off + size > s->frame_end) {
+        if (getenv("XTCG_REGION_DEBUG")) {
+            fprintf(stderr, "tb overflow: frame (%s)\n", ts->name ?: "temp");
+        }
         tcg_raise_tb_overflow(s);
     }
     s->current_frame_offset = off + size;
@@ -8874,6 +8880,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         return i;
     }
     if (!tcg_resolve_relocs(s)) {
+        if (getenv("XTCG_REGION_DEBUG")) {
+            fprintf(stderr, "tb overflow: relocs\n");
+        }
         return -2;
     }
 
