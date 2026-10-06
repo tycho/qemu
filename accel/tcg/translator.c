@@ -147,8 +147,24 @@ bool translator_loop_back(DisasContextBase *db, vaddr dest)
  * check the exit request); other jumps leave the TB.  A region in which no
  * jump goes back to one of its blocks, or of one block, gains nothing: the
  * head is dropped for good and translated as a plain TB.
+ *
+ * Probation: a new region is first translated with counters for its
+ * entries and its backward jumps.  Once it has run REGION_TRIAL_RUNS times,
+ * translator_region_judge() keeps it (backward jumps at least half its
+ * entries: it holds a loop) or drops it, and invalidates the TB either way,
+ * so a kept region is translated again without counters.  A trial's
+ * counters are never freed: an invalidated TB may still be running on
+ * another vCPU.
  */
 #define REGION_MAX_BLOCKS 64
+#define REGION_TRIAL_RUNS 4096
+
+typedef struct RegionTrial {
+    uint64_t entries, backs;
+    vaddr pc;
+    uint64_t cs_base;
+    uint32_t flags, cflags;
+} RegionTrial;
 
 typedef struct TranslatorRegion {
     CPUState *cpu;
@@ -165,6 +181,9 @@ typedef struct TranslatorRegion {
 static GMutex region_lock;              /* static: needs no init */
 static GHashTable *region_heads;        /* promoted heads, under region_lock */
 static GHashTable *region_dropped;      /* dropped heads, under region_lock */
+static GHashTable *region_kept;         /* heads past probation, ditto */
+static GPtrArray *region_trials;        /* regions on probation, ditto */
+static __thread RegionTrial *region_cur_trial;
 
 /*
  * The retry after a TB overflow (translator_region_overflow): the block
@@ -231,6 +250,46 @@ static void region_drop(vaddr pc)
     g_mutex_unlock(&region_lock);
 }
 
+static void region_count(uint64_t *counter)
+{
+    TCGv_ptr p = tcg_constant_ptr(counter);
+    TCGv_i64 c = tcg_temp_new_i64();
+
+    tcg_gen_ld_i64(c, p, 0);
+    tcg_gen_addi_i64(c, c, 1);
+    tcg_gen_st_i64(c, p, 0);
+}
+
+int translator_region_judge(TranslatorRegionVerdict *v, int max)
+{
+    int n = 0;
+
+    g_mutex_lock(&region_lock);
+    for (guint i = 0; region_trials && i < region_trials->len && n < max;) {
+        RegionTrial *t = g_ptr_array_index(region_trials, i);
+        uint64_t e = qatomic_read(&t->entries), b = qatomic_read(&t->backs);
+
+        if (e + b < REGION_TRIAL_RUNS) {
+            i++;
+            continue;
+        }
+        g_ptr_array_remove_index_fast(region_trials, i);
+        v[n] = (TranslatorRegionVerdict){
+            .pc = t->pc, .cs_base = t->cs_base, .flags = t->flags,
+            .cflags = t->cflags,
+        };
+        if (b * 2 >= e) {
+            region_set_add(&region_kept, t->pc);
+        } else {
+            g_hash_table_remove(region_heads, &(uint64_t){ t->pc });
+            region_set_add(&region_dropped, t->pc);
+        }
+        n++;
+    }
+    g_mutex_unlock(&region_lock);
+    return n;
+}
+
 bool translator_region_overflow(void)
 {
     if (region_cap < 0) {
@@ -248,6 +307,8 @@ bool translator_region_overflow(void)
     }
     if (region_tried == 1) {
         region_drop(region_head_pc);
+        g_free(region_cur_trial);
+        region_cur_trial = NULL;
         region_cap = -1;
         return true;
     }
@@ -256,6 +317,15 @@ bool translator_region_overflow(void)
 
 void translator_region_reset(void)
 {
+    if (region_cur_trial) {
+        g_mutex_lock(&region_lock);
+        if (!region_trials) {
+            region_trials = g_ptr_array_new();
+        }
+        g_ptr_array_add(region_trials, region_cur_trial);
+        g_mutex_unlock(&region_lock);
+        region_cur_trial = NULL;
+    }
     region_cap = 0;
     region_tried = 0;
     region_reject = false;
@@ -288,6 +358,9 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
             /* Already translated (or being translated): a cycle closes. */
             *backward = i < r->next;
             r->backedges += *backward;
+            if (*backward && region_cur_trial) {
+                region_count(&region_cur_trial->backs);
+            }
             return r->label[i];
         }
     }
@@ -391,6 +464,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 {
     uint32_t cflags = tb_cflags(tb);
     TCGOp *icount_start_insn;
+    TCGOp *loop_op = NULL;
     bool plugin_enabled;
 #ifndef CONFIG_USER_ONLY
     TCGOp *first_insn_start = NULL;
@@ -440,11 +514,35 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         db->loop_label = gen_new_label();
         db->loop_label->loop = true;
         gen_set_label(db->loop_label);
-        db->region_capable = ops->block_start && tb_page_addr0(tb) != -1;
+        loop_op = tcg_last_op();
+        db->region_capable = tcg_superblock && ops->block_start
+                             && tb_page_addr0(tb) != -1
+                             && !(cflags & CF_PCREL);
+        if (db->region_capable) {
+            translator_region_sampler_start();
+        }
     }
     if (db->region_capable && region_cap >= 0
         && translator_region_is_head(pc)) {
         TranslatorRegion *r = tcg_malloc(sizeof(*r));
+        bool kept;
+
+        g_mutex_lock(&region_lock);
+        kept = region_set_contains(region_kept, pc);
+        g_mutex_unlock(&region_lock);
+        g_free(region_cur_trial);
+        region_cur_trial = NULL;
+        if (!kept) {
+            region_cur_trial = g_new0(RegionTrial, 1);
+            region_cur_trial->pc = pc;
+            region_cur_trial->cs_base = tb->cs_base;
+            region_cur_trial->flags = tb->flags;
+            region_cur_trial->cflags = cflags;
+            /* Count entries before the head's label. */
+            tcg_ctx->emit_before_op = loop_op;
+            region_count(&region_cur_trial->entries);
+            tcg_ctx->emit_before_op = NULL;
+        }
 
         r->cpu = cpu;
         r->n = r->next = 1;
@@ -541,6 +639,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             /* Nothing to gain: translate the head as a plain TB. */
             region_drop(db->pc_first);
             region_reject = true;
+            g_free(region_cur_trial);
+            region_cur_trial = NULL;
             siglongjmp(tcg_ctx->jmp_trans, -2);
         }
     }

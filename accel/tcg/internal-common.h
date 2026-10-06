@@ -166,4 +166,16 @@ void translator_region_reset(void);
 bool translator_region_has_run(CPUState *cpu, const TranslationBlock *tb,
                                vaddr pc);
 
+/* A region whose probation is over; its TB is to be invalidated. */
+typedef struct TranslatorRegionVerdict {
+    vaddr pc;
+    uint64_t cs_base;
+    uint32_t flags, cflags;
+} TranslatorRegionVerdict;
+
+/* Judge regions whose probation is over: at most @max, into @v. */
+int translator_region_judge(TranslatorRegionVerdict *v, int max);
+/* Start the profile sampler that finds region heads (tcg_superblock). */
+void translator_region_sampler_start(void);
+
 #endif
