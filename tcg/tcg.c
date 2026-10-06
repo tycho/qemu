@@ -5338,6 +5338,700 @@ static bool xblk_reaches_loop(const TCGOp *op)
     return false;
 }
 
+/* Classify the labels; false if none leaves the base model. */
+static bool xblk_classify(TCGContext *s)
+{
+    TCGLabel *l;
+    TCGOp *op, *prev = NULL;
+    bool any = false;
+
+    QSIMPLEQ_FOREACH(l, &s->labels, next) {
+        TCGLabelUse *u = QSIMPLEQ_FIRST(&l->branches);
+
+        l->xkind = XLBL_CLASSIC;
+        l->live_in = l->ft_state = NULL;
+        l->snap = l->loopregs = NULL;
+        l->xset = NULL;
+        l->nb_loopregs = 0;
+        l->xseen = l->xfwd = l->xfalls = false;
+        /* Only a label with exactly one branch to it. */
+        l->xbranch = u && !QSIMPLEQ_NEXT(u, next) ? u->op : NULL;
+    }
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        if (op->opc == INDEX_op_set_label) {
+            l = arg_label(op->args[0]);
+            l->xseen = true;
+            l->xset = op;
+            l->xfalls = !prev || op_falls_through(prev);
+        } else {
+            l = op_branch_label(op);
+            if (l && op == l->xbranch) {
+                l->xfwd = !l->xseen;
+            }
+        }
+        prev = op;
+    }
+    s->xblk_region = false;
+    QSIMPLEQ_FOREACH(l, &s->labels, next) {
+        if (l->region && l->xseen) {
+            l->xkind = XLBL_REGION;
+            s->xblk_region = any = true;
+        } else if (l->xbranch && l->xseen && l->loop && !l->xfwd
+                   && l->xbranch->opc == INDEX_op_br) {
+            l->xkind = XLBL_LOOP;
+            any = true;
+        }
+    }
+    if (!any) {
+        return false;
+    }
+    QSIMPLEQ_FOREACH(l, &s->labels, next) {
+        if (l->xkind == XLBL_REGION) {
+            continue;
+        }
+        if (l->xbranch && l->xseen && !l->loop && l->xfwd && !l->xfalls
+            && (s->xblk_region
+                || xblk_reaches_loop(l->xset)
+                || (op_falls_through(l->xbranch)
+                    && xblk_reaches_loop(l->xbranch)))) {
+            l->xkind = XLBL_INHERIT;
+        }
+    }
+    return true;
+}
+
+/* liveness analysis: the state at an XLBL_INHERIT or XLBL_LOOP label. */
+static void la_record(TCGContext *s, TCGLabel *l, int nt)
+{
+    l->live_in = tcg_malloc(nt);
+    for (int i = 0; i < nt; i++) {
+        l->live_in[i] = s->temps[i].state;
+    }
+}
+
+/*
+ * liveness analysis: a branch to an XLBL_INHERIT label.  A value is live
+ * if either side needs it in a register or in memory: each side stores
+ * the ones it needs in memory at its own start (xblk_obligations).
+ */
+static void la_branch_inherit(TCGContext *s, TCGLabel *l, int nt, bool cond)
+{
+    if (cond) {
+        l->ft_state = tcg_malloc(nt);
+    }
+    for (int i = 0; i < nt; i++) {
+        TCGTemp *ts = &s->temps[i];
+        int tk = l->live_in[i];
+        int ft = ts->state;
+        bool live;
+
+        if (cond) {
+            l->ft_state[i] = ft;
+        }
+        switch (ts->kind) {
+        case TEMP_GLOBAL:
+        case TEMP_TB:
+            break;
+        case TEMP_EBB:
+        case TEMP_CONST:
+            if (!cond) {
+                ts->state = TS_DEAD;
+                la_reset_pref(ts);
+            }
+            continue;
+        default:
+            continue;
+        }
+        if (cond) {
+            live = !(ft & TS_DEAD) || (ft & TS_MEM);
+        } else {
+            live = false;
+        }
+        live |= !(tk & TS_DEAD) || (tk & TS_MEM);
+        if (s->xblk_region) {
+            /* A value live from here on may go in any register. */
+            ts->state = live ? 0 : TS_DEAD;
+            if (live && (ft & TS_DEAD)) {
+                la_reset_pref(ts);
+            }
+            continue;
+        }
+        if (live && (ft & TS_DEAD)) {
+            la_reset_pref(ts);
+        }
+        ts->state = live ? 0 : TS_DEAD;
+    }
+}
+
+/* liveness analysis: the back edge to an XLBL_LOOP label. */
+static void la_loopback(TCGContext *s, TCGLabel *l, int nt)
+{
+    XblkLoopReg *lr = l->loopregs;
+
+    for (int i = 0; i < nt; i++) {
+        TCGTemp *ts = &s->temps[i];
+
+        switch (ts->kind) {
+        case TEMP_GLOBAL:
+        case TEMP_TB:
+            ts->state = TS_DEAD | TS_MEM;
+            break;
+        case TEMP_EBB:
+        case TEMP_CONST:
+            ts->state = TS_DEAD;
+            break;
+        default:
+            continue;
+        }
+        la_reset_pref(ts);
+    }
+    /*
+     * Live in a register across the back edge; also in memory where the
+     * loop needs it there before writing it (a guest access may fault).
+     */
+    for (int i = 0; i < l->nb_loopregs; i++) {
+        lr[i].ts->state = l->live_in[temp_idx(lr[i].ts)] & TS_MEM;
+        *la_temp_pref(lr[i].ts) = (TCGRegSet)1 << lr[i].reg;
+    }
+}
+
+/*
+ * liveness analysis: the state at an XLBL_REGION label, or at a branch to
+ * one (@cond: a conditional branch, whose fall-through needs ts->state).
+ * Homes are live in their registers, every other global in memory, temps
+ * dead.  The code after the label stores the homes it needs in memory
+ * (xblk_obligations with the label's live_in), so a branch into the
+ * region stores nothing.
+ */
+static void la_region_state(TCGContext *s, int nt, bool cond)
+{
+    for (int i = 0; i < nt; i++) {
+        TCGTemp *ts = &s->temps[i];
+        int ft = ts->state, tk, st;
+        bool home;
+
+        switch (ts->kind) {
+        case TEMP_FIXED:
+            /* A pinned global flows into the label in its register. */
+            if (!ts->pinned) {
+                continue;
+            }
+            break;
+        case TEMP_GLOBAL:
+        case TEMP_TB:
+            break;
+        case TEMP_EBB:
+        case TEMP_CONST:
+            if (!cond) {
+                ts->state = TS_DEAD;
+                la_reset_pref(ts);
+            }
+            continue;
+        default:
+            continue;
+        }
+        home = ts->kind == TEMP_GLOBAL && s->xblk_home[i] >= 0;
+        /* A TB temp holds nothing across blocks, as across TBs. */
+        tk = home ? 0 : ts->kind == TEMP_TB ? TS_DEAD : TS_DEAD | TS_MEM;
+        if (cond) {
+            bool live = !(ft & TS_DEAD) || !(tk & TS_DEAD);
+
+            st = (live ? 0 : TS_DEAD) | ((ft | tk) & TS_MEM);
+        } else {
+            st = tk;
+        }
+        ts->state = st;
+        if (!(st & TS_DEAD) && (ft & TS_DEAD)) {
+            la_reset_pref(ts);
+        }
+        if (home) {
+            *la_temp_pref(ts) = (TCGRegSet)1 << s->xblk_home[i];
+        } else if (st & TS_DEAD) {
+            la_reset_pref(ts);
+        }
+    }
+}
+
+/* liveness analysis: at a branch; false to keep the base model. */
+static bool la_xblk_branch(TCGContext *s, TCGOp *op, int nt, bool cond)
+{
+    TCGLabel *l = s->xblk ? op_branch_label(op) : NULL;
+
+    if (l && l->xkind == XLBL_REGION) {
+        la_region_state(s, nt, cond);
+        return true;
+    }
+    if (!l || !l->live_in) {
+        return false;
+    }
+    if (l->xkind == XLBL_INHERIT && l->xbranch == op) {
+        la_branch_inherit(s, l, nt, cond);
+        return true;
+    }
+    if (!cond && l->xkind == XLBL_LOOP && l->xbranch == op
+        && s->xblk_pass == 2 && l->nb_loopregs) {
+        la_loopback(s, l, nt);
+        return true;
+    }
+    return false;
+}
+
+/* liveness analysis: at a label; false to keep the base model. */
+static bool la_xblk_label(TCGContext *s, TCGOp *op, int nt)
+{
+    TCGLabel *l = arg_label(op->args[0]);
+
+    if (!s->xblk || l->xkind == XLBL_CLASSIC) {
+        return false;
+    }
+    if (l->xkind == XLBL_REGION) {
+        la_record(s, l, nt);
+        la_region_state(s, nt, false);
+        return true;
+    }
+    la_record(s, l, nt);
+    if (l->xkind == XLBL_LOOP) {
+        return false;
+    }
+    /* XLBL_INHERIT: values flow from the branch; temps end here. */
+    for (int i = 0; i < nt; i++) {
+        TCGTemp *ts = &s->temps[i];
+
+        if (ts->kind == TEMP_EBB || ts->kind == TEMP_CONST) {
+            ts->state = TS_DEAD;
+            la_reset_pref(ts);
+        }
+    }
+    return true;
+}
+
+/* Vector registers a loop leaves free for its temporaries and the back edge. */
+#define XBLK_VEC_SPARE 7
+
+/* Integer registers a region keeps for its homes. */
+#define XBLK_REGION_INT 8
+
+/*
+ * The loop depth of each op, in op order: a region label and the last
+ * branch back to it bound a loop.  NULL without backward branches.
+ */
+static uint8_t *xblk_loop_depth(TCGContext *s, int *nops, int **lstart,
+                                int **lend)
+{
+    int *lpos = tcg_malloc(s->nb_labels * sizeof(*lpos));
+    int *last = tcg_malloc(s->nb_labels * sizeof(*last));
+    int16_t *diff;
+    uint8_t *depth;
+    bool any = false;
+    int i = 0, d = 0;
+    TCGOp *op;
+
+    for (int k = 0; k < s->nb_labels; k++) {
+        lpos[k] = last[k] = -1;
+    }
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        TCGLabel *b = op_branch_label(op);
+
+        if (op->opc == INDEX_op_set_label) {
+            lpos[arg_label(op->args[0])->id] = i;
+        } else if (b && b->region && lpos[b->id] >= 0) {
+            last[b->id] = i;
+            any = true;
+        }
+        i++;
+    }
+    *nops = i;
+    *lstart = lpos;
+    *lend = last;
+    if (!any) {
+        return NULL;
+    }
+    diff = tcg_malloc((i + 1) * sizeof(*diff));
+    memset(diff, 0, (i + 1) * sizeof(*diff));
+    for (int k = 0; k < s->nb_labels; k++) {
+        if (last[k] >= 0) {
+            diff[lpos[k]]++;
+            diff[last[k] + 1]--;
+        }
+    }
+    depth = tcg_malloc(i);
+    for (int k = 0; k < i; k++) {
+        d += diff[k];
+        depth[k] = MIN(d, 3);
+    }
+    return depth;
+}
+
+/*
+ * Before liveness: the region's homes, the globals its ops use most, each
+ * given a register of its own for the whole TB.  With units, uses in a
+ * loop count 16 times per loop around them, and the globals some loop
+ * reads before it writes them, whose values go round it, come first.
+ */
+static void xblk_region_homes(TCGContext *s)
+{
+    uint32_t *uses = tcg_malloc(s->nb_globals * sizeof(*uses));
+    int *order = tcg_malloc(s->nb_globals * sizeof(*order));
+    int *pend = tcg_malloc(s->nb_globals * sizeof(*pend));
+    int npend = 0;
+    TCGRegSet vregs, taken = s->reserved_regs;
+    int vec_budget = -XBLK_VEC_SPARE, nint = 0, nvec = 0, n = 0;
+    int int_budget = XBLK_REGION_INT, nops = 0, opi = -1, nord = 0;
+    int *lstart = NULL, *lend = NULL;
+    uint8_t *depth = NULL;
+    bool *carried = NULL;
+    TCGOp *op;
+
+    if (tcg_units) {
+        /* Homes for the loops: their values gain most from registers. */
+        depth = xblk_loop_depth(s, &nops, &lstart, &lend);
+        int_budget = 10;
+    }
+    if (depth) {
+        /*
+         * The globals some loop reads before it writes them: their values
+         * go round the loop, so they gain most from a register.
+         */
+        uint8_t *seen = tcg_malloc(s->nb_globals);
+        TCGLabel *l;
+
+        carried = tcg_malloc(s->nb_globals * sizeof(*carried));
+        memset(carried, 0, s->nb_globals * sizeof(*carried));
+        QSIMPLEQ_FOREACH(l, &s->labels, next) {
+            int i = lstart[l->id];
+
+            if (lend[l->id] < 0) {
+                continue;
+            }
+            memset(seen, 0, s->nb_globals);
+            /* From the loop's label to its last back edge. */
+            for (op = l->xset; op && i <= lend[l->id];
+                 op = QTAILQ_NEXT(op, link), i++) {
+                const TCGOpDef *def = &tcg_op_defs[op->opc];
+                int no, ni;
+
+                if (op->opc == INDEX_op_discard) {
+                    continue;
+                }
+                if (op->opc == INDEX_op_call) {
+                    no = TCGOP_CALLO(op);
+                    ni = TCGOP_CALLI(op);
+                } else if (op->opc == INDEX_op_set_label
+                           || op->opc == INDEX_op_insn_start) {
+                    continue;
+                } else {
+                    no = def->nb_oargs;
+                    ni = def->nb_iargs;
+                }
+                /* Inputs before outputs: an op reads before it writes. */
+                for (int j = 0; j < no + ni; j++) {
+                    int a = j < ni ? no + j : j - ni;
+                    TCGTemp *ts = arg_temp(op->args[a]);
+                    size_t idx = ts ? temp_idx(ts) : SIZE_MAX;
+
+                    if (idx < s->nb_globals && !seen[idx]) {
+                        seen[idx] = 1;
+                        carried[idx] |= a >= no;
+                    }
+                }
+            }
+        }
+    }
+
+    /*
+     * Count reads, and writes that a branch or label follows before any
+     * exit: a write on the way out of the TB (rip before an exit) gains
+     * nothing in a register; one in a loop body saves a store each time
+     * round.  @pend holds the writes not yet known to be either.
+     */
+    memset(uses, 0, s->nb_globals * sizeof(*uses));
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        uint32_t w = depth ? 1u << (4 * depth[++opi]) : 1;
+        int no, ni;
+
+        if (op->opc == INDEX_op_set_label
+            || (def->flags & (TCG_OPF_BB_END | TCG_OPF_COND_BRANCH))) {
+            bool exits = def->flags & TCG_OPF_BB_EXIT;
+
+            for (int k = 0; k < npend; k++) {
+                if (!exits) {
+                    uses[pend[k]] = MIN((uint64_t)uses[pend[k]] + w,
+                                        UINT32_MAX);
+                }
+            }
+            npend = 0;
+        }
+        if (op->opc == INDEX_op_discard || op->opc == INDEX_op_insn_start
+            || op->opc == INDEX_op_set_label) {
+            continue;
+        }
+        if (op->opc == INDEX_op_call) {
+            no = TCGOP_CALLO(op);
+            ni = TCGOP_CALLI(op);
+        } else {
+            no = def->nb_oargs;
+            ni = def->nb_iargs;
+        }
+        for (int k = 0; k < no + ni; k++) {
+            TCGTemp *ts = arg_temp(op->args[k]);
+            size_t idx = ts ? temp_idx(ts) : SIZE_MAX;
+
+            if (idx >= s->nb_globals) {
+                continue;
+            }
+            if (k >= no) {
+                uses[idx] = MIN((uint64_t)uses[idx] + w, UINT32_MAX);
+            } else if (npend < s->nb_globals) {
+                pend[npend++] = idx;
+            }
+        }
+    }
+    for (int i = 0; i < s->nb_globals; i++) {
+        int j;
+
+        if (!uses[i]) {
+            /* Never a home: left out of the order. */
+            continue;
+        }
+        j = nord++;
+        while (j > 0
+               && (carried
+                   ? (carried[order[j - 1]] < carried[i]
+                      || (carried[order[j - 1]] == carried[i]
+                          && uses[order[j - 1]] < uses[i]))
+                   : uses[order[j - 1]] < uses[i])) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = i;
+    }
+    vregs = tcg_target_available_regs[TCG_TYPE_V128] & ~s->reserved_regs;
+    for (int k = 0; k < ARRAY_SIZE(tcg_target_reg_alloc_order); k++) {
+        vec_budget += tcg_regset_test_reg(vregs, tcg_target_reg_alloc_order[k]);
+    }
+    for (int o = 0; o < nord && n < ARRAY_SIZE(s->region_home); o++) {
+        TCGTemp *ts = &s->temps[order[o]];
+        TCGRegSet ok;
+
+        if (ts->kind != TEMP_GLOBAL || ts->indirect_reg) {
+            continue;
+        }
+        switch (ts->type) {
+        case TCG_TYPE_I32:
+        case TCG_TYPE_I64:
+            if (nint >= int_budget) {
+                continue;
+            }
+            break;
+        case TCG_TYPE_V64:
+        case TCG_TYPE_V128:
+            if (nvec >= vec_budget) {
+                continue;
+            }
+            break;
+        default:
+            continue;
+        }
+        ok = tcg_target_available_regs[ts->type] & ~taken;
+        for (int k = 0; k < ARRAY_SIZE(tcg_target_reg_alloc_order); k++) {
+            TCGReg r = tcg_target_reg_alloc_order[k];
+
+            if (tcg_regset_test_reg(ok, r)) {
+                tcg_regset_set_reg(taken, r);
+                s->xblk_home[temp_idx(ts)] = r;
+                s->region_home[n++] = ts;
+                if (ts->type == TCG_TYPE_I32 || ts->type == TCG_TYPE_I64) {
+                    nint++;
+                } else {
+                    nvec++;
+                }
+                break;
+            }
+        }
+    }
+    s->nb_region_homes = n;
+}
+
+/*
+ * After a first liveness pass: the globals live into each loop, which the
+ * second pass keeps live across the back edge, within a register budget.
+ */
+static bool xblk_select_loops(TCGContext *s)
+{
+    TCGLabel *l;
+    bool any = false;
+
+    QSIMPLEQ_FOREACH(l, &s->labels, next) {
+        XblkLoopReg *lr;
+        uint8_t *used;
+        bool *wfirst;
+        uint16_t *uses;
+        int *order, vec_budget;
+        TCGRegSet taken, vregs;
+        int nint = 0, nvec = 0, nr;
+        bool in_loop = false;
+        TCGOp *op;
+
+        if (l->xkind != XLBL_LOOP || !l->live_in) {
+            continue;
+        }
+        /*
+         * The globals the loop's ops name, which of them it writes, and how
+         * many times each is named.
+         */
+        used = tcg_malloc(s->nb_globals);
+        memset(used, 0, s->nb_globals);
+        uses = tcg_malloc(s->nb_globals * sizeof(*uses));
+        memset(uses, 0, s->nb_globals * sizeof(*uses));
+        wfirst = tcg_malloc(s->nb_globals);
+        memset(wfirst, 0, s->nb_globals);
+        QTAILQ_FOREACH(op, &s->ops, link) {
+            int no, ni;
+
+            if (op->opc == INDEX_op_set_label &&
+                arg_label(op->args[0]) == l) {
+                in_loop = true;
+                continue;
+            }
+            if (op == l->xbranch) {
+                break;
+            }
+            if (!in_loop || op->opc == INDEX_op_discard) {
+                continue;
+            }
+            if (op->opc == INDEX_op_call) {
+                no = TCGOP_CALLO(op);
+                ni = TCGOP_CALLI(op);
+            } else {
+                no = tcg_op_defs[op->opc].nb_oargs;
+                ni = tcg_op_defs[op->opc].nb_iargs;
+            }
+            /* Inputs before outputs: an op reads before it writes. */
+            for (int j = 0; j < no + ni; j++) {
+                int k = j < ni ? no + j : j - ni;
+                TCGTemp *ts = arg_temp(op->args[k]);
+                size_t idx = ts ? temp_idx(ts) : SIZE_MAX;
+
+                if (idx < s->nb_globals) {
+                    if (!used[idx] && k < no) {
+                        wfirst[idx] = true;
+                    }
+                    used[idx] |= k < no ? 3 : 1;
+                    uses[idx] += uses[idx] < UINT16_MAX;
+                }
+            }
+        }
+        /*
+         * At most what the backend's vector registers allow with some left
+         * for temporaries; most used first, since more candidates than
+         * registers is common (a ymm loop names up to 32 halves).
+         */
+        vregs = tcg_target_available_regs[TCG_TYPE_V128] & ~s->reserved_regs;
+        vec_budget = -XBLK_VEC_SPARE;
+        for (int k = 0; k < ARRAY_SIZE(tcg_target_reg_alloc_order); k++) {
+            vec_budget += tcg_regset_test_reg(vregs,
+                                              tcg_target_reg_alloc_order[k]);
+        }
+        order = tcg_malloc(s->nb_globals * sizeof(*order));
+        for (int i = 0; i < s->nb_globals; i++) {
+            int j = i;
+
+            /*
+             * Globals the loop reads before it writes them first: one the
+             * loop overwrites first is live at the label only for a fault,
+             * and costs a store at the back edge without a register.
+             */
+            while (j > 0 && (wfirst[order[j - 1]] > wfirst[i]
+                             || (wfirst[order[j - 1]] == wfirst[i]
+                                 && uses[order[j - 1]] < uses[i]))) {
+                order[j] = order[j - 1];
+                j--;
+            }
+            order[j] = i;
+        }
+        lr = tcg_malloc(sizeof(*lr) * s->nb_globals);
+        l->nb_loopregs = 0;
+        for (int o = 0; o < s->nb_globals; o++) {
+            int i = order[o];
+            TCGTemp *ts = &s->temps[i];
+
+            if (ts->kind != TEMP_GLOBAL || ts->indirect_reg || !used[i]
+                || (l->live_in[i] & TS_DEAD)) {
+                continue;
+            }
+            switch (ts->type) {
+            case TCG_TYPE_I32:
+            case TCG_TYPE_I64:
+                if (nint++ >= 10) {
+                    continue;
+                }
+                break;
+            case TCG_TYPE_V64:
+            case TCG_TYPE_V128:
+                if (nvec++ >= vec_budget) {
+                    continue;
+                }
+                break;
+            default:
+                continue;
+            }
+            lr[l->nb_loopregs++] = (XblkLoopReg){
+                .ts = ts, .reg = -1, .written = used[i] & 2,
+            };
+        }
+        /*
+         * Each gets a register of its own now, the one the allocator would
+         * pick at the label (where nothing else is in a register), so that
+         * liveness can steer the loop's new values into it.
+         */
+        taken = s->reserved_regs;
+        nr = 0;
+        for (int i = 0; i < l->nb_loopregs; i++) {
+            TCGRegSet ok = tcg_target_available_regs[lr[i].ts->type] & ~taken;
+
+            for (int k = 0; k < ARRAY_SIZE(tcg_target_reg_alloc_order); k++) {
+                TCGReg r = tcg_target_reg_alloc_order[k];
+
+                if (tcg_regset_test_reg(ok, r)) {
+                    lr[i].reg = r;
+                    tcg_regset_set_reg(taken, r);
+                    s->xblk_home[temp_idx(lr[i].ts)] = r;
+                    lr[nr++] = lr[i];
+                    break;
+                }
+            }
+        }
+        l->nb_loopregs = nr;
+        l->loopregs = lr;
+        any |= l->nb_loopregs > 0;
+    }
+    return any;
+}
+
+/* liveness analysis: the list of the globals in @seen, in index order. */
+static void la_list_globals(TCGContext *s, const unsigned long *seen)
+{
+    int ng = s->nb_globals;
+
+    s->la_globals = tcg_malloc(sizeof(uint16_t) * ng);
+    s->nb_la_globals = 0;
+    for (int i = find_first_bit(seen, ng); i < ng;
+         i = find_next_bit(seen, ng, i + 1)) {
+        s->la_globals[s->nb_la_globals++] = i;
+    }
+}
+
+/* liveness analysis: list the globals that the ops name. */
+static void la_find_globals(TCGContext *s)
+{
+    int ng = s->nb_globals;
+    size_t size = BITS_TO_LONGS(ng) * sizeof(unsigned long);
+    unsigned long *seen = tcg_malloc(size);
+    TCGOp *op;
+
+    memset(seen, 0, size);
+
     QTAILQ_FOREACH(op, &s->ops, link) {
         const TCGOpDef *def = &tcg_op_defs[op->opc];
         int nargs = op->opc == INDEX_op_call
