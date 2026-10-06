@@ -5632,16 +5632,65 @@ static void gen_SFENCE(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_SHA1NEXTE(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (vint_can(INDEX_op_ext_vec, MO_8) &&
+        vint_can(INDEX_op_rotli_vec, MO_32)) {
+        /* b + { 0, 0, 0, rol(a[3], 30) } */
+        TCGv_vec zero = tcg_constant_vec(TCG_TYPE_V128, MO_64, 0);
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(a, tcg_env, decode->op[1].offset);
+        tcg_gen_ld_vec(b, tcg_env, decode->op[2].offset);
+        tcg_gen_rotli_vec(MO_32, a, a, 30);
+        tcg_gen_ext_vec(a, a, zero, 12);
+        tcg_gen_ext_vec(a, zero, a, 4);
+        tcg_gen_add_vec(MO_32, a, a, b);
+        tcg_gen_st_vec(a, tcg_env, decode->op[0].offset);
+        return;
+    }
     gen_helper_sha1nexte(OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
 static void gen_SHA1MSG1(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (vint_can(INDEX_op_ext_vec, MO_8)) {
+        /* a ^ { b[2], b[3], a[0], a[1] } */
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(a, tcg_env, decode->op[1].offset);
+        tcg_gen_ld_vec(b, tcg_env, decode->op[2].offset);
+        tcg_gen_ext_vec(b, b, a, 8);
+        tcg_gen_xor_vec(MO_64, a, a, b);
+        tcg_gen_st_vec(a, tcg_env, decode->op[0].offset);
+        return;
+    }
     gen_helper_sha1msg1(OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
 static void gen_SHA1MSG2(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (vint_can(INDEX_op_ext_vec, MO_8) &&
+        vint_can(INDEX_op_rotli_vec, MO_32)) {
+        /*
+         * r = rol(a ^ { 0, b[0], b[1], b[2] }, 1) gives elements 1-3;
+         * element 0 is rol(a[0] ^ r[3], 1) = r[0] ^ rol(r[3], 1).
+         */
+        TCGv_vec zero = tcg_constant_vec(TCG_TYPE_V128, MO_64, 0);
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(a, tcg_env, decode->op[1].offset);
+        tcg_gen_ld_vec(b, tcg_env, decode->op[2].offset);
+        tcg_gen_ext_vec(b, zero, b, 12);
+        tcg_gen_xor_vec(MO_64, a, a, b);
+        tcg_gen_rotli_vec(MO_32, a, a, 1);
+        tcg_gen_ext_vec(b, a, zero, 12);
+        tcg_gen_rotli_vec(MO_32, b, b, 1);
+        tcg_gen_xor_vec(MO_64, a, a, b);
+        tcg_gen_st_vec(a, tcg_env, decode->op[0].offset);
+        return;
+    }
     gen_helper_sha1msg2(OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
