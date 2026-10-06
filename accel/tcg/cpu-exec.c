@@ -48,6 +48,7 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "tcg/startup.h"
+#include "qemu/xtcg-stats.h"
 #if !defined(CONFIG_USER_ONLY)
 #include "accel/tcg/iommu.h"
 #endif
@@ -229,7 +230,8 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
  *
  * Returns: an existing translation block or NULL.
  */
-static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
+static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s,
+                                          bool from_helper)
 {
     TranslationBlock *tb;
     CPUJumpCache *jc;
@@ -249,6 +251,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
                tb->cs_base == s.cs_base &&
                tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
+        xtcg_stat_inc(from_helper ? XS_LOOKUP_PTR_JC_HIT : XS_LOOP_JC_HIT);
         goto hit;
     }
 
@@ -256,6 +259,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     if (tb == NULL) {
         return NULL;
     }
+    xtcg_stat_inc(from_helper ? XS_LOOKUP_PTR_HT_HIT : XS_LOOP_HT_HIT);
 
     jc->array[hash].pc = key;
     qatomic_set(&jc->array[hash].tb, tb);
@@ -597,8 +601,10 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
         cpu_loop_exit(cpu);
     }
 
-    tb = tb_lookup(cpu, s);
+    xtcg_stat_inc(XS_LOOKUP_PTR);
+    tb = tb_lookup(cpu, s, true);
     if (tb == NULL) {
+        xtcg_stat_inc(XS_LOOKUP_PTR_MISS);
         return tcg_code_gen_epilogue;
     }
 
@@ -665,6 +671,7 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
         log_cpu_exec(log_pc(cpu, itb), cpu, itb);
     }
 
+    xtcg_stat_inc(XS_TB_EXEC);
     qemu_thread_jit_execute();
     ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
     cpu->neg.can_do_io = true;
@@ -679,6 +686,8 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
      */
     last_tb = tcg_splitwx_to_rw((void *)(ret & ~TB_EXIT_MASK));
     *tb_exit = ret & TB_EXIT_MASK;
+    xtcg_stat_inc(*tb_exit == TB_EXIT_REQUESTED ? XS_EXIT_REQUESTED :
+                  last_tb ? XS_EXIT_NOCHAIN : XS_EXIT_NOTB);
 
     trace_exec_tb_exit(last_tb, *tb_exit);
 
@@ -746,6 +755,7 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
 {
     /* Non-buggy compilers preserve this; assert the correct value. */
     g_assert(cpu == current_cpu);
+    xtcg_stat_inc(XS_LONGJMP);
 
 #ifdef CONFIG_USER_ONLY
     clear_helper_retaddr();
@@ -809,7 +819,7 @@ void cpu_exec_step_atomic(CPUState *cpu)
          * Any breakpoint for this insn will have been recognized earlier.
          */
 
-        tb = tb_lookup(cpu, s);
+        tb = tb_lookup(cpu, s, false);
         if (tb == NULL) {
             mmap_lock();
             tb = tb_gen_code(cpu, s);
@@ -865,6 +875,7 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
 static inline void tb_add_jump(TranslationBlock *tb, int n,
                                TranslationBlock *tb_next)
 {
+    xtcg_stat_inc(XS_TB_ADD_JUMP);
     uintptr_t old;
 
     qemu_thread_jit_write();
@@ -945,6 +956,7 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *excp)
         return false;
     }
 
+    xtcg_hist_inc(XH_EXCP, xtcg_excp_bucket(cpu->exception_index));
     if (cpu->exception_index >= EXCP_INTERRUPT) {
         /* exit request from the cpu execution loop */
         *excp = cpu->exception_index;
@@ -955,6 +967,7 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *excp)
         return true;
     }
 
+    xtcg_stat_inc(XS_EXCEPTION);
 #if defined(CONFIG_USER_ONLY)
     /*
      * If user mode only, we simulate a fake exception which will be
@@ -1086,6 +1099,7 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
              * and via longjmp via cpu_loop_exit.
              */
             if (tcg_ops->cpu_exec_interrupt(cpu, interrupt_request)) {
+                xtcg_stat_inc(XS_INTERRUPT);
                 if (!tcg_ops->need_replay_interrupt ||
                     tcg_ops->need_replay_interrupt(interrupt_request)) {
                     replay_interrupt();
@@ -1213,7 +1227,8 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 break;
             }
 
-            tb = tb_lookup(cpu, s);
+            xtcg_stat_inc(XS_LOOP_LOOKUP);
+            tb = tb_lookup(cpu, s, false);
             if (tb == NULL) {
                 CPUJumpCache *jc;
                 uint32_t h;
