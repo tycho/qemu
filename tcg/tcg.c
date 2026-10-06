@@ -5952,6 +5952,12 @@ static void la_region_state(TCGContext *s, int nt, bool cond)
         bool home;
 
         switch (ts->kind) {
+        case TEMP_FIXED:
+            /* A pinned global flows into the label in its register. */
+            if (!ts->pinned) {
+                continue;
+            }
+            break;
         case TEMP_GLOBAL:
         case TEMP_TB:
             break;
