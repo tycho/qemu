@@ -214,6 +214,14 @@ bool translator_region_promote(vaddr pc)
     if (only && strtoull(only, NULL, 16) != pc) {
         return false;
     }
+    if (getenv("XTCG_REGION_FIRST")) {
+        static int promoted;
+
+        if (promoted >= atoi(getenv("XTCG_REGION_FIRST"))) {
+            return false;
+        }
+        promoted++;
+    }
     g_mutex_lock(&region_lock);
     if (!region_heads) {
         region_heads = g_hash_table_new(g_int64_hash, g_int64_equal);
