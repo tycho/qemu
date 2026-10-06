@@ -151,6 +151,9 @@ extern bool tcg_vregs_all;
  */
 extern unsigned tcg_region_hot;
 
+/* Debug: write the region statistics (XTCG_REGION_STATS), if any. */
+void translator_region_stats_exit(void);
+
 /*
  * The front end's scratch area in env, [ofs, ofs + size): values there
  * live only within one guest instruction, so a fault or an exit never

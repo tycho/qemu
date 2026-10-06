@@ -511,7 +511,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
             g_assert_not_reached();
         }
     }
-    translator_region_reset();
+    translator_region_reset(gen_code_size);
     tcg_ctx->gen_tb = NULL;
 
     search_size = encode_search(tb, (void *)gen_code_buf + gen_code_size);

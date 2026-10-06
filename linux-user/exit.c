@@ -18,6 +18,7 @@
  */
 #include "qemu/osdep.h"
 #include "tcg/perf.h"
+#include "tcg/startup.h"
 #include "gdbstub/syscalls.h"
 #include "qemu.h"
 #include "user-internals.h"
@@ -35,4 +36,5 @@ void preexit_cleanup(CPUArchState *env, int code)
         gdb_exit(code);
         qemu_plugin_user_exit();
         perf_exit();
+        translator_region_stats_exit();
 }

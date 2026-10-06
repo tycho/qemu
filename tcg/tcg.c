@@ -6457,6 +6457,13 @@ static void xblk_obligations(TCGContext *s, const uint8_t *state)
                 temp_dead(s, ts);
             }
             break;
+        case TEMP_CONST:
+            /* A region's labels end constants' registers too. */
+            if (s->xblk_region && (state[i] & TS_DEAD)
+                && ts->val_type == TEMP_VAL_REG) {
+                temp_dead(s, ts);
+            }
+            break;
         default:
             break;
         }

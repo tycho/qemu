@@ -155,8 +155,91 @@ bool translator_loop_back(DisasContextBase *db, vaddr dest)
 #define REGION_MAX_BLOCKS 64
 #define REGION_COUNTS 4096
 
+static GMutex region_lock;              /* static: needs no init */
+static GHashTable *region_heads;        /* promoted heads, under region_lock */
+
+/*
+ * Debug statistics (XTCG_REGION_STATS=<file>): per region TB, its size
+ * and, counted by its code, its entries and internal backward branches.
+ * Written at exit.
+ */
+typedef struct RegionStats {
+    uint64_t pc;
+    int blocks, insns, backedges, unchained;
+    int host_size;
+    uint64_t entries, backs;
+} RegionStats;
+
+static GPtrArray *region_stats;         /* under region_lock */
+static __thread RegionStats *region_cur_stats;
+static __thread bool region_reject;     /* the region was dropped: retry */
+
+/*
+ * Debug policies (XTCG_REGION_POLICY, comma-separated):
+ *   acyclic  drop a region with no branch back to one of its blocks
+ */
+static bool region_policy(const char *name)
+{
+    const char *p = getenv("XTCG_REGION_POLICY");
+
+    return p && strstr(p, name);
+}
+
+static void region_stats_dump(void)
+{
+    const char *path = getenv("XTCG_REGION_STATS");
+    FILE *f = fopen(path, "w");
+    uint64_t insns = 0, host = 0, entries = 0, backs = 0;
+    int few = 0, flat = 0;
+
+    if (!f) {
+        return;
+    }
+    for (guint i = 0; i < region_stats->len; i++) {
+        RegionStats *rs = g_ptr_array_index(region_stats, i);
+
+        insns += rs->insns;
+        host += rs->host_size;
+        entries += rs->entries;
+        backs += rs->backs;
+        few += rs->entries < 100;
+        flat += rs->backs < rs->entries;
+    }
+    fprintf(f, "# regions %u guest_insns %" PRIu64 " host_bytes %" PRIu64
+            " entries %" PRIu64 " backs %" PRIu64
+            " entered<100 %d backs<entries %d\n",
+            region_stats->len, insns, host, entries, backs, few, flat);
+    fprintf(f, "# pc blocks insns host backedges unchained entries backs\n");
+    for (guint i = 0; i < region_stats->len; i++) {
+        RegionStats *rs = g_ptr_array_index(region_stats, i);
+
+        fprintf(f, "%" PRIx64 " %d %d %d %d %d %" PRIu64 " %" PRIu64 "\n",
+                rs->pc, rs->blocks, rs->insns, rs->host_size, rs->backedges,
+                rs->unchained, rs->entries, rs->backs);
+    }
+    fclose(f);
+}
+
+void translator_region_stats_exit(void)
+{
+    if (region_stats) {
+        region_stats_dump();
+    }
+}
+
+static void region_count_u64(uint64_t *counter)
+{
+    TCGv_ptr p = tcg_constant_ptr(counter);
+    TCGv_i64 c = tcg_temp_new_i64();
+
+    tcg_gen_ld_i64(c, p, 0);
+    tcg_gen_addi_i64(c, c, 1);
+    tcg_gen_st_i64(c, p, 0);
+}
+
 typedef struct TranslatorRegion {
     CPUState *cpu;
+    int backedges;              /* branches back to a block of the region */
     int unchained;              /* direct exits without a goto_tb slot */
     int n;                      /* blocks so far */
     int next;                   /* the next block to translate */
@@ -173,6 +256,10 @@ static __thread int region_tried;       /* blocks of the region last tried */
 
 bool translator_region_overflow(void)
 {
+    if (region_reject) {
+        region_cap = -1;
+        return true;
+    }
     if (region_tried > 1) {
         region_cap = region_tried / 2;
         return true;
@@ -180,13 +267,32 @@ bool translator_region_overflow(void)
     return false;
 }
 
-void translator_region_reset(void)
+void translator_region_reset(int host_size)
 {
+    if (region_cur_stats) {
+        region_cur_stats->host_size = host_size;
+        g_mutex_lock(&region_lock);
+        if (!region_stats) {
+            region_stats = g_ptr_array_new();
+        }
+        g_ptr_array_add(region_stats, region_cur_stats);
+        g_mutex_unlock(&region_lock);
+        region_cur_stats = NULL;
+    }
     region_cap = 0;
     region_tried = 0;
+    region_reject = false;
 }
-static GMutex region_lock;              /* static: needs no init */
-static GHashTable *region_heads;        /* promoted heads, under region_lock */
+
+/* Drop @pc as a region head (the retry translates it as a plain TB). */
+static void region_drop(vaddr pc)
+{
+    uint64_t key = pc;
+
+    g_mutex_lock(&region_lock);
+    g_hash_table_remove(region_heads, &key);
+    g_mutex_unlock(&region_lock);
+}
 
 static unsigned region_hash(vaddr pc)
 {
@@ -202,6 +308,11 @@ static bool region_is_head(vaddr pc)
     ret = region_heads && g_hash_table_contains(region_heads, &key);
     g_mutex_unlock(&region_lock);
     return ret;
+}
+
+bool translator_region_is_head(vaddr pc)
+{
+    return region_is_head(pc);
 }
 
 bool translator_region_promote(vaddr pc)
@@ -242,7 +353,8 @@ void translator_region_count(DisasContextBase *db, vaddr dest)
     TCGv_i32 c;
     TCGLabel *skip;
 
-    if (!tcg_region_hot || !db->region_capable || dest == db->pc_first) {
+    if (!tcg_region_hot || !db->region_capable || dest == db->pc_first
+        || getenv("XTCG_REGION_NOCOUNT") || translator_region_sampling()) {
         return;
     }
     p = tcg_constant_ptr(&region_counts[region_hash(dest)]);
@@ -251,6 +363,9 @@ void translator_region_count(DisasContextBase *db, vaddr dest)
     tcg_gen_ld_i32(c, p, 0);
     tcg_gen_addi_i32(c, c, 1);
     tcg_gen_st_i32(c, p, 0);
+    if (getenv("XTCG_REGION_NOCHECK")) {
+        return;
+    }
     tcg_gen_brcondi_i32(TCG_COND_LT, c, tcg_region_hot, skip);
     gen_helper_region_hot(tcg_env, tcg_constant_i64(dest));
     gen_set_label(skip);
@@ -282,6 +397,12 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
             }
             /* Already emitted (or being emitted): a cycle may close here. */
             *backward = i < r->next;
+            if (*backward) {
+                r->backedges++;
+                if (region_cur_stats) {
+                    region_count_u64(&region_cur_stats->backs);
+                }
+            }
             return r->label[i];
         }
     }
@@ -526,6 +647,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 {
     uint32_t cflags = tb_cflags(tb);
     TCGOp *icount_start_insn;
+    TCGOp *loop_op = NULL;
     bool plugin_enabled;
 #ifndef CONFIG_USER_ONLY
     TCGOp *first_insn_start = NULL;
@@ -575,12 +697,25 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         db->loop_label = gen_new_label();
         db->loop_label->loop = true;
         gen_set_label(db->loop_label);
+        loop_op = tcg_last_op();
         db->region_capable = ops->block_start && tb_page_addr0(tb) != -1;
     }
-    if (db->region_capable && tcg_region_hot && region_is_head(pc)) {
+    if (db->region_capable && tcg_region_hot && region_cap >= 0
+        && region_is_head(pc)) {
         TranslatorRegion *r = tcg_malloc(sizeof(*r));
 
+        g_free(region_cur_stats);
+        region_cur_stats = NULL;
+        if (getenv("XTCG_REGION_STATS")) {
+            region_cur_stats = g_new0(RegionStats, 1);
+            region_cur_stats->pc = pc;
+            /* Count entries before the head's label. */
+            tcg_ctx->emit_before_op = loop_op;
+            region_count_u64(&region_cur_stats->entries);
+            tcg_ctx->emit_before_op = NULL;
+        }
         r->cpu = cpu;
+        r->backedges = 0;
         r->unchained = 0;
         r->n = r->next = 1;
         region_tried = 1;
@@ -685,6 +820,20 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             goto next_block;
         }
         db->pc_next = r->end;
+        if (region_cur_stats) {
+            region_cur_stats->blocks = r->n;
+            region_cur_stats->insns = db->num_insns;
+            region_cur_stats->backedges = r->backedges;
+            region_cur_stats->unchained = r->unchained;
+        }
+        if (region_policy("acyclic") && !r->backedges) {
+            /* Nothing loops inside: translate the head as a plain TB. */
+            region_drop(db->pc_first);
+            region_reject = true;
+            g_free(region_cur_stats);
+            region_cur_stats = NULL;
+            siglongjmp(tcg_ctx->jmp_trans, -2);
+        }
         if (getenv("XTCG_REGION_DEBUG")) {
             fprintf(stderr, "region %" PRIx64 ": %d blocks, %d insns, "
                     "slots %x, %d unchained%s\n",

@@ -47,6 +47,7 @@
 #include "tb-context.h"
 #include "tb-internal.h"
 #include "internal-common.h"
+#include "tcg/startup.h"
 #if !defined(CONFIG_USER_ONLY)
 #include "accel/tcg/iommu.h"
 #endif
@@ -402,6 +403,158 @@ void HELPER(region_hot)(CPUArchState *env, uint64_t dest)
     s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
     s.pc = dest;
     s.cflags = curr_cflags(cpu);
+    tb = tb_htable_lookup(cpu, s);
+    if (tb) {
+        mmap_lock();
+        tb_phys_invalidate(tb, -1);
+        mmap_unlock();
+    }
+}
+
+/*
+ * x-superblock, sampling mode (debug env XTCG_REGION_SAMPLE=<period in
+ * us>): a host thread raises every vCPU's exit request each period, and
+ * the TB that leaves on it is the sample.  The sample counts for the loop
+ * head it belongs to: the TB itself if a chained jump enters it from a
+ * higher address, else the lowest earlier TB it jumps back to.  A head with
+ * x-superblock samples becomes a region; counts halve every
+ * XTCG_REGION_DECAY samples (default 256), so only steady hotspots get
+ * there.  Nothing is added to the generated code.
+ */
+static unsigned region_sample_gen;
+static __thread unsigned region_sample_seen;
+static GHashTable *region_samples;          /* head pc -> samples */
+static unsigned region_samples_total;
+static QemuMutex region_sample_lock;
+
+static void *region_sampler(void *opaque)
+{
+    unsigned period = atoi(getenv("XTCG_REGION_SAMPLE"));
+
+    rcu_register_thread();
+    for (;;) {
+        CPUState *cpu;
+
+        g_usleep(period);
+        qatomic_inc(&region_sample_gen);
+        WITH_RCU_READ_LOCK_GUARD() {
+            CPU_FOREACH(cpu) {
+                qatomic_store_release(&cpu->neg.icount_decr.u16.high, -1);
+            }
+        }
+    }
+    return NULL;
+}
+
+static gpointer region_sampling_init(gpointer opaque)
+{
+    static QemuThread thread;
+
+    if (!getenv("XTCG_REGION_SAMPLE")) {
+        return GINT_TO_POINTER(1);
+    }
+    qemu_mutex_init(&region_sample_lock);
+    region_samples = g_hash_table_new(NULL, NULL);
+    qemu_thread_create(&thread, "region-sampler", region_sampler, NULL,
+                       QEMU_THREAD_DETACHED);
+    return GINT_TO_POINTER(2);
+}
+
+bool translator_region_sampling(void)
+{
+    static GOnce once = G_ONCE_INIT;
+
+    return GPOINTER_TO_INT(g_once(&once, region_sampling_init, NULL)) == 2;
+}
+
+/* The loop head @tb belongs to, or -1. */
+static vaddr region_sample_head(TranslationBlock *tb)
+{
+    vaddr head = -1;
+    uintptr_t p;
+
+    if (tb_cflags(tb) & CF_PCREL) {
+        return -1;
+    }
+    qemu_spin_lock(&tb->jmp_lock);
+    p = tb->jmp_list_head;
+    while (p) {
+        TranslationBlock *src = (TranslationBlock *)(p & ~TB_JMP_TAG_MASK);
+        int n = p & TB_JMP_TAG_MASK;
+
+        if (src != tb && src->pc > tb->pc) {
+            head = tb->pc;
+            break;
+        }
+        p = src->jmp_list_next[n];
+    }
+    qemu_spin_unlock(&tb->jmp_lock);
+    if (head != -1) {
+        return head;
+    }
+    for (int n = 0; n < TB_JMP_SLOTS; n++) {
+        TranslationBlock *dst = (TranslationBlock *)
+            (qatomic_read(&tb->jmp_dest[n]) & ~(uintptr_t)1);
+
+        if (dst && dst != tb && dst->pc < tb->pc
+            && (head == -1 || dst->pc < head)) {
+            head = dst->pc;
+        }
+    }
+    return head;
+}
+
+static void region_sample(CPUState *cpu, TranslationBlock *tb)
+{
+    unsigned gen = qatomic_read(&region_sample_gen);
+    unsigned decay = getenv("XTCG_REGION_DECAY")
+                     ? atoi(getenv("XTCG_REGION_DECAY")) : 256;
+    bool promote = false;
+    TCGTBCPUState s;
+    vaddr head;
+    uintptr_t n;
+
+    if (gen == region_sample_seen) {
+        return;
+    }
+    region_sample_seen = gen;
+    head = region_sample_head(tb);
+    if (head == -1 || translator_region_is_head(head)) {
+        return;
+    }
+    qemu_mutex_lock(&region_sample_lock);
+    if (++region_samples_total % decay == 0) {
+        GHashTableIter it;
+        gpointer k, v;
+
+        g_hash_table_iter_init(&it, region_samples);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            if ((uintptr_t)v / 2) {
+                g_hash_table_iter_replace(&it, (gpointer)((uintptr_t)v / 2));
+            } else {
+                g_hash_table_iter_remove(&it);
+            }
+        }
+    }
+    n = (uintptr_t)g_hash_table_lookup(region_samples, (gpointer)head) + 1;
+    if (n >= tcg_region_hot) {
+        g_hash_table_remove(region_samples, (gpointer)head);
+        promote = true;
+    } else {
+        g_hash_table_insert(region_samples, (gpointer)head, (gpointer)n);
+    }
+    qemu_mutex_unlock(&region_sample_lock);
+    if (!promote || !translator_region_promote(head)) {
+        return;
+    }
+    if (getenv("XTCG_REGION_DEBUG")) {
+        fprintf(stderr, "region_hot %" PRIx64 " (sampled at %" PRIx64 ")\n",
+                (uint64_t)head, (uint64_t)tb->pc);
+    }
+    s = (TCGTBCPUState){
+        .pc = head, .cs_base = tb->cs_base, .flags = tb->flags,
+        .cflags = tb_cflags(tb),
+    };
     tb = tb_htable_lookup(cpu, s);
     if (tb) {
         mmap_lock();
@@ -981,6 +1134,9 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
     }
 
     *last_tb = NULL;
+    if (tcg_region_hot && translator_region_sampling()) {
+        region_sample(cpu, tb);
+    }
     if (cpu_loop_exit_requested(cpu)) {
         /* Something asked us to stop executing chained TBs; just
          * continue round the main loop. Whatever requested the exit
