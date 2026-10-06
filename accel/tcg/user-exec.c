@@ -832,6 +832,14 @@ tb_page_addr_t get_page_addr_code_hostp(CPUArchState *env, vaddr addr,
     return addr;
 }
 
+tb_page_addr_t get_page_addr_code_probe(CPUArchState *env, vaddr addr)
+{
+    if (probe_access_internal(env, addr, 1, MMU_INST_FETCH, true, 0)) {
+        return -1;
+    }
+    return addr;
+}
+
 /*
  * Allocate chunks of target data together.  For the only current user,
  * if we allocate one hunk per page, we have overhead of 40/128 or 40%.
