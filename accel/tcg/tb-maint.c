@@ -45,9 +45,14 @@
 
 /* List iterators for lists of tagged pointers in TranslationBlock. */
 #define TB_FOR_EACH_TAGGED(head, tb, n, field)                          \
-    for (n = (head) & 1, tb = (TranslationBlock *)((head) & ~1);        \
-         tb; tb = (TranslationBlock *)tb->field[n], n = (uintptr_t)tb & 1, \
-             tb = (TranslationBlock *)((uintptr_t)tb & ~1))
+    for (n = (head) & TB_JMP_TAG_MASK,                                  \
+         tb = (TranslationBlock *)((head) & ~TB_JMP_TAG_MASK);          \
+         tb; tb = (TranslationBlock *)tb->field[n],                     \
+             n = (uintptr_t)tb & TB_JMP_TAG_MASK,                       \
+             tb = (TranslationBlock *)((uintptr_t)tb & ~TB_JMP_TAG_MASK))
+
+/* A TB's address has room for the tag. */
+QEMU_BUILD_BUG_ON(__alignof__(TranslationBlock) < TB_JMP_SLOTS);
 
 #define TB_FOR_EACH_JMP(head_tb, tb, n)                                 \
     TB_FOR_EACH_TAGGED((head_tb)->jmp_list_head, tb, n, jmp_list_next)
@@ -961,9 +966,10 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
         /* remove the TB from the hash list */
         tb_jmp_cache_inval_tb(tb);
 
-        /* suppress this TB from the two jump lists */
-        tb_remove_from_jmp_list(tb, 0);
-        tb_remove_from_jmp_list(tb, 1);
+        /* suppress this TB from its jump lists */
+        for (int n = 0; n < TB_JMP_SLOTS; n++) {
+            tb_remove_from_jmp_list(tb, n);
+        }
 
         /* suppress any remaining jumps to this TB */
         tb_jmp_unlink(tb);

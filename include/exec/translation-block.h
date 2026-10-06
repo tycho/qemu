@@ -127,20 +127,21 @@ struct TranslationBlock {
      * the code of this one. This can be done either by emitting direct or
      * indirect native jump instructions. These jumps are reset so that the TB
      * just continues its execution. The TB can be linked to another one by
-     * setting one of the jump targets (or patching the jump instruction). Only
-     * two of such jumps are supported.
+     * setting one of the jump targets (or patching the jump instruction).
+     * Jumps are numbered 0 to TB_JMP_SLOTS - 1, except TB_EXIT_REQUESTED.
      */
+#define TB_JMP_SLOTS 8
 #define TB_JMP_OFFSET_INVALID 0xffff /* indicates no jump generated */
-    uint16_t jmp_reset_offset[2]; /* offset of original jump target */
-    uint16_t jmp_insn_offset[2];  /* offset of direct jump insn */
-    uintptr_t jmp_target_addr[2]; /* target address */
+    uint16_t jmp_reset_offset[TB_JMP_SLOTS]; /* offset of original target */
+    uint16_t jmp_insn_offset[TB_JMP_SLOTS];  /* offset of direct jump insn */
+    uintptr_t jmp_target_addr[TB_JMP_SLOTS]; /* target address */
 
     /*
      * Each TB has a NULL-terminated list (jmp_list_head) of incoming jumps.
-     * Each TB can have two outgoing jumps, and therefore can participate
-     * in two lists. The list entries are kept in jmp_list_next[2]. The least
-     * significant bit (LSB) of the pointers in these lists is used to encode
-     * which of the two list entries is to be used in the pointed TB.
+     * Each TB can have several outgoing jumps, and therefore can participate
+     * in several lists. The list entries are kept in jmp_list_next[]. The
+     * low bits of the pointers in these lists (TB_JMP_TAG_MASK) encode
+     * which of the list entries is to be used in the pointed TB.
      *
      * List traversals are protected by jmp_lock. The destination TB of each
      * outgoing jump is kept in jmp_dest[] so that the appropriate jmp_lock
@@ -153,9 +154,11 @@ struct TranslationBlock {
      * to a destination TB that has CF_INVALID set.
      */
     uintptr_t jmp_list_head;
-    uintptr_t jmp_list_next[2];
-    uintptr_t jmp_dest[2];
+    uintptr_t jmp_list_next[TB_JMP_SLOTS];
+    uintptr_t jmp_dest[TB_JMP_SLOTS];
 };
+
+#define TB_JMP_TAG_MASK ((uintptr_t)TB_JMP_SLOTS - 1)
 
 /* The alignment given to TranslationBlock during allocation. */
 #define CODE_GEN_ALIGN  16
