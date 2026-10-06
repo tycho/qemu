@@ -266,6 +266,25 @@ static void tcg_set_region(Object *obj, bool value, Error **errp)
     tcg_region = value;
 }
 
+static void tcg_get_superblock(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    uint32_t value = tcg_superblock;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void tcg_set_superblock(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    tcg_superblock = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -303,6 +322,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Let a translation block loop back to its own start instead of "
         "chaining to itself, keeping the loop's guest registers in host "
         "registers (not with plugins or icount)");
+
+    object_class_property_add(oc, "x-superblock", "uint32",
+        tcg_get_superblock, tcg_set_superblock, NULL, NULL);
+    object_class_property_set_description(oc, "x-superblock",
+        "With x-region: after this many profile samples (one per ms) in a "
+        "loop, translate the loop's blocks that have run as one translation "
+        "block (0: never, the default; user mode)");
 }
 
 static const TypeInfo tcg_accel_type = {
