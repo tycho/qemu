@@ -157,6 +157,7 @@ bool translator_loop_back(DisasContextBase *db, vaddr dest)
 
 typedef struct TranslatorRegion {
     CPUState *cpu;
+    int unchained;              /* direct exits without a goto_tb slot */
     int n;                      /* blocks so far */
     int next;                   /* the next block to translate */
     bool stubbing;              /* insn budget spent: blocks just exit */
@@ -313,14 +314,15 @@ int translator_goto_tb_slot(DisasContextBase *db, int want)
     if (getenv("XTCG_REGION_NOSLOT")) {
         return -1;
     }
-    for (int i = 0; i < 2; i++) {
-        int slot = want ^ i;
+    for (int i = 0; i < TB_JMP_SLOTS; i++) {
+        int slot = i < 2 ? want ^ i : i;
 
-        if (!(db->goto_tb_used & (1u << slot))) {
+        if (slot != TB_EXIT_REQUESTED && !(db->goto_tb_used & (1u << slot))) {
             db->goto_tb_used |= 1u << slot;
             return slot;
         }
     }
+    db->region->unchained++;
     return -1;
 }
 
@@ -571,6 +573,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         TranslatorRegion *r = tcg_malloc(sizeof(*r));
 
         r->cpu = cpu;
+        r->unchained = 0;
         r->n = r->next = 1;
         region_tried = 1;
         r->stubbing = false;
@@ -675,8 +678,10 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         }
         db->pc_next = r->end;
         if (getenv("XTCG_REGION_DEBUG")) {
-            fprintf(stderr, "region %" PRIx64 ": %d blocks, %d insns%s\n",
+            fprintf(stderr, "region %" PRIx64 ": %d blocks, %d insns, "
+                    "slots %x, %d unchained%s\n",
                     (uint64_t)db->pc_first, r->n, db->num_insns,
+                    db->goto_tb_used, r->unchained,
                     r->stubbing ? ", stubbed" : "");
         }
     }

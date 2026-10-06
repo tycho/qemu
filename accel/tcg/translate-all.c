@@ -608,17 +608,13 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     /* init jump list */
     qemu_spin_init(&tb->jmp_lock);
     tb->jmp_list_head = (uintptr_t)NULL;
-    tb->jmp_list_next[0] = (uintptr_t)NULL;
-    tb->jmp_list_next[1] = (uintptr_t)NULL;
-    tb->jmp_dest[0] = (uintptr_t)NULL;
-    tb->jmp_dest[1] = (uintptr_t)NULL;
-
-    /* init original jump addresses which have been set during tcg_gen_code() */
-    if (tb->jmp_reset_offset[0] != TB_JMP_OFFSET_INVALID) {
-        tb_reset_jump(tb, 0);
-    }
-    if (tb->jmp_reset_offset[1] != TB_JMP_OFFSET_INVALID) {
-        tb_reset_jump(tb, 1);
+    for (int n = 0; n < TB_JMP_SLOTS; n++) {
+        tb->jmp_list_next[n] = (uintptr_t)NULL;
+        tb->jmp_dest[n] = (uintptr_t)NULL;
+        /* original jump addresses, set during tcg_gen_code() */
+        if (tb->jmp_reset_offset[n] != TB_JMP_OFFSET_INVALID) {
+            tb_reset_jump(tb, n);
+        }
     }
 
     /*

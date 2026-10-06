@@ -524,7 +524,7 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
 
     trace_exec_tb_exit(last_tb, *tb_exit);
 
-    if (*tb_exit > TB_EXIT_IDX1) {
+    if (*tb_exit == TB_EXIT_REQUESTED) {
         /* We didn't start executing this TB (eg because the instruction
          * counter hit zero); we must restore the guest PC to the address
          * of the start of the TB.
