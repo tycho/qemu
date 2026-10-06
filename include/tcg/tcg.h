@@ -111,6 +111,7 @@ struct TCGLabel {
 
     /* Cross-block register allocation (tcg_region; tcg.c, XLBL_*) */
     bool loop;                  /* a loop header, set by the translator */
+    bool region;                /* a block of a multi-block region */
     bool xseen, xfwd, xfalls;   /* classification scratch */
     uint8_t xkind;
     struct TCGOp *xbranch;      /* the label's one branch */
