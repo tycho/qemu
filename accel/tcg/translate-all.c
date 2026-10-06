@@ -352,7 +352,20 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
              *
              * Try again with half as many insns as we attempted this time.
              * If a single insn overflows, there's a bug somewhere...
+             * A multi-block region tries fewer blocks first.
              */
+            if (translator_region_overflow()) {
+                qemu_log_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT,
+                              "Restarting code generation with a smaller "
+                              "region\n");
+                max_insns = s.cflags & CF_COUNT_MASK ?: TCG_MAX_INSNS;
+                phys_p2 = tb_page_addr1(tb);
+                if (unlikely(phys_p2 != -1)) {
+                    tb_unlock_page1(phys_pc, phys_p2);
+                    tb_set_page_addr1(tb, -1);
+                }
+                goto restart_translate;
+            }
             assert(max_insns > 1);
             max_insns /= 2;
             qemu_log_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT,
@@ -387,6 +400,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
             g_assert_not_reached();
         }
     }
+    translator_region_reset();
     tcg_ctx->gen_tb = NULL;
 
     search_size = encode_search(tb, (void *)gen_code_buf + gen_code_size);

@@ -366,6 +366,19 @@ static inline bool check_for_breakpoints(CPUState *cpu, vaddr pc,
         check_for_breakpoints_slow(cpu, pc, cflags);
 }
 
+bool translator_region_has_run(CPUState *cpu, const TranslationBlock *tb,
+                               vaddr pc)
+{
+    TCGTBCPUState s = {
+        .pc = pc,
+        .cs_base = tb->cs_base,
+        .flags = tb->flags,
+        .cflags = tb_cflags(tb),
+    };
+
+    return tb_htable_lookup(cpu, s) != NULL;
+}
+
 /**
  * helper_lookup_tb_ptr: quick check for next tb
  * @env: current cpu state
