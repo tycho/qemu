@@ -260,7 +260,12 @@ static __thread int region_tried;       /* blocks of the region last tried */
 
 bool translator_region_overflow(void)
 {
+    if (region_cap < 0) {
+        /* A plain TB: halve its insns as usual. */
+        return false;
+    }
     if (region_reject) {
+        region_reject = false;
         region_cap = -1;
         return true;
     }
