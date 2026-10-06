@@ -13,6 +13,7 @@
 #define CPUINFO_PMULL           (1u << 4)
 #define CPUINFO_BTI             (1u << 5)
 #define CPUINFO_CSSC            (1u << 6)
+#define CPUINFO_SHA1            (1u << 12)
 
 /* Initialized with a constructor. */
 extern unsigned cpuinfo;
