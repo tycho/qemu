@@ -2038,6 +2038,30 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
         new_pc = (uint32_t)(new_eip + s->cs_base);
     }
 
+    if (s->jmp_opt) {
+        bool backward;
+        TCGLabel *l = translator_region_target(&s->base, new_pc, &backward);
+
+        if (l) {
+            /*
+             * Within a multi-block region: branch to the destination's
+             * block; a backward branch checks the exit request first and
+             * leaves the TB through the code below if one is pending.
+             */
+            TCGLabel *exit = backward ? gen_new_label() : NULL;
+
+            if (exit) {
+                translator_exit_check(&s->base, exit);
+            }
+            tcg_gen_br(l);
+            s->base.is_jmp = DISAS_NORETURN;
+            if (!exit) {
+                return;
+            }
+            gen_set_label(exit);
+        }
+    }
+
     if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)
         && translator_loop_back(&s->base, new_pc)) {
         /*
@@ -2045,7 +2069,8 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
          * from the TB, or, with CF_PCREL, from cpu_eip, already updated.
          */
         s->base.is_jmp = DISAS_NORETURN;
-    } else if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)) {
+    } else if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)
+               && translator_goto_tb_slot(&s->base, &tb_num)) {
         /* jump to same page: we can use a direct jump */
         tcg_gen_goto_tb(tb_num);
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
@@ -2067,7 +2092,8 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
 
 /*
  * Whether gen_jmp_rel(s, ot, diff, ...) would branch back within the TB
- * (tcg_region), from the same conditions it uses.
+ * (tcg_region, or an earlier block of a multi-block region), from the same
+ * conditions it uses.
  */
 static bool gen_jmp_rel_loops(DisasContext *s, MemOp ot, int diff)
 {
@@ -2095,6 +2121,9 @@ static bool gen_jmp_rel_loops(DisasContext *s, MemOp ot, int diff)
         }
     } else if (!CODE64(s)) {
         new_pc = (uint32_t)(new_eip + s->cs_base);
+    }
+    if (s->base.region) {
+        return translator_region_backward(&s->base, new_pc);
     }
     return new_pc == s->base.pc_first
            && translator_use_goto_tb(&s->base, new_pc);
@@ -3588,7 +3617,7 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
              * chance to happen.
              */
             dc->base.is_jmp = DISAS_EOB_NEXT;
-        } else if (!translator_is_same_page(&dc->base, dc->base.pc_next)) {
+        } else if (!translator_in_tb_pages(&dc->base, dc->base.pc_next)) {
             dc->base.is_jmp = DISAS_TOO_MANY;
         }
     }
@@ -3631,12 +3660,29 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     }
 }
 
+/*
+ * Another block of a multi-block region: every jump into it leaves cc_op
+ * in env (gen_jmp_rel runs with cc_op clean) and, with CF_PCREL, cpu_eip
+ * at the block's pc.
+ */
+static void i386_tr_block_start(DisasContextBase *dcbase, CPUState *cpu)
+{
+    DisasContext *dc = container_of(dcbase, DisasContext, base);
+
+    dc->cc_op = CC_OP_DYNAMIC;
+    dc->cc_op_dirty = false;
+    dc->cc_srcT = NULL;
+    dc->pc = dc->base.pc_next;
+    dc->pc_save = dc->base.pc_next;
+}
+
 static const TranslatorOps i386_tr_ops = {
     .init_disas_context = i386_tr_init_disas_context,
     .tb_start           = i386_tr_tb_start,
     .insn_start         = i386_tr_insn_start,
     .translate_insn     = i386_tr_translate_insn,
     .tb_stop            = i386_tr_tb_stop,
+    .block_start        = i386_tr_block_start,
 };
 
 void x86_translate_code(CPUState *cpu, TranslationBlock *tb,
