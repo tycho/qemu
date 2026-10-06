@@ -60,9 +60,27 @@ static target_ulong compute_all_adcox(target_ulong dst, target_ulong src1,
     return (src1 & ~(CC_C | CC_O)) | (dst * CC_C) | (src2 * CC_O);
 }
 
+/* A lazy INC/DEC's run-time CC_OP: its own operation in bits 0-7. */
+static bool cc_op_is_lazy(int op)
+{
+    op &= 0xff;
+    return op >= CC_OP_INCLB && op <= CC_OP_DECLQ;
+}
+
+/* The plain INC or DEC that a lazy one's flags other than CF follow. */
+static int cc_op_lazy_plain(int op)
+{
+    op &= 0xff;
+    return op >= CC_OP_DECLB ? CC_OP_DECB + (op - CC_OP_DECLB)
+                             : CC_OP_INCB + (op - CC_OP_INCLB);
+}
+
 target_ulong helper_cc_compute_nz(target_ulong dst, target_ulong src1,
                                   int op)
 {
+    if (cc_op_is_lazy(op)) {
+        op = cc_op_lazy_plain(op);
+    }
     if (CC_OP_HAS_EFLAGS(op)) {
         return ~src1 & CC_Z;
     } else {
@@ -288,9 +306,36 @@ psz_q:
     return flags;
 }
 
+/*
+ * The same with CC_DST2, for any CC_OP: a lazy INC/DEC takes CF from the
+ * earlier operation in CC_OP's upper bits.
+ */
+target_ulong helper_cc_compute_c2(target_ulong dst, target_ulong src1,
+                                  target_ulong src2, target_ulong dst2,
+                                  int op)
+{
+    if (cc_op_is_lazy(op)) {
+        return helper_cc_compute_c(dst2, src1, src2, op >> 8);
+    }
+    return helper_cc_compute_c(dst, src1, src2, op);
+}
+
+target_ulong helper_cc_compute_all2(target_ulong dst, target_ulong src1,
+                                    target_ulong src2, target_ulong dst2,
+                                    int op)
+{
+    if (cc_op_is_lazy(op)) {
+        target_ulong cf = helper_cc_compute_c(dst2, src1, src2, op >> 8);
+
+        return helper_cc_compute_all(dst, cf, 0, cc_op_lazy_plain(op));
+    }
+    return helper_cc_compute_all(dst, src1, src2, op);
+}
+
 uint32_t cpu_cc_compute_all(CPUX86State *env)
 {
-    return helper_cc_compute_all(CC_DST, CC_SRC, CC_SRC2, CC_OP);
+    return helper_cc_compute_all2(CC_DST, CC_SRC, CC_SRC2, env->cc_dst2,
+                                  CC_OP);
 }
 
 target_ulong helper_cc_compute_c(target_ulong dst, target_ulong src1,

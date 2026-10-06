@@ -2603,6 +2603,9 @@ TCGTemp *tcgv_i32_temp(TCGv_i32 v)
  * Return true if OP may appear in the opcode stream with TYPE.
  * Test the runtime variable that controls each opcode.
  */
+bool tcg_flags_guess;
+bool tcg_lazy_incdec;
+
 bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
 {
     bool has_type;
