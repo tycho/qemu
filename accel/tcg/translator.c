@@ -109,12 +109,21 @@ static void gen_tb_end(const TranslationBlock *tb, uint32_t cflags,
     }
 }
 
+void translator_exit_check(DisasContextBase *db, TCGLabel *exit)
+{
+    TCGv_i32 count = tcg_temp_new_i32();
+
+    tcg_gen_ld_i32(count, tcg_env,
+                   offsetof(CPUState, neg.icount_decr.u32) - sizeof(CPUState));
+    tcg_gen_brcondi_i32(TCG_COND_LT, count, 0, exit);
+    db->tb->loops = true;
+}
+
 bool translator_loop_back(DisasContextBase *db, vaddr dest)
 {
     TCGLabel *exit;
-    TCGv_i32 count;
 
-    if (!db->loop_label || dest != db->pc_first) {
+    if (!db->loop_label || db->region || dest != db->pc_first) {
         return false;
     }
     /*
@@ -122,15 +131,214 @@ bool translator_loop_back(DisasContextBase *db, vaddr dest)
      * register allocator can store guest state on that path alone.
      */
     exit = gen_new_label();
-    count = tcg_temp_new_i32();
-    tcg_gen_ld_i32(count, tcg_env,
-                   offsetof(CPUState, neg.icount_decr.u32) - sizeof(CPUState));
-    tcg_gen_brcondi_i32(TCG_COND_LT, count, 0, exit);
+    translator_exit_check(db, exit);
     tcg_gen_br(db->loop_label);
-    db->tb->loops = true;
     gen_set_label(exit);
     tcg_gen_exit_tb(db->tb, TB_EXIT_REQUESTED);
     return true;
+}
+
+/*
+ * Multi-block regions.  A region head (translator_region_promote) is
+ * translated as one TB holding the blocks that have run and that its
+ * blocks reach by direct jumps, at or after the head on the head's page and
+ * the next one, up to REGION_MAX_BLOCKS blocks and the TB's insn limit.
+ * Jumps between the region's blocks are branches to labels (backward ones
+ * check the exit request); other jumps leave the TB.  A region in which no
+ * jump goes back to one of its blocks, or of one block, gains nothing: the
+ * head is dropped for good and translated as a plain TB.
+ */
+#define REGION_MAX_BLOCKS 64
+
+typedef struct TranslatorRegion {
+    CPUState *cpu;
+    int n;                      /* blocks so far */
+    int next;                   /* the next block to translate */
+    int backedges;              /* jumps back to a block already translated */
+    bool stubbing;              /* insn budget spent: blocks just exit */
+    int block_insns;            /* num_insns when the current block began */
+    vaddr end;                  /* the end of the highest block */
+    vaddr pc[REGION_MAX_BLOCKS];
+    TCGLabel *label[REGION_MAX_BLOCKS];
+} TranslatorRegion;
+
+static GMutex region_lock;              /* static: needs no init */
+static GHashTable *region_heads;        /* promoted heads, under region_lock */
+static GHashTable *region_dropped;      /* dropped heads, under region_lock */
+
+/*
+ * The retry after a TB overflow (translator_region_overflow): the block
+ * limit for the region, or -1 to translate a plain TB.
+ */
+static __thread int region_cap;
+static __thread int region_tried;       /* blocks of the region last tried */
+static __thread bool region_reject;     /* the region was dropped: retry */
+static __thread vaddr region_head_pc;   /* head of the region last tried */
+
+static bool region_set_contains(GHashTable *set, vaddr pc)
+{
+    uint64_t key = pc;
+
+    return set && g_hash_table_contains(set, &key);
+}
+
+static void region_set_add(GHashTable **set, vaddr pc)
+{
+    uint64_t *key = g_new(uint64_t, 1);
+
+    *key = pc;
+    if (!*set) {
+        *set = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
+                                     NULL);
+    }
+    g_hash_table_add(*set, key);
+}
+
+bool translator_region_is_head(vaddr pc)
+{
+    bool ret;
+
+    g_mutex_lock(&region_lock);
+    ret = region_set_contains(region_heads, pc);
+    g_mutex_unlock(&region_lock);
+    return ret;
+}
+
+bool translator_region_promote(vaddr pc)
+{
+    bool added = false;
+
+    g_mutex_lock(&region_lock);
+    if (!region_set_contains(region_heads, pc)
+        && !region_set_contains(region_dropped, pc)) {
+        region_set_add(&region_heads, pc);
+        added = true;
+    }
+    g_mutex_unlock(&region_lock);
+    return added;
+}
+
+/* Drop @pc as a region head for good. */
+static void region_drop(vaddr pc)
+{
+    uint64_t key = pc;
+
+    g_mutex_lock(&region_lock);
+    if (region_heads) {
+        g_hash_table_remove(region_heads, &key);
+    }
+    region_set_add(&region_dropped, pc);
+    g_mutex_unlock(&region_lock);
+}
+
+bool translator_region_overflow(void)
+{
+    if (region_cap < 0) {
+        /* A plain TB: halve its insns as usual. */
+        return false;
+    }
+    if (region_reject) {
+        region_reject = false;
+        region_cap = -1;
+        return true;
+    }
+    if (region_tried > 1) {
+        region_cap = region_tried / 2;
+        return true;
+    }
+    if (region_tried == 1) {
+        region_drop(region_head_pc);
+        region_cap = -1;
+        return true;
+    }
+    return false;
+}
+
+void translator_region_reset(void)
+{
+    region_cap = 0;
+    region_tried = 0;
+    region_reject = false;
+}
+
+static bool region_page_ok(const DisasContextBase *db, vaddr pc)
+{
+    vaddr first = db->pc_first & TARGET_PAGE_MASK;
+
+    return pc >= db->pc_first
+           && ((pc & TARGET_PAGE_MASK) == first
+               || (pc & TARGET_PAGE_MASK) == first + TARGET_PAGE_SIZE);
+}
+
+TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
+                                   bool *backward)
+{
+    TranslatorRegion *r = db->region;
+
+    *backward = false;
+    if (!r || r->stubbing) {
+        return NULL;
+    }
+    for (int i = 0; i < r->n; i++) {
+        if (r->pc[i] == dest) {
+            if (i == r->next - 1 && db->num_insns == r->block_insns) {
+                /* The current block, still empty: don't spin on it. */
+                return NULL;
+            }
+            /* Already translated (or being translated): a cycle closes. */
+            *backward = i < r->next;
+            r->backedges += *backward;
+            return r->label[i];
+        }
+    }
+    if (r->n == (region_cap ? region_cap : REGION_MAX_BLOCKS)
+        || !region_page_ok(db, dest)
+        || !translator_region_has_run(r->cpu, db->tb, dest)) {
+        return NULL;
+    }
+    r->pc[r->n] = dest;
+    r->label[r->n] = gen_new_label();
+    r->label[r->n]->region = true;
+    region_tried = r->n + 1;
+    return r->label[r->n++];
+}
+
+bool translator_region_backward(DisasContextBase *db, vaddr dest)
+{
+    TranslatorRegion *r = db->region;
+
+    if (!r || r->stubbing) {
+        return false;
+    }
+    for (int i = 0; i < r->next; i++) {
+        if (r->pc[i] == dest) {
+            return !(i == r->next - 1 && db->num_insns == r->block_insns);
+        }
+    }
+    return false;
+}
+
+bool translator_goto_tb_slot(DisasContextBase *db, int *slot)
+{
+    if (!db->region) {
+        return true;
+    }
+    for (int i = 0; i < TB_JMP_SLOTS; i++) {
+        int n = i < 2 ? *slot ^ i : i;
+
+        if (n != TB_EXIT_REQUESTED && !(db->goto_tb_used & (1u << n))) {
+            db->goto_tb_used |= 1u << n;
+            *slot = n;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool translator_in_tb_pages(const DisasContextBase *db, vaddr addr)
+{
+    return translator_is_same_page(db, addr)
+           || (db->region && region_page_ok(db, addr));
 }
 
 bool translator_is_same_page(const DisasContextBase *db, vaddr addr)
@@ -224,14 +432,37 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
      * check.
      */
     db->loop_label = NULL;
+    db->region = NULL;
+    db->region_capable = false;
+    db->goto_tb_used = 0;
     if (tcg_region && !plugin_enabled && tcg_ctx->exitreq_label
         && !(cflags & CF_USE_ICOUNT)) {
         db->loop_label = gen_new_label();
         db->loop_label->loop = true;
         gen_set_label(db->loop_label);
+        db->region_capable = ops->block_start && tb_page_addr0(tb) != -1;
+    }
+    if (db->region_capable && region_cap >= 0
+        && translator_region_is_head(pc)) {
+        TranslatorRegion *r = tcg_malloc(sizeof(*r));
+
+        r->cpu = cpu;
+        r->n = r->next = 1;
+        r->backedges = 0;
+        r->stubbing = false;
+        r->block_insns = 0;
+        r->end = pc;
+        r->pc[0] = pc;
+        r->label[0] = db->loop_label;
+        db->loop_label->loop = false;
+        db->loop_label->region = true;
+        db->region = r;
+        region_tried = 1;
+        region_head_pc = pc;
     }
 
-    while (true) {
+ next_block:
+    while (!(db->region && db->region->stubbing)) {
         *max_insns = ++db->num_insns;
         ops->insn_start(db, cpu);
         db->insn_start = tcg_last_op();
@@ -276,12 +507,43 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
            or we have executed all of the allowed instructions.  */
         if (tcg_op_buf_full() || db->num_insns >= db->max_insns) {
             db->is_jmp = DISAS_TOO_MANY;
+            if (db->region) {
+                db->region->stubbing = true;
+            }
             break;
         }
     }
 
     /* Emit code to exit the TB, as indicated by db->is_jmp.  */
     ops->tb_stop(db, cpu);
+    if (db->region) {
+        TranslatorRegion *r = db->region;
+
+        r->end = MAX(r->end, db->pc_next);
+        if (r->next < r->n) {
+            /*
+             * The next block of the region.  Once the insn budget is spent,
+             * the remaining blocks only jump out to themselves.
+             */
+            gen_set_label(r->label[r->next]);
+            db->pc_next = r->pc[r->next++];
+            db->is_jmp = r->stubbing ? DISAS_TOO_MANY : DISAS_NEXT;
+            r->block_insns = db->num_insns;
+            ops->block_start(db, cpu);
+            if (tcg_op_buf_full() || db->num_insns >= db->max_insns) {
+                r->stubbing = true;
+                db->is_jmp = DISAS_TOO_MANY;
+            }
+            goto next_block;
+        }
+        db->pc_next = r->end;
+        if (r->n == 1 || !r->backedges) {
+            /* Nothing to gain: translate the head as a plain TB. */
+            region_drop(db->pc_first);
+            region_reject = true;
+            siglongjmp(tcg_ctx->jmp_trans, -2);
+        }
+    }
     gen_tb_end(tb, cflags, icount_start_insn, db->num_insns);
 
 #ifndef CONFIG_USER_ONLY
