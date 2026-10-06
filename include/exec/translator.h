@@ -214,6 +214,16 @@ struct TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
                                           bool *backward);
 
 /**
+ * translator_region_backward:
+ * @db: Disassembly context
+ * @dest: the destination of a direct jump
+ *
+ * Whether translator_region_target(@db, @dest) would branch back to an
+ * earlier block of the region; adds nothing.
+ */
+bool translator_region_backward(DisasContextBase *db, vaddr dest);
+
+/**
  * translator_region_count:
  * @db: Disassembly context
  * @dest: the destination of a direct jump that goes back to an earlier pc

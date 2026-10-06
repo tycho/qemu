@@ -189,8 +189,12 @@ bool translator_region_promote(vaddr pc)
 {
     uint64_t *key;
     bool added = false;
+    const char *only = getenv("XTCG_REGION_ONLY");
 
     region_counts[region_hash(pc)] = INT32_MIN;
+    if (only && strtoull(only, NULL, 16) != pc) {
+        return false;
+    }
     g_mutex_lock(&region_lock);
     if (!region_heads) {
         region_heads = g_hash_table_new(g_int64_hash, g_int64_equal);
@@ -254,18 +258,39 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
             return r->label[i];
         }
     }
-    if (r->n == REGION_MAX_BLOCKS || !region_page_ok(db, dest)) {
+    if (r->n == REGION_MAX_BLOCKS || !region_page_ok(db, dest)
+        || (getenv("XTCG_REGION_MAXB")
+            && r->n >= atoi(getenv("XTCG_REGION_MAXB")))) {
         return NULL;
     }
     r->pc[r->n] = dest;
     r->label[r->n] = gen_new_label();
+    r->label[r->n]->region = true;
     return r->label[r->n++];
+}
+
+bool translator_region_backward(DisasContextBase *db, vaddr dest)
+{
+    TranslatorRegion *r = db->region;
+
+    if (!r || r->stubbing) {
+        return false;
+    }
+    for (int i = 0; i < r->next; i++) {
+        if (r->pc[i] == dest) {
+            return !(i == r->next - 1 && db->num_insns == r->block_insns);
+        }
+    }
+    return false;
 }
 
 int translator_goto_tb_slot(DisasContextBase *db, int want)
 {
     if (!db->region) {
         return want;
+    }
+    if (getenv("XTCG_REGION_NOSLOT")) {
+        return -1;
     }
     for (int i = 0; i < 2; i++) {
         int slot = want ^ i;
@@ -530,6 +555,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         r->end = pc;
         r->pc[0] = pc;
         r->label[0] = db->loop_label;
+        db->loop_label->loop = false;
+        db->loop_label->region = true;
         db->region = r;
     }
 

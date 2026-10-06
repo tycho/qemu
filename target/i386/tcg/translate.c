@@ -2389,7 +2389,8 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
 
 /*
  * Whether gen_jmp_rel(s, ot, diff, ...) would branch back within the TB
- * (tcg_region), from the same conditions it uses.
+ * (tcg_region, or an earlier block of a multi-block region), from the same
+ * conditions it uses.
  */
 static bool gen_jmp_rel_loops(DisasContext *s, MemOp ot, int diff)
 {
@@ -2417,6 +2418,9 @@ static bool gen_jmp_rel_loops(DisasContext *s, MemOp ot, int diff)
         }
     } else if (!CODE64(s)) {
         new_pc = (uint32_t)(new_eip + s->cs_base);
+    }
+    if (s->base.region) {
+        return translator_region_backward(&s->base, new_pc);
     }
     return new_pc == s->base.pc_first
            && translator_use_goto_tb(&s->base, new_pc);
