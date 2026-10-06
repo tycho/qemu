@@ -184,4 +184,33 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr);
 
 void tcg_get_stats(AccelState *accel, GString *buf);
 
+/* Multi-block regions (translator_region_target). */
+
+/* Make @pc a region head; false if it is one or was dropped. */
+bool translator_region_promote(vaddr pc);
+/* Whether @pc is a region head. */
+bool translator_region_is_head(vaddr pc);
+/*
+ * After a TB overflow: true if the TB was a region and the retry takes
+ * fewer of its blocks (or a plain TB at its head) instead of fewer insns.
+ */
+bool translator_region_overflow(void);
+/* After a TB is generated: regions take their full size again. */
+void translator_region_reset(void);
+/* Whether a TB like @tb exists at @pc: its block has run. */
+bool translator_region_has_run(CPUState *cpu, const TranslationBlock *tb,
+                               vaddr pc);
+
+/* A region whose probation is over; its TB is to be invalidated. */
+typedef struct TranslatorRegionVerdict {
+    vaddr pc;
+    uint64_t cs_base;
+    uint32_t flags, cflags;
+} TranslatorRegionVerdict;
+
+/* Judge regions whose probation is over: at most @max, into @v. */
+int translator_region_judge(TranslatorRegionVerdict *v, int max);
+/* Start the profile sampler that finds region heads (tcg_superblock). */
+void translator_region_sampler_start(void);
+
 #endif
