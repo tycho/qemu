@@ -710,9 +710,12 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     /*
      * If gdb single-step, and we haven't raised another exception,
      * raise a debug exception.  Single-step with another exception
-     * is handled in cpu_handle_exception.
+     * is handled in cpu_handle_exception.  A TB that exited before it
+     * started has executed nothing: the main loop handles the request
+     * and runs it again.
      */
-    if (unlikely(cpu_single_stepping(cpu)) && cpu->exception_index == -1) {
+    if (unlikely(cpu_single_stepping(cpu)) && cpu->exception_index == -1
+        && *tb_exit != TB_EXIT_REQUESTED) {
         cpu->exception_index = EXCP_DEBUG;
         cpu_loop_exit(cpu);
     }
