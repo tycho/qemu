@@ -58,6 +58,8 @@ extern unsigned tcg_tlb_grow;
 bool translator_region_promote(vaddr pc);
 /* x-region-hot: whether @pc is a region head. */
 bool translator_region_is_head(vaddr pc);
+/* x-region-hot: a sample in region @pc; true if the region is dropped. */
+bool translator_region_probe_sample(vaddr pc);
 /* x-region-hot: whether heads come from sampling instead of counters. */
 bool translator_region_sampling(void);
 

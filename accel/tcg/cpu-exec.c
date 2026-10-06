@@ -469,7 +469,10 @@ bool translator_region_sampling(void)
     return GPOINTER_TO_INT(g_once(&once, region_sampling_init, NULL)) == 2;
 }
 
-/* The loop head @tb belongs to, or -1. */
+/*
+ * The loop head @tb belongs to, or -1.  A jump back further than a region
+ * reaches (two pages) is taken for a call, not a loop.
+ */
 static vaddr region_sample_head(TranslationBlock *tb)
 {
     vaddr head = -1;
@@ -484,7 +487,8 @@ static vaddr region_sample_head(TranslationBlock *tb)
         TranslationBlock *src = (TranslationBlock *)(p & ~TB_JMP_TAG_MASK);
         int n = p & TB_JMP_TAG_MASK;
 
-        if (src != tb && src->pc > tb->pc) {
+        if (src != tb && src->pc > tb->pc
+            && src->pc - tb->pc < 2 * TARGET_PAGE_SIZE) {
             head = tb->pc;
             break;
         }
@@ -499,6 +503,7 @@ static vaddr region_sample_head(TranslationBlock *tb)
             (qatomic_read(&tb->jmp_dest[n]) & ~(uintptr_t)1);
 
         if (dst && dst != tb && dst->pc < tb->pc
+            && tb->pc - dst->pc < 2 * TARGET_PAGE_SIZE
             && (head == -1 || dst->pc < head)) {
             head = dst->pc;
         }
@@ -520,6 +525,14 @@ static void region_sample(CPUState *cpu, TranslationBlock *tb)
         return;
     }
     region_sample_seen = gen;
+    if (translator_region_is_head(tb->pc)) {
+        if (translator_region_probe_sample(tb->pc)) {
+            mmap_lock();
+            tb_phys_invalidate(tb, -1);
+            mmap_unlock();
+        }
+        return;
+    }
     head = region_sample_head(tb);
     if (head == -1 || translator_region_is_head(head)) {
         return;

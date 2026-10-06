@@ -181,12 +181,49 @@ static __thread RegionStats *region_cur_stats;
  * Debug policies (XTCG_REGION_POLICY, comma-separated):
  *   keepflat  keep a region with no branch back to one of its blocks
  *             (by default it is dropped)
+ *   probe     count each region's entries; once the sampler has seen it
+ *             XTCG_REGION_PROBE_SAMPLES times (default 8), drop it if it
+ *             was entered more than XTCG_REGION_PROBE_RATE times per sample
+ *             (default 10000): it doesn't keep execution inside
  */
+typedef struct RegionProbe {
+    uint64_t entries;
+    unsigned samples;
+} RegionProbe;
+
+static GHashTable *region_probes;       /* head pc -> probe, region_lock */
 static bool region_policy(const char *name)
 {
     const char *p = getenv("XTCG_REGION_POLICY");
 
     return p && strstr(p, name);
+}
+
+bool translator_region_probe_sample(vaddr pc)
+{
+    unsigned want = getenv("XTCG_REGION_PROBE_SAMPLES")
+                    ? atoi(getenv("XTCG_REGION_PROBE_SAMPLES")) : 8;
+    uint64_t rate = getenv("XTCG_REGION_PROBE_RATE")
+                    ? atoi(getenv("XTCG_REGION_PROBE_RATE")) : 10000;
+    uint64_t key = pc;
+    RegionProbe *rp;
+    bool drop = false;
+
+    g_mutex_lock(&region_lock);
+    rp = region_probes ? g_hash_table_lookup(region_probes, &key) : NULL;
+    if (rp && ++rp->samples == want) {
+        drop = qatomic_read(&rp->entries) > rate * want;
+        if (getenv("XTCG_REGION_DEBUG")) {
+            fprintf(stderr, "region %" PRIx64 ": %" PRIu64 " entries in %u "
+                    "samples%s\n", (uint64_t)pc, rp->entries, want,
+                    drop ? ": dropped" : "");
+        }
+    }
+    g_mutex_unlock(&region_lock);
+    if (drop) {
+        region_drop(pc);
+    }
+    return drop;
 }
 
 static void region_stats_dump(void)
@@ -730,6 +767,21 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
         g_free(region_cur_stats);
         region_cur_stats = NULL;
+        if (region_policy("probe")) {
+            uint64_t *key = g_new(uint64_t, 1);
+            RegionProbe *rp = g_new0(RegionProbe, 1);
+
+            *key = pc;
+            g_mutex_lock(&region_lock);
+            if (!region_probes) {
+                region_probes = g_hash_table_new(g_int64_hash, g_int64_equal);
+            }
+            g_hash_table_replace(region_probes, key, rp);
+            g_mutex_unlock(&region_lock);
+            tcg_ctx->emit_before_op = loop_op;
+            region_count_u64(&rp->entries);
+            tcg_ctx->emit_before_op = NULL;
+        }
         if (getenv("XTCG_REGION_STATS")) {
             region_cur_stats = g_new0(RegionStats, 1);
             region_cur_stats->pc = pc;
