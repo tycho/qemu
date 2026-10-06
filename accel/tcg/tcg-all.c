@@ -48,6 +48,7 @@
 #include "accel/accel-cpu-ops.h"
 #include "accel/tcg/cpu-ops.h"
 #include "internal-common.h"
+#include "qemu/xtcg-stats.h"
 
 
 struct TCGState {
@@ -644,6 +645,16 @@ static void tcg_set_lazy_incdec(Object *obj, bool value, Error **errp)
     tcg_lazy_incdec = value;
 }
 
+static bool tcg_get_xtcg_stats(Object *obj, Error **errp)
+{
+    return xtcg_stats;
+}
+
+static void tcg_set_xtcg_stats(Object *obj, bool value, Error **errp)
+{
+    xtcg_stats_enable(value);
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -791,6 +802,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-lazyinc",
         "x86: INC and DEC after an unknown flags state keep that state "
         "for CF rather than computing it");
+
+    object_class_property_add_bool(oc, "x-stats",
+                                   tcg_get_xtcg_stats,
+                                   tcg_set_xtcg_stats);
+    object_class_property_set_description(oc, "x-stats",
+        "xtcg: count TCG events and print them to stderr at exit");
 }
 
 static const TypeInfo tcg_accel_type = {

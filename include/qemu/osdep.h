@@ -850,6 +850,10 @@ size_t qemu_get_host_physmem(void);
  * these two functions change the mode, and a thread starts with it unknown.
  */
 #ifdef __APPLE__
+/* xtcg Phase-1 counters, see qemu/xtcg-stats.h */
+extern bool xtcg_stats;
+void xtcg_stats_jit(bool execute);
+
 typedef enum {
     QEMU_THREAD_JIT_UNKNOWN,
     QEMU_THREAD_JIT_WRITE,
@@ -861,6 +865,9 @@ extern __thread QemuThreadJitMode qemu_thread_jit_mode;
 
 static inline void qemu_thread_jit_execute(void)
 {
+    if (unlikely(xtcg_stats)) {
+        xtcg_stats_jit(true);
+    }
     if (qemu_thread_jit_lazy) {
         if (qemu_thread_jit_mode == QEMU_THREAD_JIT_EXECUTE) {
             return;
@@ -872,6 +879,9 @@ static inline void qemu_thread_jit_execute(void)
 
 static inline void qemu_thread_jit_write(void)
 {
+    if (unlikely(xtcg_stats)) {
+        xtcg_stats_jit(false);
+    }
     if (qemu_thread_jit_lazy) {
         if (qemu_thread_jit_mode == QEMU_THREAD_JIT_WRITE) {
             return;
