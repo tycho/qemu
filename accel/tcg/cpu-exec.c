@@ -473,13 +473,17 @@ bool translator_region_sampling(void)
  * The loop head @tb belongs to, or -1.  A jump back further than a region
  * reaches (two pages) is taken for a call, not a loop.
  */
-static vaddr region_sample_head(TranslationBlock *tb)
+static vaddr region_sample_head(TranslationBlock *tb, bool outer)
 {
     vaddr head = -1;
     uintptr_t p;
 
     if (tb_cflags(tb) & CF_PCREL) {
         return -1;
+    }
+    if (outer) {
+        /* @tb is a region: only a loop around it, entered further back. */
+        goto back;
     }
     qemu_spin_lock(&tb->jmp_lock);
     p = tb->jmp_list_head;
@@ -498,6 +502,7 @@ static vaddr region_sample_head(TranslationBlock *tb)
     if (head != -1) {
         return head;
     }
+ back:
     for (int n = 0; n < TB_JMP_SLOTS; n++) {
         TranslationBlock *dst = (TranslationBlock *)
             (qatomic_read(&tb->jmp_dest[n]) & ~(uintptr_t)1);
@@ -530,10 +535,13 @@ static void region_sample(CPUState *cpu, TranslationBlock *tb)
             mmap_lock();
             tb_phys_invalidate(tb, -1);
             mmap_unlock();
+            return;
         }
-        return;
+        /* The sample counts for a loop around the region, if any. */
+        head = region_sample_head(tb, true);
+    } else {
+        head = region_sample_head(tb, false);
     }
-    head = region_sample_head(tb);
     if (head == -1 || translator_region_is_head(head)) {
         return;
     }
