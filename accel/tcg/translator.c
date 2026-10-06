@@ -157,6 +157,7 @@ bool translator_loop_back(DisasContextBase *db, vaddr dest)
 
 static GMutex region_lock;              /* static: needs no init */
 static GHashTable *region_heads;        /* promoted heads, under region_lock */
+static GHashTable *region_rejected;     /* dropped heads, under region_lock */
 
 /*
  * Debug statistics (XTCG_REGION_STATS=<file>): per region TB, its size
@@ -171,12 +172,15 @@ typedef struct RegionStats {
 } RegionStats;
 
 static GPtrArray *region_stats;         /* under region_lock */
-static __thread RegionStats *region_cur_stats;
 static __thread bool region_reject;     /* the region was dropped: retry */
+static __thread vaddr region_head_pc;   /* head of the region last tried */
+static void region_drop(vaddr pc);
+static __thread RegionStats *region_cur_stats;
 
 /*
  * Debug policies (XTCG_REGION_POLICY, comma-separated):
- *   acyclic  drop a region with no branch back to one of its blocks
+ *   keepflat  keep a region with no branch back to one of its blocks
+ *             (by default it is dropped)
  */
 static bool region_policy(const char *name)
 {
@@ -202,12 +206,12 @@ static void region_stats_dump(void)
         host += rs->host_size;
         entries += rs->entries;
         backs += rs->backs;
-        few += rs->entries < 100;
+        few += rs->entries + rs->backs < 1000;
         flat += rs->backs < rs->entries;
     }
     fprintf(f, "# regions %u guest_insns %" PRIu64 " host_bytes %" PRIu64
             " entries %" PRIu64 " backs %" PRIu64
-            " entered<100 %d backs<entries %d\n",
+            " runs<1000 %d backs<entries %d\n",
             region_stats->len, insns, host, entries, backs, few, flat);
     fprintf(f, "# pc blocks insns host backedges unchained entries backs\n");
     for (guint i = 0; i < region_stats->len; i++) {
@@ -264,6 +268,14 @@ bool translator_region_overflow(void)
         region_cap = region_tried / 2;
         return true;
     }
+    if (region_tried == 1) {
+        /* A region of one block gains nothing: translate a plain TB. */
+        region_drop(region_head_pc);
+        g_free(region_cur_stats);
+        region_cur_stats = NULL;
+        region_cap = -1;
+        return true;
+    }
     return false;
 }
 
@@ -288,9 +300,15 @@ void translator_region_reset(int host_size)
 static void region_drop(vaddr pc)
 {
     uint64_t key = pc;
+    uint64_t *rkey = g_new(uint64_t, 1);
 
+    *rkey = pc;
     g_mutex_lock(&region_lock);
     g_hash_table_remove(region_heads, &key);
+    if (!region_rejected) {
+        region_rejected = g_hash_table_new(g_int64_hash, g_int64_equal);
+    }
+    g_hash_table_add(region_rejected, rkey);
     g_mutex_unlock(&region_lock);
 }
 
@@ -337,7 +355,8 @@ bool translator_region_promote(vaddr pc)
     if (!region_heads) {
         region_heads = g_hash_table_new(g_int64_hash, g_int64_equal);
     }
-    if (!g_hash_table_contains(region_heads, &pc)) {
+    if (!g_hash_table_contains(region_heads, &pc)
+        && !(region_rejected && g_hash_table_contains(region_rejected, &pc))) {
         key = g_new(uint64_t, 1);
         *key = pc;
         g_hash_table_add(region_heads, key);
@@ -716,6 +735,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         }
         r->cpu = cpu;
         r->backedges = 0;
+        region_head_pc = pc;
         r->unchained = 0;
         r->n = r->next = 1;
         region_tried = 1;
@@ -826,8 +846,11 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             region_cur_stats->backedges = r->backedges;
             region_cur_stats->unchained = r->unchained;
         }
-        if (region_policy("acyclic") && !r->backedges) {
-            /* Nothing loops inside: translate the head as a plain TB. */
+        if (r->n == 1 || (!region_policy("keepflat") && !r->backedges)) {
+            /*
+             * One block (a plain TB loops on itself already), or nothing
+             * loops inside: translate the head as a plain TB.
+             */
             region_drop(db->pc_first);
             region_reject = true;
             g_free(region_cur_stats);
