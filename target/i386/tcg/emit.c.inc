@@ -4153,12 +4153,45 @@ static void gen_MOVD_from(DisasContext *s, X86DecodedInsn *decode)
     }
 }
 
+/*
+ * Operand 0, an xmm register, = @t zero-extended from element size @ot.
+ * With x-simd, built in a host vector register and stored in one piece:
+ * clearing the register and then storing the element over it makes a
+ * following 128-bit load of the register wait for two overlapping stores
+ * of different sizes, which hosts don't forward from.
+ */
+static bool gen_zext_to_xmm(DisasContext *s, X86DecodedInsn *decode,
+                            MemOp ot, TCGv_i64 t)
+{
+    int vec_len = vector_len(s, decode);
+    TCGv_vec v;
+
+    if (decode->op[0].unit != X86_OP_SSE ||
+        !vint_can(INDEX_op_insert_vec, ot)) {
+        return false;
+    }
+    v = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_insert_vec_i64(ot, v, tcg_constant_vec(TCG_TYPE_V128, MO_64, 0),
+                           t, 0);
+    tcg_gen_st_vec(v, tcg_env, decode->op[0].offset);
+    if (vec_len > 16) {
+        tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset + 16,
+                             vec_len - 16, vec_len - 16, 0);
+    }
+    return true;
+}
+
 static void gen_MOVD_to(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[2].ot;
     int vec_len = vector_len(s, decode);
     int lo_ofs = vector_elem_offset(&decode->op[0], ot, 0);
+    TCGv_i64 t = tcg_temp_new_i64();
 
+    tcg_gen_extu_tl_i64(t, s->T1);
+    if (gen_zext_to_xmm(s, decode, ot, t)) {
+        return;
+    }
     tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset, vec_len, vec_len, 0);
 
     switch (ot) {
@@ -4298,6 +4331,9 @@ static void gen_MOVQ(DisasContext *s, X86DecodedInsn *decode)
          * Because oprsz is 8, we see this here even for SSE; but more in general,
          * it disqualifies using oprsz < maxsz to emulate VEX128.
          */
+        if (gen_zext_to_xmm(s, decode, MO_64, t)) {
+            return;
+        }
         tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset, vec_len, vec_len, 0);
         tcg_gen_st_i64(t, tcg_env, lo_ofs);
     }
