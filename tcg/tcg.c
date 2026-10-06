@@ -7354,10 +7354,10 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     }
 
     /* Initialize goto_tb jump offsets. */
-    tb->jmp_reset_offset[0] = TB_JMP_OFFSET_INVALID;
-    tb->jmp_reset_offset[1] = TB_JMP_OFFSET_INVALID;
-    tb->jmp_insn_offset[0] = TB_JMP_OFFSET_INVALID;
-    tb->jmp_insn_offset[1] = TB_JMP_OFFSET_INVALID;
+    for (int n = 0; n < TB_JMP_SLOTS; n++) {
+        tb->jmp_reset_offset[n] = TB_JMP_OFFSET_INVALID;
+        tb->jmp_insn_offset[n] = TB_JMP_OFFSET_INVALID;
+    }
 
     tcg_reg_alloc_start(s);
 
