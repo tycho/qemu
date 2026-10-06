@@ -58,8 +58,16 @@ extern unsigned tcg_tlb_grow;
 bool translator_region_promote(vaddr pc);
 /* x-region-hot: whether @pc is a region head. */
 bool translator_region_is_head(vaddr pc);
-/* x-region-hot: a sample in region @pc; true if the region is dropped. */
-bool translator_region_probe_sample(vaddr pc);
+/* x-region-hot: a region that finished its probation, to invalidate. */
+typedef struct TranslatorRegionVerdict {
+    vaddr pc;
+    uint64_t cs_base;
+    uint32_t flags, cflags;
+    bool keep;
+} TranslatorRegionVerdict;
+
+/* Judge regions whose probation is over: at most @max, into @v. */
+int translator_region_judge(TranslatorRegionVerdict *v, int max);
 /* x-region-hot: whether heads come from sampling instead of counters. */
 bool translator_region_sampling(void);
 

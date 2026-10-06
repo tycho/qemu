@@ -181,17 +181,27 @@ static __thread RegionStats *region_cur_stats;
  * Debug policies (XTCG_REGION_POLICY, comma-separated):
  *   keepflat  keep a region with no branch back to one of its blocks
  *             (by default it is dropped)
- *   probe     count each region's entries; once the sampler has seen it
- *             XTCG_REGION_PROBE_SAMPLES times (default 8), drop it if it
- *             was entered more than XTCG_REGION_PROBE_RATE times per sample
- *             (default 10000): it doesn't keep execution inside
+ *   notrial   no probation: keep every region that loops
  */
-typedef struct RegionProbe {
-    uint64_t entries;
-    unsigned samples;
-} RegionProbe;
+/*
+ * Probation: a new region is first translated with counters for its
+ * entries and internal back edges.  Once it has run XTCG_REGION_TRIAL
+ * times (default 4096), translator_region_judge() keeps it (back edges at
+ * least half its entries: it holds a loop) or drops it, and invalidates
+ * the TB either way: a kept region is translated again without counters.
+ * A trial's counters are never freed (an invalidated TB may still be
+ * running on another vCPU).
+ */
+typedef struct RegionTrial {
+    uint64_t entries, backs;
+    vaddr pc;
+    uint64_t cs_base;
+    uint32_t flags, cflags;
+} RegionTrial;
 
-static GHashTable *region_probes;       /* head pc -> probe, region_lock */
+static GPtrArray *region_trials;        /* under region_lock */
+static GHashTable *region_kept;         /* heads that passed, region_lock */
+static __thread RegionTrial *region_cur_trial;
 static bool region_policy(const char *name)
 {
     const char *p = getenv("XTCG_REGION_POLICY");
@@ -199,31 +209,60 @@ static bool region_policy(const char *name)
     return p && strstr(p, name);
 }
 
-bool translator_region_probe_sample(vaddr pc)
+int translator_region_judge(TranslatorRegionVerdict *v, int max)
 {
-    unsigned want = getenv("XTCG_REGION_PROBE_SAMPLES")
-                    ? atoi(getenv("XTCG_REGION_PROBE_SAMPLES")) : 8;
-    uint64_t rate = getenv("XTCG_REGION_PROBE_RATE")
-                    ? atoi(getenv("XTCG_REGION_PROBE_RATE")) : 10000;
-    uint64_t key = pc;
-    RegionProbe *rp;
-    bool drop = false;
+    uint64_t want = getenv("XTCG_REGION_TRIAL")
+                    ? atoi(getenv("XTCG_REGION_TRIAL")) : 4096;
+    int n = 0;
 
     g_mutex_lock(&region_lock);
-    rp = region_probes ? g_hash_table_lookup(region_probes, &key) : NULL;
-    if (rp && ++rp->samples == want) {
-        drop = qatomic_read(&rp->entries) > rate * want;
-        if (getenv("XTCG_REGION_DEBUG")) {
-            fprintf(stderr, "region %" PRIx64 ": %" PRIu64 " entries in %u "
-                    "samples%s\n", (uint64_t)pc, rp->entries, want,
-                    drop ? ": dropped" : "");
+    for (guint i = 0; region_trials && i < region_trials->len && n < max;) {
+        RegionTrial *t = g_ptr_array_index(region_trials, i);
+        uint64_t e = qatomic_read(&t->entries), b = qatomic_read(&t->backs);
+        uint64_t *key;
+
+        if (e + b < want) {
+            i++;
+            continue;
         }
+        g_ptr_array_remove_index_fast(region_trials, i);
+        v[n] = (TranslatorRegionVerdict){
+            .pc = t->pc, .cs_base = t->cs_base, .flags = t->flags,
+            .cflags = t->cflags, .keep = b * 2 >= e,
+        };
+        if (v[n].keep) {
+            key = g_new(uint64_t, 1);
+            *key = t->pc;
+            if (!region_kept) {
+                region_kept = g_hash_table_new(g_int64_hash, g_int64_equal);
+            }
+            g_hash_table_add(region_kept, key);
+        }
+        if (getenv("XTCG_REGION_DEBUG")) {
+            fprintf(stderr, "region %" PRIx64 ": %" PRIu64 " entries, %"
+                    PRIu64 " back edges: %s\n", (uint64_t)t->pc, e, b,
+                    v[n].keep ? "kept" : "dropped");
+        }
+        n++;
     }
     g_mutex_unlock(&region_lock);
-    if (drop) {
-        region_drop(pc);
+    for (int i = 0; i < n; i++) {
+        if (!v[i].keep) {
+            region_drop(v[i].pc);
+        }
     }
-    return drop;
+    return n;
+}
+
+static bool region_is_kept(vaddr pc)
+{
+    uint64_t key = pc;
+    bool ret;
+
+    g_mutex_lock(&region_lock);
+    ret = region_kept && g_hash_table_contains(region_kept, &key);
+    g_mutex_unlock(&region_lock);
+    return ret;
 }
 
 static void region_stats_dump(void)
@@ -315,6 +354,8 @@ bool translator_region_overflow(void)
         region_drop(region_head_pc);
         g_free(region_cur_stats);
         region_cur_stats = NULL;
+        g_free(region_cur_trial);
+        region_cur_trial = NULL;
         region_cap = -1;
         return true;
     }
@@ -323,6 +364,15 @@ bool translator_region_overflow(void)
 
 void translator_region_reset(int host_size)
 {
+    if (region_cur_trial) {
+        g_mutex_lock(&region_lock);
+        if (!region_trials) {
+            region_trials = g_ptr_array_new();
+        }
+        g_ptr_array_add(region_trials, region_cur_trial);
+        g_mutex_unlock(&region_lock);
+        region_cur_trial = NULL;
+    }
     if (region_cur_stats) {
         region_cur_stats->host_size = host_size;
         g_mutex_lock(&region_lock);
@@ -462,6 +512,9 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
                 r->backedges++;
                 if (region_cur_stats) {
                     region_count_u64(&region_cur_stats->backs);
+                }
+                if (region_cur_trial) {
+                    region_count_u64(&region_cur_trial->backs);
                 }
             }
             return r->label[i];
@@ -767,19 +820,16 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
         g_free(region_cur_stats);
         region_cur_stats = NULL;
-        if (region_policy("probe")) {
-            uint64_t *key = g_new(uint64_t, 1);
-            RegionProbe *rp = g_new0(RegionProbe, 1);
-
-            *key = pc;
-            g_mutex_lock(&region_lock);
-            if (!region_probes) {
-                region_probes = g_hash_table_new(g_int64_hash, g_int64_equal);
-            }
-            g_hash_table_replace(region_probes, key, rp);
-            g_mutex_unlock(&region_lock);
+        g_free(region_cur_trial);
+        region_cur_trial = NULL;
+        if (!region_policy("notrial") && !region_is_kept(pc)) {
+            region_cur_trial = g_new0(RegionTrial, 1);
+            region_cur_trial->pc = pc;
+            region_cur_trial->cs_base = tb->cs_base;
+            region_cur_trial->flags = tb->flags;
+            region_cur_trial->cflags = cflags;
             tcg_ctx->emit_before_op = loop_op;
-            region_count_u64(&rp->entries);
+            region_count_u64(&region_cur_trial->entries);
             tcg_ctx->emit_before_op = NULL;
         }
         if (getenv("XTCG_REGION_STATS")) {
@@ -912,6 +962,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             region_reject = true;
             g_free(region_cur_stats);
             region_cur_stats = NULL;
+            g_free(region_cur_trial);
+            region_cur_trial = NULL;
             siglongjmp(tcg_ctx->jmp_trans, -2);
         }
         if (getenv("XTCG_REGION_DEBUG")) {

@@ -530,13 +530,24 @@ static void region_sample(CPUState *cpu, TranslationBlock *tb)
         return;
     }
     region_sample_seen = gen;
-    if (translator_region_is_head(tb->pc)) {
-        if (translator_region_probe_sample(tb->pc)) {
-            mmap_lock();
-            tb_phys_invalidate(tb, -1);
-            mmap_unlock();
-            return;
+    {
+        TranslatorRegionVerdict v[8];
+        int nv = translator_region_judge(v, ARRAY_SIZE(v));
+
+        for (int i = 0; i < nv; i++) {
+            TranslationBlock *old = tb_htable_lookup(cpu, (TCGTBCPUState){
+                .pc = v[i].pc, .cs_base = v[i].cs_base,
+                .flags = v[i].flags, .cflags = v[i].cflags,
+            });
+
+            if (old) {
+                mmap_lock();
+                tb_phys_invalidate(old, -1);
+                mmap_unlock();
+            }
         }
+    }
+    if (translator_region_is_head(tb->pc)) {
         /* The sample counts for a loop around the region, if any. */
         head = region_sample_head(tb, true);
     } else {
