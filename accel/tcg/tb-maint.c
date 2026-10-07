@@ -1045,6 +1045,7 @@ void tb_invalidate_phys_range(CPUState *cpu, tb_page_addr_t start,
 
     assert_memory_lock();
 
+    translator_region_forget(start, last);
     PAGE_FOR_EACH_TB(start, last, unused, tb, n) {
         do_tb_phys_invalidate(tb, true);
     }
@@ -1202,6 +1203,7 @@ void tb_invalidate_phys_range(CPUState *cpu, tb_page_addr_t start,
     struct page_collection *pages;
     tb_page_addr_t index, index_last;
 
+    translator_region_forget(start, last);
     pages = page_collection_lock(start, last);
 
     index_last = last >> TARGET_PAGE_BITS;
@@ -1234,7 +1236,10 @@ void tb_invalidate_phys_range_fast(CPUState *cpu, ram_addr_t start,
 
     if (p) {
         ram_addr_t last = start + len - 1;
-        struct page_collection *pages = page_collection_lock(start, last);
+        struct page_collection *pages;
+
+        translator_region_forget(start, last);
+        pages = page_collection_lock(start, last);
 
         tb_invalidate_phys_page_range__locked(cpu, pages, p,
                                               start, last, ra);

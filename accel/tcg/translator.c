@@ -169,7 +169,7 @@ bool translator_loop_back(DisasContextBase *db, vaddr dest)
 typedef struct RegionTrial {
     uint64_t entries, backs;
     int64_t start;              /* when probation began, g_get_monotonic_time */
-    vaddr pc;
+    tb_page_addr_t key;
     uint64_t cs_base;
     uint32_t flags, cflags;
 } RegionTrial;
@@ -200,20 +200,20 @@ static __thread RegionTrial *region_cur_trial;
 static __thread int region_cap;
 static __thread int region_tried;       /* blocks of the region last tried */
 static __thread bool region_reject;     /* the region was dropped: retry */
-static __thread vaddr region_head_pc;   /* head of the region last tried */
+static __thread tb_page_addr_t region_head_key; /* head last tried */
 
-static bool region_set_contains(GHashTable *set, vaddr pc)
+static bool region_set_contains(GHashTable *set, tb_page_addr_t head)
 {
-    uint64_t key = pc;
+    uint64_t key = head;
 
     return set && g_hash_table_contains(set, &key);
 }
 
-static void region_set_add(GHashTable **set, vaddr pc)
+static void region_set_add(GHashTable **set, tb_page_addr_t head)
 {
     uint64_t *key = g_new(uint64_t, 1);
 
-    *key = pc;
+    *key = head;
     if (!*set) {
         *set = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                      NULL);
@@ -221,52 +221,94 @@ static void region_set_add(GHashTable **set, vaddr pc)
     g_hash_table_add(*set, key);
 }
 
-bool translator_region_is_head(vaddr pc)
+bool translator_region_is_head(tb_page_addr_t head)
 {
     bool ret;
 
     g_mutex_lock(&region_lock);
-    ret = region_set_contains(region_heads, pc);
+    ret = region_set_contains(region_heads, head);
     g_mutex_unlock(&region_lock);
     return ret;
 }
 
-int translator_region_try_is_head(vaddr pc)
+int translator_region_try_is_head(tb_page_addr_t head)
 {
     bool ret;
 
     if (!g_mutex_trylock(&region_lock)) {
         return -1;
     }
-    ret = region_set_contains(region_heads, pc);
+    ret = region_set_contains(region_heads, head);
     g_mutex_unlock(&region_lock);
     return ret;
 }
 
-bool translator_region_promote(vaddr pc)
+bool translator_region_promote(tb_page_addr_t head)
 {
     bool added = false;
 
     g_mutex_lock(&region_lock);
-    if (!region_set_contains(region_heads, pc)
-        && !region_set_contains(region_dropped, pc)) {
-        region_set_add(&region_heads, pc);
+    if (!region_set_contains(region_heads, head)
+        && !region_set_contains(region_dropped, head)) {
+        region_set_add(&region_heads, head);
         added = true;
     }
     g_mutex_unlock(&region_lock);
     return added;
 }
 
-/* Drop @pc as a region head for good. */
-static void region_drop(vaddr pc)
+/* Drop @head as a region head for good. */
+static void region_drop(tb_page_addr_t head)
 {
-    uint64_t key = pc;
+    uint64_t key = head;
 
     g_mutex_lock(&region_lock);
     if (region_heads) {
         g_hash_table_remove(region_heads, &key);
     }
-    region_set_add(&region_dropped, pc);
+    region_set_add(&region_dropped, head);
+    g_mutex_unlock(&region_lock);
+}
+
+bool translator_region_io(const TranslationBlock *tb)
+{
+    tb_page_addr_t head = tb_page_addr0(tb);
+
+    if (!tcg_superblock || !translator_region_is_head(head)) {
+        return false;
+    }
+    region_drop(head);
+    return true;
+}
+
+static void region_set_forget(GHashTable *set, tb_page_addr_t start,
+                              tb_page_addr_t last)
+{
+    GHashTableIter it;
+    gpointer k;
+
+    if (!set) {
+        return;
+    }
+    g_hash_table_iter_init(&it, set);
+    while (g_hash_table_iter_next(&it, &k, NULL)) {
+        uint64_t head = *(uint64_t *)k;
+
+        if (head >= start && head <= last) {
+            g_hash_table_iter_remove(&it);
+        }
+    }
+}
+
+void translator_region_forget(tb_page_addr_t start, tb_page_addr_t last)
+{
+    if (!tcg_superblock) {
+        return;
+    }
+    g_mutex_lock(&region_lock);
+    region_set_forget(region_heads, start, last);
+    region_set_forget(region_kept, start, last);
+    region_set_forget(region_dropped, start, last);
     g_mutex_unlock(&region_lock);
 }
 
@@ -299,16 +341,16 @@ int translator_region_judge(TranslatorRegionVerdict *v, int max)
         }
         g_ptr_array_remove_index_fast(region_trials, i);
         v[n] = (TranslatorRegionVerdict){
-            .pc = t->pc, .cs_base = t->cs_base, .flags = t->flags,
+            .head = t->key, .cs_base = t->cs_base, .flags = t->flags,
             .cflags = t->cflags,
         };
         if (e + b < REGION_TRIAL_RUNS) {
-            g_hash_table_remove(region_heads, &(uint64_t){ t->pc });
+            g_hash_table_remove(region_heads, &(uint64_t){ t->key });
         } else if (b * 2 >= e) {
-            region_set_add(&region_kept, t->pc);
+            region_set_add(&region_kept, t->key);
         } else {
-            g_hash_table_remove(region_heads, &(uint64_t){ t->pc });
-            region_set_add(&region_dropped, t->pc);
+            g_hash_table_remove(region_heads, &(uint64_t){ t->key });
+            region_set_add(&region_dropped, t->key);
         }
         n++;
     }
@@ -332,7 +374,7 @@ bool translator_region_overflow(void)
         return true;
     }
     if (region_tried == 1) {
-        region_drop(region_head_pc);
+        region_drop(region_head_key);
         g_free(region_cur_trial);
         region_cur_trial = NULL;
         region_cap = -1;
@@ -544,24 +586,24 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         loop_op = tcg_last_op();
         db->region_capable = tcg_superblock && ops->block_start
                              && tb_page_addr0(tb) != -1
-                             && !(cflags & CF_PCREL);
+                             && !(cflags & CF_COUNT_MASK);
         if (db->region_capable) {
             translator_region_sampler_start();
         }
     }
     if (db->region_capable && region_cap >= 0
-        && translator_region_is_head(pc)) {
+        && translator_region_is_head(tb_page_addr0(tb))) {
         TranslatorRegion *r = tcg_malloc(sizeof(*r));
         bool kept;
 
         g_mutex_lock(&region_lock);
-        kept = region_set_contains(region_kept, pc);
+        kept = region_set_contains(region_kept, tb_page_addr0(tb));
         g_mutex_unlock(&region_lock);
         g_free(region_cur_trial);
         region_cur_trial = NULL;
         if (!kept) {
             region_cur_trial = g_new0(RegionTrial, 1);
-            region_cur_trial->pc = pc;
+            region_cur_trial->key = tb_page_addr0(tb);
             region_cur_trial->cs_base = tb->cs_base;
             region_cur_trial->flags = tb->flags;
             region_cur_trial->cflags = cflags;
@@ -583,7 +625,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         db->loop_label->region = true;
         db->region = r;
         region_tried = 1;
-        region_head_pc = pc;
+        region_head_key = tb_page_addr0(tb);
     }
 
  next_block:
@@ -651,6 +693,10 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
              * the remaining blocks only jump out to themselves.
              */
             gen_set_label(r->label[r->next]);
+#ifndef CONFIG_USER_ONLY
+            /* The last insn's block may branch back to this one. */
+            set_can_do_io(db, false);
+#endif
             db->pc_next = r->pc[r->next++];
             db->is_jmp = r->stubbing ? DISAS_TOO_MANY : DISAS_NEXT;
             r->block_insns = db->num_insns;
@@ -664,7 +710,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         db->pc_next = r->end;
         if (r->n == 1 || !r->backedges) {
             /* Nothing to gain: translate the head as a plain TB. */
-            region_drop(db->pc_first);
+            region_drop(tb_page_addr0(tb));
             region_reject = true;
             g_free(region_cur_trial);
             region_cur_trial = NULL;
