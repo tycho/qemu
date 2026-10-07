@@ -2179,11 +2179,14 @@ static void gen_ldy_env_A0(DisasContext *s, int offset, bool align)
         TCGv_vec v0 = tcg_temp_new_vec(TCG_TYPE_V128);
         TCGv_vec v1 = tcg_temp_new_vec(TCG_TYPE_V128);
 
-        /* Both halves are loaded before either is stored, as below. */
-        tcg_gen_qemu_ld_vec(v0, s->A0, mem_index,
-                            mop | (align ? MO_ALIGN_32 : 0));
+        /*
+         * Both halves are loaded before either is stored, as below.  x86
+         * doesn't order the accesses that make up one instruction's
+         * access, so they are ordered against other accesses as one.
+         */
         tcg_gen_addi_tl(a0_hi, s->A0, 16);
-        tcg_gen_qemu_ld_vec(v1, a0_hi, mem_index, mop);
+        tcg_gen_qemu_ld_vec2(v0, s->A0, mop | (align ? MO_ALIGN_32 : 0),
+                             v1, a0_hi, mop, mem_index);
         tcg_gen_st_vec(v0, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));
         tcg_gen_st_vec(v1, tcg_env, offset + offsetof(YMMReg, YMM_X(1)));
         return;
@@ -2203,10 +2206,16 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
     TCGv_i128 t = tcg_temp_new_i128();
     TCGv a0_hi = tcg_temp_new();
 
-    if (gen_st_vec_env(s, s->A0, offset + offsetof(YMMReg, YMM_X(0)),
-                       mop | (align ? MO_ALIGN_32 : 0))) {
+    if (tcg_vecmem && tcg_can_qemu_ldst_vec(mop)) {
+        TCGv_vec v0 = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec v1 = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        /* One access, as for gen_ldy_env_A0. */
+        tcg_gen_ld_vec(v0, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));
+        tcg_gen_ld_vec(v1, tcg_env, offset + offsetof(YMMReg, YMM_X(1)));
         tcg_gen_addi_tl(a0_hi, s->A0, 16);
-        gen_st_vec_env(s, a0_hi, offset + offsetof(YMMReg, YMM_X(1)), mop);
+        tcg_gen_qemu_st_vec2(v0, s->A0, mop | (align ? MO_ALIGN_32 : 0),
+                             v1, a0_hi, mop, mem_index);
         return;
     }
     tcg_gen_ld_i128(t, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));

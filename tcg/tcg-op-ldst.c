@@ -681,36 +681,61 @@ bool tcg_can_qemu_ldst_vec(MemOp memop)
     return atom == MO_ATOM_NONE || atom == MO_ATOM_IFALIGN_PAIR;
 }
 
-void tcg_gen_qemu_ld_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
-                             MemOp memop, TCGType addr_type)
+/* One vector access, without the barrier the memory order may need. */
+static void qemu_ldst_vec1(TCGOpcode opc, TCGv_vec val, TCGTemp *addr,
+                           TCGArg idx, MemOp memop, TCGType addr_type)
 {
     TCGTemp *addr_new;
 
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);
     tcg_debug_assert(tcg_can_qemu_ldst_vec(memop));
     check_max_alignment(memop_alignment_bits(memop));
-    tcg_gen_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
 
     addr_new = tci_extend_addr(addr);
-    gen_ldst1(INDEX_op_qemu_ld_vec, TCG_TYPE_V128, tcgv_vec_temp(val),
-              addr_new, make_memop_idx(qemu_ldst_vec_memop(memop), idx));
+    gen_ldst1(opc, TCG_TYPE_V128, tcgv_vec_temp(val), addr_new,
+              make_memop_idx(qemu_ldst_vec_memop(memop), idx));
     maybe_free_addr(addr, addr_new);
+}
+
+void tcg_gen_qemu_ld_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
+                             MemOp memop, TCGType addr_type)
+{
+    tcg_gen_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
+    qemu_ldst_vec1(INDEX_op_qemu_ld_vec, val, addr, idx, memop, addr_type);
 }
 
 void tcg_gen_qemu_st_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
                              MemOp memop, TCGType addr_type)
 {
-    TCGTemp *addr_new;
-
-    tcg_debug_assert(addr_type == tcg_ctx->addr_type);
-    tcg_debug_assert(tcg_can_qemu_ldst_vec(memop));
-    check_max_alignment(memop_alignment_bits(memop));
     tcg_gen_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
+    qemu_ldst_vec1(INDEX_op_qemu_st_vec, val, addr, idx, memop, addr_type);
+}
 
-    addr_new = tci_extend_addr(addr);
-    gen_ldst1(INDEX_op_qemu_st_vec, TCG_TYPE_V128, tcgv_vec_temp(val),
-              addr_new, make_memop_idx(qemu_ldst_vec_memop(memop), idx));
-    maybe_free_addr(addr, addr_new);
+/*
+ * Two vector accesses that make up one guest access, whose parts the
+ * guest doesn't order among themselves: the barrier the memory order
+ * needs is emitted once, for both.
+ */
+void tcg_gen_qemu_ld_vec2_chk(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
+                              TCGv_vec hi, TCGTemp *addr_hi, MemOp memop_hi,
+                              TCGArg idx, TCGType addr_type)
+{
+    tcg_gen_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
+    qemu_ldst_vec1(INDEX_op_qemu_ld_vec, lo, addr_lo, idx, memop_lo,
+                   addr_type);
+    qemu_ldst_vec1(INDEX_op_qemu_ld_vec, hi, addr_hi, idx, memop_hi,
+                   addr_type);
+}
+
+void tcg_gen_qemu_st_vec2_chk(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
+                              TCGv_vec hi, TCGTemp *addr_hi, MemOp memop_hi,
+                              TCGArg idx, TCGType addr_type)
+{
+    tcg_gen_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
+    qemu_ldst_vec1(INDEX_op_qemu_st_vec, lo, addr_lo, idx, memop_lo,
+                   addr_type);
+    qemu_ldst_vec1(INDEX_op_qemu_st_vec, hi, addr_hi, idx, memop_hi,
+                   addr_type);
 }
 
 static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
