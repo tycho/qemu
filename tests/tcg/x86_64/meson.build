@@ -64,6 +64,9 @@ tests += {
   'fxsave.c': {},
   'noexec.c': {},
   'segment-prefixes.c': {},
+  'smc-crossing.c': {
+    'cflags': ['-pthread', '-Wl,--no-warn-rwx-segments']
+  },
   'test-1648.c': {},
   'test-2175.c': {},
   'test-2413.c': {},
