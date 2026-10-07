@@ -955,7 +955,7 @@ static void qemu_ld_vec_ordered(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
     bool after;
 
     if (tcg_tso_vec_grouped(memop_lo, hi != NULL)) {
-        bool order = xtcg_dec("XTCG_NOACQ") ? 0 : tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
+        bool order = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
 
         tcg_ctx->tso_run_emit = true;
         qemu_ldst_vec1(INDEX_op_qemu_ld_vec, lo, addr_lo, idx, memop_lo,
