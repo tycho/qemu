@@ -63,4 +63,11 @@ void tcg_prologue_init(void);
  */
 extern bool tcg_tsc_counter;
 
+/*
+ * x86 guests: TCG implements the Hyper-V interface for the enlightenments
+ * it supports (hv-* CPU properties), and turns them on by default.  Needs
+ * tcg_tsc_counter.
+ */
+extern bool tcg_hyperv;
+
 #endif
