@@ -126,6 +126,9 @@ static void gen_st_i64(TCGv_i64 v, TCGTemp *addr, MemOpIdx oi)
 static bool tcg_ldst_private(void)
 {
 #ifdef CONFIG_USER_ONLY
+    if (tcg_ctx->ldst_unordered && tcg_tso_mode == TCG_TSO_ACQREL) {
+        return true;
+    }
     return tcg_tso_stack && tcg_ctx->ldst_private;
 #else
     return false;
@@ -681,6 +684,19 @@ static bool tcg_tso_grouped(MemOp memop)
 {
     return tcg_tso_vec_group && tcg_tso_mode == TCG_TSO_ACQREL &&
            memop_alignment_bits(memop) < MO_128;
+}
+
+/* [EXP] The unordered loads just emitted, ordered as one access. */
+void tcg_tso_loads_done(void)
+{
+    if (tcg_tso_mode != TCG_TSO_ACQREL || !tcg_mb_emitted()) {
+        return;
+    }
+    if (tcg_tso_vec_group) {
+        tcg_ctx->tso_run_ld = true;
+    } else {
+        tcg_gen_mb(TCG_MO_LD_LD | TCG_MO_LD_ST | TCG_BAR_SC);
+    }
 }
 
 void tcg_tso_run_end(void)

@@ -259,9 +259,53 @@ static bool sse_needs_alignment(DisasContext *s, X86DecodedInsn *decode, MemOp o
     }
 }
 
+/* [EXP] XTCG_RO / XTCG_GQ measurement switches. */
+static int xtcg_exp_env(const char *n)
+{
+    return getenv(n) != NULL;
+}
+
+void tcg_tso_loads_done(void);
+
+/*
+ * [EXP] XTCG_RO: a RIP-relative load from a page the guest can't write
+ * (at translation time) needs no ordering under x-tso-vec=group.
+ */
+static bool exp_ro_load(DisasContext *s, X86DecodedInsn *decode, MemOp ot)
+{
+#ifdef CONFIG_USER_ONLY
+    static int on = -1;
+    vaddr a = decode->mem.disp;
+    int len = 1 << (ot & MO_SIZE);
+
+    if (on < 0) {
+        on = xtcg_exp_env("XTCG_RO");
+    }
+    if (!on || !tcg_tso_vec_group || decode->mem.base != -2 ||
+        decode->mem.index != -1 || s->override >= 0) {
+        return false;
+    }
+    if ((ot & MO_SIZE) > MO_64) {
+        len = 16;
+    }
+    return !(page_get_flags(a) & PAGE_WRITE) &&
+           !(page_get_flags(a + len - 1) & PAGE_WRITE) &&
+           (page_get_flags(a) & PAGE_VALID);
+#else
+    return false;
+#endif
+}
+
 static void gen_load(DisasContext *s, X86DecodedInsn *decode, int opn, TCGv v)
 {
     X86DecodedOp *op = &decode->op[opn];
+    bool ro = op->has_ea && (op->unit == X86_OP_INT || op->unit == X86_OP_SSE) &&
+              exp_ro_load(s, decode, op->ot);
+
+    if (ro) {
+        tcg_ctx->ldst_unordered = true;
+        tcg_ctx->tso_run_emit = true;
+    }
 
     switch (op->unit) {
     case X86_OP_SKIP:
@@ -332,6 +376,10 @@ static void gen_load(DisasContext *s, X86DecodedInsn *decode, int opn, TCGv v)
 
     default:
         g_assert_not_reached();
+    }
+    if (ro) {
+        tcg_ctx->ldst_unordered = false;
+        tcg_ctx->tso_run_emit = false;
     }
 }
 
@@ -2643,6 +2691,14 @@ static TCGLabel *gen_vint_gather(DisasContext *s, X86DecodedInsn *decode,
         tcg_gen_ld_vec(d[h], tcg_env, d_ofs[h]);
         tcg_gen_ld_vec(m[h], tcg_env, m_ofs[h]);
     }
+    static int gq = -1;
+    if (gq < 0) {
+        gq = xtcg_exp_env("XTCG_GQ");
+    }
+    if (gq) {
+        tcg_ctx->ldst_unordered = true;
+        tcg_ctx->tso_run_emit = true;
+    }
     for (int i = 0; i < n; i++) {
         int h = i / per_half, j = i % per_half;
 
@@ -2665,6 +2721,11 @@ static TCGLabel *gen_vint_gather(DisasContext *s, X86DecodedInsn *decode,
         tcg_gen_st_vec(m[h], tcg_env, m_ofs[h]);
     }
 
+    if (gq) {
+        tcg_ctx->ldst_unordered = false;
+        tcg_ctx->tso_run_emit = false;
+        tcg_tso_loads_done();
+    }
     /* 64-bit indices, 32-bit elements: the rest of both registers is zero. */
     if (qidx && esz == MO_32) {
         if (s->vex_l) {

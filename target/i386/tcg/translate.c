@@ -34,6 +34,10 @@
 #include "helper-tcg.h"
 #include "host/counter.h"
 #include "decode-new.h"
+#ifdef CONFIG_USER_ONLY
+#include "user/page-protection.h"
+#include "exec/page-protection.h"
+#endif
 
 #include "exec/log.h"
 

@@ -2148,6 +2148,7 @@ void tcg_prologue_init(void)
 
 void tcg_func_start(TCGContext *s)
 {
+    s->ldst_unordered = false;
     s->tso_run_ld = false;
     s->tso_run_st = false;
     s->tso_run_emit = false;
