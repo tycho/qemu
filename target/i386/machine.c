@@ -335,6 +335,10 @@ static int cpu_post_load(void *opaque, int version_id)
 #ifndef CONFIG_USER_ONLY
     if (tcg_enabled() && tcg_tsc_counter) {
         x86_tsc_counter_set(env, env->tsc);
+        /* Hyper-V's reference time continues from vCPU 0's TSC. */
+        if (tcg_hyperv && CPU(cpu)->cpu_index == 0) {
+            x86_tsc_counter_rebase(env);
+        }
     }
 #endif
 
