@@ -231,7 +231,9 @@ static void x86_tcg_cpu_instance_init(CPUState *cs)
     x86_tcg_cpu_xsave_init();
 
 #ifndef CONFIG_USER_ONLY
+    /* x-hyperv: on by default; -cpu ...,hv-time=off etc. still apply. */
     if (tcg_hyperv) {
+        cpu->hyperv_features |= TCG_HYPERV_FEATURES;
         x86_tcg_hyperv_init();
     }
 #endif
