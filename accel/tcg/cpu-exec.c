@@ -370,17 +370,51 @@ static inline bool check_for_breakpoints(CPUState *cpu, vaddr pc,
         check_for_breakpoints_slow(cpu, pc, cflags);
 }
 
+/* A TB like the one described, starting at @head, for multi-block regions. */
+struct region_tb_desc {
+    tb_page_addr_t head;
+    uint64_t cs_base;
+    uint32_t flags, cflags;
+};
+
+static bool region_tb_cmp(const void *p, const void *d)
+{
+    const TranslationBlock *tb = p;
+    const struct region_tb_desc *desc = d;
+
+    return tb_page_addr0(tb) == desc->head &&
+           ((tb_cflags(tb) & CF_PCREL) || tb->pc == desc->head) &&
+           tb->cs_base == desc->cs_base &&
+           tb->flags == desc->flags &&
+           tb_cflags(tb) == desc->cflags;
+}
+
+/*
+ * The TB whose code starts at @head, whatever virtual address it runs at
+ * and wherever a second page is mapped.  A TB that isn't PC-relative is
+ * only a region head in user mode, where @head is its virtual address.
+ */
+static TranslationBlock *region_tb_lookup(tb_page_addr_t head,
+                                          uint64_t cs_base, uint32_t flags,
+                                          uint32_t cflags)
+{
+    struct region_tb_desc desc = {
+        .head = head, .cs_base = cs_base, .flags = flags, .cflags = cflags,
+    };
+    uint32_t h = tb_hash_func(head, cflags & CF_PCREL ? 0 : head,
+                              flags, cs_base, cflags);
+
+    return qht_lookup_custom(&tb_ctx.htable, &desc, h, region_tb_cmp);
+}
+
 bool translator_region_has_run(CPUState *cpu, const TranslationBlock *tb,
                                vaddr pc)
 {
-    TCGTBCPUState s = {
-        .pc = pc,
-        .cs_base = tb->cs_base,
-        .flags = tb->flags,
-        .cflags = tb_cflags(tb),
-    };
+    tb_page_addr_t head = get_page_addr_code_probe(cpu_env(cpu), pc);
 
-    return tb_htable_lookup(cpu, s) != NULL;
+    return head != -1 &&
+           region_tb_lookup(head, tb->cs_base, tb->flags,
+                            tb_cflags(tb)) != NULL;
 }
 
 /*
@@ -460,26 +494,34 @@ void translator_region_sampler_start(void)
     g_once(&once, region_sampler_init, NULL);
 }
 
-/* The loop @tb belongs to (a region: the loop around it), or -1. */
-static vaddr region_sample_head(TranslationBlock *tb, bool region)
+/*
+ * The loop @tb belongs to (a region: the loop around it), or NULL: the TB
+ * at its head.  TBs are compared by where their code starts, which for a
+ * PC-relative TB is the only address it has.
+ */
+static TranslationBlock *region_sample_head(TranslationBlock *tb,
+                                            bool region)
 {
-    vaddr head = -1;
+    tb_page_addr_t at = tb_page_addr0(tb);
+    TranslationBlock *head = NULL;
     uintptr_t p;
 
     if (!region) {
+        /* TBs are in the code buffer, which may be write-protected. */
+        qemu_thread_jit_write();
         qemu_spin_lock(&tb->jmp_lock);
         for (p = tb->jmp_list_head; p; ) {
             TranslationBlock *src = (TranslationBlock *)(p & ~TB_JMP_TAG_MASK);
 
-            if (src != tb && src->pc > tb->pc
-                && src->pc - tb->pc < 2 * TARGET_PAGE_SIZE) {
-                head = tb->pc;
+            if (src != tb && tb_page_addr0(src) > at &&
+                tb_page_addr0(src) - at < 2 * TARGET_PAGE_SIZE) {
+                head = tb;
                 break;
             }
             p = src->jmp_list_next[p & TB_JMP_TAG_MASK];
         }
         qemu_spin_unlock(&tb->jmp_lock);
-        if (head != -1) {
+        if (head) {
             return head;
         }
     }
@@ -487,26 +529,31 @@ static vaddr region_sample_head(TranslationBlock *tb, bool region)
         TranslationBlock *dst = (TranslationBlock *)
             (qatomic_read(&tb->jmp_dest[n]) & ~(uintptr_t)1);
 
-        if (dst && dst != tb && dst->pc < tb->pc
-            && tb->pc - dst->pc < 2 * TARGET_PAGE_SIZE
-            && (head == -1 || dst->pc < head)) {
-            head = dst->pc;
+        if (dst && dst != tb && tb_page_addr0(dst) != -1 &&
+            tb_page_addr0(dst) < at &&
+            at - tb_page_addr0(dst) < 2 * TARGET_PAGE_SIZE &&
+            (!head || tb_page_addr0(dst) < tb_page_addr0(head))) {
+            head = dst;
         }
     }
     return head;
 }
 
-static void region_invalidate(CPUState *cpu, vaddr pc, uint64_t cs_base,
+static void region_invalidate_tb(TranslationBlock *tb)
+{
+    mmap_lock();
+    tb_phys_invalidate(tb, -1);
+    mmap_unlock();
+}
+
+/* Invalidate the TBs starting at @head (one per second-page mapping). */
+static void region_invalidate(tb_page_addr_t head, uint64_t cs_base,
                               uint32_t flags, uint32_t cflags)
 {
-    TranslationBlock *tb = tb_htable_lookup(cpu, (TCGTBCPUState){
-        .pc = pc, .cs_base = cs_base, .flags = flags, .cflags = cflags,
-    });
+    TranslationBlock *tb;
 
-    if (tb) {
-        mmap_lock();
-        tb_phys_invalidate(tb, -1);
-        mmap_unlock();
+    while ((tb = region_tb_lookup(head, cs_base, flags, cflags))) {
+        region_invalidate_tb(tb);
     }
 }
 
@@ -515,26 +562,30 @@ static void region_sample(CPUState *cpu, TranslationBlock *tb)
 {
     unsigned gen = qatomic_read(&region_sample_gen);
     TranslatorRegionVerdict v[8];
+    TranslationBlock *head_tb;
     uint64_t *key;
     uintptr_t n;
-    vaddr head;
+    tb_page_addr_t head;
     int nv, is_head;
 
-    if (gen == region_sample_seen || (tb_cflags(tb) & CF_PCREL)) {
+    if (gen == region_sample_seen || tb_page_addr0(tb) == -1) {
         return;
     }
     region_sample_seen = gen;
     nv = translator_region_judge(v, ARRAY_SIZE(v));
     for (int i = 0; i < nv; i++) {
-        region_invalidate(cpu, v[i].pc, v[i].cs_base, v[i].flags,
-                          v[i].cflags);
+        region_invalidate(v[i].head, v[i].cs_base, v[i].flags, v[i].cflags);
     }
-    is_head = translator_region_try_is_head(tb->pc);
+    is_head = translator_region_try_is_head(tb_page_addr0(tb));
     if (is_head < 0) {
         return;
     }
-    head = region_sample_head(tb, is_head);
-    if (head == -1 || translator_region_try_is_head(head) != 0) {
+    head_tb = region_sample_head(tb, is_head);
+    if (!head_tb) {
+        return;
+    }
+    head = tb_page_addr0(head_tb);
+    if (translator_region_try_is_head(head) != 0) {
         return;
     }
     if (qemu_mutex_trylock(&region_sample_lock)) {
@@ -564,7 +615,7 @@ static void region_sample(CPUState *cpu, TranslationBlock *tb)
     qemu_mutex_unlock(&region_sample_lock);
     if (n >= tcg_superblock && translator_region_promote(head)) {
         qatomic_inc(&region_promotions);
-        region_invalidate(cpu, head, tb->cs_base, tb->flags, tb_cflags(tb));
+        region_invalidate_tb(head_tb);
     }
 }
 
