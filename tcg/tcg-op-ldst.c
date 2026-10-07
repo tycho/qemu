@@ -173,6 +173,11 @@ static bool tcg_mb_emitted(void)
  * is not provided by RCpc acquire/release: a guest that requires it gets
  * the barrier.
  */
+static int xtcg_dec(const char *n)
+{
+    return getenv(n) != NULL;
+}
+
 static MemOp tcg_gen_ldst_order(TCGBar type)
 {
     if (tcg_ldst_private()) {
@@ -336,7 +341,7 @@ static void tcg_gen_qemu_ld_i32_int(TCGv_i32 val, TCGTemp *addr,
     TCGv_i64 copy_addr;
     TCGTemp *addr_new;
 
-    order = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
+    order = xtcg_dec("XTCG_NOACQ") ? 0 : tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
     orig_memop = memop = tcg_canonicalize_memop(memop, 0, 0);
     orig_oi = make_memop_idx(memop, idx);
     memop |= order;
@@ -391,7 +396,7 @@ static void tcg_gen_qemu_st_i32_int(TCGv_i32 orig_val, TCGTemp *addr,
     TCGTemp *addr_new;
     MemOp order;
 
-    order = tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST);
+    order = xtcg_dec("XTCG_NOREL") ? 0 : tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST);
     memop = tcg_canonicalize_memop(memop, 0, 1);
     orig_oi = make_memop_idx(memop, idx);
     memop |= order;
@@ -440,7 +445,7 @@ static void tcg_gen_qemu_ld_i64_int(TCGv_i64 val, TCGTemp *addr,
     TCGv_i64 copy_addr;
     TCGTemp *addr_new;
 
-    order = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
+    order = xtcg_dec("XTCG_NOACQ") ? 0 : tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
     orig_memop = memop = tcg_canonicalize_memop(memop, 1, 0);
     orig_oi = make_memop_idx(memop, idx);
     memop |= order;
@@ -499,7 +504,7 @@ static void tcg_gen_qemu_st_i64_int(TCGv_i64 orig_val, TCGTemp *addr,
     TCGTemp *addr_new;
     MemOp order;
 
-    order = tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST);
+    order = xtcg_dec("XTCG_NOREL") ? 0 : tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST);
     memop = tcg_canonicalize_memop(memop, 1, 1);
     orig_oi = make_memop_idx(memop, idx);
     memop |= order;
@@ -682,6 +687,9 @@ static bool tcg_ldst_i128_acqrel(MemOp memop)
  */
 static bool tcg_tso_grouped(MemOp memop)
 {
+    if (xtcg_dec("XTCG_NOVEC")) {
+        return tcg_tso_mode == TCG_TSO_ACQREL;
+    }
     return tcg_tso_vec_group && tcg_tso_mode == TCG_TSO_ACQREL &&
            memop_alignment_bits(memop) < MO_128;
 }
@@ -701,7 +709,7 @@ void tcg_tso_loads_done(void)
 
 void tcg_tso_run_end(void)
 {
-    bool ld = tcg_ctx->tso_run_ld;
+    bool ld = tcg_ctx->tso_run_ld && !xtcg_dec("XTCG_NOVEC");
 
     tcg_ctx->tso_run_ld = false;
     tcg_ctx->tso_run_st = false;
@@ -933,6 +941,9 @@ static void qemu_ldst_vec1(TCGOpcode opc, TCGv_vec val, TCGTemp *addr,
  */
 static bool tcg_tso_vec_grouped(MemOp memop, bool pair)
 {
+    if (xtcg_dec("XTCG_NOVEC")) {
+        return tcg_tso_mode == TCG_TSO_ACQREL;
+    }
     return tcg_tso_vec_group && tcg_tso_mode == TCG_TSO_ACQREL &&
            (pair || memop_alignment_bits(memop) < MO_128);
 }
@@ -944,7 +955,7 @@ static void qemu_ld_vec_ordered(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
     bool after;
 
     if (tcg_tso_vec_grouped(memop_lo, hi != NULL)) {
-        bool order = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
+        bool order = xtcg_dec("XTCG_NOACQ") ? 0 : tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
 
         tcg_ctx->tso_run_emit = true;
         qemu_ldst_vec1(INDEX_op_qemu_ld_vec, lo, addr_lo, idx, memop_lo,
