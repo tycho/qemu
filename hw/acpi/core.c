@@ -33,6 +33,7 @@
 #include "qemu/module.h"
 #include "qemu/option.h"
 #include "system/runstate.h"
+#include "exec/icount.h"
 #include "trace.h"
 
 struct acpi_table_header {
@@ -525,7 +526,22 @@ static void acpi_pm_tmr_timer(void *opaque)
 
 static uint64_t acpi_pm_tmr_read(void *opaque, hwaddr addr, unsigned width)
 {
-    return acpi_pm_tmr_get(opaque);
+    ACPIREGS *ar = opaque;
+    uint32_t last = qatomic_read(&ar->tmr.last_read);
+    uint32_t d = acpi_pm_tmr_get(ar);
+
+    /*
+     * On hardware a read of the timer takes longer than a tick (279 ns),
+     * so two reads never return the same count, and guests rely on it:
+     * Windows XP's HAL rejects the timer once 1000 reads have repeated the
+     * previous one.  Reads here can be quicker than that, so wait for the
+     * next tick.  Not with icount, whose clock stands still meanwhile.
+     */
+    while (d == last && !icount_enabled()) {
+        d = acpi_pm_tmr_get(ar);
+    }
+    qatomic_set(&ar->tmr.last_read, d);
+    return d;
 }
 
 static void acpi_pm_tmr_write(void *opaque, hwaddr addr, uint64_t val,
