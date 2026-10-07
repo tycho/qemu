@@ -76,6 +76,22 @@ tcg_gen_qemu_st_vec(TCGv_vec v, TCGv_va a, TCGArg i, MemOp m)
     tcg_gen_qemu_st_vec_chk(v, tcgv_va_temp(a), i, m, TCG_TYPE_VA);
 }
 
+static inline void
+tcg_gen_qemu_ld_vec2(TCGv_vec lo, TCGv_va alo, MemOp mlo,
+                     TCGv_vec hi, TCGv_va ahi, MemOp mhi, TCGArg i)
+{
+    tcg_gen_qemu_ld_vec2_chk(lo, tcgv_va_temp(alo), mlo,
+                             hi, tcgv_va_temp(ahi), mhi, i, TCG_TYPE_VA);
+}
+
+static inline void
+tcg_gen_qemu_st_vec2(TCGv_vec lo, TCGv_va alo, MemOp mlo,
+                     TCGv_vec hi, TCGv_va ahi, MemOp mhi, TCGArg i)
+{
+    tcg_gen_qemu_st_vec2_chk(lo, tcgv_va_temp(alo), mlo,
+                             hi, tcgv_va_temp(ahi), mhi, i, TCG_TYPE_VA);
+}
+
 #define DEF_ATOMIC2(N, S)                                               \
     static inline void N##_##S(TCGv_##S r, TCGv_va a, TCGv_##S v,       \
                                TCGArg i, MemOp m)                       \
