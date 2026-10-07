@@ -2120,7 +2120,12 @@ static bool acqrel_may_cross(MemOp memop)
  */
 static bool acqrel_onepath(MemOp memop)
 {
-    return tcg_use_softmmu && (memop & MO_ACQ_REL)
+    static int off = -1;
+
+    if (off < 0) {
+        off = getenv("XTCG_NO_ONEPATH") != NULL;
+    }
+    return !off && tcg_use_softmmu && (memop & MO_ACQ_REL)
            && !(memop & MO_ACQ_REL_CROSS) && acqrel_may_cross(memop);
 }
 
