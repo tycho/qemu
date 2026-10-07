@@ -910,12 +910,39 @@ static void qemu_ldst_vec1(TCGOpcode opc, TCGv_vec val, TCGTemp *addr,
  * up one guest access (@hi non-null) need no order among themselves, so
  * the barrier is emitted once, for both.
  */
+/*
+ * tcg_tso_vec_group: a vector access the guest doesn't make atomic (not
+ * required to be 16-byte aligned, or half of a wider access) joins the
+ * run of grouped accesses, as for tcg_tso_grouped.
+ */
+static bool tcg_tso_vec_grouped(MemOp memop, bool pair)
+{
+    return tcg_tso_vec_group && tcg_tso_mode == TCG_TSO_ACQREL &&
+           (pair || memop_alignment_bits(memop) < MO_128);
+}
+
 static void qemu_ld_vec_ordered(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
                                 TCGv_vec hi, TCGTemp *addr_hi, MemOp memop_hi,
                                 TCGArg idx, TCGType addr_type)
 {
-    bool after = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
+    bool after;
 
+    if (tcg_tso_vec_grouped(memop_lo, hi != NULL)) {
+        bool order = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
+
+        tcg_ctx->tso_run_emit = true;
+        qemu_ldst_vec1(INDEX_op_qemu_ld_vec, lo, addr_lo, idx, memop_lo,
+                       addr_type);
+        if (hi) {
+            qemu_ldst_vec1(INDEX_op_qemu_ld_vec, hi, addr_hi, idx, memop_hi,
+                           addr_type);
+        }
+        tcg_ctx->tso_run_emit = false;
+        tcg_ctx->tso_run_ld |= order;
+        return;
+    }
+    tcg_tso_run_end();
+    after = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
     if (after && tcg_ldst_vec_acqrel(memop_lo)
         && (!hi || tcg_ldst_vec_acqrel(memop_hi))) {
         memop_lo |= MO_ACQ_REL;
@@ -937,6 +964,23 @@ static void qemu_st_vec_ordered(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
                                 TCGv_vec hi, TCGTemp *addr_hi, MemOp memop_hi,
                                 TCGArg idx, TCGType addr_type)
 {
+    if (tcg_tso_vec_grouped(memop_lo, hi != NULL)) {
+        if (!tcg_ctx->tso_run_st &&
+            tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST)) {
+            tcg_gen_req_mo_plain_st();
+            tcg_ctx->tso_run_st = true;
+        }
+        tcg_ctx->tso_run_emit = true;
+        qemu_ldst_vec1(INDEX_op_qemu_st_vec, lo, addr_lo, idx, memop_lo,
+                       addr_type);
+        if (hi) {
+            qemu_ldst_vec1(INDEX_op_qemu_st_vec, hi, addr_hi, idx, memop_hi,
+                           addr_type);
+        }
+        tcg_ctx->tso_run_emit = false;
+        return;
+    }
+    tcg_tso_run_end();
     if (tcg_ldst_vec_acqrel(memop_lo)
         && (!hi || tcg_ldst_vec_acqrel(memop_hi))) {
         /* A store-release orders earlier loads and stores before it. */
