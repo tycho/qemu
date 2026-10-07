@@ -249,6 +249,7 @@ STUB_HELPER(stgi, TCGv_env env)
 STUB_HELPER(svm_check_intercept, TCGv_env env, TCGv_i32 type)
 STUB_HELPER(vmload, TCGv_env env, TCGv_i32 aflag)
 STUB_HELPER(vmmcall, TCGv_env env)
+STUB_HELPER(hyperv_hypercall, TCGv_env env)
 STUB_HELPER(vmrun, TCGv_env env, TCGv_i32 aflag, TCGv_i32 pc_ofs)
 STUB_HELPER(vmsave, TCGv_env env, TCGv_i32 aflag)
 STUB_HELPER(write_crN, TCGv_env env, TCGv_i32 reg, TCGv val)
@@ -2903,6 +2904,16 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             s->base.is_jmp = DISAS_NORETURN;
             break;
 
+        case 0xc1: /* VMCALL: only as a Hyper-V hypercall */
+            if (!tcg_hyperv || CPL(s) != 0 || GUEST(s)) {
+                goto illegal_op;
+            }
+        hypercall:
+            gen_update_cc_op(s);
+            gen_update_eip_cur(s);
+            gen_helper_hyperv_hypercall(tcg_env);
+            break;
+
         case 0xca: /* clac */
             if (!(s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_SMAP)
                 || CPL(s) != 0) {
@@ -2990,6 +3001,9 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             break;
 
         case 0xd9: /* VMMCALL */
+            if (tcg_hyperv && CPL(s) == 0 && !GUEST(s)) {
+                goto hypercall;
+            }
             if (!SVME(s)) {
                 goto illegal_op;
             }

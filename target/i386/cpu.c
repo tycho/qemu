@@ -10024,6 +10024,13 @@ static bool x86_cpu_filter_features(X86CPU *cpu, bool verbose)
     return have_filtered_features;
 }
 
+/* TCG implements the Hyper-V interface for this vCPU (x-hyperv). */
+bool x86_tcg_hyperv(X86CPU *cpu)
+{
+    return tcg_enabled() && tcg_hyperv &&
+           (cpu->hyperv_features & TCG_HYPERV_FEATURES);
+}
+
 static void x86_cpu_hyperv_realize(X86CPU *cpu)
 {
     size_t len;

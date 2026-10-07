@@ -26,6 +26,7 @@
 #include "exec/target_page.h"
 #include "accel/tcg/cpu-ops.h"
 #include "tcg-cpu.h"
+#include "tcg/startup.h"
 
 /* Frob eflags into and out of the CPU temporary format.  */
 
@@ -228,6 +229,12 @@ static void x86_tcg_cpu_instance_init(CPUState *cs)
     }
 
     x86_tcg_cpu_xsave_init();
+
+#ifndef CONFIG_USER_ONLY
+    if (tcg_hyperv) {
+        x86_tcg_hyperv_init();
+    }
+#endif
 }
 
 static void x86_tcg_cpu_accel_class_init(ObjectClass *oc, const void *data)
