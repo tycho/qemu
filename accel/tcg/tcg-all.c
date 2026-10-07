@@ -663,6 +663,22 @@ static void tcg_set_superblock(Object *obj, Visitor *v, const char *name,
     tcg_superblock = value;
 }
 
+static char *tcg_get_tso_vec(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_tso_vec_group ? "group" : "strict");
+}
+
+static void tcg_set_tso_vec(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "strict")) {
+        tcg_tso_vec_group = false;
+    } else if (!strcmp(value, "group")) {
+        tcg_tso_vec_group = true;
+    } else {
+        error_setg(errp, "Invalid 'x-tso-vec' value: %s", value);
+    }
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -708,6 +724,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "acqrel (load-acquire/store-release accesses), "
         "auto (acqrel where the host supports it, else barrier), "
         "none (no barriers: unsafe, for measurement)");
+
+    object_class_property_add_str(oc, "x-tso-vec", tcg_get_tso_vec,
+                                  tcg_set_tso_vec);
+    object_class_property_set_description(oc, "x-tso-vec",
+        "Guest accesses wider than 8 bytes the guest doesn't make atomic: "
+        "strict (each ordered, default), group (with x-tso=acqrel, "
+        "barriers only where a run of them begins and ends: not exact)");
 
     object_class_property_add_bool(oc, "x-tso-stack",
                                    tcg_get_tso_stack, tcg_set_tso_stack);

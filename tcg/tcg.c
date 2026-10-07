@@ -259,6 +259,7 @@ bool tcg_iopl_runtime;
 
 TCGTsoMode tcg_tso_mode;
 bool tcg_tso_stack;
+bool tcg_tso_vec_group;
 
 /*
  * A guest insn is promoted (see tcg_tso_cross_count) once its MO_ACQ_REL
@@ -2147,6 +2148,9 @@ void tcg_prologue_init(void)
 
 void tcg_func_start(TCGContext *s)
 {
+    s->tso_run_ld = false;
+    s->tso_run_st = false;
+    s->tso_run_emit = false;
     tcg_pool_reset(s);
     s->nb_temps = s->nb_globals;
 
@@ -3881,7 +3885,20 @@ static TCGOp *tcg_op_alloc(TCGOpcode opc, unsigned nargs)
 
 TCGOp *tcg_emit_op(TCGOpcode opc, unsigned nargs)
 {
-    TCGOp *op = tcg_op_alloc(opc, nargs);
+    TCGOp *op;
+
+    /*
+     * A run of grouped guest accesses ends before any op that may access
+     * guest memory otherwise, call out or leave the straight-line code.
+     */
+    if (unlikely(tcg_ctx->tso_run_ld || tcg_ctx->tso_run_st) &&
+        !tcg_ctx->tso_run_emit && !tcg_ctx->emit_before_op &&
+        opc != INDEX_op_mb &&
+        (tcg_op_defs[opc].flags &
+         (TCG_OPF_BB_END | TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS))) {
+        tcg_tso_run_end();
+    }
+    op = tcg_op_alloc(opc, nargs);
 
     if (tcg_ctx->emit_before_op) {
         QTAILQ_INSERT_BEFORE(tcg_ctx->emit_before_op, op, link);
