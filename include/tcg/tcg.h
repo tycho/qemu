@@ -726,7 +726,7 @@ static inline bool tcg_op_buf_full(void)
      * 16-bit unsigned offsets, TranslationBlock.jmp_reset_offset[]
      * and TCGContext.gen_insn_end_off[].
      */
-    return tcg_ctx->nb_ops >= 4000;
+    return tcg_ctx->nb_ops >= (getenv("XTCG_OPS") ? atoi(getenv("XTCG_OPS")) : 4000);
 }
 
 /* pool based memory allocation */
