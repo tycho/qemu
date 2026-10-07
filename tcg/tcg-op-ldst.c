@@ -829,6 +829,7 @@ static bool tcg_ldst_vec_acqrel(MemOp memop)
 
 /* Exploratory: XTCG_VB=pair|noload|none (measurement only). */
 __thread bool xtcg_vb_skip_next;
+__thread bool xtcg_vb_skip_st_next;
 
 int xtcg_vb_mode(void)
 {
@@ -838,7 +839,7 @@ int xtcg_vb_mode(void)
         const char *e = getenv("XTCG_VB");
 
         m = !e ? 0 : !strcmp(e, "pair") ? 1 : !strcmp(e, "noload") ? 2
-            : !strcmp(e, "none") ? 3 : 0;
+            : !strcmp(e, "none") ? 3 : !strcmp(e, "pair2") ? 4 : 0;
     }
     return m;
 }
@@ -888,7 +889,7 @@ void tcg_gen_qemu_ld_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
               addr_new, make_memop_idx(qemu_ldst_vec_memop(memop), idx));
     maybe_free_addr(addr, addr_new);
 
-    if (after && xtcg_vb_mode() >= 2) {
+    if (after && (xtcg_vb_mode() == 2 || xtcg_vb_mode() == 3)) {
         after = false;
     }
     if (after && xtcg_vb_skip_next) {
@@ -911,9 +912,10 @@ void tcg_gen_qemu_st_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
     if (tcg_ldst_vec_acqrel(memop)) {
         /* A store-release orders earlier loads and stores before it. */
         memop |= tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST);
-    } else if (xtcg_vb_mode() < 3) {
+    } else if (xtcg_vb_mode() < 3 && !xtcg_vb_skip_st_next) {
         tcg_gen_req_mo_plain_st();
     }
+    xtcg_vb_skip_st_next = false;
 
     addr_new = tci_extend_addr(addr);
     gen_ldst1(INDEX_op_qemu_st_vec, TCG_TYPE_V128, tcgv_vec_temp(val),

@@ -2559,7 +2559,7 @@ static void gen_ldy_env_A0(DisasContext *s, int offset, bool align)
             extern __thread bool xtcg_vb_skip_next;
             extern int xtcg_vb_mode(void);
 
-            xtcg_vb_skip_next = xtcg_vb_mode() == 1;
+            xtcg_vb_skip_next = xtcg_vb_mode() == 1 || xtcg_vb_mode() == 4;
         }
         tcg_gen_qemu_ld_vec(v0, s->A0, mem_index,
                             mop | (align ? MO_ALIGN_32 : 0));
@@ -2587,6 +2587,12 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
     if (gen_st_vec_env(s, s->A0, offset + offsetof(YMMReg, YMM_X(0)),
                        mop | (align ? MO_ALIGN_32 : 0))) {
         tcg_gen_addi_tl(a0_hi, s->A0, 16);
+        {
+            extern __thread bool xtcg_vb_skip_st_next;
+            extern int xtcg_vb_mode(void);
+
+            xtcg_vb_skip_st_next = xtcg_vb_mode() == 4;
+        }
         gen_st_vec_env(s, a0_hi, offset + offsetof(YMMReg, YMM_X(1)),
                        mop | ymm_hi_align(align));
         return;
