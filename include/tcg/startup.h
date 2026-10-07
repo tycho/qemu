@@ -50,6 +50,14 @@ typedef enum TCGTsoMode {
 extern TCGTsoMode tcg_tso_mode;
 
 /*
+ * Guest accesses wider than 8 bytes that the guest doesn't make atomic
+ * (accel property x-tso-vec): each ordered like any access (false, the
+ * default), or, under TCG_TSO_ACQREL, as runs with barriers only where a
+ * run begins and ends (true).  Not exact: see tcg_tso_run_end().
+ */
+extern bool tcg_tso_vec_group;
+
+/*
  * In qemu-user, guest accesses the front end marks as thread-private
  * (TCGContext.ldst_private: x86 RSP-based and implicit stack accesses)
  * get no memory-order constraint (accel property x-tso-stack).
