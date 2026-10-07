@@ -62,6 +62,7 @@ tests += {
   },
   'fma.c': {},
   'fxsave.c': {},
+  'maskmov-page.c': {},
   'noexec.c': {},
   'segment-prefixes.c': {},
   'sse-scalar-mem.c': {},
