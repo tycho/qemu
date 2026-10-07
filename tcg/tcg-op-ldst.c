@@ -912,7 +912,7 @@ void tcg_gen_qemu_st_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
     if (tcg_ldst_vec_acqrel(memop)) {
         /* A store-release orders earlier loads and stores before it. */
         memop |= tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST);
-    } else if (xtcg_vb_mode() < 3 && !xtcg_vb_skip_st_next) {
+    } else if (xtcg_vb_mode() != 3 && !xtcg_vb_skip_st_next) {
         tcg_gen_req_mo_plain_st();
     }
     xtcg_vb_skip_st_next = false;
