@@ -30,6 +30,7 @@
 /*
  * Hypercall numbers
  */
+#define HV_NOTIFY_LONG_SPIN_WAIT              0x0008
 #define HV_POST_MESSAGE                       0x005c
 #define HV_SIGNAL_EVENT                       0x005d
 #define HV_POST_DEBUG_DATA                    0x0069

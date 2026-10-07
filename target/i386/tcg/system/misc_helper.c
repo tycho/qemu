@@ -314,15 +314,20 @@ void helper_wrmsr(CPUX86State *env)
         if (tcg_tsc_counter) {
             env->tsc_adjust += val - cpu_get_tsc(env);
             x86_tsc_counter_set(env, val);
+            x86_tcg_hyperv_tsc_changed(env);
         }
         break;
     case MSR_TSC_ADJUST:
         if (tcg_tsc_counter) {
             x86_tsc_counter_set(env, cpu_get_tsc(env) + val - env->tsc_adjust);
             env->tsc_adjust = val;
+            x86_tcg_hyperv_tsc_changed(env);
         }
         break;
     default:
+        if (x86_tcg_hyperv_wrmsr(env, (uint32_t)env->regs[R_ECX], val)) {
+            break;
+        }
         if ((uint32_t)env->regs[R_ECX] >= MSR_MC0_CTL
             && (uint32_t)env->regs[R_ECX] < MSR_MC0_CTL +
             (4 * env->mcg_cap & 0xff)) {
@@ -507,6 +512,9 @@ void helper_rdmsr(CPUX86State *env)
         val = tcg_tsc_counter ? env->tsc_adjust : 0;
         break;
     default:
+        if (x86_tcg_hyperv_rdmsr(env, (uint32_t)env->regs[R_ECX], &val)) {
+            break;
+        }
         if ((uint32_t)env->regs[R_ECX] >= MSR_MC0_CTL
             && (uint32_t)env->regs[R_ECX] < MSR_MC0_CTL +
             (4 * env->mcg_cap & 0xff)) {

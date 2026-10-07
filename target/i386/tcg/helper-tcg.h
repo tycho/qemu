@@ -124,6 +124,14 @@ void do_smm_enter(X86CPU *cpu);
 /* system/bpt_helper.c */
 bool check_hw_breakpoints(CPUX86State *env, bool force_dr6_update);
 
+/* system/hyperv.c */
+#ifndef CONFIG_USER_ONLY
+void x86_tcg_hyperv_init(void);
+void x86_tcg_hyperv_tsc_changed(CPUX86State *env);
+bool x86_tcg_hyperv_rdmsr(CPUX86State *env, uint32_t msr, uint64_t *val);
+bool x86_tcg_hyperv_wrmsr(CPUX86State *env, uint32_t msr, uint64_t val);
+#endif
+
 /*
  * Do the tasks usually performed by gen_eob().  Callers of this function
  * should also handle TF as appropriate.
