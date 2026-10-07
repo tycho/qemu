@@ -8610,6 +8610,68 @@ uint32_t cpu_x86_virtual_addr_width(CPUX86State *env)
     }
 }
 
+/*
+ * Hyper-V's CPUID leaves for the enlightenments TCG implements, as KVM
+ * builds them (kvm.c, hyperv_fill_cpuids).
+ */
+static void x86_tcg_hyperv_cpuid(X86CPU *cpu, uint32_t index,
+                                 uint32_t *eax, uint32_t *ebx,
+                                 uint32_t *ecx, uint32_t *edx)
+{
+    *eax = *ebx = *ecx = *edx = 0;
+    switch (index) {
+    case HV_CPUID_VENDOR_AND_MAX_FUNCTIONS:
+        *eax = HV_CPUID_IMPLEMENT_LIMITS;
+        *ebx = cpu->hyperv_vendor_id[0];
+        *ecx = cpu->hyperv_vendor_id[1];
+        *edx = cpu->hyperv_vendor_id[2];
+        break;
+    case HV_CPUID_INTERFACE:
+        *eax = cpu->hyperv_interface_id[0];
+        *ebx = cpu->hyperv_interface_id[1];
+        *ecx = cpu->hyperv_interface_id[2];
+        *edx = cpu->hyperv_interface_id[3];
+        break;
+    case HV_CPUID_VERSION:
+        *eax = cpu->hyperv_ver_id_build;
+        *ebx = (uint32_t)cpu->hyperv_ver_id_major << 16 |
+               cpu->hyperv_ver_id_minor;
+        *ecx = cpu->hyperv_ver_id_sp;
+        *edx = (uint32_t)cpu->hyperv_ver_id_sb << 24 |
+               (cpu->hyperv_ver_id_sn & 0xffffff);
+        break;
+    case HV_CPUID_FEATURES:
+        *eax = HV_HYPERCALL_AVAILABLE;
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_VPINDEX)) {
+            *eax |= HV_VP_INDEX_AVAILABLE;
+        }
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_TIME)) {
+            *eax |= HV_TIME_REF_COUNT_AVAILABLE | HV_REFERENCE_TSC_AVAILABLE;
+        }
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_FREQUENCIES)) {
+            *eax |= HV_ACCESS_FREQUENCY_MSRS;
+            *edx |= HV_FREQUENCY_MSRS_AVAILABLE;
+        }
+        *edx |= HV_CPU_DYNAMIC_PARTITIONING_AVAILABLE;
+        break;
+    case HV_CPUID_ENLIGHTMENT_INFO:
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_RELAXED)) {
+            *eax |= HV_RELAXED_TIMING_RECOMMENDED;
+        }
+        *ebx = cpu->hyperv_spinlock_attempts;
+        break;
+    case HV_CPUID_IMPLEMENT_LIMITS:
+#ifndef CONFIG_USER_ONLY
+        *eax = cpu->hv_max_vps >= 0 ? cpu->hv_max_vps :
+               MACHINE(qdev_get_machine())->smp.max_cpus;
+#endif
+        *ebx = cpu->hyperv_limits[0];
+        *ecx = cpu->hyperv_limits[1];
+        *edx = cpu->hyperv_limits[2];
+        break;
+    }
+}
+
 void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                    uint32_t *eax, uint32_t *ebx,
                    uint32_t *ecx, uint32_t *edx)
@@ -8629,7 +8691,7 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
     } else if (index >= 0x80000000) {
         limit = env->cpuid_xlevel;
     } else if (index >= 0x40000000) {
-        limit = 0x40000001;
+        limit = x86_tcg_hyperv(cpu) ? 0x40000005 : 0x40000001;
     } else {
         limit = env->cpuid_level;
     }
@@ -9071,7 +9133,18 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
             *ebx = env->features[FEAT_29_0_EBX];
         }
         break;
-    case 0x40000000:
+    case 0x40000000 ... 0x40000005:
+        if (x86_tcg_hyperv(cpu)) {
+            x86_tcg_hyperv_cpuid(cpu, index, eax, ebx, ecx, edx);
+            break;
+        }
+        if (index != 0x40000000) {
+            *eax = 0;
+            *ebx = 0;
+            *ecx = 0;
+            *edx = 0;
+            break;
+        }
         /*
          * CPUID code in kvm_arch_init_vcpu() ignores stuff
          * set here, but we restrict to TCG none the less.
@@ -9088,12 +9161,6 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
             *ecx = 0;
             *edx = 0;
         }
-        break;
-    case 0x40000001:
-        *eax = 0;
-        *ebx = 0;
-        *ecx = 0;
-        *edx = 0;
         break;
     case 0x80000000:
         *eax = env->cpuid_xlevel;
