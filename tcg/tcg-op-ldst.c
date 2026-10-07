@@ -846,6 +846,35 @@ bool tcg_can_qemu_ldst_vec(MemOp memop)
     return atom == MO_ATOM_NONE || atom == MO_ATOM_IFALIGN_PAIR;
 }
 
+/* Exploratory: XTCG_VG=1 groups non-atomic vector accesses. */
+static bool xtcg_vg(void)
+{
+    static int v = -1;
+
+    if (v < 0) {
+        v = getenv("XTCG_VG") != NULL;
+    }
+    return v;
+}
+
+void tcg_vec_group_flush(void)
+{
+    bool ld = tcg_ctx->vg_ld_pending;
+
+    tcg_ctx->vg_ld_pending = false;
+    tcg_ctx->vg_st_ordered = false;
+    if (ld) {
+        tcg_gen_mb(TCG_MO_LD_LD | TCG_MO_LD_ST | TCG_BAR_SC);
+    }
+}
+
+/* Not a 16-byte access x86 makes atomic: a pair, or an unaligned form. */
+static bool vec_groupable(MemOp memop, bool pair)
+{
+    return xtcg_vg() && tcg_tso_mode == TCG_TSO_ACQREL
+        && (pair || memop_alignment_bits(memop) < MO_128);
+}
+
 /* One vector access, without the barrier the memory order may need. */
 static void qemu_ldst_vec1(TCGOpcode opc, TCGv_vec val, TCGTemp *addr,
                            TCGArg idx, MemOp memop, TCGType addr_type)
@@ -873,8 +902,22 @@ static void qemu_ld_vec_ordered(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
                                 TCGv_vec hi, TCGTemp *addr_hi, MemOp memop_hi,
                                 TCGArg idx, TCGType addr_type)
 {
-    bool after = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
+    bool after;
 
+    if (vec_groupable(memop_lo, hi != NULL)) {
+        if (tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD)) {
+            tcg_ctx->vg_ld_pending = true;
+        }
+        qemu_ldst_vec1(INDEX_op_qemu_ld_vec, lo, addr_lo, idx, memop_lo,
+                       addr_type);
+        if (hi) {
+            qemu_ldst_vec1(INDEX_op_qemu_ld_vec, hi, addr_hi, idx, memop_hi,
+                           addr_type);
+        }
+        return;
+    }
+    tcg_vec_group_flush();
+    after = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
     if (after && tcg_ldst_vec_acqrel(memop_lo)
         && (!hi || tcg_ldst_vec_acqrel(memop_hi))) {
         memop_lo |= MO_ACQ_REL;
@@ -896,6 +939,21 @@ static void qemu_st_vec_ordered(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
                                 TCGv_vec hi, TCGTemp *addr_hi, MemOp memop_hi,
                                 TCGArg idx, TCGType addr_type)
 {
+    if (vec_groupable(memop_lo, hi != NULL)) {
+        if (!tcg_ctx->vg_st_ordered
+            && tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST)) {
+            tcg_gen_req_mo_plain_st();
+            tcg_ctx->vg_st_ordered = true;
+        }
+        qemu_ldst_vec1(INDEX_op_qemu_st_vec, lo, addr_lo, idx, memop_lo,
+                       addr_type);
+        if (hi) {
+            qemu_ldst_vec1(INDEX_op_qemu_st_vec, hi, addr_hi, idx, memop_hi,
+                           addr_type);
+        }
+        return;
+    }
+    tcg_vec_group_flush();
     if (tcg_ldst_vec_acqrel(memop_lo)
         && (!hi || tcg_ldst_vec_acqrel(memop_hi))) {
         /* A store-release orders earlier loads and stores before it. */

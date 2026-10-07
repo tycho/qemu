@@ -386,6 +386,8 @@ typedef struct TCGLazyMap {
 } TCGLazyMap;
 
 struct TCGContext {
+    /* Exploratory XTCG_VG: a run of grouped vector accesses is open. */
+    bool vg_ld_pending, vg_st_ordered;
     uintptr_t pool_cur, pool_end;
     TCGPool *pool_first, *pool_current, *pool_first_large;
     int nb_labels;

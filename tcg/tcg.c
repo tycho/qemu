@@ -2147,6 +2147,8 @@ void tcg_prologue_init(void)
 
 void tcg_func_start(TCGContext *s)
 {
+    s->vg_ld_pending = false;
+    s->vg_st_ordered = false;
     tcg_pool_reset(s);
     s->nb_temps = s->nb_globals;
 
@@ -3879,9 +3881,21 @@ static TCGOp *tcg_op_alloc(TCGOpcode opc, unsigned nargs)
     return op;
 }
 
+void tcg_vec_group_flush(void);
+
 TCGOp *tcg_emit_op(TCGOpcode opc, unsigned nargs)
 {
-    TCGOp *op = tcg_op_alloc(opc, nargs);
+    TCGOp *op;
+
+    if (unlikely(tcg_ctx->vg_ld_pending || tcg_ctx->vg_st_ordered)
+        && !tcg_ctx->emit_before_op
+        && opc != INDEX_op_qemu_ld_vec && opc != INDEX_op_qemu_st_vec
+        && opc != INDEX_op_mb
+        && (tcg_op_defs[opc].flags
+            & (TCG_OPF_BB_END | TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS))) {
+        tcg_vec_group_flush();
+    }
+    op = tcg_op_alloc(opc, nargs);
 
     if (tcg_ctx->emit_before_op) {
         QTAILQ_INSERT_BEFORE(tcg_ctx->emit_before_op, op, link);
