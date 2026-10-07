@@ -57,6 +57,7 @@ struct TCGState {
     int splitwx_enabled;
     unsigned long tb_size;
     bool hosttime;
+    bool hyperv;
 };
 typedef struct TCGState TCGState;
 
@@ -162,6 +163,20 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #endif
         tcg_tsc_counter = HOST_COUNTER_SUPPORTED && !icount_enabled();
     }
+
+#ifndef CONFIG_USER_ONLY
+    /*
+     * x-hyperv: the reference TSC page and reference time are the TSC
+     * scaled to 100 ns, which needs the TSC at a fixed 1 GHz.
+     */
+    if (s->hyperv) {
+        if (!tcg_tsc_counter) {
+            error_report("x-hyperv needs x-hosttime (and no icount)");
+            return -EINVAL;
+        }
+        tcg_hyperv = true;
+    }
+#endif
 
     tcg_allowed = true;
 
@@ -286,6 +301,16 @@ static void tcg_set_hosttime(Object *obj, bool value, Error **errp)
     TCG_STATE(obj)->hosttime = value;
 }
 
+static bool tcg_get_hyperv(Object *obj, Error **errp)
+{
+    return TCG_STATE(obj)->hyperv;
+}
+
+static void tcg_set_hyperv(Object *obj, bool value, Error **errp)
+{
+    TCG_STATE(obj)->hyperv = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -324,6 +349,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "finer than 1 us), and the x86 TSC from the host's constant-rate "
         "counter, read inline, invariant, with IA32_TSC_ADJUST (not with "
         "icount)");
+
+    object_class_property_add_bool(oc, "x-hyperv",
+                                   tcg_get_hyperv, tcg_set_hyperv);
+    object_class_property_set_description(oc, "x-hyperv",
+        "x86 system mode: implement the Hyper-V interface for hv-relaxed, "
+        "hv-vpindex, hv-time and hv-frequencies (otherwise ignored under "
+        "TCG), and turn them on by default; needs x-hosttime");
 }
 
 static const TypeInfo tcg_accel_type = {
