@@ -992,7 +992,7 @@ static void qemu_st_vec_ordered(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
                                 TCGArg idx, TCGType addr_type)
 {
     if (tcg_tso_vec_grouped(memop_lo, hi != NULL)) {
-        if (!tcg_ctx->tso_run_st &&
+        if (!tcg_ctx->tso_run_st && !xtcg_dec("XTCG_NOVEC") &&
             tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST)) {
             tcg_gen_req_mo_plain_st();
             tcg_ctx->tso_run_st = true;
