@@ -2840,6 +2840,9 @@ void cpu_x86_update_dr7(CPUX86State *env, uint32_t new_dr7);
 uint64_t cpu_get_tsc(CPUX86State *env);
 void x86_tsc_counter_set(CPUX86State *env, uint64_t tsc);
 void x86_tsc_counter_reset(CPUX86State *env);
+uint64_t x86_tsc_counter_partition(void);
+int64_t x86_tsc_counter_base(void);
+void x86_tsc_counter_rebase(CPUX86State *env);
 
 #define CPU_RESOLVING_TYPE TYPE_X86_CPU
 
@@ -3088,6 +3091,14 @@ static inline bool hyperv_feat_enabled(X86CPU *cpu, int feat)
 {
     return !!(cpu->hyperv_features & BIT(feat));
 }
+
+/* The Hyper-V enlightenments TCG implements (tcg_hyperv). */
+#define TCG_HYPERV_FEATURES (BIT(HYPERV_FEAT_RELAXED) | \
+                             BIT(HYPERV_FEAT_VPINDEX) | \
+                             BIT(HYPERV_FEAT_TIME) | \
+                             BIT(HYPERV_FEAT_FREQUENCIES))
+
+bool x86_tcg_hyperv(X86CPU *cpu);
 
 static inline uint64_t cr4_reserved_bits(CPUX86State *env)
 {
