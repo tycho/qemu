@@ -115,6 +115,7 @@ struct ACPIPMTimer {
     QEMUTimer *timer;
     MemoryRegion io;
     int64_t overflow_time;
+    uint32_t last_read;
 
     acpi_update_sci_fn update_sci;
 };
