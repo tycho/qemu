@@ -393,6 +393,14 @@ bool tcg_can_qemu_ldst_vec(MemOp);
 bool tcg_can_qemu_ldst_vec_acqrel(void);
 void tcg_gen_qemu_ld_vec_chk(TCGv_vec, TCGTemp *, TCGArg, MemOp, TCGType);
 void tcg_gen_qemu_st_vec_chk(TCGv_vec, TCGTemp *, TCGArg, MemOp, TCGType);
+/*
+ * Two such accesses that make up one guest access whose parts need no
+ * order among themselves (e.g. a 32-byte access): ordered once, as one.
+ */
+void tcg_gen_qemu_ld_vec2_chk(TCGv_vec, TCGTemp *, MemOp,
+                              TCGv_vec, TCGTemp *, MemOp, TCGArg, TCGType);
+void tcg_gen_qemu_st_vec2_chk(TCGv_vec, TCGTemp *, MemOp,
+                              TCGv_vec, TCGTemp *, MemOp, TCGArg, TCGType);
 
 /* Atomic ops */
 
