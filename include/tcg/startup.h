@@ -38,6 +38,14 @@ typedef enum TCGTsoMode {
 extern TCGTsoMode tcg_tso_mode;
 
 /*
+ * Guest accesses wider than 8 bytes that the guest doesn't make atomic
+ * (accel property x-tso-vec): each ordered like any access (false, the
+ * default), or, under TCG_TSO_ACQREL, as runs with barriers only where a
+ * run begins and ends (true).  Not exact: see tcg_tso_run_end().
+ */
+extern bool tcg_tso_vec_group;
+
+/*
  * With TCG_TSO_ACQREL, a guest insn whose MO_ACQ_REL accesses have crossed
  * a 16-byte boundary is promoted: retranslated with MO_ACQ_REL_CROSS, a
  * form that handles any alignment without a data-dependent branch.

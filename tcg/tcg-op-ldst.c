@@ -608,6 +608,35 @@ static bool tcg_ldst_i128_acqrel(MemOp memop)
            !((memop & MO_BSWAP) && !tcg_target_has_memory_bswap(memop));
 }
 
+/*
+ * tcg_tso_vec_group: under TCG_TSO_ACQREL, guest accesses wider than 8
+ * bytes that the guest doesn't make atomic (here: not required to be
+ * 16-byte aligned) form runs.  Inside a run nothing orders them among
+ * themselves; the run's first store gets the barrier a store needs, and a
+ * run with loads ends with the barrier a load needs after it, before the
+ * next op that may access guest memory otherwise, call out or branch
+ * (tcg_emit_op).  Every order between a run and other accesses holds,
+ * since those are load-acquires and store-releases; only the order among
+ * the run's own accesses is given up.  Aligned accesses, which may be
+ * atomic and synchronizing, end the run and are ordered as usual.
+ */
+static bool tcg_tso_grouped(MemOp memop)
+{
+    return tcg_tso_vec_group && tcg_tso_mode == TCG_TSO_ACQREL &&
+           memop_alignment_bits(memop) < MO_128;
+}
+
+void tcg_tso_run_end(void)
+{
+    bool ld = tcg_ctx->tso_run_ld;
+
+    tcg_ctx->tso_run_ld = false;
+    tcg_ctx->tso_run_st = false;
+    if (ld) {
+        tcg_gen_mb(TCG_MO_LD_LD | TCG_MO_LD_ST | TCG_BAR_SC);
+    }
+}
+
 static void tcg_gen_qemu_ld_i128_int(TCGv_i128 val, TCGTemp *addr,
                                      TCGArg idx, MemOp memop)
 {
@@ -616,10 +645,13 @@ static void tcg_gen_qemu_ld_i128_int(TCGv_i128 val, TCGTemp *addr,
     TCGTemp *addr_new;
     TCGBar after = 0;
     MemOp acq = 0;
+    bool group = false;
 
     check_max_alignment(memop_alignment_bits(memop));
     if (tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD)) {
-        if (tcg_ldst_i128_acqrel(memop)) {
+        if (tcg_tso_grouped(memop)) {
+            group = true;
+        } else if (tcg_ldst_i128_acqrel(memop)) {
             acq = MO_ACQ_REL;
         } else {
             /*
@@ -630,6 +662,11 @@ static void tcg_gen_qemu_ld_i128_int(TCGv_i128 val, TCGTemp *addr,
              */
             after = TCG_MO_LD_LD | TCG_MO_LD_ST;
         }
+    }
+    if (group) {
+        tcg_ctx->tso_run_emit = true;
+    } else {
+        tcg_tso_run_end();
     }
 
     /* In serial mode, reduce atomicity. */
@@ -725,6 +762,10 @@ static void tcg_gen_qemu_ld_i128_int(TCGv_i128 val, TCGTemp *addr,
     if (after) {
         tcg_gen_mb(after | TCG_BAR_SC);
     }
+    if (group) {
+        tcg_ctx->tso_run_emit = false;
+        tcg_ctx->tso_run_ld = true;
+    }
     plugin_gen_mem_callbacks_i128(val, ext_addr, addr, orig_oi,
                                   QEMU_PLUGIN_MEM_R);
 }
@@ -747,11 +788,21 @@ static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
     MemOp rel = 0;
 
     check_max_alignment(memop_alignment_bits(memop));
-    if (tcg_ldst_i128_acqrel(memop)) {
-        /* A store-release orders earlier loads and stores before it. */
-        rel = tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST);
+    if (tcg_tso_grouped(memop) &&
+        tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST)) {
+        if (!tcg_ctx->tso_run_st) {
+            tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
+            tcg_ctx->tso_run_st = true;
+        }
+        tcg_ctx->tso_run_emit = true;
     } else {
-        tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
+        tcg_tso_run_end();
+        if (tcg_ldst_i128_acqrel(memop)) {
+            /* A store-release orders earlier loads and stores before it. */
+            rel = tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST);
+        } else {
+            tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
+        }
     }
 
     /* In serial mode, reduce atomicity. */
@@ -843,6 +894,7 @@ static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
         gen_helper_st_i128(tcg_env, temp_tcgv_i64(addr), val,
                            tcg_constant_i32(orig_oi));
     }
+    tcg_ctx->tso_run_emit = false;
 
     plugin_gen_mem_callbacks_i128(val, ext_addr, addr, orig_oi,
                                   QEMU_PLUGIN_MEM_W);
