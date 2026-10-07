@@ -170,6 +170,19 @@ static bool tcg_mb_emitted(void)
  * is not provided by RCpc acquire/release: a guest that requires it gets
  * the barrier.
  */
+/* Exploratory: XTCG_ACQREL=loads|stores keeps acqrel on one side only. */
+static int exp_acqrel_side(void)
+{
+    static int side = -1;
+
+    if (side < 0) {
+        const char *e = getenv("XTCG_ACQREL");
+
+        side = !e ? 3 : !strcmp(e, "loads") ? 1 : !strcmp(e, "stores") ? 2 : 3;
+    }
+    return side;
+}
+
 static MemOp tcg_gen_ldst_order(TCGBar type)
 {
     if (tcg_ldst_private()) {
@@ -181,7 +194,8 @@ static MemOp tcg_gen_ldst_order(TCGBar type)
         return 0;
     }
     if (tcg_tso_mode == TCG_TSO_ACQREL && !(type & TCG_MO_ST_LD)
-        && TCG_TARGET_HAS_qemu_ldst_acqrel) {
+        && TCG_TARGET_HAS_qemu_ldst_acqrel
+        && (exp_acqrel_side() & ((type & TCG_MO_LD_LD) ? 1 : 2))) {
         if (!tcg_mb_emitted()) {
             return 0;
         }
@@ -203,7 +217,8 @@ static MemOp tcg_gen_ldst_order(TCGBar type)
  */
 static void tcg_gen_req_mo_plain_st(void)
 {
-    if (tcg_tso_mode == TCG_TSO_ACQREL && TCG_TARGET_HAS_qemu_ldst_acqrel) {
+    if (tcg_tso_mode == TCG_TSO_ACQREL && TCG_TARGET_HAS_qemu_ldst_acqrel
+        && (exp_acqrel_side() & 1)) {
         tcg_gen_req_mo(TCG_MO_ST_ST);
     } else {
         tcg_gen_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);

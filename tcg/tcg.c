@@ -276,6 +276,10 @@ bool tcg_tso_cross_count(uint64_t pc)
     gpointer key = &pc, orig, val;
     unsigned n;
 
+    if (getenv("XTCG_NO_PROMOTE")) {
+        return false;
+    }
+
     qemu_mutex_lock(&tso_cross_lock);
     if (g_hash_table_lookup_extended(tso_cross_counts, key, &orig, &val)) {
         n = GPOINTER_TO_UINT(val) + 1;
