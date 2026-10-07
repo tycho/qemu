@@ -344,6 +344,10 @@ static inline TCGRegSet output_pref(const TCGOp *op, unsigned i)
 }
 
 struct TCGContext {
+    /* The open run of grouped guest accesses (tcg_tso_vec_group). */
+    bool tso_run_ld;            /* loads not yet ordered before later ops */
+    bool tso_run_st;            /* the run's stores have had their barrier */
+    bool tso_run_emit;          /* a grouped access is being emitted */
     uintptr_t pool_cur, pool_end;
     TCGPool *pool_first, *pool_current, *pool_first_large;
     int nb_labels;
