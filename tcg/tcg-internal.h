@@ -111,5 +111,8 @@ bool tcg_op_imm_match(TCGOpcode op, TCGType type, tcg_target_ulong imm);
 
 /* End the open run of grouped guest accesses (tcg_tso_vec_group). */
 void tcg_tso_run_end(void);
+/* The run of grouped accesses at a branch to @l, and at @l. */
+void tcg_tso_run_branch(TCGLabel *l, bool uncond);
+void tcg_tso_run_label(TCGLabel *l);
 
 #endif /* TCG_INTERNAL_H */

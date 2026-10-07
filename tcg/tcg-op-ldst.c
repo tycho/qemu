@@ -683,6 +683,69 @@ static bool tcg_tso_grouped(MemOp memop)
            memop_alignment_bits(memop) < MO_128;
 }
 
+/*
+ * A run of grouped accesses may continue across branches within the TB:
+ * the state at a label is what all its predecessors give (loads pending if
+ * on any path, earlier stores ordered only if on all), and a branch back to
+ * a label already emitted provides what the code after the label assumed.
+ * A loop's grouped accesses then need their barriers once, not once per
+ * iteration.
+ */
+void tcg_tso_run_branch(TCGLabel *l, bool uncond)
+{
+    bool ld = tcg_ctx->tso_run_ld, st = tcg_ctx->tso_run_st;
+
+    if (!tcg_tso_vec_group || tcg_ctx->emit_before_op) {
+        return;
+    }
+    if (l->present) {
+        if (ld && !l->tso_ld) {
+            tcg_gen_mb(TCG_MO_LD_LD | TCG_MO_LD_ST | TCG_BAR_SC);
+            tcg_ctx->tso_run_ld = false;
+        }
+        if (l->tso_st && !st) {
+            tcg_gen_req_mo_plain_st();
+            tcg_ctx->tso_run_st = true;
+        }
+    } else if (l->tso_seen) {
+        l->tso_ld |= ld;
+        l->tso_st &= st;
+    } else {
+        l->tso_seen = true;
+        l->tso_ld = ld;
+        l->tso_st = st;
+    }
+    if (uncond) {
+        tcg_ctx->tso_run_dead = true;
+    }
+}
+
+void tcg_tso_run_label(TCGLabel *l)
+{
+    bool ld, st;
+
+    if (!tcg_tso_vec_group || tcg_ctx->emit_before_op) {
+        return;
+    }
+    if (tcg_ctx->tso_run_dead) {
+        ld = l->tso_seen && l->tso_ld;
+        st = l->tso_seen && l->tso_st;
+    } else {
+        ld = tcg_ctx->tso_run_ld;
+        st = tcg_ctx->tso_run_st;
+        if (l->tso_seen) {
+            ld |= l->tso_ld;
+            st &= l->tso_st;
+        }
+    }
+    l->tso_seen = true;
+    l->tso_ld = ld;
+    l->tso_st = st;
+    tcg_ctx->tso_run_ld = ld;
+    tcg_ctx->tso_run_st = st;
+    tcg_ctx->tso_run_dead = false;
+}
+
 void tcg_tso_run_end(void)
 {
     bool ld = tcg_ctx->tso_run_ld;

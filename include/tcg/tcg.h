@@ -100,6 +100,10 @@ typedef struct TCGLabel TCGLabel;
 struct TCGLabel {
     bool present;
     bool has_value;
+    /* The run of grouped guest accesses at the label (tcg_tso_vec_group). */
+    bool tso_seen;              /* a branch to it, or it, has been seen */
+    bool tso_ld;                /* loads may be pending */
+    bool tso_st;                /* earlier stores are ordered */
     uint16_t id;
     union {
         uintptr_t value;
@@ -390,6 +394,7 @@ struct TCGContext {
     bool tso_run_ld;            /* loads not yet ordered before later ops */
     bool tso_run_st;            /* the run's stores have had their barrier */
     bool tso_run_emit;          /* a grouped access is being emitted */
+    bool tso_run_dead;          /* the code here is unreachable */
     uintptr_t pool_cur, pool_end;
     TCGPool *pool_first, *pool_current, *pool_first_large;
     int nb_labels;

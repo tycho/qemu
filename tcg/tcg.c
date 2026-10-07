@@ -2151,6 +2151,7 @@ void tcg_func_start(TCGContext *s)
     s->tso_run_ld = false;
     s->tso_run_st = false;
     s->tso_run_emit = false;
+    s->tso_run_dead = false;
     tcg_pool_reset(s);
     s->nb_temps = s->nb_globals;
 
@@ -3893,7 +3894,8 @@ TCGOp *tcg_emit_op(TCGOpcode opc, unsigned nargs)
      */
     if (unlikely(tcg_ctx->tso_run_ld || tcg_ctx->tso_run_st) &&
         !tcg_ctx->tso_run_emit && !tcg_ctx->emit_before_op &&
-        opc != INDEX_op_mb &&
+        opc != INDEX_op_mb && opc != INDEX_op_br &&
+        opc != INDEX_op_brcond && opc != INDEX_op_set_label &&
         (tcg_op_defs[opc].flags &
          (TCG_OPF_BB_END | TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS))) {
         tcg_tso_run_end();

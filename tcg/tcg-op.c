@@ -336,6 +336,7 @@ static void DNI tcg_gen_op6i_i64(TCGOpcode opc, TCGv_i64 a1, TCGv_i64 a2,
 
 void gen_set_label(TCGLabel *l)
 {
+    tcg_tso_run_label(l);
     l->present = 1;
     tcg_gen_op1(INDEX_op_set_label, 0, label_arg(l));
 }
@@ -350,6 +351,7 @@ static void add_as_label_use(TCGLabel *l, TCGOp *op)
 
 void tcg_gen_br(TCGLabel *l)
 {
+    tcg_tso_run_branch(l, true);
     add_as_label_use(l, tcg_gen_op1(INDEX_op_br, 0, label_arg(l)));
 }
 
@@ -590,7 +592,10 @@ void tcg_gen_brcond_i32(TCGCond cond, TCGv_i32 arg1, TCGv_i32 arg2, TCGLabel *l)
     if (cond == TCG_COND_ALWAYS) {
         tcg_gen_br(l);
     } else if (cond != TCG_COND_NEVER) {
-        TCGOp *op = tcg_gen_op4ii_i32(INDEX_op_brcond,
+        TCGOp *op;
+
+        tcg_tso_run_branch(l, false);
+        op = tcg_gen_op4ii_i32(INDEX_op_brcond,
                                       arg1, arg2, cond, label_arg(l));
         add_as_label_use(l, op);
     }
@@ -1715,7 +1720,10 @@ void tcg_gen_brcond_i64(TCGCond cond, TCGv_i64 arg1, TCGv_i64 arg2, TCGLabel *l)
     if (cond == TCG_COND_ALWAYS) {
         tcg_gen_br(l);
     } else if (cond != TCG_COND_NEVER) {
-        TCGOp *op = tcg_gen_op4ii_i64(INDEX_op_brcond, arg1, arg2, cond,
+        TCGOp *op;
+
+        tcg_tso_run_branch(l, false);
+        op = tcg_gen_op4ii_i64(INDEX_op_brcond, arg1, arg2, cond,
                                       label_arg(l));
         add_as_label_use(l, op);
     }
