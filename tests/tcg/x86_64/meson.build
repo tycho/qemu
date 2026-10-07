@@ -61,6 +61,7 @@ tests += {
     'cflags': ['-pthread', '-Wl,--no-warn-rwx-segments']
   },
   'fma.c': {},
+  'maskmov-page.c': {},
   'noexec.c': {},
   'segment-prefixes.c': {},
   'sse-scalar-mem.c': {},
