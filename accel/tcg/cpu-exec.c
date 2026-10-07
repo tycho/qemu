@@ -507,6 +507,8 @@ static TranslationBlock *region_sample_head(TranslationBlock *tb,
     uintptr_t p;
 
     if (!region) {
+        /* TBs are in the code buffer, which may be write-protected. */
+        qemu_thread_jit_write();
         qemu_spin_lock(&tb->jmp_lock);
         for (p = tb->jmp_list_head; p; ) {
             TranslationBlock *src = (TranslationBlock *)(p & ~TB_JMP_TAG_MASK);
