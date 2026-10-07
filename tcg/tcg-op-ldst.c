@@ -827,6 +827,22 @@ static bool tcg_ldst_vec_acqrel(MemOp memop)
            memop_alignment_bits(memop) >= MO_128;
 }
 
+/* Exploratory: XTCG_VB=pair|noload|none (measurement only). */
+__thread bool xtcg_vb_skip_next;
+
+int xtcg_vb_mode(void)
+{
+    static int m = -1;
+
+    if (m < 0) {
+        const char *e = getenv("XTCG_VB");
+
+        m = !e ? 0 : !strcmp(e, "pair") ? 1 : !strcmp(e, "noload") ? 2
+            : !strcmp(e, "none") ? 3 : 0;
+    }
+    return m;
+}
+
 bool tcg_can_qemu_ldst_vec(MemOp memop)
 {
     MemOp atom = qemu_ldst_vec_memop(memop) & MO_ATOM_MASK;
@@ -872,6 +888,13 @@ void tcg_gen_qemu_ld_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
               addr_new, make_memop_idx(qemu_ldst_vec_memop(memop), idx));
     maybe_free_addr(addr, addr_new);
 
+    if (after && xtcg_vb_mode() >= 2) {
+        after = false;
+    }
+    if (after && xtcg_vb_skip_next) {
+        after = false;
+    }
+    xtcg_vb_skip_next = false;
     if (after) {
         tcg_gen_mb(TCG_MO_LD_LD | TCG_MO_LD_ST | TCG_BAR_SC);
     }
@@ -888,7 +911,7 @@ void tcg_gen_qemu_st_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
     if (tcg_ldst_vec_acqrel(memop)) {
         /* A store-release orders earlier loads and stores before it. */
         memop |= tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST);
-    } else {
+    } else if (xtcg_vb_mode() < 3) {
         tcg_gen_req_mo_plain_st();
     }
 

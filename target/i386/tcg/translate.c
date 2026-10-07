@@ -2555,6 +2555,12 @@ static void gen_ldy_env_A0(DisasContext *s, int offset, bool align)
         TCGv_vec v1 = tcg_temp_new_vec(TCG_TYPE_V128);
 
         /* Both halves are loaded before either is stored, as below. */
+        {
+            extern __thread bool xtcg_vb_skip_next;
+            extern int xtcg_vb_mode(void);
+
+            xtcg_vb_skip_next = xtcg_vb_mode() == 1;
+        }
         tcg_gen_qemu_ld_vec(v0, s->A0, mem_index,
                             mop | (align ? MO_ALIGN_32 : 0));
         tcg_gen_addi_tl(a0_hi, s->A0, 16);
