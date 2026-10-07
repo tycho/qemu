@@ -2443,9 +2443,17 @@ static void tcg_out_qemu_st_direct(TCGContext *s, MemOp memop,
  * An MO_ACQ_REL_CROSS access (of a promoted guest insn) that may cross
  * 16 bytes: use the branch-free forms instead of the check.
  */
-static bool acqrel_cross(MemOp memop)
+static bool acqrel_cross(MemOp memop, bool is_ld)
 {
-    return (memop & MO_ACQ_REL_CROSS) && acqrel_may_cross(memop);
+    static int side = -1;
+
+    if (side < 0) {
+        const char *e = getenv("XTCG_CROSS");
+
+        side = !e ? 3 : !strcmp(e, "loads") ? 1 : !strcmp(e, "stores") ? 2 : 3;
+    }
+    return (side & (is_ld ? 1 : 2)) &&
+           (memop & MO_ACQ_REL_CROSS) && acqrel_may_cross(memop);
 }
 
 static void tgen_qemu_ld(TCGContext *s, TCGType data_type, TCGReg data_reg,
@@ -2456,7 +2464,7 @@ static void tgen_qemu_ld(TCGContext *s, TCGType data_type, TCGReg data_reg,
 
     ldst = prepare_host_addr(s, &h, addr_reg, oi, true,
                              acqrel_onepath(get_memop(oi)));
-    if (acqrel_cross(get_memop(oi))) {
+    if (acqrel_cross(get_memop(oi), true)) {
         tcg_out_qemu_ld_acquire_any(s, get_memop(oi), data_type, data_reg,
                                     tcg_out_host_addr_reg(s, h));
     } else if (get_memop(oi) & MO_ACQ_REL) {
@@ -2493,7 +2501,7 @@ static void tgen_qemu_st(TCGContext *s, TCGType data_type, TCGReg data_reg,
 
     ldst = prepare_host_addr(s, &h, addr_reg, oi, false,
                              acqrel_onepath(get_memop(oi)));
-    if (acqrel_cross(get_memop(oi))) {
+    if (acqrel_cross(get_memop(oi), false)) {
         /* Any alignment: a plain store after a barrier. */
         tcg_out_mb(s, TCG_MO_LD_ST | TCG_MO_ST_ST);
         tcg_out_qemu_st_direct(s, get_memop(oi), data_reg, h);

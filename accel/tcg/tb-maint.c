@@ -1299,11 +1299,20 @@ static void tso_cross_note(CPUState *cpu, uint64_t addr, MemOpIdx oi,
     }
 }
 
+static bool exp_cross_side(bool is_ld)
+{
+    const char *e = getenv("XTCG_CROSS");
+
+    return !e || !strcmp(e, is_ld ? "loads" : "stores");
+}
+
 tcg_target_ulong helper_tso_cross_ld(CPUArchState *env, uint64_t addr,
                                      MemOpIdx oi, uintptr_t retaddr,
                                      uint64_t site)
 {
-    tso_cross_note(env_cpu(env), addr, oi, retaddr, site);
+    if (exp_cross_side(true)) {
+        tso_cross_note(env_cpu(env), addr, oi, retaddr, site);
+    }
     tso_cross_probe(env, addr, oi, MMU_DATA_LOAD, retaddr);
     switch (get_memop(oi) & MO_SIZE) {
     case MO_16:
@@ -1320,7 +1329,9 @@ tcg_target_ulong helper_tso_cross_ld(CPUArchState *env, uint64_t addr,
 void helper_tso_cross_st(CPUArchState *env, uint64_t addr, uint64_t val,
                          MemOpIdx oi, uintptr_t retaddr, uint64_t site)
 {
-    tso_cross_note(env_cpu(env), addr, oi, retaddr, site);
+    if (exp_cross_side(false)) {
+        tso_cross_note(env_cpu(env), addr, oi, retaddr, site);
+    }
     tso_cross_probe(env, addr, oi, MMU_DATA_STORE, retaddr);
     switch (get_memop(oi) & MO_SIZE) {
     case MO_16:
