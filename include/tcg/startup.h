@@ -251,4 +251,11 @@ extern bool tcg_vint;
  */
 extern bool tcg_addr32;
 
+/*
+ * tcg_exit_irq_only: a TB that ends to let a pending interrupt be taken
+ * (after STI's interrupt shadow, after an x86 CR8 write) leaves generated
+ * code only if the vCPU has an interrupt request; otherwise it chains.
+ */
+extern bool tcg_exit_irq_only;
+
 #endif

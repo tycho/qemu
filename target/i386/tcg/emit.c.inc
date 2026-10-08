@@ -386,7 +386,15 @@ static void gen_writeback(DisasContext *s, X86DecodedInsn *decode, int opn, TCGv
             translator_io_start(&s->base);
         }
         gen_helper_write_crN(tcg_env, tcg_constant_i32(op->n), v);
-        s->base.is_jmp = DISAS_EOB_NEXT;
+        if (op->n == 8 && exit_irq_only(s)) {
+            /*
+             * The TPR changes no TB flags, and an interrupt it unmasks is
+             * a pending request, taken right after this instruction.
+             */
+            gen_exit_if_irq_pending(s, true);
+        } else {
+            s->base.is_jmp = DISAS_EOB_NEXT;
+        }
         break;
     case X86_OP_DR:
         /* CR4.DE tested in the helper.  */
