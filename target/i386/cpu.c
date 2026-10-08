@@ -8892,7 +8892,9 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
             *ebx = xsave_area_size(xstate, true);
             *ecx = env->features[FEAT_XSAVE_XSS_LO];
             *edx = env->features[FEAT_XSAVE_XSS_HI];
-        } else if (count < ARRAY_SIZE(x86_ext_save_areas)) {
+        } else if (count < ARRAY_SIZE(x86_ext_save_areas) &&
+                   ((x86_cpu_xsave_xcr0_components(cpu) |
+                     x86_cpu_xsave_xss_components(cpu)) & (1ULL << count))) {
             const ExtSaveArea *esa = &x86_ext_save_areas[count];
 
             *eax = esa->size;
