@@ -273,4 +273,19 @@ extern bool tcg_tsc_counter;
  */
 extern bool tcg_pause_hint;
 
+/*
+ * tcg_flags_guess: a front end with lazily computed condition codes may
+ * guess, when it translates a block, that the block is entered with the
+ * condition-code state it is being translated for, and test the guess at
+ * run time instead of calling its generic helper.  Set by the TCG
+ * accelerator property x-flags.
+ */
+extern bool tcg_flags_guess;
+
+/*
+ * x86 guests: INC and DEC after an unknown flags state (a TB's first
+ * flag producer) keep the earlier state for CF instead of computing it.
+ */
+extern bool tcg_lazy_incdec;
+
 #endif
