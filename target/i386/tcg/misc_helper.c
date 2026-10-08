@@ -84,9 +84,14 @@ G_NORETURN void helper_rdpmc(CPUX86State *env)
     }
     cpu_svm_check_intercept_param(env, SVM_EXIT_RDPMC, 0, GETPC());
 
-    /* currently unimplemented */
-    qemu_log_mask(LOG_UNIMP, "x86: unimplemented rdpmc\n");
-    raise_exception_err(env, EXCP06_ILLOP, 0);
+    /*
+     * There are no performance counters to read, so every counter index
+     * is invalid: #GP(0), for both vendors, as KVM does without a virtual
+     * PMU.  An Intel guest can tell from CPUID leaf 0xA (no architectural
+     * PMU); AMD has no CPUID bit for its legacy counters, and a guest
+     * under Hyper-V uses its performance monitor feature bit instead.
+     */
+    raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
 }
 
 G_NORETURN void helper_pause(CPUX86State *env)

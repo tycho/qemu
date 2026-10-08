@@ -2096,8 +2096,6 @@ VINT_BINARY(VPACKUSDW, packusdw, NULL,
             vint_pack, TCG_NARROW_SAT_SU | MO_16 << 8)
 BINARY_INT_SSE(VPERMILPS,  vpermilps)
 BINARY_INT_SSE(VPERMILPD,  vpermilpd)
-BINARY_INT_SSE(VMASKMOVPS, vpmaskmovd)
-BINARY_INT_SSE(VMASKMOVPD, vpmaskmovq)
 
 VINT_BINARY(PMULDQ, pmuldq, NULL,
             vint_can(INDEX_op_mulw_vec, MO_32)
@@ -2586,7 +2584,6 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
 VINT_SHIFTV(VPSLLV, vpsllv, INDEX_op_shlv_vec)
 VINT_SHIFTV(VPSRLV, vpsrlv, INDEX_op_shrv_vec)
 VINT_SHIFTV(VPSRAV, vpsrav, INDEX_op_sarv_vec)
-VEXW_AVX(VPMASKMOV, vpmaskmov)
 
 /*
  * With tcg_vint, the gathers' elements as guest loads in order, when every
@@ -6667,6 +6664,29 @@ static inline void gen_maskmov(DisasContext *s, X86DecodedInsn *decode,
     }
 }
 
+/* The loads take the address only: masked-off elements must not fault. */
+static inline void gen_maskmov_ld(DisasContext *s, X86DecodedInsn *decode,
+                                  SSEFunc_0_eppt xmm, SSEFunc_0_eppt ymm)
+{
+    if (!s->vex_l) {
+        xmm(tcg_env, OP_PTR0, OP_PTR1, s->A0);
+    } else {
+        ymm(tcg_env, OP_PTR0, OP_PTR1, s->A0);
+    }
+}
+
+static void gen_VMASKMOVPD(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_maskmov_ld(s, decode, gen_helper_vpmaskmovq_ld_xmm,
+                   gen_helper_vpmaskmovq_ld_ymm);
+}
+
+static void gen_VMASKMOVPS(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_maskmov_ld(s, decode, gen_helper_vpmaskmovd_ld_xmm,
+                   gen_helper_vpmaskmovd_ld_ymm);
+}
+
 static void gen_VMASKMOVPD_st(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_maskmov(s, decode, gen_helper_vpmaskmovq_st_xmm, gen_helper_vpmaskmovq_st_ymm);
@@ -6874,6 +6894,15 @@ static void gen_VMOVSS_st(DisasContext *s, X86DecodedInsn *decode)
 
     tcg_gen_ld_i32(tmp, OP_PTR2, offsetof(ZMMReg, ZMM_L(0)));
     tcg_gen_qemu_st_i32(tmp, s->A0, s->mem_index, MO_LEUL);
+}
+
+static void gen_VPMASKMOV(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (s->vex_w) {
+        gen_VMASKMOVPD(s, decode);
+    } else {
+        gen_VMASKMOVPS(s, decode);
+    }
 }
 
 static void gen_VPMASKMOV_st(DisasContext *s, X86DecodedInsn *decode)

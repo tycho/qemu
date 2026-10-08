@@ -104,6 +104,7 @@ static CGInterpolationQuality zoom_interpolation = kCGInterpolationNone;
 static NSTextField *pauseLabel;
 
 static bool allow_events;
+static id<NSObject> activity;
 
 static NSInteger cbchangecount = -1;
 static QemuClipboardInfo *cbinfo;
@@ -1214,6 +1215,19 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     COCOA_DEBUG("QemuCocoaAppController: applicationDidFinishLaunching\n");
     allow_events = true;
+
+    /*
+     * The guest keeps running while the window is hidden or covered.
+     * Without an activity, App Nap then throttles the whole process:
+     * every thread drops to background QoS, which runs only on
+     * efficiency cores, and timers are coalesced.  The activity lasts
+     * as long as QEMU (it ends if its token is released), and still
+     * lets the host sleep when idle.
+     */
+    activity = [[[NSProcessInfo processInfo]
+        beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep |
+                                 NSActivityLatencyCritical
+                          reason:@"Running a virtual machine"] retain];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)aNotification
