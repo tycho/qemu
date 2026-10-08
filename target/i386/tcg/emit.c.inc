@@ -3762,6 +3762,18 @@ static void gen_Jcc(DisasContext *s, X86DecodedInsn *decode)
     TCGLabel *taken = gen_new_label();
 
     gen_bnd_jmp(s);
+    if (gen_jmp_rel_loops(s, s->dflag, decode->immediate)) {
+        /*
+         * The jump closes a loop within the TB: leave on the inverse
+         * condition, so that going round again falls through to the
+         * back edge (one taken branch per iteration instead of two).
+         */
+        gen_jcc(s, (decode->b & 0xf) ^ 1, taken);
+        gen_jmp_rel(s, s->dflag, decode->immediate, 0);
+        gen_set_label(taken);
+        gen_jmp_rel_csize(s, 0, 1);
+        return;
+    }
     gen_jcc(s, decode->b & 0xf, taken);
     gen_conditional_jump_labels(s, decode->immediate, NULL, taken);
 }
