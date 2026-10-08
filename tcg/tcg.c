@@ -238,6 +238,7 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 
 TCGContext tcg_init_ctx;
 bool tcg_tbpack;
+bool tcg_tb_flags_canon;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
