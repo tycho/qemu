@@ -52,6 +52,7 @@ struct TCGState {
 
     OnOffAuto mttcg_enabled;
     bool one_insn_per_tb;
+    bool i386_runtime;
     int splitwx_enabled;
     unsigned long tb_size;
 };
@@ -163,6 +164,9 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
         as->gdbstub.can_reverse = true;
     }
 
+    tcg_fpcheck_runtime = s->i386_runtime;
+    tcg_iopl_runtime = s->i386_runtime;
+
     page_init();
     tb_htable_init();
     tcg_init(s->tb_size * MiB, s->splitwx_enabled, max_threads);
@@ -256,6 +260,16 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
     qatomic_set(&one_insn_per_tb, value);
 }
 
+static bool tcg_get_i386_runtime(Object *obj, Error **errp)
+{
+    return TCG_STATE(obj)->i386_runtime;
+}
+
+static void tcg_set_i386_runtime(Object *obj, bool value, Error **errp)
+{
+    TCG_STATE(obj)->i386_runtime = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -286,6 +300,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                    tcg_set_one_insn_per_tb);
     object_class_property_set_description(oc, "one-insn-per-tb",
         "Only put one guest insn in each translation block");
+
+    object_class_property_add_bool(oc, "x-i386-runtime",
+                                   tcg_get_i386_runtime,
+                                   tcg_set_i386_runtime);
+    object_class_property_set_description(oc, "x-i386-runtime",
+        "x86 system mode: leave CR0.MP/EM/TS and EFLAGS.IOPL out of the "
+        "TB flags and check them at run time, so one translation serves "
+        "every FPU and IOPL state");
 }
 
 static const TypeInfo tcg_accel_type = {
