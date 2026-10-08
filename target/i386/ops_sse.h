@@ -20,6 +20,7 @@
 
 #include "crypto/aes.h"
 #include "crypto/aes-round.h"
+#include "host/crypto/sha1.h"
 #include "crypto/clmul.h"
 
 #if SHIFT == 0
@@ -2550,11 +2551,23 @@ SSE_HELPER_FMAP(helper_fma4pd,  ZMM_D, 1 << SHIFT, float64_muladd)
 #endif
 
 #if SHIFT == 1
-#define SSE_HELPER_SHA1RNDS4(name, F, K) \
+#define SSE_HELPER_SHA1RNDS4(name, F, K, ACCEL_F) \
     void name(Reg *d, Reg *a, Reg *b)                                       \
     {                                                                       \
         uint32_t A, B, C, D, E, t, i;                                       \
                                                                             \
+        if (HAVE_SHA1_ACCEL) {                                              \
+            uint32_t s[4] = { a->L(3), a->L(2), a->L(1), a->L(0) };         \
+            uint32_t w[4] = { b->L(3) + K, b->L(2) + K,                     \
+                              b->L(1) + K, b->L(0) + K };                   \
+                                                                            \
+            sha1_rounds4_accel(s, w, ACCEL_F);                              \
+            d->L(3) = s[0];                                                 \
+            d->L(2) = s[1];                                                 \
+            d->L(1) = s[2];                                                 \
+            d->L(0) = s[3];                                                 \
+            return;                                                         \
+        }                                                                   \
         A = a->L(3);                                                        \
         B = a->L(2);                                                        \
         C = a->L(1);                                                        \
@@ -2580,10 +2593,10 @@ SSE_HELPER_FMAP(helper_fma4pd,  ZMM_D, 1 << SHIFT, float64_muladd)
 #define SHA1_F1(b, c, d) ((b) ^ (c) ^ (d))
 #define SHA1_F2(b, c, d) (((b) & (c)) ^ ((b) & (d)) ^ ((c) & (d)))
 
-SSE_HELPER_SHA1RNDS4(helper_sha1rnds4_f0, SHA1_F0, 0x5A827999)
-SSE_HELPER_SHA1RNDS4(helper_sha1rnds4_f1, SHA1_F1, 0x6ED9EBA1)
-SSE_HELPER_SHA1RNDS4(helper_sha1rnds4_f2, SHA1_F2, 0x8F1BBCDC)
-SSE_HELPER_SHA1RNDS4(helper_sha1rnds4_f3, SHA1_F1, 0xCA62C1D6)
+SSE_HELPER_SHA1RNDS4(helper_sha1rnds4_f0, SHA1_F0, 0x5A827999, 0)
+SSE_HELPER_SHA1RNDS4(helper_sha1rnds4_f1, SHA1_F1, 0x6ED9EBA1, 1)
+SSE_HELPER_SHA1RNDS4(helper_sha1rnds4_f2, SHA1_F2, 0x8F1BBCDC, 2)
+SSE_HELPER_SHA1RNDS4(helper_sha1rnds4_f3, SHA1_F1, 0xCA62C1D6, 1)
 
 void helper_sha1nexte(Reg *d, Reg *a, Reg *b)
 {

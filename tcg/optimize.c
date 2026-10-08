@@ -1602,9 +1602,18 @@ static bool fold_call(OptContext *ctx, TCGOp *op)
 
 static bool fold_cmp_vec(OptContext *ctx, TCGOp *op)
 {
+    int i;
+
     /* Canonicalize the comparison to put immediate second. */
     if (swap_commutative(NO_DEST, &op->args[1], &op->args[2])) {
         op->args[3] = tcg_swap_cond(op->args[3]);
+    }
+
+    /* A result known for every element: all ones or all zeros. */
+    i = do_constant_folding_cond(ctx->type, op->args[1], op->args[2],
+                                 op->args[3]);
+    if (i >= 0) {
+        return tcg_opt_gen_movi(ctx, op, op->args[0], -i);
     }
     return finish_folding(ctx, op);
 }
@@ -1971,6 +1980,24 @@ static bool fold_extract(OptContext *ctx, TCGOp *op)
     a_mask = pos ? -1 : t1->z_mask ^ z_mask;
 
     return fold_masks_zosa(ctx, op, z_mask, o_mask, 0, a_mask);
+}
+
+/* The element is zero-extended into the integer output. */
+static bool fold_extract_vec(OptContext *ctx, TCGOp *op)
+{
+    TempOptInfo *t1 = arg_info(op->args[1]);
+    unsigned bits = 8 << TCGOP_VECE(op);
+
+    /* The output is a 64-bit integer, whatever the vector type. */
+    ctx->type = TCG_TYPE_I64;
+
+    /* A vector constant is a 64-bit pattern repeated across the vector. */
+    if (ti_is_const(t1)) {
+        return tcg_opt_gen_movi(ctx, op, op->args[0],
+                                extract64(ti_const_val(t1),
+                                          op->args[2] * bits % 64, bits));
+    }
+    return fold_masks_z(ctx, op, MAKE_64BIT_MASK(0, bits));
 }
 
 static bool fold_extract2(OptContext *ctx, TCGOp *op)
@@ -3182,6 +3209,9 @@ void tcg_optimize(TCGContext *s)
         case INDEX_op_extract2:
             done = fold_extract2(&ctx, op);
             break;
+        case INDEX_op_extract_vec:
+            done = fold_extract_vec(&ctx, op);
+            break;
         case INDEX_op_ext_i32_i64:
             done = fold_exts(&ctx, op);
             break;
@@ -3259,10 +3289,12 @@ void tcg_optimize(TCGContext *s)
             done = fold_qemu_ld_1reg(&ctx, op);
             break;
         case INDEX_op_qemu_ld2:
+        case INDEX_op_qemu_ld_vec:
             done = fold_qemu_ld_2reg(&ctx, op);
             break;
         case INDEX_op_qemu_st:
         case INDEX_op_qemu_st2:
+        case INDEX_op_qemu_st_vec:
             done = fold_qemu_st(&ctx, op);
             break;
         case INDEX_op_rems:
