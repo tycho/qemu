@@ -18,6 +18,9 @@
 /* qemu_atomic, with FEAT_LSE (its constraint set says) */
 #define TCG_TARGET_HAS_QEMU_ATOMIC
 
+/* tcg_out_pinned_st_pairs, and the slow paths' shared copy of it */
+#define TCG_TARGET_HAS_PINNED_ST_PAIRS
+
 /*
  * MO_ACQ_REL guest accesses: LDAPR/STLR.  Unaligned ones rely on FEAT_LSE2
  * (they must not cross 16 bytes; the backend checks).
@@ -26,8 +29,9 @@
 /* 16-byte aligned, single-copy atomic acquire/release: LDIAPP/STILP */
 #define TCG_TARGET_HAS_qemu_ldst_i128_acqrel \
     (TCG_TARGET_HAS_qemu_ldst_acqrel && have_lrcpc3)
-/* tcg_out_pinned_st_pairs, and the slow paths' shared copy of it */
-#define TCG_TARGET_HAS_PINNED_ST_PAIRS
+/* 16-byte aligned vector load-acquire/store-release: LDAPUR/STLUR (Q) */
+#define TCG_TARGET_HAS_qemu_ldst_vec_acqrel \
+    (TCG_TARGET_HAS_qemu_ldst_acqrel && have_lrcpc3)
 
 /* optional instructions */
 #define TCG_TARGET_HAS_extr_i64_i32     0
