@@ -1563,6 +1563,69 @@ static bool fold_bswap(OptContext *ctx, TCGOp *op)
     return fold_masks_zos(ctx, op, z_mask, o_mask, s_mask);
 }
 
+/*
+ * Globals that alias their env memory (TCGTemp.env_alias): forget that
+ * one is a copy of anything once its memory may change, and forget what
+ * its memory holds once the global changes.
+ */
+static void reset_alias(OptContext *ctx, TCGTemp *base, intptr_t lo,
+                        intptr_t last)
+{
+    TCGContext *s = ctx->tcg;
+
+    if (base == s->alias_base
+        && (lo >= s->alias_hi || last < s->alias_lo)) {
+        return;
+    }
+    for (int i = 0; i < s->nb_alias; i++) {
+        int idx = s->alias_temp[i];
+        TCGTemp *ts = &s->temps[idx];
+
+        if (!test_bit(idx, ctx->temps_used.l)) {
+            continue;
+        }
+        if (base == ts->mem_base
+            && (lo >= ts->mem_offset + tcg_type_size(ts->base_type)
+                || last < ts->mem_offset)) {
+            continue;
+        }
+        reset_ts(ctx, ts);
+    }
+}
+
+static void fold_alias(OptContext *ctx, TCGOp *op, const TCGOpDef *def)
+{
+    intptr_t size;
+
+    for (int i = 0; i < def->nb_oargs; i++) {
+        TCGTemp *ts = arg_temp(op->args[i]);
+
+        if (ts->env_alias) {
+            remove_mem_copy_in(ctx, ts->mem_offset, ts->mem_offset
+                               + tcg_type_size(ts->base_type) - 1);
+        }
+    }
+    switch (op->opc) {
+    case INDEX_op_st8:
+        size = 1;
+        break;
+    case INDEX_op_st16:
+        size = 2;
+        break;
+    case INDEX_op_st32:
+        size = 4;
+        break;
+    case INDEX_op_st:
+    case INDEX_op_st_vec:
+        size = tcg_type_size(ctx->type);
+        break;
+    default:
+        return;
+    }
+    reset_alias(ctx, arg_temp(op->args[1]), op->args[2],
+                op->args[2] + size - 1);
+}
+
 static bool fold_call(OptContext *ctx, TCGOp *op)
 {
     TCGContext *s = ctx->tcg;
@@ -1584,6 +1647,9 @@ static bool fold_call(OptContext *ctx, TCGOp *op)
             }
         }
     }
+
+    /* A helper may write any env memory through a pointer. */
+    reset_alias(ctx, NULL, 0, -1);
 
     /* If the function has side effects, reset mem data. */
     if (!(flags & TCG_CALL_NO_SIDE_EFFECTS)) {
@@ -3142,6 +3208,10 @@ void tcg_optimize(TCGContext *s)
 
         /* Pre-compute the type of the operation. */
         ctx.type = TCGOP_TYPE(op);
+
+        if (s->nb_alias) {
+            fold_alias(&ctx, op, def);
+        }
 
         /*
          * Process each opcode.
