@@ -67,6 +67,11 @@ typedef enum XtcgStat {
     XS_X86_INVLPG,          /* INVLPG (helper_flush_page) */
     XS_X86_FILL_GLOBAL,     /* page walks ending in a global leaf, CR4.PGE */
     XS_X86_PCIDE_SET,       /* CR4 writes that set CR4.PCIDE */
+    XS_JC_FILL,             /* jump-cache fills, non-global code */
+    XS_JC_FILL_GLOBAL,      /* ... code on a global page */
+    XS_JC_FLUSH_NONGLOBAL,  /* jump-cache flushes of non-global entries */
+    XS_JC_CLEAR_PAGE_HIT,   /* page clears: entries on the page dropped */
+    XS_JC_CLEAR_PAGE_KEPT,  /* ... live entries of other pages kept */
     XS__COUNT
 } XtcgStat;
 

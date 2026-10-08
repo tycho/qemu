@@ -55,6 +55,11 @@ static const char * const stat_names[XS__COUNT] = {
     [XS_X86_INVLPG] = "x86_invlpg",
     [XS_X86_FILL_GLOBAL] = "x86_fill_global",
     [XS_X86_PCIDE_SET] = "x86_pcide_set",
+    [XS_JC_FILL] = "jc_fill",
+    [XS_JC_FILL_GLOBAL] = "jc_fill_global",
+    [XS_JC_FLUSH_NONGLOBAL] = "jc_flush_nonglobal",
+    [XS_JC_CLEAR_PAGE_HIT] = "jc_clear_page_hit",
+    [XS_JC_CLEAR_PAGE_KEPT] = "jc_clear_page_kept",
 };
 
 static const char * const hist_names[XH__COUNT] = {
