@@ -103,6 +103,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-hosttime", "on" },
         { "x-tlb-grow", "1" },
         { "x-pause", "hint" },
+        { "x-cr3-flush", "nonglobal" },
 #ifdef CONFIG_DARWIN
         { "x-jitwx", "lazy" },
 #endif
