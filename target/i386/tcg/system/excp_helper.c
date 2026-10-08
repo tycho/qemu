@@ -41,6 +41,7 @@ typedef struct TranslateResult {
     hwaddr paddr;
     int prot;
     int page_size;
+    bool global;    /* a global leaf (G) with CR4.PGE */
 } TranslateResult;
 
 typedef enum TranslateFaultStage2 {
@@ -487,6 +488,7 @@ do_check_protect_pse36:
     out->paddr = paddr & x86_get_a20_mask(env);
     out->prot = prot;
     out->page_size = page_size;
+    out->global = (pte & PG_GLOBAL_MASK) && (env->cr[4] & CR4_PGE_MASK);
     return true;
 
  do_fault_rsvd:
@@ -619,7 +621,7 @@ bool x86_cpu_tlb_fill(CPUState *cs, vaddr addr, int size,
                       bool probe, uintptr_t retaddr)
 {
     CPUX86State *env = cpu_env(cs);
-    TranslateResult out;
+    TranslateResult out = {};
     TranslateFault err;
 
     if (get_physical_address(env, addr, access_type, mmu_idx, &out, &err,
@@ -628,11 +630,17 @@ bool x86_cpu_tlb_fill(CPUState *cs, vaddr addr, int size,
          * Even if 4MB pages, we map only one 4KB page in the cache to
          * avoid filling it too fast.
          */
+        CPUTLBEntryFull full = {
+            .phys_addr = out.paddr & TARGET_PAGE_MASK,
+            .attrs = cpu_get_mem_attrs(env),
+            .prot = out.prot,
+            .lg_page_size = ctz64(out.page_size),
+            .global = out.global,
+        };
+
         assert(out.prot & (1 << access_type));
-        tlb_set_page_with_attrs(cs, addr & TARGET_PAGE_MASK,
-                                out.paddr & TARGET_PAGE_MASK,
-                                cpu_get_mem_attrs(env),
-                                out.prot, mmu_idx, out.page_size);
+        assert(is_power_of_2(out.page_size));
+        tlb_set_page_full(cs, mmu_idx, addr & TARGET_PAGE_MASK, &full);
         return true;
     }
 

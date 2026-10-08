@@ -720,6 +720,7 @@ static void tcg_set_xtcg_stats(Object *obj, bool value, Error **errp)
 static const char * const tcg_cr3_flush_names[] = {
     [TCG_CR3_FLUSH_ALL] = "all",
     [TCG_CR3_FLUSH_PAGING] = "paging",
+    [TCG_CR3_FLUSH_NONGLOBAL] = "nonglobal",
 };
 
 static char *tcg_get_cr3_flush(Object *obj, Error **errp)
@@ -735,7 +736,8 @@ static void tcg_set_cr3_flush(Object *obj, const char *value, Error **errp)
             return;
         }
     }
-    error_setg(errp, "Invalid 'x-cr3-flush' value: %s (all, paging)", value);
+    error_setg(errp, "Invalid 'x-cr3-flush' value: %s "
+               "(all, paging, nonglobal)", value);
 }
 
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
@@ -914,9 +916,10 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "x-cr3-flush",
                                   tcg_get_cr3_flush, tcg_set_cr3_flush);
     object_class_property_set_description(oc, "x-cr3-flush",
-        "x86: what a CR3 write flushes from the TLB: all (every mmu index) "
-        "or paging (not the physical-address ones, which don't depend on "
-        "CR3)");
+        "x86: what a CR3 write flushes from the TLB: all (every mmu index), "
+        "paging (not the physical-address ones, which don't depend on "
+        "CR3), or nonglobal (as paging, but keep global pages, as a MOV "
+        "to CR3 without PCIDs does)");
 }
 
 static const TypeInfo tcg_accel_type = {
