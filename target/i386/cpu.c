@@ -430,11 +430,11 @@ static void encode_topo_cpuid1f(CPUX86State *env, uint32_t count,
     unsigned long level, base_level, next_level;
     uint32_t num_threads_next_level, offset_next_level;
 
-    assert(count <= CPU_TOPOLOGY_LEVEL_SOCKET);
-
     /*
      * Find the No.(count + 1) topology level in avail_cpu_topo bitmap.
-     * The search starts from bit 0 (CPU_TOPOLOGY_LEVEL_THREAD).
+     * The search starts from bit 0 (CPU_TOPOLOGY_LEVEL_THREAD).  Any
+     * count, including one the guest made up past the last level, ends
+     * at the invalid level within as many steps as there are levels.
      */
     level = CPU_TOPOLOGY_LEVEL_THREAD;
     base_level = level;
@@ -476,6 +476,39 @@ static void encode_topo_cpuid1f(CPUX86State *env, uint32_t count,
     *edx = cpu->apic_id;
 
     assert(!(*eax & ~0x1f));
+}
+
+/*
+ * CPUID[0x80000026], AMD's extended CPU topology: one subleaf per level,
+ * from the innermost, with the level type in ECX[15:8] (1: core, counting
+ * its threads; 2: complex; 3: die; 4: socket), the logical processors in
+ * the level's domain in EBX[15:0], and the x2APIC ID shift to that
+ * domain's ID in EAX[4:0].  QEMU's modules are the complexes.  The cores
+ * are all alike: no efficiency ranking, heterogeneous or asymmetric
+ * topology flags.  Past the socket, the invalid level ends the walk.
+ */
+static void encode_topo_cpuid80000026(CPUX86State *env, uint32_t count,
+                                      X86CPUTopoInfo *topo_info,
+                                      uint32_t *eax, uint32_t *ebx,
+                                      uint32_t *ecx, uint32_t *edx)
+{
+    static const enum CpuTopologyLevel levels[] = {
+        CPU_TOPOLOGY_LEVEL_CORE,
+        CPU_TOPOLOGY_LEVEL_MODULE,
+        CPU_TOPOLOGY_LEVEL_DIE,
+        CPU_TOPOLOGY_LEVEL_SOCKET,
+    };
+
+    *ecx = count & 0xff;
+    *edx = env_archcpu(env)->apic_id;
+    if (count >= ARRAY_SIZE(levels)) {
+        *eax = 0;
+        *ebx = 0;
+        return;
+    }
+    *eax = apicid_offset_by_topo_level(topo_info, levels[count]);
+    *ebx = num_threads_by_topo_level(topo_info, levels[count]) & 0xffff;
+    *ecx |= (count + 1) << 8;
 }
 
 /* Encode cache info for CPUID[0x80000005].ECX or CPUID[0x80000005].EDX */
@@ -8635,10 +8668,16 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
     }
 
     if (index > limit) {
-        /* Intel documentation states that invalid EAX input will
-         * return the same information as EAX=cpuid_level
-         * (Intel SDM Vol. 2A - Instruction Set Reference - CPUID)
+        /*
+         * AMD and Hygon processors return zeros for a leaf above the
+         * maximum of its range.  Intel documentation states that invalid
+         * EAX input will return the same information as EAX=cpuid_level
+         * (Intel SDM Vol. 2A - Instruction Set Reference - CPUID).
          */
+        if (IS_AMD_CPU(env) || IS_HYGON_CPU(env)) {
+            *eax = *ebx = *ecx = *edx = 0;
+            return;
+        }
         index = env->cpuid_level;
     }
 
@@ -8794,6 +8833,12 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                 *ecx |= CPUID_7_0_ECX_OSPKE;
             }
             *edx = env->features[FEAT_7_0_EDX]; /* Feature flags */
+        } else if (count > env->cpuid_level_func7) {
+            /* Above the maximum subleaf. */
+            *eax = 0;
+            *ebx = 0;
+            *ecx = 0;
+            *edx = 0;
         } else if (count == 1) {
             *eax = env->features[FEAT_7_1_EAX];
             *ecx = env->features[FEAT_7_1_ECX];
@@ -8888,7 +8933,9 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
             *ebx = xsave_area_size(xstate, true);
             *ecx = env->features[FEAT_XSAVE_XSS_LO];
             *edx = env->features[FEAT_XSAVE_XSS_HI];
-        } else if (count < ARRAY_SIZE(x86_ext_save_areas)) {
+        } else if (count < ARRAY_SIZE(x86_ext_save_areas) &&
+                   ((x86_cpu_xsave_xcr0_components(cpu) |
+                     x86_cpu_xsave_xss_components(cpu)) & (1ULL << count))) {
             const ExtSaveArea *esa = &x86_ext_save_areas[count];
 
             *eax = esa->size;
@@ -8952,6 +8999,8 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                 *eax &= ~(1U << 4);
             }
         }
+#else
+        *eax = *ebx = *ecx = *edx = 0;
 #endif
         break;
     case 0x14: {
@@ -9032,7 +9081,14 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
             /* Highest numbered palette subleaf */
             *ebx = INTEL_AMX_TMUL_MAX_K | (INTEL_AMX_TMUL_MAX_N << 8);
         } else if (count == 1) {
-            *eax = env->features[FEAT_1E_1_EAX];
+            uint32_t max, unused;
+
+            /* Subleaf 1 exists only if subleaf 0 says so. */
+            x86_cpu_get_supported_cpuid(0x1E, 0, &max, &unused,
+                                        &unused, &unused);
+            if (max >= 1) {
+                *eax = env->features[FEAT_1E_1_EAX];
+            }
         }
         break;
     }
@@ -9057,7 +9113,7 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         if (count == 0) {
             *eax = env->avx10_max_subleaf;
             *ebx = env->features[FEAT_24_0_EBX] | env->avx10_version;
-        } else if (count == 1) {
+        } else if (count == 1 && env->avx10_max_subleaf >= 1) {
             *ecx = env->features[FEAT_24_1_ECX];
         }
         break;
@@ -9304,6 +9360,18 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         *eax = env->features[FEAT_8000_0021_EAX];
         *ebx = env->features[FEAT_8000_0021_EBX];
         *ecx = env->features[FEAT_8000_0021_ECX];
+        break;
+    case 0x80000026:
+        /*
+         * Under KVM the host's leaf is used, and kvm_arch_init_vcpu builds
+         * one entry per leaf for leaves it doesn't know to have subleaves.
+         */
+        if (tcg_enabled() && (IS_AMD_CPU(env) || IS_HYGON_CPU(env))) {
+            encode_topo_cpuid80000026(env, count, topo_info,
+                                      eax, ebx, ecx, edx);
+        } else {
+            *eax = *ebx = *ecx = *edx = 0;
+        }
         break;
     case 0x80000022:
         *eax = *ebx = *ecx = *edx = 0;
@@ -9893,6 +9961,15 @@ void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
 
     if (env->features[FEAT_8000_0021_EAX]) {
         x86_cpu_adjust_level(cpu, &env->cpuid_min_xlevel, 0x80000021);
+    }
+
+    /*
+     * The TCG "max" CPU with an AMD-style vendor describes its topology in
+     * CPUID[0x80000026], as current AMD processors do.
+     */
+    if (xcc->max_features && tcg_enabled() &&
+        (IS_AMD_CPU(env) || IS_HYGON_CPU(env))) {
+        x86_cpu_adjust_level(cpu, &env->cpuid_min_xlevel, 0x80000026);
     }
 
     /* SGX requires CPUID[0x12] for EPC enumeration */
