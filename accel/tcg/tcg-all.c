@@ -233,6 +233,7 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 
 bool tcg_ijmp_inline;
 bool tcg_jcgen;
+bool tcg_jc_keep_pcrel;
 
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
@@ -269,6 +270,7 @@ static void tcg_set_tblookup(Object *obj, bool value, Error **errp)
 {
     tcg_ijmp_inline = value;
     tcg_tbpack = value;
+    tcg_jc_keep_pcrel = value;
 }
 
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
