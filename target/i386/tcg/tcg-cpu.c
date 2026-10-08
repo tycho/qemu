@@ -26,6 +26,7 @@
 #include "exec/target_page.h"
 #include "accel/tcg/cpu-ops.h"
 #include "tcg-cpu.h"
+#include "tcg/startup.h"
 
 /* Frob eflags into and out of the CPU temporary format.  */
 
@@ -57,6 +58,15 @@ static TCGTBCPUState x86_get_tb_cpu_state(CPUState *cs)
     flags = env->hflags |
         (env->eflags & (IOPL_MASK | TF_MASK | RF_MASK | VM_MASK | AC_MASK));
     if (env->hflags & HF_CS64_MASK) {
+        /*
+         * SS.B has no effect in 64-bit code (see mo_stacksize), but the
+         * kernel runs with SS loaded by SYSCALL or by an interrupt gate,
+         * so its code would be translated twice.  Set rather than clear
+         * it, as qemu-user's translator takes SS32 to be true.
+         */
+        if (tcg_tb_flags_canon) {
+            flags |= HF_SS32_MASK;
+        }
         cs_base = 0;
         pc = env->eip;
     } else {
