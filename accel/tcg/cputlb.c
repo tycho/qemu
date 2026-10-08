@@ -151,15 +151,32 @@ static void tlb_window_reset(CPUTLBDesc *desc, int64_t ns,
 static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
+    uint64_t salt, gsalt;
     int i, i0;
 
     if (unlikely(!jc)) {
         return;
     }
 
+    salt = qatomic_read(&jc->salt);
+    gsalt = qatomic_read(&jc->gsalt);
     i0 = tb_jmp_cache_hash_page(page_addr);
     for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
-        qatomic_set(&jc->array[i0 + i].tb, NULL);
+        vaddr key = jc->array[i0 + i].pc;
+
+        /*
+         * The group holds other pages' entries too: with tcg_jc_global,
+         * drop only this page's, under either salt (entries under older
+         * salts never match again).
+         */
+        if (!qatomic_read(&jc->array[i0 + i].tb)) {
+            continue;
+        }
+        if (!tcg_jc_global ||
+            ((key ^ salt) & TARGET_PAGE_MASK) == page_addr ||
+            ((key ^ gsalt) & TARGET_PAGE_MASK) == page_addr) {
+            qatomic_set(&jc->array[i0 + i].tb, NULL);
+        }
     }
 }
 
@@ -497,7 +514,7 @@ void tlb_flush_nonglobal_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap)
     }
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
-    tcg_flush_jmp_cache(cpu);
+    tcg_flush_jmp_cache_nonglobal(cpu);
 
     qatomic_set(&cpu->neg.tlb.c.part_flush_count,
                 cpu->neg.tlb.c.part_flush_count + ctpop16(to_clean));
@@ -1374,6 +1391,17 @@ static inline bool tlb_hit_page(uint64_t tlb_addr, vaddr addr)
 static inline bool tlb_hit(uint64_t tlb_addr, vaddr addr)
 {
     return tlb_hit_page(tlb_addr, addr & TARGET_PAGE_MASK);
+}
+
+/* Whether the TLB holds @addr's code page, as a global translation. */
+bool tlb_code_global(CPUState *cpu, vaddr addr)
+{
+    int mmu_idx = cpu_mmu_index(cpu, true);
+    uintptr_t index = tlb_index(cpu, mmu_idx, addr);
+    CPUTLBEntry *entry = tlb_entry(cpu, mmu_idx, addr);
+
+    return tlb_hit(tlb_read_idx(entry, MMU_INST_FETCH), addr) &&
+           cpu->neg.tlb.d[mmu_idx].fulltlb[index].global;
 }
 
 /*

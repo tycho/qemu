@@ -33,6 +33,7 @@
 #include "exec/page-protection.h"
 #include "exec/mmap-lock.h"
 #include "exec/translation-block.h"
+#include "exec/cputlb.h"
 #include "tcg/tcg.h"
 #include "tcg/startup.h"
 #include "qemu/atomic.h"
@@ -218,11 +219,39 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
     return qht_lookup_custom(&tb_ctx.htable, &desc, h, tb_lookup_cmp);
 }
 
+/* The key stored with a jump-cache entry for @pc. */
+static inline vaddr tb_jmp_cache_key(CPUJumpCache *jc, vaddr pc, bool global)
+{
+    return pc ^ (global ? qatomic_read(&jc->gsalt) : qatomic_read(&jc->salt));
+}
+
+/* Whether jump-cache entry @key is for @pc, under either salt. */
+static inline bool tb_jmp_cache_key_match(CPUJumpCache *jc, vaddr key,
+                                          vaddr pc)
+{
+    return key == (pc ^ qatomic_read(&jc->salt)) ||
+           (tcg_jc_global && key == (pc ^ qatomic_read(&jc->gsalt)));
+}
+
 /* tcg_jc_ctx: whether the jump cache holds TBs for state @s. */
 static inline bool tb_jmp_cache_ctx_match(CPUJumpCache *jc, TCGTBCPUState s)
 {
     return jc->ctx_cs_base == s.cs_base && jc->ctx_flags == s.flags &&
            jc->ctx_cflags == s.cflags;
+}
+
+/*
+ * tcg_jcgen: whether the jump-cache entry for @tb at @pc may outlive a
+ * flush of non-global translations: its code is on one page, which the
+ * TLB holds as global.
+ */
+static bool tb_jmp_cache_global(CPUState *cpu, TranslationBlock *tb, vaddr pc)
+{
+#ifdef CONFIG_USER_ONLY
+    return false;
+#else
+    return tcg_jc_global && tb_page_addr1(tb) == -1 && tlb_code_global(cpu, pc);
+#endif
 }
 
 /**
@@ -251,11 +280,10 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 
     hash = tb_jmp_cache_hash_func(s.pc);
     jc = cpu->tb_jmp_cache;
-    key = s.pc ^ qatomic_read(&jc->salt);
 
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
-               jc->array[hash].pc == key &&
+               tb_jmp_cache_key_match(jc, jc->array[hash].pc, s.pc) &&
                tb->cs_base == s.cs_base &&
                tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
@@ -285,6 +313,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
         return NULL;
     }
 
+    key = tb_jmp_cache_key(jc, s.pc, tb_jmp_cache_global(cpu, tb, s.pc));
     jc->array[hash].pc = key;
     qatomic_set(&jc->array[hash].tb, tb);
 
@@ -745,7 +774,7 @@ const void *HELPER(lookup_tb_ptr_jcp)(CPUArchState *env, uint64_t pc,
     TranslationBlock *tb = qatomic_read(&jc->array[hash].tb);
 
     if (likely(tb &&
-               jc->array[hash].pc == (pc ^ qatomic_read(&jc->salt)) &&
+               tb_jmp_cache_key_match(jc, jc->array[hash].pc, pc) &&
                QTAILQ_EMPTY(&cpu->breakpoints) &&
                tb->cs_base == cs_base &&
                tb->flags == flags &&
@@ -1363,7 +1392,8 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 h = tb_jmp_cache_hash_func(s.pc);
                 jc = cpu->tb_jmp_cache;
                 if (!tcg_jc_ctx || tb_jmp_cache_ctx_match(jc, s)) {
-                    jc->array[h].pc = s.pc ^ qatomic_read(&jc->salt);
+                    jc->array[h].pc = tb_jmp_cache_key(jc, s.pc,
+                                        tb_jmp_cache_global(cpu, tb, s.pc));
                     qatomic_set(&jc->array[h].tb, tb);
                 }
             }
@@ -1483,6 +1513,7 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
     tcg_update_cflags(cpu);
 
     cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
+    cpu->tb_jmp_cache->gsalt = TB_JMP_GSALT_BASE;
     if (tcg_retstack && tcg_retsp_off) {
         size_t page = qemu_real_host_page_size();
         char *p = mmap(NULL, TCG_RETSTACK_SIZE + 2 * page, PROT_NONE,
