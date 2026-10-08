@@ -3872,9 +3872,13 @@ static void gen_INTO(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_INVPCID(DisasContext *s, X86DecodedInsn *decode)
 {
-    TCGv_i64 desc = tcg_temp_new_i64();
-    TCGv_i64 addr = tcg_temp_new_i64();
+    TCGv_i64 desc, addr;
 
+    if (!check_cpl0(s)) {
+        return;
+    }
+    desc = tcg_temp_new_i64();
+    addr = tcg_temp_new_i64();
     tcg_gen_qemu_ld_i64(desc, s->A0, s->mem_index, MO_LEUQ);
     gen_add_A0_im(s, 8);
     tcg_gen_qemu_ld_i64(addr, s->A0, s->mem_index, MO_LEUQ);
