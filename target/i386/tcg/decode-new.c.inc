@@ -2705,6 +2705,14 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
             if (!(s->flags & HF_AVX_EN_MASK)) {
                 goto illegal;
             }
+            /*
+             * Without a 66, F2 or F3 prefix these opcodes are MMX
+             * instructions, which have no VEX form.
+             */
+            if (e->special == X86_SPECIAL_MMX &&
+                !(s->prefix & (PREFIX_DATA | PREFIX_REPZ | PREFIX_REPNZ))) {
+                goto illegal;
+            }
         } else if (e->special != X86_SPECIAL_MMX ||
                    (s->prefix & (PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA))) {
             if (!(s->flags & HF_OSFXSR_MASK)) {
