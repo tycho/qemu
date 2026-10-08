@@ -279,6 +279,16 @@ static void tcg_set_cr3_flush(Object *obj, const char *value, Error **errp)
                "(all, paging, nonglobal)", value);
 }
 
+static bool tcg_get_pcid(Object *obj, Error **errp)
+{
+    return tcg_pcid;
+}
+
+static void tcg_set_pcid(Object *obj, bool value, Error **errp)
+{
+    tcg_pcid = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -317,6 +327,10 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "paging (not the physical-address ones, which don't depend on "
         "CR3), or nonglobal (as paging, but keep global pages, as a MOV "
         "to CR3 without PCIDs does)");
+
+    object_class_property_add_bool(oc, "x-pcid", tcg_get_pcid, tcg_set_pcid);
+    object_class_property_set_description(oc, "x-pcid",
+        "x86: offer process-context identifiers (CPUID PCID and INVPCID)");
 }
 
 static const TypeInfo tcg_accel_type = {

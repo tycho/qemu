@@ -67,4 +67,10 @@ typedef enum TCGCR3Flush {
 
 extern TCGCR3Flush tcg_cr3_flush;
 
+/*
+ * x86 guests: offer PCIDs (CPUID PCID and INVPCID; the TCG accelerator
+ * property x-pcid).
+ */
+extern bool tcg_pcid;
+
 #endif
