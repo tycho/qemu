@@ -2140,8 +2140,12 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP1, TCG_AREG0,
                      tlb_mask_table_ofs(s, mem_index), 1, 0);
 
-        /* Extract the TLB index from the address into X0.  */
-        tcg_out_insn(s, addsub_realshift, AND_LSR, TCG_TYPE_I64,
+        /*
+         * Extract the TLB index from the address into X0.  The bits of a
+         * 32-bit address's register above bit 31 are undefined: keep them
+         * out of the index.
+         */
+        tcg_out_insn(s, addsub_realshift, AND_LSR, addr_type,
                      TCG_REG_TMP0, TCG_REG_TMP0, addr_reg,
                      TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
 
