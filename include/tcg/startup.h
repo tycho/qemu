@@ -266,4 +266,11 @@ extern bool tcg_exit_irq_only;
  */
 extern bool tcg_tsc_counter;
 
+/*
+ * Translate x86 PAUSE as a host spin hint inline (spin_hint) instead of
+ * a helper that leaves the execution loop; for MTTCG, where each vCPU
+ * has its own thread.
+ */
+extern bool tcg_pause_hint;
+
 #endif

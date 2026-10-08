@@ -60,6 +60,7 @@ struct TCGState {
     unsigned long tb_size;
     bool iofast;
     bool hosttime;
+    bool pause_hint;
 };
 typedef struct TCGState TCGState;
 
@@ -195,6 +196,18 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #endif
         tcg_tsc_counter = HOST_COUNTER_SUPPORTED && !icount_enabled();
     }
+
+    /*
+     * x-pause=hint: only where no other vCPU shares the thread (with
+     * round-robin TCG the exit is how the others get to run).
+     */
+#ifdef CONFIG_USER_ONLY
+    tcg_pause_hint = s->pause_hint;
+#else
+    tcg_pause_hint = s->pause_hint &&
+                     (s->mttcg_enabled == ON_OFF_AUTO_ON ||
+                      ms->smp.max_cpus == 1);
+#endif
 
     tcg_allowed = true;
 
@@ -572,6 +585,24 @@ static void tcg_set_hosttime(Object *obj, bool value, Error **errp)
     TCG_STATE(obj)->hosttime = value;
 }
 
+static char *tcg_get_pause(Object *obj, Error **errp)
+{
+    return g_strdup(TCG_STATE(obj)->pause_hint ? "hint" : "exit");
+}
+
+static void tcg_set_pause(Object *obj, const char *value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+
+    if (strcmp(value, "hint") == 0) {
+        s->pause_hint = true;
+    } else if (strcmp(value, "exit") == 0) {
+        s->pause_hint = false;
+    } else {
+        error_setg(errp, "Invalid 'x-pause' value: %s (exit, hint)", value);
+    }
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -707,6 +738,11 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "macOS MAP_JIT write/execute toggles: always (default) or lazy "
         "(skip the calls that wouldn't change the thread's mode); "
         "no effect on other hosts");
+
+    object_class_property_add_str(oc, "x-pause", tcg_get_pause, tcg_set_pause);
+    object_class_property_set_description(oc, "x-pause",
+        "x86 PAUSE: leave the execution loop (exit, QEMU's) or a host "
+        "spin hint inline (hint; with a thread per vCPU)");
 }
 
 static const TypeInfo tcg_accel_type = {
