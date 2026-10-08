@@ -851,6 +851,23 @@ static MemOp qemu_ldst_vec_memop(MemOp memop)
     return memop;
 }
 
+/*
+ * x-tso=acqrel: whether a vector access can itself be a load-acquire or
+ * store-release (aarch64: FEAT_LRCPC3 LDAPUR/STLUR of a Q register, which
+ * fault when crossing 16 bytes: aligned accesses only).
+ */
+bool tcg_can_qemu_ldst_vec_acqrel(void)
+{
+    return TCG_TARGET_HAS_qemu_ldst_vec_acqrel &&
+           tcg_tso_mode == TCG_TSO_ACQREL;
+}
+
+static bool tcg_ldst_vec_acqrel(MemOp memop)
+{
+    return tcg_can_qemu_ldst_vec_acqrel() &&
+           memop_alignment_bits(memop) >= MO_128;
+}
+
 bool tcg_can_qemu_ldst_vec(MemOp memop)
 {
     MemOp atom = qemu_ldst_vec_memop(memop) & MO_ATOM_MASK;
@@ -886,45 +903,128 @@ static void qemu_ldst_vec1(TCGOpcode opc, TCGv_vec val, TCGTemp *addr,
     maybe_free_addr(addr, addr_new);
 }
 
+/*
+ * As for tcg_gen_qemu_ld_i128: any barrier the mode needs before the
+ * loads is emitted here; with x-tso=acqrel a load that is not itself an
+ * acquire is followed by a barrier instead.  Two vector accesses that make
+ * up one guest access (@hi non-null) need no order among themselves, so
+ * the barrier is emitted once, for both.
+ */
+/*
+ * tcg_tso_vec_group: a vector access the guest doesn't make atomic (not
+ * required to be 16-byte aligned, or half of a wider access) joins the
+ * run of grouped accesses, as for tcg_tso_grouped.
+ */
+static bool tcg_tso_vec_grouped(MemOp memop, bool pair)
+{
+    return tcg_tso_vec_group && tcg_tso_mode == TCG_TSO_ACQREL &&
+           (pair || memop_alignment_bits(memop) < MO_128);
+}
+
+static void qemu_ld_vec_ordered(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
+                                TCGv_vec hi, TCGTemp *addr_hi, MemOp memop_hi,
+                                TCGArg idx, TCGType addr_type)
+{
+    bool after;
+
+    if (tcg_tso_vec_grouped(memop_lo, hi != NULL)) {
+        bool order = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
+
+        tcg_ctx->tso_run_emit = true;
+        qemu_ldst_vec1(INDEX_op_qemu_ld_vec, lo, addr_lo, idx, memop_lo,
+                       addr_type);
+        if (hi) {
+            qemu_ldst_vec1(INDEX_op_qemu_ld_vec, hi, addr_hi, idx, memop_hi,
+                           addr_type);
+        }
+        tcg_ctx->tso_run_emit = false;
+        tcg_ctx->tso_run_ld |= order;
+        return;
+    }
+    tcg_tso_run_end();
+    after = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
+    if (after && tcg_ldst_vec_acqrel(memop_lo)
+        && (!hi || tcg_ldst_vec_acqrel(memop_hi))) {
+        memop_lo |= MO_ACQ_REL;
+        memop_hi |= MO_ACQ_REL;
+        after = false;
+    }
+    qemu_ldst_vec1(INDEX_op_qemu_ld_vec, lo, addr_lo, idx, memop_lo,
+                   addr_type);
+    if (hi) {
+        qemu_ldst_vec1(INDEX_op_qemu_ld_vec, hi, addr_hi, idx, memop_hi,
+                       addr_type);
+    }
+    if (after) {
+        tcg_gen_mb(TCG_MO_LD_LD | TCG_MO_LD_ST | TCG_BAR_SC);
+    }
+}
+
+static void qemu_st_vec_ordered(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
+                                TCGv_vec hi, TCGTemp *addr_hi, MemOp memop_hi,
+                                TCGArg idx, TCGType addr_type)
+{
+    if (tcg_tso_vec_grouped(memop_lo, hi != NULL)) {
+        if (!tcg_ctx->tso_run_st &&
+            tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST)) {
+            tcg_gen_req_mo_plain_st();
+            tcg_ctx->tso_run_st = true;
+        }
+        tcg_ctx->tso_run_emit = true;
+        qemu_ldst_vec1(INDEX_op_qemu_st_vec, lo, addr_lo, idx, memop_lo,
+                       addr_type);
+        if (hi) {
+            qemu_ldst_vec1(INDEX_op_qemu_st_vec, hi, addr_hi, idx, memop_hi,
+                           addr_type);
+        }
+        tcg_ctx->tso_run_emit = false;
+        return;
+    }
+    tcg_tso_run_end();
+    if (tcg_ldst_vec_acqrel(memop_lo)
+        && (!hi || tcg_ldst_vec_acqrel(memop_hi))) {
+        /* A store-release orders earlier loads and stores before it. */
+        MemOp rel = tcg_gen_ldst_order(TCG_MO_LD_ST | TCG_MO_ST_ST);
+
+        memop_lo |= rel;
+        memop_hi |= rel;
+    } else {
+        tcg_gen_req_mo_plain_st();
+    }
+    qemu_ldst_vec1(INDEX_op_qemu_st_vec, lo, addr_lo, idx, memop_lo,
+                   addr_type);
+    if (hi) {
+        qemu_ldst_vec1(INDEX_op_qemu_st_vec, hi, addr_hi, idx, memop_hi,
+                       addr_type);
+    }
+}
+
 void tcg_gen_qemu_ld_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
                              MemOp memop, TCGType addr_type)
 {
-    tcg_gen_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
-    qemu_ldst_vec1(INDEX_op_qemu_ld_vec, val, addr, idx, memop, addr_type);
+    qemu_ld_vec_ordered(val, addr, memop, NULL, NULL, 0, idx, addr_type);
 }
 
 void tcg_gen_qemu_st_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
                              MemOp memop, TCGType addr_type)
 {
-    tcg_gen_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
-    qemu_ldst_vec1(INDEX_op_qemu_st_vec, val, addr, idx, memop, addr_type);
+    qemu_st_vec_ordered(val, addr, memop, NULL, NULL, 0, idx, addr_type);
 }
 
-/*
- * Two vector accesses that make up one guest access, whose parts the
- * guest doesn't order among themselves: the barrier the memory order
- * needs is emitted once, for both.
- */
 void tcg_gen_qemu_ld_vec2_chk(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
                               TCGv_vec hi, TCGTemp *addr_hi, MemOp memop_hi,
                               TCGArg idx, TCGType addr_type)
 {
-    tcg_gen_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
-    qemu_ldst_vec1(INDEX_op_qemu_ld_vec, lo, addr_lo, idx, memop_lo,
-                   addr_type);
-    qemu_ldst_vec1(INDEX_op_qemu_ld_vec, hi, addr_hi, idx, memop_hi,
-                   addr_type);
+    qemu_ld_vec_ordered(lo, addr_lo, memop_lo, hi, addr_hi, memop_hi, idx,
+                        addr_type);
 }
 
 void tcg_gen_qemu_st_vec2_chk(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
                               TCGv_vec hi, TCGTemp *addr_hi, MemOp memop_hi,
                               TCGArg idx, TCGType addr_type)
 {
-    tcg_gen_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
-    qemu_ldst_vec1(INDEX_op_qemu_st_vec, lo, addr_lo, idx, memop_lo,
-                   addr_type);
-    qemu_ldst_vec1(INDEX_op_qemu_st_vec, hi, addr_hi, idx, memop_hi,
-                   addr_type);
+    qemu_st_vec_ordered(lo, addr_lo, memop_lo, hi, addr_hi, memop_hi, idx,
+                        addr_type);
 }
 
 static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
