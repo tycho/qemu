@@ -2862,6 +2862,9 @@ void x86_tsc_counter_rebase(CPUX86State *env);
 #define MMU_PHYS_IDX       6
 #define MMU_NESTED_IDX     7
 
+/* The mmu indexes that translate through the guest's paging. */
+#define MMU_PAGING_IDX_BITS ((1 << MMU_PHYS_IDX) - 1)
+
 #ifdef CONFIG_USER_ONLY
 #ifdef TARGET_X86_64
 #define MMU_USER_IDX MMU_USER64_IDX
