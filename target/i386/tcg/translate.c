@@ -2257,6 +2257,48 @@ static void gen_lookup_and_goto_ptr(DisasContext *s, int mode)
 }
 
 /*
+ * [DEV] exp: end blocks after STI, the interrupt shadow and CR8 writes by
+ * chaining unless an interrupt is pending (XTCG_NOEXITFAST: always exit).
+ */
+static bool exitfast(DisasContext *s)
+{
+    static int off = -1;
+
+    if (off < 0) {
+        off = getenv("XTCG_NOEXITFAST") != NULL;
+    }
+    return !off && !(tb_cflags(s->base.tb) & CF_USE_ICOUNT);
+}
+
+/*
+ * Leave the block for the main loop if the vCPU has an interrupt request
+ * (one that IF or the TPR held back may be deliverable now); otherwise
+ * fall through.  cpu_eip must hold the pc to resume at, or @eip_next asks
+ * to store the next instruction's, on the exit path only.
+ */
+static void gen_exit_if_irq_pending(DisasContext *s, bool eip_next)
+{
+    TCGLabel *cont = gen_new_label();
+    TCGv_i32 t = tcg_temp_new_i32();
+
+    gen_update_cc_op(s);
+    tcg_gen_ld_i32(t, tcg_env,
+                   offsetof(CPUState, interrupt_request) - sizeof(CPUState));
+    tcg_gen_brcondi_i32(TCG_COND_EQ, t, 0, cont);
+    if (eip_next) {
+        if (tb_cflags(s->base.tb) & CF_PCREL) {
+            tcg_gen_addi_tl(cpu_eip, cpu_eip, s->pc - s->pc_save);
+        } else if (CODE64(s)) {
+            tcg_gen_movi_tl(cpu_eip, s->pc);
+        } else {
+            tcg_gen_movi_tl(cpu_eip, (uint32_t)(s->pc - s->cs_base));
+        }
+    }
+    tcg_gen_exit_tb(NULL, 0);
+    gen_set_label(cont);
+}
+
+/*
  * Generate an end of block, including common tasks such as generating
  * single step traps, resetting the RF flag, and handling the interrupt
  * shadow.
@@ -2289,6 +2331,15 @@ gen_eob(DisasContext *s, int mode)
                /* give irqs a chance to happen */
                !inhibit_reset) {
         gen_lookup_and_goto_ptr(s, mode);
+    } else if (inhibit_reset && exitfast(s) &&
+               (mode == DISAS_EOB_NEXT || mode == DISAS_EOB_INHIBIT_IRQ ||
+                mode == DISAS_JUMP || mode == DISAS_JUMP_FAR)) {
+        /* The shadow is over: leave only if an interrupt may be taken. */
+        gen_exit_if_irq_pending(s, false);
+        tcg_gen_lookup_and_goto_ptr();
+    } else if (mode == DISAS_EOB_INHIBIT_IRQ && exitfast(s)) {
+        /* No interrupt is taken in the shadow: chain to its block. */
+        tcg_gen_lookup_and_goto_ptr();
     } else {
         tcg_gen_exit_tb(NULL, 0);
     }

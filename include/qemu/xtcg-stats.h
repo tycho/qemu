@@ -91,6 +91,7 @@ typedef enum XtcgHist {
     XH_X86_IRQ_HI,          /* ... vector 128-255, at vector - 128 */
     XH_X86_CR3_PCID,        /* PCID of CR3 writes with CR4.PCIDE (127: >=) */
     XH_X86_INVPCID,         /* INVPCID by type */
+    XH_JC_FULL,             /* full jump-cache flushes by call site */
     XH__COUNT
 } XtcgHist;
 

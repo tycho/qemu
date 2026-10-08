@@ -26,6 +26,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xtcg-stats.h"
 #include "accel/accel-ops.h"
 #include "accel/accel-cpu-ops.h"
 #include "accel/tcg/cpu-loop.h"
@@ -89,7 +90,7 @@ int tcg_cpu_exec(CPUState *cpu)
 
 static void tcg_cpu_reset_hold(CPUState *cpu)
 {
-    tcg_flush_jmp_cache(cpu);
+    xtcg_hist_inc(XH_JC_FULL, 21); tcg_flush_jmp_cache(cpu);
 
     tlb_flush(cpu);
 }

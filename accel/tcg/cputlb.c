@@ -429,7 +429,7 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
-    tcg_flush_jmp_cache(cpu);
+    xtcg_hist_inc(XH_JC_FULL, 1); tcg_flush_jmp_cache(cpu);
 
     if (to_clean == ALL_MMUIDX_BITS) {
         qatomic_set(&cpu->neg.tlb.c.full_flush_count,
@@ -840,7 +840,7 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
      * longer to clear each entry individually than it will to clear it all.
      */
     if (d.len >= (TARGET_PAGE_SIZE * TB_JMP_CACHE_SIZE)) {
-        tcg_flush_jmp_cache(cpu);
+        xtcg_hist_inc(XH_JC_FULL, 2); tcg_flush_jmp_cache(cpu);
         return;
     }
 

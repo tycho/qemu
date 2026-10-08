@@ -789,7 +789,7 @@ void tb_flush__exclusive_or_serial(void)
            (current_cpu && cpu_in_serial_context(current_cpu)));
 
     CPU_FOREACH(cpu) {
-        tcg_flush_jmp_cache(cpu);
+        xtcg_hist_inc(XH_JC_FULL, 11); tcg_flush_jmp_cache(cpu);
     }
 
     qht_reset_size(&tb_ctx.htable, CODE_GEN_HTABLE_SIZE);
@@ -920,7 +920,7 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
          */
         if (old) {
             CPU_FOREACH(cpu) {
-                tcg_flush_jmp_cache(cpu);
+                xtcg_hist_inc(XH_JC_FULL, 12); tcg_flush_jmp_cache(cpu);
             }
         }
     } else {

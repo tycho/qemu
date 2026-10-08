@@ -77,6 +77,7 @@ static const char * const hist_names[XH__COUNT] = {
     [XH_X86_IRQ_HI] = "x86_irq.vector_minus_128",
     [XH_X86_CR3_PCID] = "x86_cr3.pcid",
     [XH_X86_INVPCID] = "x86_invpcid.type",
+    [XH_JC_FULL] = "jc_full_flush.site",
 };
 
 static bool dumped;
