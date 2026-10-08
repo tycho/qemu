@@ -499,9 +499,13 @@ static size_t tcg_n_regions(size_t tb_size, unsigned max_threads)
 /*
  * We expect most system emulation to run one or two guests per host.
  * Users running large scale system emulation may want to tweak their
- * runtime setup via the tb-size control on the command line.
+ * runtime setup via the tb-size control on the command line.  [DEV] The
+ * fork's default is 4 GiB: a Windows 11 boot generates over 4 GiB of
+ * code and flushed a 1 GiB buffer 15 times, retranslating its working set
+ * each time.  Only the pages used are touched; still capped at an eighth
+ * of host memory.
  */
-#define DEFAULT_CODE_GEN_BUFFER_SIZE_1 (1 * GiB)
+#define DEFAULT_CODE_GEN_BUFFER_SIZE_1 (4 * GiB)
 #endif
 
 #define DEFAULT_CODE_GEN_BUFFER_SIZE \
