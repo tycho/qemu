@@ -2339,21 +2339,39 @@ void glue(helper_vpmaskmovq_st, SUFFIX)(CPUX86State *env,
     }
 }
 
-void glue(helper_vpmaskmovd, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
+/*
+ * Only the elements whose mask bit is set are read: the others can't
+ * fault, e.g. where the vector extends into an unmapped page.  The
+ * destination is written after all the reads, so that it is unchanged
+ * if one faults.
+ */
+void glue(helper_vpmaskmovd_ld, SUFFIX)(CPUX86State *env,
+                                        Reg *d, Reg *v, target_ulong a0)
 {
+    Reg r;
     int i;
 
     for (i = 0; i < (2 << SHIFT); i++) {
-        d->L(i) = (v->L(i) >> 31) ? s->L(i) : 0;
+        r.L(i) = (v->L(i) >> 31)
+            ? cpu_ldl_le_data_ra(env, a0 + i * 4, GETPC()) : 0;
+    }
+    for (i = 0; i < (2 << SHIFT); i++) {
+        d->L(i) = r.L(i);
     }
 }
 
-void glue(helper_vpmaskmovq, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
+void glue(helper_vpmaskmovq_ld, SUFFIX)(CPUX86State *env,
+                                        Reg *d, Reg *v, target_ulong a0)
 {
+    Reg r;
     int i;
 
     for (i = 0; i < (1 << SHIFT); i++) {
-        d->Q(i) = (v->Q(i) >> 63) ? s->Q(i) : 0;
+        r.Q(i) = (v->Q(i) >> 63)
+            ? cpu_ldq_le_data_ra(env, a0 + i * 8, GETPC()) : 0;
+    }
+    for (i = 0; i < (1 << SHIFT); i++) {
+        d->Q(i) = r.Q(i);
     }
 }
 

@@ -64,6 +64,24 @@ static void gen_NM_exception(DisasContext *s)
     gen_exception(s, EXCP07_PREX);
 }
 
+/*
+ * The CR0 checks of an MMX or 3DNow! instruction that validate_vex
+ * doesn't see: #UD with EM, else #NM with TS.  Return false if the
+ * instruction raises one.
+ */
+static bool gen_check_cr0_mmx(DisasContext *s)
+{
+    if (s->flags & HF_EM_MASK) {
+        gen_illegal_opcode(s);
+        return false;
+    }
+    if (s->flags & HF_TS_MASK) {
+        gen_NM_exception(s);
+        return false;
+    }
+    return true;
+}
+
 static void gen_lea_modrm(DisasContext *s, X86DecodedInsn *decode)
 {
     AddressParts *mem = &decode->mem;
@@ -510,12 +528,7 @@ static void gen_3dnow(DisasContext *s, X86DecodedInsn *decode)
         gen_illegal_opcode(s);
         return;
     }
-    if (s->flags & HF_TS_MASK) {
-        gen_NM_exception(s);
-        return;
-    }
-    if (s->flags & HF_EM_MASK) {
-        gen_illegal_opcode(s);
+    if (!gen_check_cr0_mmx(s)) {
         return;
     }
 
@@ -957,8 +970,6 @@ BINARY_INT_SSE(PUNPCKHQDQ, punpckhqdq)
 BINARY_INT_SSE(VPACKUSDW,  packusdw)
 BINARY_INT_SSE(VPERMILPS,  vpermilps)
 BINARY_INT_SSE(VPERMILPD,  vpermilpd)
-BINARY_INT_SSE(VMASKMOVPS, vpmaskmovd)
-BINARY_INT_SSE(VMASKMOVPD, vpmaskmovq)
 
 BINARY_INT_SSE(PMULDQ,    pmuldq)
 
@@ -1096,7 +1107,6 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
 VEXW_AVX(VPSLLV,    vpsllv)
 VEXW_AVX(VPSRLV,    vpsrlv)
 VEXW_AVX(VPSRAV,    vpsrav)
-VEXW_AVX(VPMASKMOV, vpmaskmov)
 
 /* Same as above, but with extra arguments to the helper.  */
 static inline void gen_vsib_avx(DisasContext *s, X86DecodedInsn *decode,
@@ -2008,6 +2018,9 @@ static void gen_DIV(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_EMMS(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (!gen_check_cr0_mmx(s)) {
+        return;
+    }
     gen_helper_emms(tcg_env);
 }
 
@@ -4476,6 +4489,29 @@ static inline void gen_maskmov(DisasContext *s, X86DecodedInsn *decode,
     }
 }
 
+/* The loads take the address only: masked-off elements must not fault. */
+static inline void gen_maskmov_ld(DisasContext *s, X86DecodedInsn *decode,
+                                  SSEFunc_0_eppt xmm, SSEFunc_0_eppt ymm)
+{
+    if (!s->vex_l) {
+        xmm(tcg_env, OP_PTR0, OP_PTR1, s->A0);
+    } else {
+        ymm(tcg_env, OP_PTR0, OP_PTR1, s->A0);
+    }
+}
+
+static void gen_VMASKMOVPD(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_maskmov_ld(s, decode, gen_helper_vpmaskmovq_ld_xmm,
+                   gen_helper_vpmaskmovq_ld_ymm);
+}
+
+static void gen_VMASKMOVPS(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_maskmov_ld(s, decode, gen_helper_vpmaskmovd_ld_xmm,
+                   gen_helper_vpmaskmovd_ld_ymm);
+}
+
 static void gen_VMASKMOVPD_st(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_maskmov(s, decode, gen_helper_vpmaskmovq_st_xmm, gen_helper_vpmaskmovq_st_ymm);
@@ -4609,6 +4645,15 @@ static void gen_VMOVSS_st(DisasContext *s, X86DecodedInsn *decode)
 
     tcg_gen_ld_i32(tmp, OP_PTR2, offsetof(ZMMReg, ZMM_L(0)));
     tcg_gen_qemu_st_i32(tmp, s->A0, s->mem_index, MO_LEUL);
+}
+
+static void gen_VPMASKMOV(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (s->vex_w) {
+        gen_VMASKMOVPD(s, decode);
+    } else {
+        gen_VMASKMOVPS(s, decode);
+    }
 }
 
 static void gen_VPMASKMOV_st(DisasContext *s, X86DecodedInsn *decode)

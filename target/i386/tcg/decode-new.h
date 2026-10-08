@@ -257,6 +257,12 @@ typedef enum X86VEXSpecial {
     X86_VEX_REPScalar,
 
     /*
+     * Scalar FMA instructions, whose memory operand is single or double
+     * precision depending on VEX.W.  The decoding table uses "x" for it.
+     */
+    X86_VEX_WScalar,
+
+    /*
      * VEX instructions that only support 256-bit operands with AVX2 (Table 2-17
      * column 3).  Columns 2 and 4 (instructions limited to 256- and 127-bit
      * operands respectively) are implicit in the presence of dq and qq

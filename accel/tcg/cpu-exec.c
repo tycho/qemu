@@ -483,9 +483,12 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     /*
      * If gdb single-step, and we haven't raised another exception,
      * raise a debug exception.  Single-step with another exception
-     * is handled in cpu_handle_exception.
+     * is handled in cpu_handle_exception.  A TB that exited before it
+     * started has executed nothing: the main loop handles the request
+     * and runs it again.
      */
-    if (unlikely(cpu_single_stepping(cpu)) && cpu->exception_index == -1) {
+    if (unlikely(cpu_single_stepping(cpu)) && cpu->exception_index == -1
+        && *tb_exit != TB_EXIT_REQUESTED) {
         cpu->exception_index = EXCP_DEBUG;
         cpu_loop_exit(cpu);
     }
@@ -553,6 +556,8 @@ void cpu_exec_step_atomic(CPUState *cpu)
 {
     TranslationBlock *tb;
     int tb_exit;
+    /* Whether cpu_exec_enter ran: volatile, as it's read after a longjmp. */
+    volatile bool entered = false;
 
     if (sigsetjmp(cpu->jmp_env, 0) == 0) {
         start_exclusive();
@@ -584,12 +589,23 @@ void cpu_exec_step_atomic(CPUState *cpu)
         }
 
         cpu_exec_enter(cpu);
+        entered = true;
         /* execute the generated code */
         trace_exec_tb(tb, s.pc);
         cpu_tb_exec(cpu, tb, &tb_exit);
         cpu_exec_exit(cpu);
     } else {
         cpu_exec_longjmp_cleanup(cpu);
+        /*
+         * The insn raised an exception: undo cpu_exec_enter as cpu_exec
+         * does when it leaves.  Otherwise the state cpu_exec_enter moved
+         * out of the architectural registers (x86: the arithmetic flags,
+         * held as cc_src/cc_op) is lost: the signal frame or exception
+         * frame, and the next cpu_exec_enter, read eflags without them.
+         */
+        if (entered) {
+            cpu_exec_exit(cpu);
+        }
     }
 
     /*
