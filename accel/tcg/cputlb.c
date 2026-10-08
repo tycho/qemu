@@ -279,6 +279,7 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
 
 static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
 {
+    desc->has_global = false;
     desc->n_used_entries = 0;
     desc->large_page_addr = -1;
     desc->large_page_mask = -1;
@@ -416,6 +417,76 @@ void tlb_flush_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap)
     tlb_flush_by_mmuidx_async_work(cpu, RUN_ON_CPU_HOST_INT(idxmap));
 }
 
+/**
+ * tlb_entry_is_empty - return true if the entry is not in use
+ * @te: pointer to CPUTLBEntry
+ */
+static inline bool tlb_entry_is_empty(const CPUTLBEntry *te)
+{
+    return te->addr_read == -1 && te->addr_write == -1 && te->addr_code == -1;
+}
+
+/*
+ * Flush the entries of @mmu_idx that are not marked global.  When the
+ * table is resized it is reallocated, and holds no entries at all.
+ */
+static void tlb_flush_nonglobal_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
+                                                  int64_t now)
+{
+    CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
+    CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
+    size_t n = tlb_n_entries(fast);
+
+    if (!desc->has_global) {
+        tlb_flush_one_mmuidx_locked(cpu, mmu_idx, now);
+        return;
+    }
+    tlb_mmu_resize_locked(desc, fast, now);
+    if (tlb_n_entries(fast) != n) {
+        tlb_mmu_flush_locked(desc, fast);
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        CPUTLBEntry *te = &fast->table[i];
+
+        if (!tlb_entry_is_empty(te) && !desc->fulltlb[i].global) {
+            memset(te, -1, sizeof(*te));
+            desc->n_used_entries--;
+        }
+    }
+    for (int i = 0; i < CPU_VTLB_SIZE; i++) {
+        if (!desc->vfulltlb[i].global) {
+            memset(&desc->vtable[i], -1, sizeof(desc->vtable[i]));
+        }
+    }
+}
+
+void tlb_flush_nonglobal_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap)
+{
+    MMUIdxMap to_clean, work;
+    int64_t now = get_clock_realtime();
+
+    assert_cpu_is_self(cpu);
+
+    qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    to_clean = idxmap & cpu->neg.tlb.c.dirty;
+    for (work = to_clean; work != 0; work &= work - 1) {
+        int mmu_idx = ctz32(work);
+
+        tlb_flush_nonglobal_one_mmuidx_locked(cpu, mmu_idx, now);
+        /* An index that kept global entries stays dirty. */
+        if (!cpu->neg.tlb.d[mmu_idx].has_global) {
+            cpu->neg.tlb.c.dirty &= ~(1 << mmu_idx);
+        }
+    }
+    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+
+    tcg_flush_jmp_cache(cpu);
+
+    qatomic_set(&cpu->neg.tlb.c.part_flush_count,
+                cpu->neg.tlb.c.part_flush_count + ctpop16(to_clean));
+}
+
 void tlb_flush(CPUState *cpu)
 {
     tlb_flush_by_mmuidx(cpu, ALL_MMUIDX_BITS);
@@ -450,15 +521,6 @@ static bool tlb_hit_page_mask_anyprot(CPUTLBEntry *tlb_entry,
 static inline bool tlb_hit_page_anyprot(CPUTLBEntry *tlb_entry, vaddr page)
 {
     return tlb_hit_page_mask_anyprot(tlb_entry, page, -1);
-}
-
-/**
- * tlb_entry_is_empty - return true if the entry is not in use
- * @te: pointer to CPUTLBEntry
- */
-static inline bool tlb_entry_is_empty(const CPUTLBEntry *te)
-{
-    return te->addr_read == -1 && te->addr_write == -1 && te->addr_code == -1;
 }
 
 /* Called with tlb_c.lock held */
@@ -1153,6 +1215,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
      * vaddr we add back in io_prepare()/get_page_addr_code().
      */
     desc->fulltlb[index] = *full;
+    if (full->global) {
+        desc->has_global = true;
+    }
     full = &desc->fulltlb[index];
     full->xlat_offset = iotlb - addr_page;
     full->section = section;
