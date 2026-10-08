@@ -916,19 +916,25 @@ static void tcg_flush_jmp_cache_1(CPUState *cpu, bool clear)
         int shift = cpu->cc->tcg_ops->jmp_cache_salt_shift(cpu);
         uint64_t step = 1ull << shift;
         uint64_t salt = qatomic_read(&jc->salt) + step;
+        uint64_t gsalt = qatomic_read(&jc->gsalt) + step;
 
         /*
-         * Once every 2^(64 - shift) flushes the salt comes round, and in
-         * a mode with another shift the old entries' keys may alias new
-         * pcs: clear for real then.
+         * Once every 2^(63 - shift) flushes a salt comes round (into the
+         * other's half), and in a mode with another shift the old
+         * entries' keys may alias new pcs: clear for real then.
          */
-        if (!clear && step == jc->salt_step && salt != 0) {
+        if (!clear && step == jc->salt_step &&
+            !(salt & TB_JMP_GSALT_BASE) && (gsalt & TB_JMP_GSALT_BASE)) {
             qatomic_set(&jc->salt, salt);
+            qatomic_set(&jc->gsalt, gsalt);
             return;
         }
         jc->salt_step = step;
     }
-    qatomic_set(&jc->salt, 0);
+    if (tcg_jcgen) {
+        qatomic_set(&jc->salt, 0);
+        qatomic_set(&jc->gsalt, TB_JMP_GSALT_BASE);
+    }
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
         qatomic_set(&jc->array[i].tb, NULL);
     }
@@ -961,6 +967,8 @@ void tcg_drop_jmp_cache(CPUState *cpu)
     if (unlikely(jc == NULL)) {
         return;
     }
+    qatomic_set(&jc->salt, 0);
+    qatomic_set(&jc->gsalt, TB_JMP_GSALT_BASE);
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
         qatomic_set(&jc->array[i].tb, NULL);
     }

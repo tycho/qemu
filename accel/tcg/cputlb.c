@@ -153,7 +153,7 @@ static void tlb_window_reset(CPUTLBDesc *desc, int64_t ns,
 static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
-    uint64_t salt;
+    uint64_t salt, gsalt;
     int i, i0;
 
     if (unlikely(!jc)) {
@@ -163,6 +163,7 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
     tcg_retstack_bump(cpu);
 
     salt = qatomic_read(&jc->salt);
+    gsalt = qatomic_read(&jc->gsalt);
     i0 = tb_jmp_cache_hash_page(page_addr);
     /* No entry made for the page since its group was last scanned. */
     if (!test_bit(tb_jmp_cache_filter_bit(page_addr), jc->filter)) {
@@ -171,19 +172,28 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
     bitmap_clear(jc->filter, i0, TB_JMP_PAGE_SIZE);
     for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
         vaddr pc = jc->array[i0 + i].pc ^ salt;
+        vaddr gpc = jc->array[i0 + i].pc ^ gsalt;
 
         /*
          * The group holds other pages' entries too.  With tcg_jcgen the
-         * key gives back the pc under the current salt: drop only this
-         * page's entries, and set the bits of those that stay.  Those
-         * made under older salts stay too, but only the revalidation of
-         * a stale entry takes them again, and it checks the TB's pages
-         * as they are mapped now.
+         * key gives back the pc under the current salt, or with
+         * tcg_jc_global under gsalt: drop only this page's entries, and
+         * set the bits of those that stay (under both, since the key
+         * doesn't say which).  Those made under older salts stay too,
+         * but only the revalidation of a stale entry takes them again,
+         * and it checks the TB's pages as they are mapped now.
          */
-        if (!tcg_jcgen || (pc & TARGET_PAGE_MASK) == page_addr) {
+        if (!qatomic_read(&jc->array[i0 + i].tb)) {
+            continue;
+        }
+        if (!tcg_jcgen || (pc & TARGET_PAGE_MASK) == page_addr ||
+            (tcg_jc_global && (gpc & TARGET_PAGE_MASK) == page_addr)) {
             qatomic_set(&jc->array[i0 + i].tb, NULL);
-        } else if (qatomic_read(&jc->array[i0 + i].tb)) {
+        } else {
             set_bit(tb_jmp_cache_filter_bit(pc), jc->filter);
+            if (tcg_jc_global) {
+                set_bit(tb_jmp_cache_filter_bit(gpc), jc->filter);
+            }
         }
     }
 }
@@ -624,7 +634,7 @@ void tlb_flush_nonglobal_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap)
     }
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
-    tcg_flush_jmp_cache(cpu);
+    tcg_flush_jmp_cache_nonglobal(cpu);
 
     qatomic_set(&cpu->neg.tlb.c.part_flush_count,
                 cpu->neg.tlb.c.part_flush_count + ctpop16(to_clean));
@@ -1572,6 +1582,17 @@ static inline bool tlb_hit_page(uint64_t tlb_addr, vaddr addr)
 static inline bool tlb_hit(uint64_t tlb_addr, vaddr addr)
 {
     return tlb_hit_page(tlb_addr, addr & TARGET_PAGE_MASK);
+}
+
+/* Whether the TLB holds @addr's code page, as a global translation. */
+bool tlb_code_global(CPUState *cpu, vaddr addr)
+{
+    int mmu_idx = cpu_mmu_index(cpu, true);
+    uintptr_t index = tlb_index(cpu, mmu_idx, addr);
+    CPUTLBEntry *entry = tlb_entry(cpu, mmu_idx, addr);
+
+    return tlb_hit(tlb_read_idx(entry, MMU_INST_FETCH), addr) &&
+           cpu->neg.tlb.d[mmu_idx].fulltlb[index].global;
 }
 
 /*

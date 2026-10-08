@@ -186,6 +186,7 @@ void tlb_flush_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap);
  * clears the CPU's jump cache.
  */
 void tlb_flush_nonglobal_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap);
+bool tlb_code_global(CPUState *cpu, vaddr addr);
 
 /**
  * tlb_flush_by_mmuidx_all_cpus_synced:
@@ -262,6 +263,10 @@ static inline void tlb_flush_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap)
 static inline void tlb_flush_nonglobal_by_mmuidx(CPUState *cpu,
                                                  MMUIdxMap idxmap)
 {
+}
+static inline bool tlb_code_global(CPUState *cpu, vaddr addr)
+{
+    return false;
 }
 static inline void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *cpu,
                                                             vaddr addr,

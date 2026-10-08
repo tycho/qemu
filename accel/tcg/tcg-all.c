@@ -325,7 +325,10 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     tcg_iopl_runtime = s->i386_runtime;
 
     tcg_jcgen = cc->tcg_ops->jmp_cache_salt_shift != NULL;
-#ifdef CONFIG_USER_ONLY
+#ifndef CONFIG_USER_ONLY
+    tcg_jc_global = tcg_jcgen && tcg_ijmp_inline &&
+                    tcg_cr3_flush == TCG_CR3_FLUSH_NONGLOBAL;
+#else
     tcg_jc_ctx = tcg_jcgen && tcg_ijmp_inline;
 #endif
     page_init();
@@ -488,6 +491,7 @@ TCGXPage tcg_xpage;
 bool tcg_jcgen;
 bool tcg_jc_ctx;
 bool tcg_jc_keep_pcrel;
+bool tcg_jc_global;
 
 bool tcg_iolast;
 bool tcg_iolazy;
