@@ -476,6 +476,39 @@ static void encode_topo_cpuid1f(CPUX86State *env, uint32_t count,
     assert(!(*eax & ~0x1f));
 }
 
+/*
+ * CPUID[0x80000026], AMD's extended CPU topology: one subleaf per level,
+ * from the innermost, with the level type in ECX[15:8] (1: core, counting
+ * its threads; 2: complex; 3: die; 4: socket), the logical processors in
+ * the level's domain in EBX[15:0], and the x2APIC ID shift to that
+ * domain's ID in EAX[4:0].  QEMU's modules are the complexes.  The cores
+ * are all alike: no efficiency ranking, heterogeneous or asymmetric
+ * topology flags.  Past the socket, the invalid level ends the walk.
+ */
+static void encode_topo_cpuid80000026(CPUX86State *env, uint32_t count,
+                                      X86CPUTopoInfo *topo_info,
+                                      uint32_t *eax, uint32_t *ebx,
+                                      uint32_t *ecx, uint32_t *edx)
+{
+    static const enum CpuTopologyLevel levels[] = {
+        CPU_TOPOLOGY_LEVEL_CORE,
+        CPU_TOPOLOGY_LEVEL_MODULE,
+        CPU_TOPOLOGY_LEVEL_DIE,
+        CPU_TOPOLOGY_LEVEL_SOCKET,
+    };
+
+    *ecx = count & 0xff;
+    *edx = env_archcpu(env)->apic_id;
+    if (count >= ARRAY_SIZE(levels)) {
+        *eax = 0;
+        *ebx = 0;
+        return;
+    }
+    *eax = apicid_offset_by_topo_level(topo_info, levels[count]);
+    *ebx = num_threads_by_topo_level(topo_info, levels[count]) & 0xffff;
+    *ecx |= (count + 1) << 8;
+}
+
 /* Encode cache info for CPUID[0x80000005].ECX or CPUID[0x80000005].EDX */
 static uint32_t encode_cache_cpuid80000005(CPUCacheInfo *cache)
 {
@@ -9326,6 +9359,18 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         *ebx = env->features[FEAT_8000_0021_EBX];
         *ecx = env->features[FEAT_8000_0021_ECX];
         break;
+    case 0x80000026:
+        /*
+         * Under KVM the host's leaf is used, and kvm_arch_init_vcpu builds
+         * one entry per leaf for leaves it doesn't know to have subleaves.
+         */
+        if (tcg_enabled() && (IS_AMD_CPU(env) || IS_HYGON_CPU(env))) {
+            encode_topo_cpuid80000026(env, count, topo_info,
+                                      eax, ebx, ecx, edx);
+        } else {
+            *eax = *ebx = *ecx = *edx = 0;
+        }
+        break;
     case 0x80000022:
         *eax = *ebx = *ecx = *edx = 0;
         /* AMD Extended Performance Monitoring and Debug */
@@ -9884,6 +9929,15 @@ void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
 
     if (env->features[FEAT_8000_0021_EAX]) {
         x86_cpu_adjust_level(cpu, &env->cpuid_min_xlevel, 0x80000021);
+    }
+
+    /*
+     * The TCG "max" CPU with an AMD-style vendor describes its topology in
+     * CPUID[0x80000026], as current AMD processors do.
+     */
+    if (xcc->max_features && tcg_enabled() &&
+        (IS_AMD_CPU(env) || IS_HYGON_CPU(env))) {
+        x86_cpu_adjust_level(cpu, &env->cpuid_min_xlevel, 0x80000026);
     }
 
     /* SGX requires CPUID[0x12] for EPC enumeration */
