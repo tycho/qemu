@@ -62,6 +62,7 @@ void tcg_prologue_init(void);
 typedef enum TCGCR3Flush {
     TCG_CR3_FLUSH_ALL,      /* every mmu index */
     TCG_CR3_FLUSH_PAGING,   /* the indexes that translate through paging */
+    TCG_CR3_FLUSH_NONGLOBAL, /* ... and of those, only non-global entries */
 } TCGCR3Flush;
 
 extern TCGCR3Flush tcg_cr3_flush;
