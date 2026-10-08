@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xtcg-stats.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "cpu.h"
@@ -206,6 +207,8 @@ bool x86_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         intno = cpu_get_pic_interrupt(env);
         qemu_log_mask(CPU_LOG_INT,
                       "Servicing hardware INT=0x%02x\n", intno);
+        xtcg_hist_inc(intno < 128 ? XH_X86_IRQ_LO : XH_X86_IRQ_HI,
+                      intno & 127);
         do_interrupt_x86_hardirq(env, intno, 1);
         break;
     case CPU_INTERRUPT_VIRQ:
@@ -214,6 +217,8 @@ bool x86_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
                              + offsetof(struct vmcb, control.int_vector));
         qemu_log_mask(CPU_LOG_INT,
                       "Servicing virtual hardware INT=0x%02x\n", intno);
+        xtcg_hist_inc(intno < 128 ? XH_X86_IRQ_LO : XH_X86_IRQ_HI,
+                      intno & 127);
         do_interrupt_x86_hardirq(env, intno, 1);
         cpu_reset_interrupt(cs, CPU_INTERRUPT_VIRQ);
         env->int_ctl &= ~V_IRQ_MASK;

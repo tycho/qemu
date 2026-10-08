@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xtcg-stats.h"
 #include "tcg/startup.h"
 #include "qemu/main-loop.h"
 #include "cpu.h"
@@ -545,6 +546,7 @@ void helper_rdmsr(CPUX86State *env)
 
 void helper_flush_page(CPUX86State *env, target_ulong addr)
 {
+    xtcg_stat_inc(XS_X86_INVLPG);
     tlb_flush_page(env_cpu(env), addr);
 }
 

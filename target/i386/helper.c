@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xtcg-stats.h"
 #include "qapi/error.h"
 #include "qapi/qapi-events-run-state.h"
 #include "cpu.h"
@@ -141,6 +142,7 @@ void cpu_x86_update_cr0(CPUX86State *env, uint32_t new_cr0)
     qemu_log_mask(CPU_LOG_MMU, "CR0 update: CR0=0x%08x\n", new_cr0);
     if ((new_cr0 & (CR0_PG_MASK | CR0_WP_MASK | CR0_PE_MASK)) !=
         (env->cr[0] & (CR0_PG_MASK | CR0_WP_MASK | CR0_PE_MASK))) {
+        xtcg_stat_inc(XS_X86_CR0_FLUSH);
         tlb_flush(CPU(cpu));
     }
 
@@ -177,6 +179,15 @@ void cpu_x86_update_cr0(CPUX86State *env, uint32_t new_cr0)
    the PDPT */
 void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
 {
+    if (env->cr[0] & CR0_PG_MASK) {
+        xtcg_stat_inc(XS_X86_CR3_WRITE);
+        if (new_cr3 == env->cr[3]) {
+            xtcg_stat_inc(XS_X86_CR3_SAME);
+        }
+        if (new_cr3 >> 63) {
+            xtcg_stat_inc(XS_X86_CR3_NOFLUSH);
+        }
+    }
     env->cr[3] = new_cr3;
     if (env->cr[0] & CR0_PG_MASK) {
         qemu_log_mask(CPU_LOG_MMU,
@@ -195,6 +206,7 @@ void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
     if ((new_cr4 ^ env->cr[4]) &
         (CR4_PGE_MASK | CR4_PAE_MASK | CR4_PSE_MASK |
          CR4_SMEP_MASK | CR4_SMAP_MASK | CR4_LA57_MASK)) {
+        xtcg_stat_inc(XS_X86_CR4_FLUSH);
         tlb_flush(env_cpu(env));
     }
 

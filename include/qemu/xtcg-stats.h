@@ -58,6 +58,14 @@ typedef enum XtcgStat {
     XS_JIT_TO_EXEC,         /* qemu_thread_jit_execute calls */
     XS_JIT_TO_WRITE,        /* qemu_thread_jit_write calls */
     XS_JIT_FLIPS,           /* ... that changed this thread's mode */
+    /* x86 TLB maintenance by cause (CH-30) */
+    XS_X86_CR3_WRITE,       /* CR3 writes with paging on (each flushes all) */
+    XS_X86_CR3_SAME,        /* ... of the value CR3 already held */
+    XS_X86_CR3_NOFLUSH,     /* ... with bit 63 set (PCID no-flush) */
+    XS_X86_CR0_FLUSH,       /* CR0 writes that flushed (PG, WP, PE) */
+    XS_X86_CR4_FLUSH,       /* CR4 writes that flushed (PGE, PAE, ...) */
+    XS_X86_INVLPG,          /* INVLPG (helper_flush_page) */
+    XS_X86_FILL_GLOBAL,     /* page walks ending in a global leaf, CR4.PGE */
     XS__COUNT
 } XtcgStat;
 
@@ -69,6 +77,8 @@ typedef enum XtcgHist {
     XH_EXCP,                /* exception_index, see xtcg_excp_bucket() */
     XH_TLB_FILL_BITS,       /* log2(TLB entries) of the mmu_idx at a fill */
     XH_TLB_FILL_MMUIDX,     /* mmu_idx of each fill */
+    XH_X86_IRQ_LO,          /* x86 external interrupts taken, vector 0-127 */
+    XH_X86_IRQ_HI,          /* ... vector 128-255, at vector - 128 */
     XH__COUNT
 } XtcgHist;
 

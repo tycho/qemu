@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xtcg-stats.h"
 #include "cpu.h"
 #include "accel/tcg/cpu-ldst.h"
 #include "accel/tcg/probe.h"
@@ -369,6 +370,9 @@ do_check_protect_pse36:
         goto do_fault_rsvd;
     }
     ptep ^= PG_NX_MASK;
+    if ((pte & PG_GLOBAL_MASK) && (env->cr[4] & CR4_PGE_MASK)) {
+        xtcg_stat_inc(XS_X86_FILL_GLOBAL);
+    }
 
     /* can the page can be put in the TLB?  prot will tell us */
     if (is_user && !(ptep & PG_USER_MASK)) {

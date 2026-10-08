@@ -47,6 +47,13 @@ static const char * const stat_names[XS__COUNT] = {
     [XS_JIT_TO_EXEC] = "jit_to_exec",
     [XS_JIT_TO_WRITE] = "jit_to_write",
     [XS_JIT_FLIPS] = "jit_flips",
+    [XS_X86_CR3_WRITE] = "x86_cr3_write",
+    [XS_X86_CR3_SAME] = "x86_cr3_same",
+    [XS_X86_CR3_NOFLUSH] = "x86_cr3_noflush",
+    [XS_X86_CR0_FLUSH] = "x86_cr0_flush",
+    [XS_X86_CR4_FLUSH] = "x86_cr4_flush",
+    [XS_X86_INVLPG] = "x86_invlpg",
+    [XS_X86_FILL_GLOBAL] = "x86_fill_global",
 };
 
 static const char * const hist_names[XH__COUNT] = {
@@ -56,6 +63,8 @@ static const char * const hist_names[XH__COUNT] = {
     [XH_EXCP] = "exception_index",
     [XH_TLB_FILL_BITS] = "tlb_fill.size_bits",
     [XH_TLB_FILL_MMUIDX] = "tlb_fill.mmu_idx",
+    [XH_X86_IRQ_LO] = "x86_irq.vector",
+    [XH_X86_IRQ_HI] = "x86_irq.vector_minus_128",
 };
 
 static bool dumped;
