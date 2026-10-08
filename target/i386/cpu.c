@@ -22,6 +22,7 @@
 #include "qemu/cutils.h"
 #include "qemu/qemu-print.h"
 #include "qemu/hw-version.h"
+#include "tcg/startup.h"
 #include "cpu.h"
 #include "tcg/helper-tcg.h"
 #include "exec/translation-block.h"
@@ -8253,6 +8254,13 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w)
         }
     } else if (tcg_enabled() || qtest_enabled()) {
         r = wi->tcg_features;
+        if (tcg_enabled() && tcg_pcid) {
+            if (w == FEAT_1_ECX) {
+                r |= CPUID_EXT_PCID;
+            } else if (w == FEAT_7_0_EBX) {
+                r |= CPUID_7_0_EBX_INVPCID;
+            }
+        }
     } else {
         return ~0;
     }
