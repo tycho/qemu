@@ -60,6 +60,13 @@ extern unsigned tcg_tlb_grow;
  */
 extern bool tcg_jc_keep_pcrel;
 
+/*
+ * tcg_jc_global: with tcg_jcgen, jump-cache entries for code on a global
+ * page (CPUJumpCache.gsalt) outlive flushes of the non-global
+ * translations; set when x-tblookup and x-cr3-flush=nonglobal are on.
+ */
+extern bool tcg_jc_global;
+
 extern bool icount_align_option;
 
 /*

@@ -820,14 +820,48 @@ void tcg_flush_jmp_cache(CPUState *cpu)
 
     if (tcg_jcgen) {
         uint64_t salt = qatomic_read(&jc->salt) + TB_JMP_SALT_STEP;
+        uint64_t gsalt = qatomic_read(&jc->gsalt) + TB_JMP_SALT_STEP;
 
-        /* Once every 65536 flushes the salt comes round: clear for real. */
-        if (salt != 0) {
+        /*
+         * Once every 32768 flushes a salt comes round (into the other's
+         * half): clear for real.
+         */
+        if (!(salt & TB_JMP_GSALT_BASE) && (gsalt & TB_JMP_GSALT_BASE)) {
             qatomic_set(&jc->salt, salt);
+            qatomic_set(&jc->gsalt, gsalt);
             return;
         }
         qatomic_set(&jc->salt, 0);
+        qatomic_set(&jc->gsalt, TB_JMP_GSALT_BASE);
     }
+    for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+        qatomic_set(&jc->array[i].tb, NULL);
+    }
+}
+
+/*
+ * Forget the entries for code on non-global pages: with tcg_jcgen, move
+ * only the salt on, keeping the entries made under gsalt.
+ */
+void tcg_flush_jmp_cache_nonglobal(CPUState *cpu)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    uint64_t salt;
+
+    if (unlikely(jc == NULL)) {
+        return;
+    }
+    if (!tcg_jc_global) {
+        tcg_flush_jmp_cache(cpu);
+        return;
+    }
+    salt = qatomic_read(&jc->salt) + TB_JMP_SALT_STEP;
+    if (!(salt & TB_JMP_GSALT_BASE)) {
+        qatomic_set(&jc->salt, salt);
+        return;
+    }
+    qatomic_set(&jc->salt, 0);
+    qatomic_set(&jc->gsalt, TB_JMP_GSALT_BASE);
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
         qatomic_set(&jc->array[i].tb, NULL);
     }

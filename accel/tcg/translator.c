@@ -591,6 +591,7 @@ static void gen_inline_lookup(TCGv_i64 pc, uint64_t cs_base, uint32_t flags)
     TCGv_i32 t32 = tcg_temp_ebb_new_i32();
     TCGv_i32 cf = tcg_temp_ebb_new_i32();
     TCGv_i64 key = pc;
+    TCGv_i64 gkey = NULL;
 
     plugin_gen_disable_mem_helpers();
 
@@ -609,6 +610,12 @@ static void gen_inline_lookup(TCGv_i64 pc, uint64_t cs_base, uint32_t flags)
         key = tcg_temp_ebb_new_i64();
         tcg_gen_ld_i64(key, jc, offsetof(CPUJumpCache, salt));
         tcg_gen_xor_i64(key, key, pc);
+        if (tcg_jc_global) {
+            /* Or pc ^ gsalt, for code on a global page. */
+            gkey = tcg_temp_ebb_new_i64();
+            tcg_gen_ld_i64(gkey, jc, offsetof(CPUJumpCache, gsalt));
+            tcg_gen_xor_i64(gkey, gkey, pc);
+        }
     }
     gen_jmp_cache_offset(t64, pc);
     tcg_gen_trunc_i64_ptr(tb, t64);
@@ -616,7 +623,16 @@ static void gen_inline_lookup(TCGv_i64 pc, uint64_t cs_base, uint32_t flags)
     QEMU_BUILD_BUG_ON(sizeof(vaddr) != sizeof(uint64_t));
     tcg_gen_ld_i64(t64, jc, offsetof(CPUJumpCache, array[0].pc));
     tcg_gen_ld_ptr(tb, jc, offsetof(CPUJumpCache, array[0].tb));
-    tcg_gen_brcond_i64(TCG_COND_NE, t64, key, miss);
+    if (gkey) {
+        /* Either key; no branch between, as tb must stay live. */
+        tcg_gen_setcond_i64(TCG_COND_EQ, key, t64, key);
+        tcg_gen_setcond_i64(TCG_COND_EQ, gkey, t64, gkey);
+        tcg_gen_or_i64(key, key, gkey);
+        tcg_gen_brcondi_i64(TCG_COND_EQ, key, 0, miss);
+        tcg_temp_free_i64(gkey);
+    } else {
+        tcg_gen_brcond_i64(TCG_COND_NE, t64, key, miss);
+    }
     tcg_gen_brcondi_ptr(TCG_COND_EQ, tb, 0, miss);
 
     /* check_for_breakpoints() runs only in the helper. */

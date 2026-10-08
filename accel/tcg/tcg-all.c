@@ -268,6 +268,8 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     tcg_iopl_runtime = s->i386_runtime;
 
     tcg_jcgen = cc->tcg_ops->jmp_cache_salt;
+    tcg_jc_global = tcg_jcgen && tcg_ijmp_inline &&
+                    tcg_cr3_flush == TCG_CR3_FLUSH_NONGLOBAL;
     page_init();
     tb_htable_init();
     tcg_init(s->tb_size * MiB, s->splitwx_enabled, max_threads);
@@ -338,6 +340,7 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 bool tcg_ijmp_inline;
 bool tcg_jcgen;
 bool tcg_jc_keep_pcrel;
+bool tcg_jc_global;
 
 bool tcg_iolast;
 bool tcg_mmio_lockless;
