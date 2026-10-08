@@ -127,6 +127,7 @@ bool check_hw_breakpoints(CPUX86State *env, bool force_dr6_update);
 /* system/hyperv.c */
 #ifndef CONFIG_USER_ONLY
 void x86_tcg_hyperv_init(void);
+void x86_tcg_psample_start(void);
 void x86_tcg_hyperv_tsc_changed(CPUX86State *env);
 bool x86_tcg_hyperv_rdmsr(CPUX86State *env, uint32_t msr, uint64_t *val);
 bool x86_tcg_hyperv_wrmsr(CPUX86State *env, uint32_t msr, uint64_t val);

@@ -48,6 +48,8 @@ bool tcg_cpu_realizefn(CPUState *cs, Error **errp)
 {
     X86CPU *cpu = X86_CPU(cs);
 
+    x86_tcg_psample_start();
+
     /*
      * The realize order is important, since x86_cpu_realize() checks if
      * nothing else has been set by the user (or by accelerators) in
