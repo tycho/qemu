@@ -3862,6 +3862,18 @@ static void gen_INTO(DisasContext *s, X86DecodedInsn *decode)
     gen_helper_into(tcg_env, cur_insn_len_i32(s));
 }
 
+static void gen_INVPCID(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv_i64 desc = tcg_temp_new_i64();
+    TCGv_i64 addr = tcg_temp_new_i64();
+
+    tcg_gen_qemu_ld_i64(desc, s->A0, s->mem_index, MO_LEUQ);
+    gen_add_A0_im(s, 8);
+    tcg_gen_qemu_ld_i64(addr, s->A0, s->mem_index, MO_LEUQ);
+    gen_helper_invpcid(tcg_env, s->T0, desc, addr);
+    s->base.is_jmp = DISAS_EOB_NEXT;
+}
+
 static void gen_IRET(DisasContext *s, X86DecodedInsn *decode)
 {
     if (!PE(s) || VM86(s)) {

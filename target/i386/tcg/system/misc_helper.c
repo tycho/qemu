@@ -102,9 +102,22 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
             ((env->cr[0] ^ t0) & ~(CR0_TS_MASK | CR0_MP_MASK))) {
             cpu_vmexit(env, SVM_EXIT_CR0_SEL_WRITE, 0, GETPC());
         }
+        /* With CR4.PCIDE set, paging stays on (SDM, MOV to CR0). */
+        if ((env->cr[4] & CR4_PCIDE_MASK) && !(t0 & CR0_PG_MASK)) {
+            raise_exception_ra(env, EXCP0D_GPF, GETPC());
+        }
         cpu_x86_update_cr0(env, t0);
         break;
     case 3:
+        /*
+         * With CR4.PCIDE set, bits 11:0 are the PCID and bit 63 asks not
+         * to invalidate that PCID's translations; it is not stored.  The
+         * TLB doesn't keep translations per PCID, so the write invalidates
+         * the non-global ones regardless.
+         */
+        if (env->cr[4] & CR4_PCIDE_MASK) {
+            t0 &= ~(1ULL << 63);
+        }
         if ((env->efer & MSR_EFER_LMA) &&
                 (t0 & ((~0ULL) << env_archcpu(env)->phys_bits))) {
             cpu_vmexit(env, SVM_EXIT_ERR, 0, GETPC());
@@ -120,6 +133,11 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
         }
         if (((t0 ^ env->cr[4]) & CR4_LA57_MASK) &&
             (env->hflags & HF_CS64_MASK)) {
+            raise_exception_ra(env, EXCP0D_GPF, GETPC());
+        }
+        /* PCIDE is set only in IA-32e mode, with CR3's PCID 0. */
+        if ((t0 & ~env->cr[4] & CR4_PCIDE_MASK) &&
+            (!(env->efer & MSR_EFER_LMA) || (env->cr[3] & 0xfff))) {
             raise_exception_ra(env, EXCP0D_GPF, GETPC());
         }
         cpu_x86_update_cr4(env, t0);
@@ -542,6 +560,44 @@ void helper_rdmsr(CPUX86State *env)
     }
     env->regs[R_EAX] = (uint32_t)(val);
     env->regs[R_EDX] = (uint32_t)(val >> 32);
+}
+
+/*
+ * INVPCID: @type in a register, a 16-byte descriptor (PCID in bits 11:0
+ * of the first quadword, the rest reserved; a linear address in the
+ * second).  The TLB doesn't keep translations per PCID, so each type
+ * invalidates at least what it must, for every PCID.
+ */
+void helper_invpcid(CPUX86State *env, target_ulong type, uint64_t desc_pcid,
+                    uint64_t addr)
+{
+    bool pcide = env->cr[4] & CR4_PCIDE_MASK;
+    uint64_t pcid = desc_pcid & 0xfff;
+    int64_t sext = (int64_t)addr >> (env->cr[4] & CR4_LA57_MASK ? 56 : 47);
+
+    if (type > 3 || (desc_pcid >> 12)) {
+        raise_exception_ra(env, EXCP0D_GPF, GETPC());
+    }
+    switch (type) {
+    case 0:     /* one address in one PCID */
+        if ((!pcide && pcid) || (sext != 0 && sext != -1)) {
+            raise_exception_ra(env, EXCP0D_GPF, GETPC());
+        }
+        tlb_flush_page(env_cpu(env), addr);
+        break;
+    case 1:     /* one PCID's non-global translations */
+        if (!pcide && pcid) {
+            raise_exception_ra(env, EXCP0D_GPF, GETPC());
+        }
+        x86_tlb_flush_nonglobal(env);
+        break;
+    case 2:     /* everything, global translations included */
+        tlb_flush(env_cpu(env));
+        break;
+    case 3:     /* everything but global translations */
+        x86_tlb_flush_nonglobal(env);
+        break;
+    }
 }
 
 void helper_flush_page(CPUX86State *env, target_ulong addr)

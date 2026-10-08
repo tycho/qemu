@@ -178,6 +178,22 @@ void cpu_x86_update_cr0(CPUX86State *env, uint32_t new_cr0)
 
 /* XXX: in legacy PAE mode, generate a GPF if reserved bits are set in
    the PDPT */
+/*
+ * Invalidate the translations a MOV to CR3 invalidates: the non-global
+ * ones (SDM 4.10.4.1), or more, as x-cr3-flush says.
+ */
+void x86_tlb_flush_nonglobal(CPUX86State *env)
+{
+    if (!tcg_enabled() || tcg_cr3_flush == TCG_CR3_FLUSH_ALL) {
+        tlb_flush(env_cpu(env));
+    } else if (tcg_cr3_flush == TCG_CR3_FLUSH_PAGING) {
+        /* The physical and nested-physical translations don't use CR3. */
+        tlb_flush_by_mmuidx(env_cpu(env), MMU_PAGING_IDX_BITS);
+    } else {
+        tlb_flush_nonglobal_by_mmuidx(env_cpu(env), MMU_PAGING_IDX_BITS);
+    }
+}
+
 void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
 {
     if (env->cr[0] & CR0_PG_MASK) {
@@ -193,18 +209,7 @@ void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
     if (env->cr[0] & CR0_PG_MASK) {
         qemu_log_mask(CPU_LOG_MMU,
                         "CR3 update: CR3=" TARGET_FMT_lx "\n", new_cr3);
-        /*
-         * The physical and nested-physical translations (page table
-         * walks, SVM's nested paging) don't depend on CR3.
-         */
-        if (!tcg_enabled() || tcg_cr3_flush == TCG_CR3_FLUSH_ALL) {
-            tlb_flush(env_cpu(env));
-        } else if (tcg_cr3_flush == TCG_CR3_FLUSH_PAGING) {
-            tlb_flush_by_mmuidx(env_cpu(env), MMU_PAGING_IDX_BITS);
-        } else {
-            /* Global translations survive (SDM 4.10.4.1). */
-            tlb_flush_nonglobal_by_mmuidx(env_cpu(env), MMU_PAGING_IDX_BITS);
-        }
+        x86_tlb_flush_nonglobal(env);
     }
 }
 
@@ -216,7 +221,7 @@ void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
     printf("CR4 update: %08x -> %08x\n", (uint32_t)env->cr[4], new_cr4);
 #endif
     if ((new_cr4 ^ env->cr[4]) &
-        (CR4_PGE_MASK | CR4_PAE_MASK | CR4_PSE_MASK |
+        (CR4_PGE_MASK | CR4_PAE_MASK | CR4_PSE_MASK | CR4_PCIDE_MASK |
          CR4_SMEP_MASK | CR4_SMAP_MASK | CR4_LA57_MASK)) {
         xtcg_stat_inc(XS_X86_CR4_FLUSH);
         tlb_flush(env_cpu(env));
