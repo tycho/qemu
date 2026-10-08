@@ -19,6 +19,26 @@ extern int64_t max_advance;
 
 extern bool one_insn_per_tb;
 
+/*
+ * tcg_ijmp_inline: at a TB exit that looks up the next TB, probe the
+ * vCPU's jump cache in generated code, and call helper_lookup_tb_ptr only
+ * on a miss (see translator_lookup_and_goto_ptr).
+ */
+extern bool tcg_ijmp_inline;
+
+/*
+ * tcg_jcgen: flushing a vCPU's jump cache moves its salt on (O(1))
+ * instead of clearing every entry (see CPUJumpCache); set from the
+ * target's TCGCPUOps.jmp_cache_salt.
+ */
+extern bool tcg_jcgen;
+
+/*
+ * tcg_jc_keep_pcrel: invalidating a CF_PCREL TB leaves the vCPUs' jump
+ * caches alone instead of flushing them all (see tb_jmp_cache_inval_tb).
+ */
+extern bool tcg_jc_keep_pcrel;
+
 extern bool icount_align_option;
 
 /*

@@ -900,9 +900,17 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
     CPUState *cpu;
 
     if (tb_cflags(tb) & CF_PCREL) {
-        /* A TB may be at any virtual address */
-        CPU_FOREACH(cpu) {
-            tcg_flush_jmp_cache(cpu);
+        /*
+         * A TB may be at any virtual address, so its entries can't be
+         * found.  With tcg_jc_keep_pcrel they stay: CF_INVALID is set, and
+         * every jump-cache lookup compares the TB's cflags with the
+         * current ones, so they never match again; the TB's memory is
+         * reused only after tb_flush, which flushes every jump cache.
+         */
+        if (!tcg_jc_keep_pcrel) {
+            CPU_FOREACH(cpu) {
+                tcg_flush_jmp_cache(cpu);
+            }
         }
     } else {
         uint32_t h = tb_jmp_cache_hash_func(tb->pc);

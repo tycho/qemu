@@ -87,6 +87,27 @@ void tcg_gen_goto_tb(unsigned idx);
  */
 void tcg_gen_lookup_and_goto_ptr(void);
 
+/**
+ * tcg_gen_lookup_jc_and_goto_ptr() - look up @pc in the jump cache and jump
+ * @pc: guest address of the next TB
+ * @cs_base: the current TB's cs_base, which the next TB must share
+ * @flags: the current TB's flags, which the next TB must share
+ *
+ * Like tcg_gen_lookup_and_goto_ptr(), by a call that probes the jump
+ * cache before the full lookup.  Not with CF_NO_GOTO_PTR.
+ */
+void tcg_gen_lookup_jc_and_goto_ptr(TCGv_i64 pc, uint64_t cs_base,
+                                    uint32_t flags);
+
+/**
+ * tcg_gen_goto_ptr() - jump to a TB's host code
+ * @ptr: host address of the TB's code, as helper_lookup_tb_ptr returns
+ *
+ * The caller must have established that the TB is valid for the current
+ * CPU state, as tcg_gen_lookup_and_goto_ptr() does.
+ */
+void tcg_gen_goto_ptr(TCGv_ptr ptr);
+
 void tcg_gen_plugin_cb(unsigned from);
 void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo);
 

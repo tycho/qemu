@@ -26,7 +26,6 @@
 #include "exec/mmap-lock.h"
 #include "tb-internal.h"
 #include "exec/tb-flush.h"
-#include "qemu/cacheinfo.h"
 #include "qemu/target-info.h"
 #include "exec/log.h"
 #include "exec/icount.h"
@@ -643,10 +642,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 
     /* if the TB already exists, discard what we just translated */
     if (unlikely(existing_tb != tb)) {
-        uintptr_t orig_aligned = (uintptr_t)gen_code_buf;
-
-        orig_aligned -= ROUND_UP(sizeof(*tb), qemu_icache_linesize);
-        qatomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);
+        /* Give back the TB and its code: tcg_tb_alloc put the TB first. */
+        qatomic_set(&tcg_ctx->code_gen_ptr, (void *)tb);
         tcg_tb_remove(tb);
         return existing_tb;
     }
@@ -745,6 +742,16 @@ void tcg_flush_jmp_cache(CPUState *cpu)
         return;
     }
 
+    if (tcg_jcgen) {
+        uint64_t salt = qatomic_read(&jc->salt) + TB_JMP_SALT_STEP;
+
+        /* Once every 65536 flushes the salt comes round: clear for real. */
+        if (salt != 0) {
+            qatomic_set(&jc->salt, salt);
+            return;
+        }
+        qatomic_set(&jc->salt, 0);
+    }
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
         qatomic_set(&jc->array[i].tb, NULL);
     }

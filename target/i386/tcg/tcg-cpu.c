@@ -71,6 +71,15 @@ static TCGTBCPUState x86_get_tb_cpu_state(CPUState *cs)
     }
 #endif
     if (env->hflags & HF_CS64_MASK) {
+        /*
+         * SS.B has no effect in 64-bit code (see mo_stacksize), but the
+         * kernel runs with SS loaded by SYSCALL or by an interrupt gate,
+         * so its code would be translated twice.  Set rather than clear
+         * it, as qemu-user's translator takes SS32 to be true.
+         */
+        if (tcg_tb_flags_canon) {
+            flags |= HF_SS32_MASK;
+        }
         cs_base = 0;
         pc = env->eip;
     } else {
@@ -174,6 +183,11 @@ static vaddr x86_pointer_wrap(CPUState *cs, int mmu_idx,
 const TCGCPUOps x86_tcg_ops = {
     .mttcg_supported = true,
     .precise_smc = true,
+    /*
+     * Canonical 64-bit addresses, 32-bit ones otherwise; user and kernel
+     * code with the same low 48 bits differ in CPL, part of the flags.
+     */
+    .jmp_cache_salt = true,
     /*
      * The x86 has a strong memory model with some store-after-load re-ordering
      */
