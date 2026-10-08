@@ -816,6 +816,8 @@ static const X86OpEntry opcodes_0F38_00toEF[240] = {
     [0x78] = X86_OP_ENTRY3(VPBROADCASTB,   V,x,  None,None, W,b,  vex6 chk(W0) cpuid(AVX2) p_66),
     [0x79] = X86_OP_ENTRY3(VPBROADCASTW,   V,x,  None,None, W,w,  vex6 chk(W0) cpuid(AVX2) p_66),
 
+    [0x82] = X86_OP_ENTRYrr(INVPCID, G, y_d64, M, dq,
+                            chk(cpl0) cpuid(INVPCID) p_66),
     [0x8c] = X86_OP_ENTRY3(VPMASKMOV,    V,x,  H,x, WM,x, vex6 cpuid(AVX2) p_66),
     [0x8e] = X86_OP_ENTRY3(VPMASKMOV_st, M,x,  V,x, H,x,  vex6 cpuid(AVX2) p_66),
 
@@ -2635,6 +2637,8 @@ static bool has_cpuid_feature(DisasContext *s, X86CPUIDFeature cpuid)
         return (s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_FSGSBASE);
     case X86_FEAT_SHA_NI:
         return (s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_SHA_NI);
+    case X86_FEAT_INVPCID:
+        return s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_INVPCID;
 
     case X86_FEAT_CMPCCXADD:
         return (s->cpuid_7_1_eax_features & CPUID_7_1_EAX_CMPCCXADD);
