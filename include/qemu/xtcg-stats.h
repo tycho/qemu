@@ -72,6 +72,10 @@ typedef enum XtcgStat {
     XS_JC_FLUSH_NONGLOBAL,  /* jump-cache flushes of non-global entries */
     XS_JC_CLEAR_PAGE_HIT,   /* page clears: entries on the page dropped */
     XS_JC_CLEAR_PAGE_KEPT,  /* ... live entries of other pages kept */
+    XS_JC_MISS_EMPTY,       /* helper lookups: jump-cache slot empty */
+    XS_JC_MISS_FLAGS,       /* ... same pc, other flags/cs_base/cflags */
+    XS_JC_MISS_STALE,       /* ... same pc, older salt */
+    XS_JC_MISS_OTHER,       /* ... another pc */
     XS__COUNT
 } XtcgStat;
 

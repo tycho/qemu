@@ -908,9 +908,20 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
     CPUState *cpu;
 
     if (tb_cflags(tb) & CF_PCREL) {
-        /* A TB may be at any virtual address */
-        CPU_FOREACH(cpu) {
-            tcg_flush_jmp_cache(cpu);
+        static int old = -1;
+
+        if (old < 0) {
+            old = getenv("XTCG_JCINVAL") != NULL;   /* [DEV] A/B switch */
+        }
+        /*
+         * A TB may be at any virtual address.  Its entries need no
+         * clearing: CF_INVALID is set, and every jump-cache lookup
+         * compares the TB's cflags with the current ones.
+         */
+        if (old) {
+            CPU_FOREACH(cpu) {
+                tcg_flush_jmp_cache(cpu);
+            }
         }
     } else {
         uint32_t h = tb_jmp_cache_hash_func(tb->pc);

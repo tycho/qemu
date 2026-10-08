@@ -293,6 +293,25 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s,
         goto hit;
     }
 
+    if (from_helper) {
+        TranslationBlock *e = qatomic_read(&jc->array[hash].tb);
+        vaddr k = jc->array[hash].pc;
+
+        if (!e) {
+            xtcg_stat_inc(XS_JC_MISS_EMPTY);
+        } else if (k == (s.pc ^ qatomic_read(&jc->salt)) ||
+                   k == (s.pc ^ qatomic_read(&jc->gsalt))) {
+            xtcg_stat_inc(XS_JC_MISS_FLAGS);
+        } else if (((k ^ qatomic_read(&jc->salt)) & ~(vaddr)0xffff000000000000ull) ==
+                   (s.pc & ~(vaddr)0xffff000000000000ull) ||
+                   ((k ^ qatomic_read(&jc->gsalt)) & ~(vaddr)0xffff000000000000ull) ==
+                   (s.pc & ~(vaddr)0xffff000000000000ull) ||
+                   (k & 0xffffffffffffull) == (s.pc & 0xffffffffffffull)) {
+            xtcg_stat_inc(XS_JC_MISS_STALE);
+        } else {
+            xtcg_stat_inc(XS_JC_MISS_OTHER);
+        }
+    }
     tb = tb_htable_lookup(cpu, s);
     if (tb == NULL) {
         return NULL;
@@ -730,6 +749,61 @@ const void *HELPER(lookup_tb_ptr_jc)(CPUArchState *env, uint64_t pc,
     return HELPER(lookup_tb_ptr)(env);
 }
 
+/*
+ * [DEV] XTCG_EXITSAMPLE=FILE[,N]: every Nth (default 256) return to the
+ * main loop without a chaining TB, the guest pc it resumes at, as
+ * psample.c records ("<QIIQQ": ns, cpu, flags, pc, 0; flags bit 3
+ * paging, bits 1-2 CPL 0 or 3 from the canonical half of pc).
+ */
+static FILE *exit_sample_file;
+static int exit_sample_every;
+static QemuMutex exit_sample_lock;
+
+static void __attribute__((constructor)) xtcg_exit_sample_init(void)
+{
+    const char *v = getenv("XTCG_EXITSAMPLE");
+    g_autofree char *path = NULL;
+    char *c;
+
+    if (!v) {
+        return;
+    }
+    path = g_strdup(v);
+    c = strchr(path, ',');
+    if (c) {
+        *c = 0;
+        exit_sample_every = atoi(c + 1);
+    }
+    if (exit_sample_every <= 0) {
+        exit_sample_every = 256;
+    }
+    exit_sample_file = fopen(path, "wb");
+    qemu_mutex_init(&exit_sample_lock);
+}
+
+static void xtcg_exit_sample(CPUState *cpu)
+{
+    static __thread unsigned n;
+    struct {
+        uint64_t ns;
+        uint32_t cpu, flags;
+        uint64_t pc, cr3;
+    } QEMU_PACKED r;
+
+    if (!exit_sample_file || ++n % exit_sample_every) {
+        return;
+    }
+    r.ns = get_clock_realtime();
+    r.cpu = cpu->cpu_index;
+    r.pc = cpu->cc->get_pc(cpu);
+    r.flags = 8 | ((r.pc >> 63) ? 0 : 3 << 1);
+    r.cr3 = 0;
+    qemu_mutex_lock(&exit_sample_lock);
+    fwrite(&r, sizeof(r), 1, exit_sample_file);
+    fflush(exit_sample_file);
+    qemu_mutex_unlock(&exit_sample_lock);
+}
+
 /* Return the current PC from CPU, which may be cached in TB. */
 static vaddr log_pc(CPUState *cpu, const TranslationBlock *tb)
 {
@@ -778,6 +852,9 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     *tb_exit = ret & TB_EXIT_MASK;
     xtcg_stat_inc(*tb_exit == TB_EXIT_REQUESTED ? XS_EXIT_REQUESTED :
                   last_tb ? XS_EXIT_NOCHAIN : XS_EXIT_NOTB);
+    if (!last_tb && *tb_exit != TB_EXIT_REQUESTED) {
+        xtcg_exit_sample(cpu);
+    }
 
     trace_exec_tb_exit(last_tb, *tb_exit);
 

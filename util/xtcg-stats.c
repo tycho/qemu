@@ -60,6 +60,10 @@ static const char * const stat_names[XS__COUNT] = {
     [XS_JC_FLUSH_NONGLOBAL] = "jc_flush_nonglobal",
     [XS_JC_CLEAR_PAGE_HIT] = "jc_clear_page_hit",
     [XS_JC_CLEAR_PAGE_KEPT] = "jc_clear_page_kept",
+    [XS_JC_MISS_EMPTY] = "jc_miss_empty",
+    [XS_JC_MISS_FLAGS] = "jc_miss_flags",
+    [XS_JC_MISS_STALE] = "jc_miss_stale",
+    [XS_JC_MISS_OTHER] = "jc_miss_other",
 };
 
 static const char * const hist_names[XH__COUNT] = {
