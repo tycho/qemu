@@ -36,6 +36,13 @@ typedef struct CPUJumpCache {
      */
     uint64_t salt;
     /*
+     * tcg_jcgen: the salt of entries whose code is on a global page (in
+     * the TLB, and the TB on one page), which survive a flush of the
+     * non-global translations (tcg_flush_jmp_cache_nonglobal).  Bit 63
+     * is set in gsalt and clear in salt, so the two never meet.
+     */
+    uint64_t gsalt;
+    /*
      * tcg_jc_ctx: the TB state (cs_base, flags, cflags) every entry under
      * the current salt was made for.  A lookup in another state moves the
      * salt on first, so the generated lookup needn't compare them.
@@ -55,5 +62,6 @@ typedef struct CPUJumpCache {
 } CPUJumpCache;
 
 #define TB_JMP_SALT_STEP (1ull << 48)
+#define TB_JMP_GSALT_BASE (1ull << 63)
 
 #endif /* ACCEL_TCG_TB_JMP_CACHE_H */
