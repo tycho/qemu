@@ -648,6 +648,39 @@ static void tcg_set_superblock(Object *obj, Visitor *v, const char *name,
     tcg_superblock = value;
 }
 
+static const char * const tcg_cr3_flush_names[] = {
+    [TCG_CR3_FLUSH_ALL] = "all",
+    [TCG_CR3_FLUSH_PAGING] = "paging",
+    [TCG_CR3_FLUSH_NONGLOBAL] = "nonglobal",
+};
+
+static char *tcg_get_cr3_flush(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_cr3_flush_names[tcg_cr3_flush]);
+}
+
+static void tcg_set_cr3_flush(Object *obj, const char *value, Error **errp)
+{
+    for (int i = 0; i < ARRAY_SIZE(tcg_cr3_flush_names); i++) {
+        if (!strcmp(value, tcg_cr3_flush_names[i])) {
+            tcg_cr3_flush = i;
+            return;
+        }
+    }
+    error_setg(errp, "Invalid 'x-cr3-flush' value: %s "
+               "(all, paging, nonglobal)", value);
+}
+
+static bool tcg_get_pcid(Object *obj, Error **errp)
+{
+    return tcg_pcid;
+}
+
+static void tcg_set_pcid(Object *obj, bool value, Error **errp)
+{
+    tcg_pcid = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -809,6 +842,18 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "With x-region: after this many profile samples (one per ms) in a "
         "loop, translate the loop's blocks that have run as one translation "
         "block (0: never, the default)");
+
+    object_class_property_add_str(oc, "x-cr3-flush",
+                                  tcg_get_cr3_flush, tcg_set_cr3_flush);
+    object_class_property_set_description(oc, "x-cr3-flush",
+        "x86: what a CR3 write flushes from the TLB: all (every mmu index), "
+        "paging (not the physical-address ones, which don't depend on "
+        "CR3), or nonglobal (as paging, but keep global pages, as a MOV "
+        "to CR3 without PCIDs does)");
+
+    object_class_property_add_bool(oc, "x-pcid", tcg_get_pcid, tcg_set_pcid);
+    object_class_property_set_description(oc, "x-pcid",
+        "x86: offer process-context identifiers (CPUID PCID and INVPCID)");
 }
 
 static const TypeInfo tcg_accel_type = {

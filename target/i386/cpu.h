@@ -2839,6 +2839,7 @@ void x86_stq_phys(CPUState *cs, hwaddr addr, uint64_t val);
 /* will be suppressed */
 void cpu_x86_update_cr0(CPUX86State *env, uint32_t new_cr0);
 void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3);
+void x86_tlb_flush_nonglobal(CPUX86State *env);
 void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4);
 void cpu_x86_update_dr7(CPUX86State *env, uint32_t new_dr7);
 
@@ -2864,6 +2865,9 @@ void x86_tsc_counter_reset(CPUX86State *env);
 #define MMU_KNOSMAP32_IDX  5
 #define MMU_PHYS_IDX       6
 #define MMU_NESTED_IDX     7
+
+/* The mmu indexes that translate through the guest's paging. */
+#define MMU_PAGING_IDX_BITS ((1 << MMU_PHYS_IDX) - 1)
 
 #ifdef CONFIG_USER_ONLY
 #ifdef TARGET_X86_64
