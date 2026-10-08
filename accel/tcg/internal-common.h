@@ -150,6 +150,14 @@ tb_page_addr_t get_page_addr_code_hostp(CPUArchState *env, vaddr addr,
  *
  * Note: this function can trigger an exception.
  */
+/*
+ * get_page_addr_code_probe()
+ *
+ * As get_page_addr_code(), but never raises an exception: -1 where that
+ * would (the page is not mapped or not executable).
+ */
+tb_page_addr_t get_page_addr_code_probe(CPUArchState *env, vaddr addr);
+
 static inline tb_page_addr_t get_page_addr_code(CPUArchState *env,
                                                 vaddr addr)
 {
@@ -189,5 +197,50 @@ void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr);
 void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr);
 
 void tcg_get_stats(AccelState *accel, GString *buf);
+
+/*
+ * Multi-block regions (translator_region_target).  A region head is named
+ * by where its TB starts, tb_page_addr0(): a PC-relative TB runs at any
+ * virtual alias of its code.
+ */
+
+/* Make @head a region head; false if it is one or was dropped. */
+bool translator_region_promote(tb_page_addr_t head);
+/* Whether @head is a region head. */
+bool translator_region_is_head(tb_page_addr_t head);
+/* Likewise, but -1 if another thread holds the region state. */
+int translator_region_try_is_head(tb_page_addr_t head);
+/*
+ * An I/O access in @tb, which made it end there: if @tb is a region, drop
+ * its head for good (true), so the loop isn't recompiled every time.
+ */
+bool translator_region_io(const TranslationBlock *tb);
+/* Code in [@start, @last] was rewritten: forget its region heads. */
+void translator_region_forget(tb_page_addr_t start, tb_page_addr_t last);
+/*
+ * After a TB overflow: true if the TB was a region and the retry takes
+ * fewer of its blocks (or a plain TB at its head) instead of fewer insns.
+ */
+bool translator_region_overflow(void);
+/* After a TB is generated: regions take their full size again. */
+void translator_region_reset(void);
+/* Whether a TB like @tb exists at @pc: its block has run. */
+bool translator_region_has_run(CPUState *cpu, const TranslationBlock *tb,
+                               vaddr pc);
+
+/* A region whose probation is over; its TB is to be invalidated. */
+typedef struct TranslatorRegionVerdict {
+    tb_page_addr_t head;
+    uint64_t cs_base;
+    uint32_t flags, cflags;
+} TranslatorRegionVerdict;
+
+/*
+ * Judge regions whose probation is over, or has gone on too long: at most
+ * @max, into @v.  None if another thread holds the region state.
+ */
+int translator_region_judge(TranslatorRegionVerdict *v, int max);
+/* Start the profile sampler that finds region heads (tcg_superblock). */
+void translator_region_sampler_start(void);
 
 #endif

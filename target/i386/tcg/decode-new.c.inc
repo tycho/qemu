@@ -288,7 +288,7 @@ static uint64_t advance_pc(CPUX86State *env, DisasContext *s, int num_bytes)
 
     /* This is a subsequent insn that crosses a page boundary.  */
     if (s->base.num_insns > 1 &&
-        !translator_is_same_page(&s->base, s->pc + num_bytes - 1)) {
+        !translator_in_tb_pages(&s->base, s->pc + num_bytes - 1)) {
         siglongjmp(s->jmpbuf, 2);
     }
 

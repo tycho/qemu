@@ -111,6 +111,7 @@ struct TCGLabel {
 
     /* Cross-block register allocation (tcg_region; tcg.c, XLBL_*) */
     bool loop;                  /* a loop header, set by the translator */
+    bool region;                /* a block of a multi-block region */
     bool xseen, xfwd, xfalls;   /* classification scratch */
     uint8_t xkind;
     struct TCGOp *xbranch;      /* the label's one branch */
@@ -404,6 +405,10 @@ struct TCGContext {
     bool xblk;                  /* some label keeps registers */
     int xblk_pass;              /* liveness pass, 1 or 2 with a loop */
     int8_t *xblk_home;          /* each temp's loop register */
+    bool xblk_region;           /* region labels: one shared entry state */
+    bool xblk_ft;               /* the previous op falls through */
+    int nb_region_homes;
+    struct TCGTemp *region_home[64];
     int nb_ops;
     TCGType addr_type;            /* TCG_TYPE_I32 or TCG_TYPE_I64 */
     TCGBar guest_mo;
@@ -1033,10 +1038,10 @@ static inline size_t tcg_current_code_size(TCGContext *s)
  * to this default (which just calls the prologue.code emitted by
  * tcg_target_qemu_prologue()).
  */
-#define TB_EXIT_MASK      3
+#define TB_EXIT_MASK      7
 #define TB_EXIT_IDX0      0
 #define TB_EXIT_IDX1      1
-#define TB_EXIT_IDXMAX    1
+#define TB_EXIT_IDXMAX    7     /* but not TB_EXIT_REQUESTED */
 #define TB_EXIT_REQUESTED 3
 
 #ifdef CONFIG_TCG_INTERPRETER

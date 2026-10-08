@@ -47,6 +47,7 @@
 #include "tb-context.h"
 #include "tb-internal.h"
 #include "internal-common.h"
+#include "tcg/startup.h"
 #if !defined(CONFIG_USER_ONLY)
 #include "accel/tcg/iommu.h"
 #endif
@@ -369,6 +370,255 @@ static inline bool check_for_breakpoints(CPUState *cpu, vaddr pc,
         check_for_breakpoints_slow(cpu, pc, cflags);
 }
 
+/* A TB like the one described, starting at @head, for multi-block regions. */
+struct region_tb_desc {
+    tb_page_addr_t head;
+    uint64_t cs_base;
+    uint32_t flags, cflags;
+};
+
+static bool region_tb_cmp(const void *p, const void *d)
+{
+    const TranslationBlock *tb = p;
+    const struct region_tb_desc *desc = d;
+
+    return tb_page_addr0(tb) == desc->head &&
+           ((tb_cflags(tb) & CF_PCREL) || tb->pc == desc->head) &&
+           tb->cs_base == desc->cs_base &&
+           tb->flags == desc->flags &&
+           tb_cflags(tb) == desc->cflags;
+}
+
+/*
+ * The TB whose code starts at @head, whatever virtual address it runs at
+ * and wherever a second page is mapped.  A TB that isn't PC-relative is
+ * only a region head in user mode, where @head is its virtual address.
+ */
+static TranslationBlock *region_tb_lookup(tb_page_addr_t head,
+                                          uint64_t cs_base, uint32_t flags,
+                                          uint32_t cflags)
+{
+    struct region_tb_desc desc = {
+        .head = head, .cs_base = cs_base, .flags = flags, .cflags = cflags,
+    };
+    uint32_t h = tb_hash_func(head, cflags & CF_PCREL ? 0 : head,
+                              flags, cs_base, cflags);
+
+    return qht_lookup_custom(&tb_ctx.htable, &desc, h, region_tb_cmp);
+}
+
+bool translator_region_has_run(CPUState *cpu, const TranslationBlock *tb,
+                               vaddr pc)
+{
+    tb_page_addr_t head = get_page_addr_code_probe(cpu_env(cpu), pc);
+
+    return head != -1 &&
+           region_tb_lookup(head, tb->cs_base, tb->flags,
+                            tb_cflags(tb)) != NULL;
+}
+
+/*
+ * Finding region heads (tcg_superblock): a host thread raises every vCPU's
+ * exit request once per period, and the TB that leaves on it is the
+ * sample.  The period starts at REGION_SAMPLE_US and doubles, up to
+ * REGION_SAMPLE_US_MAX, after REGION_SAMPLE_QUIET periods in which no loop
+ * was promoted; a promotion brings it back.  So the sampler's own wakeups,
+ * which a virtual machine can make costly, are rare once a program's
+ * loops are found.  The sample counts for the loop it belongs to: the TB itself
+ * if a chained jump enters it from further on, else the earliest TB it
+ * jumps back to; in a region, the loop around the region.  A jump that
+ * goes further than a region reaches (two pages) is taken for a call.  A
+ * loop with tcg_superblock samples becomes a region; counts halve every
+ * REGION_SAMPLE_DECAY samples, so only steady hotspots get there.  The
+ * sampler also ends the probation of new regions.  Nothing is added to
+ * the generated code.  A vCPU that finds another holding the sample counts
+ * or the region state drops its sample instead of waiting: with several
+ * vCPUs there are samples to spare, and a vCPU that sleeps on a lock comes
+ * back to cold caches.
+ */
+#define REGION_SAMPLE_US 1000
+#define REGION_SAMPLE_US_MAX 4000
+#define REGION_SAMPLE_QUIET 16
+#define REGION_SAMPLE_DECAY 256
+
+static unsigned region_sample_gen;
+static unsigned region_promotions;
+static __thread unsigned region_sample_seen;
+static GHashTable *region_samples;          /* head pc -> samples */
+static unsigned region_samples_total;
+static QemuMutex region_sample_lock;
+
+static void *region_sampler(void *opaque)
+{
+    unsigned period = REGION_SAMPLE_US, quiet = 0, promotions = 0;
+
+    rcu_register_thread();
+    for (;;) {
+        CPUState *cpu;
+
+        g_usleep(period);
+        if (qatomic_read(&region_promotions) != promotions) {
+            promotions = qatomic_read(&region_promotions);
+            period = REGION_SAMPLE_US;
+            quiet = 0;
+        } else if (++quiet == REGION_SAMPLE_QUIET) {
+            period = MIN(period * 2, REGION_SAMPLE_US_MAX);
+            quiet = 0;
+        }
+        qatomic_inc(&region_sample_gen);
+        WITH_RCU_READ_LOCK_GUARD() {
+            CPU_FOREACH(cpu) {
+                qatomic_store_release(&cpu->neg.icount_decr.u16.high, -1);
+            }
+        }
+    }
+    return NULL;
+}
+
+static gpointer region_sampler_init(gpointer opaque)
+{
+    static QemuThread thread;
+
+    qemu_mutex_init(&region_sample_lock);
+    region_samples = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                           g_free, NULL);
+    qemu_thread_create(&thread, "region-sampler", region_sampler, NULL,
+                       QEMU_THREAD_DETACHED);
+    return NULL;
+}
+
+void translator_region_sampler_start(void)
+{
+    static GOnce once = G_ONCE_INIT;
+
+    g_once(&once, region_sampler_init, NULL);
+}
+
+/*
+ * The loop @tb belongs to (a region: the loop around it), or NULL: the TB
+ * at its head.  TBs are compared by where their code starts, which for a
+ * PC-relative TB is the only address it has.
+ */
+static TranslationBlock *region_sample_head(TranslationBlock *tb,
+                                            bool region)
+{
+    tb_page_addr_t at = tb_page_addr0(tb);
+    TranslationBlock *head = NULL;
+    uintptr_t p;
+
+    if (!region) {
+        /* TBs are in the code buffer, which may be write-protected. */
+        qemu_thread_jit_write();
+        qemu_spin_lock(&tb->jmp_lock);
+        for (p = tb->jmp_list_head; p; ) {
+            TranslationBlock *src = (TranslationBlock *)(p & ~TB_JMP_TAG_MASK);
+
+            if (src != tb && tb_page_addr0(src) > at &&
+                tb_page_addr0(src) - at < 2 * TARGET_PAGE_SIZE) {
+                head = tb;
+                break;
+            }
+            p = src->jmp_list_next[p & TB_JMP_TAG_MASK];
+        }
+        qemu_spin_unlock(&tb->jmp_lock);
+        if (head) {
+            return head;
+        }
+    }
+    for (int n = 0; n < TB_JMP_SLOTS; n++) {
+        TranslationBlock *dst = (TranslationBlock *)
+            (qatomic_read(&tb->jmp_dest[n]) & ~(uintptr_t)1);
+
+        if (dst && dst != tb && tb_page_addr0(dst) != -1 &&
+            tb_page_addr0(dst) < at &&
+            at - tb_page_addr0(dst) < 2 * TARGET_PAGE_SIZE &&
+            (!head || tb_page_addr0(dst) < tb_page_addr0(head))) {
+            head = dst;
+        }
+    }
+    return head;
+}
+
+static void region_invalidate_tb(TranslationBlock *tb)
+{
+    mmap_lock();
+    tb_phys_invalidate(tb, -1);
+    mmap_unlock();
+}
+
+/* Invalidate the TBs starting at @head (one per second-page mapping). */
+static void region_invalidate(tb_page_addr_t head, uint64_t cs_base,
+                              uint32_t flags, uint32_t cflags)
+{
+    TranslationBlock *tb;
+
+    while ((tb = region_tb_lookup(head, cs_base, flags, cflags))) {
+        region_invalidate_tb(tb);
+    }
+}
+
+/* @tb left on an exit request: a sample if the sampler asked for it. */
+static void region_sample(CPUState *cpu, TranslationBlock *tb)
+{
+    unsigned gen = qatomic_read(&region_sample_gen);
+    TranslatorRegionVerdict v[8];
+    TranslationBlock *head_tb;
+    uint64_t *key;
+    uintptr_t n;
+    tb_page_addr_t head;
+    int nv, is_head;
+
+    if (gen == region_sample_seen || tb_page_addr0(tb) == -1) {
+        return;
+    }
+    region_sample_seen = gen;
+    nv = translator_region_judge(v, ARRAY_SIZE(v));
+    for (int i = 0; i < nv; i++) {
+        region_invalidate(v[i].head, v[i].cs_base, v[i].flags, v[i].cflags);
+    }
+    is_head = translator_region_try_is_head(tb_page_addr0(tb));
+    if (is_head < 0) {
+        return;
+    }
+    head_tb = region_sample_head(tb, is_head);
+    if (!head_tb) {
+        return;
+    }
+    head = tb_page_addr0(head_tb);
+    if (translator_region_try_is_head(head) != 0) {
+        return;
+    }
+    if (qemu_mutex_trylock(&region_sample_lock)) {
+        return;
+    }
+    if (++region_samples_total % REGION_SAMPLE_DECAY == 0) {
+        GHashTableIter it;
+        gpointer k, c;
+
+        g_hash_table_iter_init(&it, region_samples);
+        while (g_hash_table_iter_next(&it, &k, &c)) {
+            if ((uintptr_t)c / 2) {
+                g_hash_table_iter_replace(&it, (gpointer)((uintptr_t)c / 2));
+            } else {
+                g_hash_table_iter_remove(&it);
+            }
+        }
+    }
+    n = (uintptr_t)g_hash_table_lookup(region_samples, &(uint64_t){ head });
+    if (++n >= tcg_superblock) {
+        g_hash_table_remove(region_samples, &(uint64_t){ head });
+    } else {
+        key = g_new(uint64_t, 1);
+        *key = head;
+        g_hash_table_replace(region_samples, key, (gpointer)n);
+    }
+    qemu_mutex_unlock(&region_sample_lock);
+    if (n >= tcg_superblock && translator_region_promote(head)) {
+        qatomic_inc(&region_promotions);
+        region_invalidate_tb(head_tb);
+    }
+}
+
 /**
  * helper_lookup_tb_ptr: quick check for next tb
  * @env: current cpu state
@@ -483,7 +733,7 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
 
     trace_exec_tb_exit(last_tb, *tb_exit);
 
-    if (*tb_exit > TB_EXIT_IDX1) {
+    if (*tb_exit == TB_EXIT_REQUESTED) {
         /* We didn't start executing this TB (eg because the instruction
          * counter hit zero); we must restore the guest PC to the address
          * of the start of the TB.
@@ -943,6 +1193,9 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
     }
 
     *last_tb = NULL;
+    if (tcg_superblock) {
+        region_sample(cpu, tb);
+    }
     if (cpu_loop_exit_requested(cpu)) {
         /* Something asked us to stop executing chained TBs; just
          * continue round the main loop. Whatever requested the exit

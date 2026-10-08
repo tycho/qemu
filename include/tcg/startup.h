@@ -168,6 +168,13 @@ void tcg_set_env_scratch(intptr_t ofs, intptr_t size);
  */
 extern bool tcg_region;
 
+/*
+ * With tcg_region, the profile samples (one per millisecond) after which a
+ * loop's blocks are translated as one multi-block region (0: never).
+ * User mode, and only for TBs that aren't PC-relative.
+ */
+extern unsigned tcg_superblock;
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size
