@@ -6401,6 +6401,24 @@ static void ldst_record_writeback(TCGContext *s, TCGRegSet allocated_regs)
     s->ldst_nb_wb = n;
 }
 
+/*
+ * The call-clobbered registers still holding values when a guest access
+ * is emitted: its slow path saves them around the call (new_ldst_label).
+ * Taken after ldst_record_writeback, which may have loaded a constant
+ * global into a register to store it, leaving the global there.
+ */
+static void ldst_note_save_regs(TCGContext *s, TCGRegSet clobber)
+{
+    s->ldst_save_regs = 0;
+    for (int i = 0; i < TCG_TARGET_NB_REGS; i++) {
+        if (tcg_regset_test_reg(tcg_target_call_clobber_regs, i)
+            && !tcg_regset_test_reg(clobber, i)
+            && s->reg_to_temp[i]) {
+            tcg_regset_set_reg(s->ldst_save_regs, i);
+        }
+    }
+}
+
 /* at the end of a basic block, we assume all temporaries are dead and
    all globals are stored at their canonical location. */
 static void tcg_reg_alloc_bb_end(TCGContext *s, TCGRegSet allocated_regs)
@@ -7356,18 +7374,6 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
                     tcg_reg_free(s, i, i_allocated_regs);
                 }
             }
-            /*
-             * The call-clobbered registers still holding values: a guest
-             * access's slow path saves them (new_ldst_label).
-             */
-            s->ldst_save_regs = 0;
-            for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
-                if (tcg_regset_test_reg(tcg_target_call_clobber_regs, i)
-                    && !tcg_regset_test_reg(clobber, i)
-                    && s->reg_to_temp[i]) {
-                    tcg_regset_set_reg(s->ldst_save_regs, i);
-                }
-            }
         }
         s->ldst_nb_wb = 0;
         if (op_lazysync(op->opc)) {
@@ -7378,6 +7384,9 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             /* sync globals if the op has side effects and might trigger
                an exception. */
             sync_globals(s, i_allocated_regs);
+        }
+        if (def->flags & TCG_OPF_CALL_CLOBBER) {
+            ldst_note_save_regs(s, op_clobber_regs(op->opc));
         }
 
         /* satisfy the output constraints */
