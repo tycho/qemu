@@ -897,6 +897,23 @@ static void apic_tpr_write_lockless(APICCommonState *s, uint8_t val)
     apic_update_irq(s);
 }
 
+/*
+ * A vCPU's own TPR write through CR8, without the BQL where x-lockless-tpr
+ * allows it, as for its MMIO TPR above; in x2APIC mode too, as CR8 writes
+ * the same register either way.  Returns false if the caller must take
+ * the BQL and use cpu_set_apic_tpr.
+ */
+bool cpu_set_apic_tpr_lockless(APICCommonState *s, uint8_t val)
+{
+    if (!s || !s->lockless_tpr ||
+        !(s->apicbase & MSR_IA32_APICBASE_ENABLE) ||
+        s->vapic_paddr || apic_report_tpr_access) {
+        return false;
+    }
+    apic_tpr_write_lockless(s, val << 4);
+    return true;
+}
+
 static uint64_t apic_mem_read_locked(void *opaque, hwaddr addr,
                                      unsigned size)
 {
