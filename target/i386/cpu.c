@@ -8958,6 +8958,8 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                 *eax &= ~(1U << 4);
             }
         }
+#else
+        *eax = *ebx = *ecx = *edx = 0;
 #endif
         break;
     case 0x14: {
