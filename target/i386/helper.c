@@ -201,8 +201,8 @@ void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
         if (new_cr3 == env->cr[3]) {
             xtcg_stat_inc(XS_X86_CR3_SAME);
         }
-        if (new_cr3 >> 63) {
-            xtcg_stat_inc(XS_X86_CR3_NOFLUSH);
+        if (env->cr[4] & CR4_PCIDE_MASK) {
+            xtcg_hist_inc(XH_X86_CR3_PCID, new_cr3 & 0xfff);
         }
     }
     env->cr[3] = new_cr3;
@@ -224,6 +224,9 @@ void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
         (CR4_PGE_MASK | CR4_PAE_MASK | CR4_PSE_MASK | CR4_PCIDE_MASK |
          CR4_SMEP_MASK | CR4_SMAP_MASK | CR4_LA57_MASK)) {
         xtcg_stat_inc(XS_X86_CR4_FLUSH);
+        if (new_cr4 & ~env->cr[4] & CR4_PCIDE_MASK) {
+            xtcg_stat_inc(XS_X86_PCIDE_SET);
+        }
         tlb_flush(env_cpu(env));
     }
 

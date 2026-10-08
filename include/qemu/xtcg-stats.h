@@ -61,11 +61,12 @@ typedef enum XtcgStat {
     /* x86 TLB maintenance by cause (CH-30) */
     XS_X86_CR3_WRITE,       /* CR3 writes with paging on (each flushes all) */
     XS_X86_CR3_SAME,        /* ... of the value CR3 already held */
-    XS_X86_CR3_NOFLUSH,     /* ... with bit 63 set (PCID no-flush) */
+    XS_X86_CR3_NOFLUSH,     /* MOV to CR3 with CR4.PCIDE and bit 63 set */
     XS_X86_CR0_FLUSH,       /* CR0 writes that flushed (PG, WP, PE) */
     XS_X86_CR4_FLUSH,       /* CR4 writes that flushed (PGE, PAE, ...) */
     XS_X86_INVLPG,          /* INVLPG (helper_flush_page) */
     XS_X86_FILL_GLOBAL,     /* page walks ending in a global leaf, CR4.PGE */
+    XS_X86_PCIDE_SET,       /* CR4 writes that set CR4.PCIDE */
     XS__COUNT
 } XtcgStat;
 
@@ -79,6 +80,8 @@ typedef enum XtcgHist {
     XH_TLB_FILL_MMUIDX,     /* mmu_idx of each fill */
     XH_X86_IRQ_LO,          /* x86 external interrupts taken, vector 0-127 */
     XH_X86_IRQ_HI,          /* ... vector 128-255, at vector - 128 */
+    XH_X86_CR3_PCID,        /* PCID of CR3 writes with CR4.PCIDE (127: >=) */
+    XH_X86_INVPCID,         /* INVPCID by type */
     XH__COUNT
 } XtcgHist;
 

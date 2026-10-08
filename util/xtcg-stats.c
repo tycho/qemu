@@ -54,6 +54,7 @@ static const char * const stat_names[XS__COUNT] = {
     [XS_X86_CR4_FLUSH] = "x86_cr4_flush",
     [XS_X86_INVLPG] = "x86_invlpg",
     [XS_X86_FILL_GLOBAL] = "x86_fill_global",
+    [XS_X86_PCIDE_SET] = "x86_pcide_set",
 };
 
 static const char * const hist_names[XH__COUNT] = {
@@ -65,6 +66,8 @@ static const char * const hist_names[XH__COUNT] = {
     [XH_TLB_FILL_MMUIDX] = "tlb_fill.mmu_idx",
     [XH_X86_IRQ_LO] = "x86_irq.vector",
     [XH_X86_IRQ_HI] = "x86_irq.vector_minus_128",
+    [XH_X86_CR3_PCID] = "x86_cr3.pcid",
+    [XH_X86_INVPCID] = "x86_invpcid.type",
 };
 
 static bool dumped;

@@ -116,6 +116,9 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
          * the non-global ones regardless.
          */
         if (env->cr[4] & CR4_PCIDE_MASK) {
+            if (t0 >> 63) {
+                xtcg_stat_inc(XS_X86_CR3_NOFLUSH);
+            }
             t0 &= ~(1ULL << 63);
         }
         if ((env->efer & MSR_EFER_LMA) &&
@@ -578,6 +581,7 @@ void helper_invpcid(CPUX86State *env, target_ulong type, uint64_t desc_pcid,
     if (type > 3 || (desc_pcid >> 12)) {
         raise_exception_ra(env, EXCP0D_GPF, GETPC());
     }
+    xtcg_hist_inc(XH_X86_INVPCID, type);
     switch (type) {
     case 0:     /* one address in one PCID */
         if ((!pcide && pcid) || (sext != 0 && sext != -1)) {
