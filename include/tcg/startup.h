@@ -288,4 +288,11 @@ extern bool tcg_lazy_incdec;
  */
 extern bool tcg_exit_irq_only;
 
+/*
+ * tcg_tb_flags_canon: targets leave out of a TB's flags the state that
+ * can't change its code in the current mode, so one TB serves them all
+ * (x86: SS.B in 64-bit code).
+ */
+extern bool tcg_tb_flags_canon;
+
 #endif

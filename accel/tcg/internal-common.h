@@ -54,6 +54,12 @@ extern bool tcg_mmio_lockless;
  */
 extern unsigned tcg_tlb_grow;
 
+/*
+ * tcg_jc_keep_pcrel: invalidating a CF_PCREL TB leaves the vCPUs' jump
+ * caches alone instead of flushing them all (see tb_jmp_cache_inval_tb).
+ */
+extern bool tcg_jc_keep_pcrel;
+
 extern bool icount_align_option;
 
 /*

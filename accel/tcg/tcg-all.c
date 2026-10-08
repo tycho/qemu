@@ -337,6 +337,7 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 
 bool tcg_ijmp_inline;
 bool tcg_jcgen;
+bool tcg_jc_keep_pcrel;
 
 bool tcg_iolast;
 bool tcg_mmio_lockless;
@@ -569,6 +570,8 @@ static void tcg_set_tblookup(Object *obj, bool value, Error **errp)
 {
     tcg_ijmp_inline = value;
     tcg_tbpack = value;
+    tcg_jc_keep_pcrel = value;
+    tcg_tb_flags_canon = value;
 }
 
 static bool tcg_get_addr32(Object *obj, Error **errp)

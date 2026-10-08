@@ -332,6 +332,9 @@ bool tcg_tsc_counter;
 bool tcg_pause_hint;
 
 unsigned tcg_superblock;
+
+bool tcg_tb_flags_canon;
+
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
