@@ -28,6 +28,12 @@
 # ifndef HWCAP_ILRCPC
 #  define HWCAP_ILRCPC 0
 # endif
+# ifndef HWCAP2_AFP
+#  define HWCAP2_AFP 0  /* added in glibc 2.35 */
+# endif
+# ifndef HWCAP2_RPRES
+#  define HWCAP2_RPRES 0  /* added in glibc 2.35 */
+# endif
 #endif
 #ifdef CONFIG_ELF_AUX_INFO
 #include <sys/auxv.h>
@@ -89,6 +95,8 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= (hwcap2 & HWCAP2_BTI ? CPUINFO_BTI : 0);
     info |= (hwcap2 & HWCAP2_LRCPC3 ? CPUINFO_LRCPC3 : 0);
     info |= (hwcap2 & HWCAP2_CSSC ? CPUINFO_CSSC : 0);
+    info |= (hwcap2 & HWCAP2_AFP ? CPUINFO_AFP : 0);
+    info |= (hwcap2 & HWCAP2_RPRES ? CPUINFO_RPRES : 0);
 #endif
 #ifdef CONFIG_DARWIN
     info |= sysctl_for_bool("hw.optional.arm.FEAT_LSE") * CPUINFO_LSE;
@@ -101,6 +109,8 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= sysctl_for_bool("hw.optional.arm.FEAT_LRCPC") * CPUINFO_LRCPC;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_LRCPC2") * CPUINFO_LRCPC2;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_LRCPC3") * CPUINFO_LRCPC3;
+    info |= sysctl_for_bool("hw.optional.arm.FEAT_AFP") * CPUINFO_AFP;
+    info |= sysctl_for_bool("hw.optional.arm.FEAT_RPRES") * CPUINFO_RPRES;
 #endif
 #if defined(__OpenBSD__) && !defined(CONFIG_ELF_AUX_INFO)
     int mib[2];

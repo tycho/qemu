@@ -22,6 +22,7 @@
 #include "qemu/target-info.h"
 #include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/cpu-ops.h"
+#include "accel/tcg/host-fp.h"
 #include "accel/tcg/iommu.h"
 #include "accel/tcg/probe.h"
 #include "exec/page-protection.h"
@@ -1935,6 +1936,8 @@ static uint64_t int_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
                                 int mmu_idx, MMUAccessType type, uintptr_t ra,
                                 MemoryRegion *mr, hwaddr mr_offset)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(cpu);
+
     do {
         MemOp this_mop;
         unsigned this_size;
@@ -2449,6 +2452,8 @@ static uint64_t int_st_mmio_leN(CPUState *cpu, CPUTLBEntryFull *full,
                                 int mmu_idx, uintptr_t ra,
                                 MemoryRegion *mr, hwaddr mr_offset)
 {
+    TCG_HOST_FP_SUSPEND_GUARD(cpu);
+
     do {
         MemOp this_mop;
         unsigned this_size;

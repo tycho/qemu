@@ -28,6 +28,7 @@
 #include "exec/replay-core.h"
 #include "exec/icount.h"
 #include "tcg/startup.h"
+#include "host/fpenv.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/accel.h"
@@ -341,6 +342,54 @@ static void tcg_set_simd(Object *obj, bool value, Error **errp)
     tcg_vint = value;
 }
 
+static char *tcg_get_ssefp(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_ssefp_native ? "native" :
+                    tcg_ssefp_vec ? "vec" : "soft");
+}
+
+/*
+ * Whether "auto" picks the softfloat vector fast paths where the host
+ * can't run guest floating point natively: they are tuned for AArch64
+ * hosts, and elsewhere "auto" keeps the lane-by-lane helpers.
+ */
+static bool tcg_ssefp_auto_vec(void)
+{
+#ifdef HOST_AARCH64
+    return true;
+#else
+    return false;
+#endif
+}
+
+static void tcg_set_ssefp(Object *obj, const char *value, Error **errp)
+{
+    bool native, vec;
+
+    if (!strcmp(value, "native")) {
+        if (!host_fpenv_native()) {
+            error_setg(errp, "x-ssefp=native is not supported on this host");
+            return;
+        }
+        native = true;
+        vec = false;
+    } else if (!strcmp(value, "auto")) {
+        native = host_fpenv_native();
+        vec = !native && tcg_ssefp_auto_vec();
+    } else if (!strcmp(value, "vec")) {
+        native = false;
+        vec = true;
+    } else if (!strcmp(value, "soft")) {
+        native = false;
+        vec = false;
+    } else {
+        error_setg(errp, "Invalid 'x-ssefp' value: %s", value);
+        return;
+    }
+    tcg_ssefp_native = native;
+    tcg_ssefp_vec = vec;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -406,6 +455,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "backend can: vector loads and stores as host vector accesses, "
         "permutes and element inserts as host permutes and table lookups, "
         "integer vector operations as host vector operations");
+
+    object_class_property_add_str(oc, "x-ssefp", tcg_get_ssefp, tcg_set_ssefp);
+    object_class_property_set_description(oc, "x-ssefp",
+        "SIMD floating point: soft (default, lane by lane), vec (compute "
+        "whole vectors on the host FPU when that gives the same results "
+        "and flags), native (run with the guest's FP mode in the host "
+        "FPU; needs a host that can express it) or auto (native where "
+        "possible, else vec on AArch64 hosts and soft elsewhere)");
 }
 
 static const TypeInfo tcg_accel_type = {
