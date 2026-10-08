@@ -33,6 +33,7 @@
 #include "qemu/log.h"
 #ifdef CONFIG_TCG
 #include "accel/tcg/cpu-loop.h"
+#include "tcg/startup.h"
 #include "tcg/insn-start-words.h"
 #endif
 
@@ -181,7 +182,15 @@ void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
     if (env->cr[0] & CR0_PG_MASK) {
         qemu_log_mask(CPU_LOG_MMU,
                         "CR3 update: CR3=" TARGET_FMT_lx "\n", new_cr3);
-        tlb_flush(env_cpu(env));
+        /*
+         * The physical and nested-physical translations (page table
+         * walks, SVM's nested paging) don't depend on CR3.
+         */
+        if (tcg_enabled() && tcg_cr3_flush == TCG_CR3_FLUSH_PAGING) {
+            tlb_flush_by_mmuidx(env_cpu(env), MMU_PAGING_IDX_BITS);
+        } else {
+            tlb_flush(env_cpu(env));
+        }
     }
 }
 

@@ -55,4 +55,15 @@ void tcg_register_thread(void);
  */
 void tcg_prologue_init(void);
 
+/*
+ * x86 guests: what a CR3 write flushes from the softmmu TLB (the TCG
+ * accelerator property x-cr3-flush).
+ */
+typedef enum TCGCR3Flush {
+    TCG_CR3_FLUSH_ALL,      /* every mmu index */
+    TCG_CR3_FLUSH_PAGING,   /* the indexes that translate through paging */
+} TCGCR3Flush;
+
+extern TCGCR3Flush tcg_cr3_flush;
+
 #endif
