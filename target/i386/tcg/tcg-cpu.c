@@ -71,6 +71,19 @@ static TCGTBCPUState x86_get_tb_cpu_state(CPUState *cs)
     }
 #endif
     if (env->hflags & HF_CS64_MASK) {
+        static int off = -1;
+
+        if (off < 0) {
+            off = getenv("XTCG_NOSS32FIX") != NULL;     /* [DEV] A/B switch */
+        }
+        /*
+         * SS.B has no effect in 64-bit code (mo_stacksize): one TB whatever
+         * SS was last loaded with, as the kernel is entered both by
+         * SYSCALL and through interrupt gates.
+         */
+        if (!off) {
+            flags |= HF_SS32_MASK;
+        }
         cs_base = 0;
         pc = env->eip;
     } else {
