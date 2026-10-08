@@ -71,6 +71,7 @@ tests += {
   'test-1648.c': {},
   'test-2175.c': {},
   'test-2413.c': {},
+  'vex-ud.c': {},
   'vsyscall.c': {},
 }
 

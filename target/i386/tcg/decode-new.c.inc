@@ -638,7 +638,7 @@ static void decode_0F7E(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
 {
     static const X86OpEntry opcodes_0F7E[4] = {
         X86_OP_ENTRY3(MOVD_from,  E,y, None,None, P,y, vex5 mmx),
-        X86_OP_ENTRY3(MOVD_from,  E,y, None,None, V,y, vex5),
+        X86_OP_ENTRY3(MOVD_from,  E, y, None, None, V, y, vex5 chk(VEX128)),
         X86_OP_ENTRY3(MOVQ,       V,dq,None,None, W,q, vex5),  /* wrong dest Vq on SDM! */
         {},
     };
@@ -2707,6 +2707,14 @@ static bool validate_vex(DisasContext *s, X86DecodedInsn *decode)
     case 7:
         if (s->prefix & PREFIX_VEX) {
             if (!(s->flags & HF_AVX_EN_MASK)) {
+                goto illegal;
+            }
+            /*
+             * Without a 66, F2 or F3 prefix these opcodes are MMX
+             * instructions, which have no VEX form.
+             */
+            if (e->special == X86_SPECIAL_MMX &&
+                !(s->prefix & (PREFIX_DATA | PREFIX_REPZ | PREFIX_REPNZ))) {
                 goto illegal;
             }
         } else if (e->special != X86_SPECIAL_MMX ||
