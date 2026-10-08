@@ -13,6 +13,7 @@ int cpu_set_apic_base(APICCommonState *s, uint64_t val);
 uint64_t cpu_get_apic_base(APICCommonState *s);
 bool cpu_is_apic_enabled(APICCommonState *s);
 void cpu_set_apic_tpr(APICCommonState *s, uint8_t val);
+bool cpu_set_apic_tpr_lockless(APICCommonState *s, uint8_t val);
 uint8_t cpu_get_apic_tpr(APICCommonState *s);
 void apic_init_reset(APICCommonState *s);
 void apic_sipi(APICCommonState *s);
