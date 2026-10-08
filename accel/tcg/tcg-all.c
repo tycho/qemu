@@ -48,6 +48,7 @@
 #include "accel/accel-cpu-ops.h"
 #include "accel/tcg/cpu-ops.h"
 #include "internal-common.h"
+#include "qemu/xtcg-stats.h"
 
 
 struct TCGState {
@@ -706,6 +707,16 @@ static void tcg_set_hyperv(Object *obj, bool value, Error **errp)
     TCG_STATE(obj)->hyperv = value;
 }
 
+static bool tcg_get_xtcg_stats(Object *obj, Error **errp)
+{
+    return xtcg_stats;
+}
+
+static void tcg_set_xtcg_stats(Object *obj, bool value, Error **errp)
+{
+    xtcg_stats_enable(value);
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -873,6 +884,11 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "x86 system mode: implement the Hyper-V interface for hv-relaxed, "
         "hv-vpindex, hv-time and hv-frequencies (otherwise ignored under "
         "TCG), and turn them on by default; needs x-hosttime");
+    object_class_property_add_bool(oc, "x-stats",
+                                   tcg_get_xtcg_stats,
+                                   tcg_set_xtcg_stats);
+    object_class_property_set_description(oc, "x-stats",
+        "xtcg: count TCG events and print them to stderr at exit");
 }
 
 static const TypeInfo tcg_accel_type = {
