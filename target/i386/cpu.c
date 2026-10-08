@@ -8633,10 +8633,16 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
     }
 
     if (index > limit) {
-        /* Intel documentation states that invalid EAX input will
-         * return the same information as EAX=cpuid_level
-         * (Intel SDM Vol. 2A - Instruction Set Reference - CPUID)
+        /*
+         * AMD and Hygon processors return zeros for a leaf above the
+         * maximum of its range.  Intel documentation states that invalid
+         * EAX input will return the same information as EAX=cpuid_level
+         * (Intel SDM Vol. 2A - Instruction Set Reference - CPUID).
          */
+        if (IS_AMD_CPU(env) || IS_HYGON_CPU(env)) {
+            *eax = *ebx = *ecx = *edx = 0;
+            return;
+        }
         index = env->cpuid_level;
     }
 
