@@ -269,6 +269,7 @@ static void tcg_set_tblookup(Object *obj, bool value, Error **errp)
 {
     tcg_ijmp_inline = value;
     tcg_tbpack = value;
+    tcg_tb_flags_canon = value;
 }
 
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
