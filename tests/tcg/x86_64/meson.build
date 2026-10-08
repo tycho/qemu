@@ -60,6 +60,7 @@ tests += {
   'cross-modifying-code.c': {
     'cflags': ['-pthread', '-Wl,--no-warn-rwx-segments']
   },
+  'cpuid-leaves.c': {},
   'fma.c': {},
   'fxsave.c': {},
   'maskmov-page.c': {},
