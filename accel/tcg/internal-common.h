@@ -103,6 +103,14 @@ extern bool tcg_mmio_lockless;
 extern unsigned tcg_tlb_grow;
 
 /*
+ * tcg_jc_global: with tcg_jcgen, jump-cache entries for code on a global
+ * page (CPUJumpCache.gsalt) outlive flushes of the non-global
+ * translations; set in system mode when x-tblookup and
+ * x-cr3-flush=nonglobal are on.
+ */
+extern bool tcg_jc_global;
+
+/*
  * x-smc=check (user mode): self-modifying code is detected by a CRC32C of
  * each TB's guest bytes at its entry, not by write-protecting its pages.
  */
