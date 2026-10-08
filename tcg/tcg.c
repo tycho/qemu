@@ -335,6 +335,8 @@ unsigned tcg_superblock;
 
 bool tcg_tb_flags_canon;
 
+TCGCR3Flush tcg_cr3_flush;
+bool tcg_pcid;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
