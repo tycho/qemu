@@ -37,6 +37,41 @@ extern bool tcg_fpcheck_runtime;
  */
 extern bool tcg_iopl_runtime;
 
+/*
+ * How guest memory ordering is implemented for ordinary guest loads and
+ * stores (accel property x-tso).
+ */
+typedef enum TCGTsoMode {
+    TCG_TSO_BARRIER,    /* a barrier before each access (default) */
+    TCG_TSO_ACQREL,     /* load-acquire / store-release accesses */
+    TCG_TSO_NONE,       /* no barriers at all: UNSAFE, for measurement */
+} TCGTsoMode;
+
+extern TCGTsoMode tcg_tso_mode;
+
+/*
+ * Guest accesses wider than 8 bytes that the guest doesn't make atomic
+ * (accel property x-tso-vec): each ordered like any access (false, the
+ * default), or, under TCG_TSO_ACQREL, as runs with barriers only where a
+ * run begins and ends (true).  Not exact: see tcg_tso_run_end().
+ */
+extern bool tcg_tso_vec_group;
+
+/*
+ * With TCG_TSO_ACQREL, a guest insn whose MO_ACQ_REL accesses have crossed
+ * a 16-byte boundary is promoted: retranslated with MO_ACQ_REL_CROSS, a
+ * form that handles any alignment without a data-dependent branch.
+ *
+ * tcg_tso_cross_count counts one crossing at guest insn @pc, and returns
+ * true once the insn is promoted; tcg_tso_cross_promoted returns true if
+ * it has been.
+ */
+bool tcg_tso_cross_count(uint64_t pc);
+bool tcg_tso_cross_promoted(uint64_t pc);
+
+/* True if the host backend can emit MO_ACQ_REL accesses. */
+bool tcg_can_ldst_acqrel(void);
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size

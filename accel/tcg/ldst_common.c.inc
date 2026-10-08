@@ -15,29 +15,45 @@
 tcg_target_ulong helper_ldub_mmu(CPUArchState *env, uint64_t addr,
                                  MemOpIdx oi, uintptr_t retaddr)
 {
+    tcg_target_ulong ret;
+
     tcg_debug_assert((get_memop(oi) & MO_SIZE) == MO_8);
-    return do_ld1_mmu(env_cpu(env), addr, oi, retaddr, MMU_DATA_LOAD);
+    ret = do_ld1_mmu(env_cpu(env), addr, oi, retaddr, MMU_DATA_LOAD);
+    cpu_req_mo_after_ld(env_cpu(env));
+    return ret;
 }
 
 tcg_target_ulong helper_lduw_mmu(CPUArchState *env, uint64_t addr,
                                  MemOpIdx oi, uintptr_t retaddr)
 {
+    tcg_target_ulong ret;
+
     tcg_debug_assert((get_memop(oi) & MO_SIZE) == MO_16);
-    return do_ld2_mmu(env_cpu(env), addr, oi, retaddr, MMU_DATA_LOAD);
+    ret = do_ld2_mmu(env_cpu(env), addr, oi, retaddr, MMU_DATA_LOAD);
+    cpu_req_mo_after_ld(env_cpu(env));
+    return ret;
 }
 
 tcg_target_ulong helper_ldul_mmu(CPUArchState *env, uint64_t addr,
                                  MemOpIdx oi, uintptr_t retaddr)
 {
+    tcg_target_ulong ret;
+
     tcg_debug_assert((get_memop(oi) & MO_SIZE) == MO_32);
-    return do_ld4_mmu(env_cpu(env), addr, oi, retaddr, MMU_DATA_LOAD);
+    ret = do_ld4_mmu(env_cpu(env), addr, oi, retaddr, MMU_DATA_LOAD);
+    cpu_req_mo_after_ld(env_cpu(env));
+    return ret;
 }
 
 uint64_t helper_ldq_mmu(CPUArchState *env, uint64_t addr,
                         MemOpIdx oi, uintptr_t retaddr)
 {
+    uint64_t ret;
+
     tcg_debug_assert((get_memop(oi) & MO_SIZE) == MO_64);
-    return do_ld8_mmu(env_cpu(env), addr, oi, retaddr, MMU_DATA_LOAD);
+    ret = do_ld8_mmu(env_cpu(env), addr, oi, retaddr, MMU_DATA_LOAD);
+    cpu_req_mo_after_ld(env_cpu(env));
+    return ret;
 }
 
 /*
@@ -66,8 +82,12 @@ tcg_target_ulong helper_ldsl_mmu(CPUArchState *env, uint64_t addr,
 Int128 helper_ld16_mmu(CPUArchState *env, uint64_t addr,
                        MemOpIdx oi, uintptr_t retaddr)
 {
+    Int128 ret;
+
     tcg_debug_assert((get_memop(oi) & MO_SIZE) == MO_128);
-    return do_ld16_mmu(env_cpu(env), addr, oi, retaddr);
+    ret = do_ld16_mmu(env_cpu(env), addr, oi, retaddr);
+    cpu_req_mo_after_ld(env_cpu(env));
+    return ret;
 }
 
 Int128 helper_ld_i128(CPUArchState *env, uint64_t addr, uint32_t oi)
@@ -141,6 +161,7 @@ uint8_t cpu_ldb_mmu(CPUArchState *env, vaddr addr, MemOpIdx oi, uintptr_t ra)
 
     tcg_debug_assert((get_memop(oi) & MO_SIZE) == MO_UB);
     ret = do_ld1_mmu(env_cpu(env), addr, oi, ra, MMU_DATA_LOAD);
+    cpu_req_mo_after_ld(env_cpu(env));
     plugin_load_cb(env, addr, ret, 0, oi);
     return ret;
 }
@@ -152,6 +173,7 @@ uint16_t cpu_ldw_mmu(CPUArchState *env, vaddr addr,
 
     tcg_debug_assert((get_memop(oi) & MO_SIZE) == MO_16);
     ret = do_ld2_mmu(env_cpu(env), addr, oi, ra, MMU_DATA_LOAD);
+    cpu_req_mo_after_ld(env_cpu(env));
     plugin_load_cb(env, addr, ret, 0, oi);
     return ret;
 }
@@ -163,6 +185,7 @@ uint32_t cpu_ldl_mmu(CPUArchState *env, vaddr addr,
 
     tcg_debug_assert((get_memop(oi) & MO_SIZE) == MO_32);
     ret = do_ld4_mmu(env_cpu(env), addr, oi, ra, MMU_DATA_LOAD);
+    cpu_req_mo_after_ld(env_cpu(env));
     plugin_load_cb(env, addr, ret, 0, oi);
     return ret;
 }
@@ -174,6 +197,7 @@ uint64_t cpu_ldq_mmu(CPUArchState *env, vaddr addr,
 
     tcg_debug_assert((get_memop(oi) & MO_SIZE) == MO_64);
     ret = do_ld8_mmu(env_cpu(env), addr, oi, ra, MMU_DATA_LOAD);
+    cpu_req_mo_after_ld(env_cpu(env));
     plugin_load_cb(env, addr, ret, 0, oi);
     return ret;
 }
@@ -185,6 +209,7 @@ Int128 cpu_ld16_mmu(CPUArchState *env, vaddr addr,
 
     tcg_debug_assert((get_memop(oi) & MO_SIZE) == MO_128);
     ret = do_ld16_mmu(env_cpu(env), addr, oi, ra);
+    cpu_req_mo_after_ld(env_cpu(env));
     plugin_load_cb(env, addr, int128_getlo(ret), int128_gethi(ret), oi);
     return ret;
 }

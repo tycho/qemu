@@ -66,6 +66,9 @@ tests += {
   'noexec.c': {},
   'segment-prefixes.c': {},
   'sse-scalar-mem.c': {},
+  'smc-crossing.c': {
+    'cflags': ['-pthread', '-Wl,--no-warn-rwx-segments']
+  },
   'test-1648.c': {},
   'test-2175.c': {},
   'test-2413.c': {},

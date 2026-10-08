@@ -344,6 +344,10 @@ static inline TCGRegSet output_pref(const TCGOp *op, unsigned i)
 }
 
 struct TCGContext {
+    /* The open run of grouped guest accesses (tcg_tso_vec_group). */
+    bool tso_run_ld;            /* loads not yet ordered before later ops */
+    bool tso_run_st;            /* the run's stores have had their barrier */
+    bool tso_run_emit;          /* a grouped access is being emitted */
     uintptr_t pool_cur, pool_end;
     TCGPool *pool_first, *pool_current, *pool_first_large;
     int nb_labels;
@@ -435,6 +439,16 @@ struct TCGContext {
 
     uint16_t gen_insn_end_off[TCG_MAX_INSNS];
     uint64_t *gen_insn_data;
+
+    /*
+     * The guest pc of each insn, as the translator saw it (insn_pc is the
+     * one being translated), and during code generation the index of the
+     * insn being emitted: backends use gen_insn_pc[gen_cur_insn] to name
+     * the guest insn of an op.
+     */
+    uint64_t insn_pc;
+    uint64_t gen_insn_pc[TCG_MAX_INSNS];
+    int gen_cur_insn;
 
     /* Exit to translator on overflow. */
     sigjmp_buf jmp_trans;
