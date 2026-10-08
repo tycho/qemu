@@ -110,7 +110,8 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
         cpu_x86_update_cr4(env, t0);
         break;
     case 8:
-        if (!(env->hflags2 & HF2_VINTR_MASK)) {
+        if (!(env->hflags2 & HF2_VINTR_MASK) &&
+            !cpu_set_apic_tpr_lockless(env_archcpu(env)->apic_state, t0)) {
             bql_lock();
             cpu_set_apic_tpr(env_archcpu(env)->apic_state, t0);
             bql_unlock();
