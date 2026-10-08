@@ -24,6 +24,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
+#include "host/counter.h"
 #include "system/tcg.h"
 #include "exec/replay-core.h"
 #include "exec/icount.h"
@@ -57,6 +59,7 @@ struct TCGState {
     int splitwx_enabled;
     unsigned long tb_size;
     bool iofast;
+    bool hosttime;
 };
 typedef struct TCGState TCGState;
 
@@ -179,6 +182,19 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
                          G_N_ELEMENTS(iofast_props));
     }
 #endif
+
+    /*
+     * x-hosttime: QEMU's clock from CLOCK_MONOTONIC_RAW, and the x86 TSC
+     * from the host's constant-rate counter.  Not the TSC with icount,
+     * where it must follow the instruction count so that record and
+     * replay see the same values.
+     */
+    if (s->hosttime) {
+#if QEMU_CLOCK_RAW_SUPPORTED
+        qemu_clock_use_raw();
+#endif
+        tcg_tsc_counter = HOST_COUNTER_SUPPORTED && !icount_enabled();
+    }
 
     tcg_allowed = true;
 
@@ -499,6 +515,20 @@ static void tcg_set_iofast(Object *obj, bool value, Error **errp)
     TCG_STATE(obj)->iofast = value;
 }
 
+static bool tcg_get_hosttime(Object *obj, Error **errp)
+{
+    return TCG_STATE(obj)->hosttime;
+}
+
+static void tcg_set_hosttime(Object *obj, bool value, Error **errp)
+{
+    if (value && !QEMU_CLOCK_RAW_SUPPORTED && !HOST_COUNTER_SUPPORTED) {
+        error_setg(errp, "x-hosttime: not supported on this host");
+        return;
+    }
+    TCG_STATE(obj)->hosttime = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -613,6 +643,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "with icount), MMIO to lockless_io regions without the BQL, the "
         "x86 APIC's TPR and the RTC's update polls without the BQL, and "
         "no kvmvapic option ROM");
+
+    object_class_property_add_bool(oc, "x-hosttime",
+                                   tcg_get_hosttime, tcg_set_hosttime);
+    object_class_property_set_description(oc, "x-hosttime",
+        "QEMU's clock from CLOCK_MONOTONIC_RAW (unadjusted, and on macOS "
+        "finer than 1 us), and the x86 TSC from the host's constant-rate "
+        "counter, read inline, invariant, with IA32_TSC_ADJUST (not with "
+        "icount)");
 }
 
 static const TypeInfo tcg_accel_type = {
