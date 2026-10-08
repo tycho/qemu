@@ -8798,6 +8798,12 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
                 *ecx |= CPUID_7_0_ECX_OSPKE;
             }
             *edx = env->features[FEAT_7_0_EDX]; /* Feature flags */
+        } else if (count > env->cpuid_level_func7) {
+            /* Above the maximum subleaf. */
+            *eax = 0;
+            *ebx = 0;
+            *ecx = 0;
+            *edx = 0;
         } else if (count == 1) {
             *eax = env->features[FEAT_7_1_EAX];
             *ecx = env->features[FEAT_7_1_ECX];
@@ -9040,7 +9046,14 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
             /* Highest numbered palette subleaf */
             *ebx = INTEL_AMX_TMUL_MAX_K | (INTEL_AMX_TMUL_MAX_N << 8);
         } else if (count == 1) {
-            *eax = env->features[FEAT_1E_1_EAX];
+            uint32_t max, unused;
+
+            /* Subleaf 1 exists only if subleaf 0 says so. */
+            x86_cpu_get_supported_cpuid(0x1E, 0, &max, &unused,
+                                        &unused, &unused);
+            if (max >= 1) {
+                *eax = env->features[FEAT_1E_1_EAX];
+            }
         }
         break;
     }
@@ -9065,7 +9078,7 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         if (count == 0) {
             *eax = env->avx10_max_subleaf;
             *ebx = env->features[FEAT_24_0_EBX] | env->avx10_version;
-        } else if (count == 1) {
+        } else if (count == 1 && env->avx10_max_subleaf >= 1) {
             *ecx = env->features[FEAT_24_1_ECX];
         }
         break;
