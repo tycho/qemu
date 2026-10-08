@@ -1322,10 +1322,12 @@ static void tso_cross_probe(CPUArchState *env, uint64_t addr, MemOpIdx oi,
 
 /*
  * An MO_ACQ_REL access of guest insn @site crossed a 16-byte boundary.
- * Once the insn is promoted, invalidate the TB at @retaddr so that it is
- * retranslated with MO_ACQ_REL_CROSS for the insn (see
- * tcg_gen_ldst_order).  The TB may finish its current execution: its code
- * stays valid, and invalidation unlinks jumps into it.
+ * Once the insn is promoted, invalidate the TB at @retaddr and leave it
+ * before the access, so that the insn is retranslated with
+ * MO_ACQ_REL_CROSS (see tcg_gen_ldst_order) and executed again.  The TB
+ * must not go on: invalidation takes it off its pages' TB lists, and the
+ * precise SMC check finds the current TB among those, so a store of the
+ * TB's own to code further on in it would not stop it.
  */
 static void tso_cross_note(CPUState *cpu, uint64_t addr, MemOpIdx oi,
                            uintptr_t retaddr, uint64_t site)
@@ -1346,6 +1348,8 @@ static void tso_cross_note(CPUState *cpu, uint64_t addr, MemOpIdx oi,
         mmap_lock();
         tb_phys_invalidate(tb, -1);
         mmap_unlock();
+        cpu_restore_state_from_tb(cpu, tb, retaddr);
+        cpu_loop_exit_noexc(cpu);
     }
 }
 

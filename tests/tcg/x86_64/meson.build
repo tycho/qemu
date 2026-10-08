@@ -65,6 +65,9 @@ tests += {
   'maskmov-page.c': {},
   'noexec.c': {},
   'segment-prefixes.c': {},
+  'smc-crossing.c': {
+    'cflags': ['-pthread', '-Wl,--no-warn-rwx-segments']
+  },
   'sse-scalar-mem.c': {},
   'test-1648.c': {},
   'test-2175.c': {},
