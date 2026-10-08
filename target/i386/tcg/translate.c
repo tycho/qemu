@@ -23,6 +23,7 @@
 #include "accel/tcg/cpu-mmu-index.h"
 #include "exec/translation-block.h"
 #include "tcg/tcg-op.h"
+#include "tcg/startup.h"
 #include "tcg/tcg-op-gvec.h"
 #include "tcg/startup.h"
 #include "exec/translator.h"
@@ -2220,6 +2221,39 @@ static void gen_bnd_jmp(DisasContext *s)
     }
 }
 
+/* tcg_exit_irq_only, outside icount (which counts every exit). */
+static bool exit_irq_only(DisasContext *s)
+{
+    return tcg_exit_irq_only && !(tb_cflags(s->base.tb) & CF_USE_ICOUNT);
+}
+
+/*
+ * Leave generated code if the vCPU has an interrupt request (one that IF
+ * or the TPR held back may now be taken); otherwise fall through.  With
+ * @eip_next, cpu_eip is set to the next instruction on the way out only.
+ */
+static void gen_exit_if_irq_pending(DisasContext *s, bool eip_next)
+{
+    TCGLabel *cont = gen_new_label();
+    TCGv_i32 t = tcg_temp_new_i32();
+
+    gen_update_cc_op(s);
+    tcg_gen_ld_i32(t, tcg_env,
+                   offsetof(CPUState, interrupt_request) - sizeof(CPUState));
+    tcg_gen_brcondi_i32(TCG_COND_EQ, t, 0, cont);
+    if (eip_next) {
+        if (tb_cflags(s->base.tb) & CF_PCREL) {
+            tcg_gen_addi_tl(cpu_eip, cpu_eip, s->pc - s->pc_save);
+        } else if (CODE64(s)) {
+            tcg_gen_movi_tl(cpu_eip, s->pc);
+        } else {
+            tcg_gen_movi_tl(cpu_eip, (uint32_t)(s->pc - s->cs_base));
+        }
+    }
+    tcg_gen_exit_tb(NULL, 0);
+    gen_set_label(cont);
+}
+
 /*
  * Look up the next TB after a near jump.  The CPU state is then the one
  * this TB was translated for: an insn that changes the hflags or CS ends
@@ -2287,6 +2321,18 @@ gen_eob(DisasContext *s, int mode)
                /* give irqs a chance to happen */
                !inhibit_reset) {
         gen_lookup_and_goto_ptr(s, mode);
+    } else if (inhibit_reset && exit_irq_only(s) &&
+               (mode == DISAS_EOB_NEXT || mode == DISAS_EOB_INHIBIT_IRQ ||
+                mode == DISAS_JUMP || mode == DISAS_JUMP_FAR)) {
+        /* The shadow is over: leave only if an interrupt may be taken. */
+        gen_exit_if_irq_pending(s, false);
+        tcg_gen_lookup_and_goto_ptr();
+    } else if (mode == DISAS_EOB_INHIBIT_IRQ && exit_irq_only(s)) {
+        /*
+         * No interrupt is taken in the shadow (x86_cpu_interrupts_enabled
+         * checks HF_INHIBIT_IRQ): chain to its block.
+         */
+        tcg_gen_lookup_and_goto_ptr();
     } else {
         tcg_gen_exit_tb(NULL, 0);
     }

@@ -193,7 +193,8 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     qemu_add_vm_change_state_handler(tcg_vm_change_state, NULL);
 
     /*
-     * x-iofast: TBs end after instructions known to do I/O; MMIO from
+     * x-iofast: TBs end after instructions known to do I/O; a TB ends to
+     * let an interrupt be taken only when one is pending; MMIO from
      * generated code to lockless_io regions skips the BQL; the x86 local
      * APIC serves a vCPU's own TPR accesses and the MC146818 RTC its
      * index writes and update-in-progress polls without the BQL; and the
@@ -213,6 +214,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 
         tcg_iolast = true;
         tcg_mmio_lockless = true;
+        tcg_exit_irq_only = true;
         if (!ac->compat_props) {
             ac->compat_props = g_ptr_array_new();
         }
@@ -338,6 +340,7 @@ bool tcg_jcgen;
 
 bool tcg_iolast;
 bool tcg_mmio_lockless;
+bool tcg_exit_irq_only;
 
 unsigned tcg_tlb_grow;
 
