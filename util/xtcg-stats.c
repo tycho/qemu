@@ -64,6 +64,8 @@ static const char * const stat_names[XS__COUNT] = {
     [XS_JC_MISS_FLAGS] = "jc_miss_flags",
     [XS_JC_MISS_STALE] = "jc_miss_stale",
     [XS_JC_MISS_OTHER] = "jc_miss_other",
+    [XS_LOOKUP_JC_CALL] = "lookup_jc_call",
+    [XS_LOOKUP_JC_HIT] = "lookup_jc_hit",
 };
 
 static const char * const hist_names[XH__COUNT] = {
@@ -78,6 +80,7 @@ static const char * const hist_names[XH__COUNT] = {
     [XH_X86_CR3_PCID] = "x86_cr3.pcid",
     [XH_X86_INVPCID] = "x86_invpcid.type",
     [XH_JC_FULL] = "jc_full_flush.site",
+    [XH_JC_FLAGS_BIT] = "jc_miss_flags.bit",
 };
 
 static bool dumped;

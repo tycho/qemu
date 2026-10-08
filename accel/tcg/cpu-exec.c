@@ -301,7 +301,19 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s,
             xtcg_stat_inc(XS_JC_MISS_EMPTY);
         } else if (k == (s.pc ^ qatomic_read(&jc->salt)) ||
                    k == (s.pc ^ qatomic_read(&jc->gsalt))) {
+            uint32_t x = e->flags ^ s.flags;
+
             xtcg_stat_inc(XS_JC_MISS_FLAGS);
+            while (x) {
+                xtcg_hist_inc(XH_JC_FLAGS_BIT, ctz32(x));
+                x &= x - 1;
+            }
+            if (e->cs_base != s.cs_base) {
+                xtcg_hist_inc(XH_JC_FLAGS_BIT, 40);
+            }
+            if (tb_cflags(e) != s.cflags) {
+                xtcg_hist_inc(XH_JC_FLAGS_BIT, 41);
+            }
         } else if (((k ^ qatomic_read(&jc->salt)) & ~(vaddr)0xffff000000000000ull) ==
                    (s.pc & ~(vaddr)0xffff000000000000ull) ||
                    ((k ^ qatomic_read(&jc->gsalt)) & ~(vaddr)0xffff000000000000ull) ==
@@ -738,12 +750,14 @@ const void *HELPER(lookup_tb_ptr_jc)(CPUArchState *env, uint64_t pc,
     uint32_t hash = tb_jmp_cache_hash_func(pc);
     TranslationBlock *tb = qatomic_read(&jc->array[hash].tb);
 
+    xtcg_stat_inc(XS_LOOKUP_JC_CALL);
     if (likely(tb &&
                tb_jmp_cache_key_match(jc, jc->array[hash].pc, pc) &&
                QTAILQ_EMPTY(&cpu->breakpoints) &&
                tb->cs_base == cs_base &&
                tb->flags == flags &&
                tb_cflags(tb) == cpu->tcg_cflags)) {
+        xtcg_stat_inc(XS_LOOKUP_JC_HIT);
         return tb->tc.ptr;
     }
     return HELPER(lookup_tb_ptr)(env);

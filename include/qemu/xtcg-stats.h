@@ -76,6 +76,8 @@ typedef enum XtcgStat {
     XS_JC_MISS_FLAGS,       /* ... same pc, other flags/cs_base/cflags */
     XS_JC_MISS_STALE,       /* ... same pc, older salt */
     XS_JC_MISS_OTHER,       /* ... another pc */
+    XS_LOOKUP_JC_CALL,      /* helper_lookup_tb_ptr_jc calls (cross-page) */
+    XS_LOOKUP_JC_HIT,       /* ... hits */
     XS__COUNT
 } XtcgStat;
 
@@ -92,6 +94,7 @@ typedef enum XtcgHist {
     XH_X86_CR3_PCID,        /* PCID of CR3 writes with CR4.PCIDE (127: >=) */
     XH_X86_INVPCID,         /* INVPCID by type */
     XH_JC_FULL,             /* full jump-cache flushes by call site */
+    XH_JC_FLAGS_BIT,        /* same-pc misses: TB flag bits that differ (40 cs_base, 41 cflags) */
     XH__COUNT
 } XtcgHist;
 
