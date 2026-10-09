@@ -125,6 +125,13 @@ struct TranslationBlock {
      */
 #define TB_JMP_OFFSET_INVALID 0xffff /* indicates no jump generated */
     uint16_t jmp_reset_offset[2]; /* offset of original jump target */
+    /*
+     * The goto_tb slots that leave by a host call (tcg_gen_call_tb), and
+     * TB_JMP_RET_LANDING if host returns may enter the TB
+     * (tcg_gen_push_ret).
+     */
+    uint16_t jmp_call;
+#define TB_JMP_RET_LANDING 0x100
     uint16_t jmp_insn_offset[2];  /* offset of direct jump insn */
     uintptr_t jmp_target_addr[2]; /* target address */
 
