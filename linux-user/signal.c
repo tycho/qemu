@@ -38,6 +38,7 @@
 #include "user/safe-syscall.h"
 #include "user/signal.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 
 /* target_siginfo_t must fit in gdbstub's siginfo save area. */
 QEMU_BUILD_BUG_ON(sizeof(target_siginfo_t) > MAX_SIGINFO_LENGTH);
@@ -661,6 +662,12 @@ void signal_init(const char *rtsig_map)
     /* initialize signal conversion tables */
     signal_table_init(rtsig_map);
 
+    /*
+     * host_sigbus_handler handles the alignment fault of an ordered access
+     * that crosses 16 bytes, so the backend needn't check for it.
+     */
+    tcg_tso_cross_faults = true;
+
     /* Set the signal mask from the host mask. */
     sigprocmask(0, 0, &ts->signal_mask);
 
@@ -1012,7 +1019,8 @@ static void host_sigsegv_handler(CPUState *cpu, siginfo_t *info,
 static uintptr_t host_sigbus_handler(CPUState *cpu, siginfo_t *info,
                                 host_sigcontext *uc)
 {
-    uintptr_t pc = host_signal_pc(uc);
+    uintptr_t fault_pc = host_signal_pc(uc);
+    uintptr_t pc = fault_pc;
     bool is_write = host_signal_write(info, uc);
     MMUAccessType access_type = adjust_signal_pc(&pc, is_write);
 
@@ -1028,6 +1036,11 @@ static uintptr_t host_sigbus_handler(CPUState *cpu, siginfo_t *info,
         uintptr_t host_addr = (uintptr_t)info->si_addr;
         abi_ptr guest_addr = h2g_nocheck(host_addr);
 
+        /* An ordered access crossing 16 bytes: promote it and run it again. */
+        if (tcg_tso_cross_fault(cpu, fault_pc, pc)) {
+            sigprocmask(SIG_SETMASK, host_signal_mask(uc), NULL);
+            cpu_loop_exit_noexc(cpu);
+        }
         sigprocmask(SIG_SETMASK, host_signal_mask(uc), NULL);
         cpu_loop_exit_sigbus(cpu, guest_addr, access_type, pc);
     }
