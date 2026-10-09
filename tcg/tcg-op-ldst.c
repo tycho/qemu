@@ -920,23 +920,25 @@ static void qemu_ldst_vec1(TCGOpcode opc, TCGv_vec val, TCGTemp *addr,
 }
 
 /*
+ * tcg_tso_vec_group: as for tcg_tso_grouped, a vector access joins the run
+ * of grouped accesses unless it is atomic as a whole or the host can make
+ * it an acquire or release itself (tcg_ldst_vec_acqrel); half of a wider
+ * access always joins.
+ */
+static bool tcg_tso_vec_grouped(MemOp memop, bool pair)
+{
+    return tcg_tso_vec_group && tcg_tso_mode == TCG_TSO_ACQREL &&
+           (pair || (!tcg_tso_atom_whole(memop) &&
+                     !tcg_ldst_vec_acqrel(memop)));
+}
+
+/*
  * As for tcg_gen_qemu_ld_i128: any barrier the mode needs before the
  * loads is emitted here; with x-tso=acqrel a load that is not itself an
  * acquire is followed by a barrier instead.  Two vector accesses that make
  * up one guest access (@hi non-null) need no order among themselves, so
  * the barrier is emitted once, for both.
  */
-/*
- * tcg_tso_vec_group: a vector access the guest doesn't make atomic (not
- * required to be 16-byte aligned, or half of a wider access) joins the
- * run of grouped accesses, as for tcg_tso_grouped.
- */
-static bool tcg_tso_vec_grouped(MemOp memop, bool pair)
-{
-    return tcg_tso_vec_group && tcg_tso_mode == TCG_TSO_ACQREL &&
-           (pair || memop_alignment_bits(memop) < MO_128);
-}
-
 static void qemu_ld_vec_ordered(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
                                 TCGv_vec hi, TCGTemp *addr_hi, MemOp memop_hi,
                                 TCGArg idx, TCGType addr_type)
