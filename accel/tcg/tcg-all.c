@@ -88,7 +88,8 @@ static void xtcg_fork_defaults(Object *obj)
 #if defined(__aarch64__)
     static const char *const defaults[][2] = {
         { "x-tso", "auto" },
-        { "x-tso-vec", "group" },
+        { "x-tso-vec", "none" },
+        { "x-tso-stack", "on" },
         { "x-ssefp", "auto" },
         { "x-simd", "on" },
         { "x-regcache", "on" },
