@@ -1981,6 +1981,9 @@ static void tgen_qemu_st_x(TCGContext *s, TCGType type, TCGReg data,
     }
 }
 
+/* x-lean: a shift feeding an add as lea, ADD (shifted register). */
+#define TCG_TARGET_SHL_ADD_LEA
+
 static const TCGOutOpQemuLdStX outop_qemu_ld_x = {
     .base.static_constraint = C_O1_I2(r, r, rz),
     .out = tgen_qemu_ld_x,
