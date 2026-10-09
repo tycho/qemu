@@ -6860,6 +6860,17 @@ static bool gen_movs_native_ld(DisasContext *s, X86DecodedInsn *decode,
         return false;
     }
     b = tcg_temp_new_vec(TCG_TYPE_V128);
+    if (!merge &&
+        tcg_can_emit_vec_op(INDEX_op_movz_vec, TCG_TYPE_V128, vece) > 0) {
+        /* The other elements zero: one host move from the loaded value. */
+        TCGv_i64 t = tcg_temp_new_i64();
+
+        tcg_gen_qemu_ld_i64(t, s->A0, s->mem_index,
+                            vece == MO_32 ? MO_LEUL : MO_LEUQ);
+        tcg_gen_movz_vec_i64(vece, b, t);
+        fp_scalar_store(decode, b);
+        return true;
+    }
     if (vece == MO_32) {
         TCGv_i32 t = tcg_temp_new_i32();
 
