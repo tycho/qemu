@@ -2052,6 +2052,7 @@ static void
 gen_eob(DisasContext *s, int mode)
 {
     bool inhibit_reset;
+    TCGLabel *req = NULL;
 
     gen_update_cc_op(s);
 
@@ -2075,8 +2076,13 @@ gen_eob(DisasContext *s, int mode)
     } else if (mode == DISAS_JUMP &&
                /* give irqs a chance to happen */
                !inhibit_reset) {
+        req = translator_edge_check(&s->base, s->base.pc_first);
         tcg_gen_lookup_and_goto_ptr();
     } else {
+        tcg_gen_exit_tb(NULL, 0);
+    }
+    if (req) {
+        gen_set_label(req);
         tcg_gen_exit_tb(NULL, 0);
     }
 
@@ -2130,7 +2136,12 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
         s->base.is_jmp = DISAS_NORETURN;
     } else if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)) {
         /* jump to same page: we can use a direct jump */
+        TCGLabel *req = translator_edge_check(&s->base, new_pc);
+
         tcg_gen_goto_tb(tb_num);
+        if (req) {
+            gen_set_label(req);
+        }
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
             tcg_gen_movi_tl(cpu_eip, new_eip);
         }
@@ -3739,6 +3750,7 @@ static const TranslatorOps i386_tr_ops = {
     .insn_start         = i386_tr_insn_start,
     .translate_insn     = i386_tr_translate_insn,
     .tb_stop            = i386_tr_tb_stop,
+    .edge_checks        = true,
 };
 
 void x86_translate_code(CPUState *cpu, TranslationBlock *tb,
