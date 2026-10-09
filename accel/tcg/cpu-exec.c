@@ -1243,6 +1243,10 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
     tb = cpu_tb_exec(cpu, tb, tb_exit);
     if (*tb_exit != TB_EXIT_REQUESTED) {
         *last_tb = tb;
+        /* A TB that checks the request on its exits left on it. */
+        if (tcg_superblock && tb && unlikely(cpu_loop_exit_requested(cpu))) {
+            region_sample(cpu, tb);
+        }
         return;
     }
 

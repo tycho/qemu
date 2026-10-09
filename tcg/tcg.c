@@ -9236,6 +9236,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     num_insns = -1;
     s->gen_cur_insn = -1;
     s->carry_live = false;
+    s->xblk_ft = true;          /* the TB's entry falls into its first op */
     QTAILQ_FOREACH(op, &s->ops, link) {
         TCGOpcode opc = op->opc;
 
