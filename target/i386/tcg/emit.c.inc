@@ -191,7 +191,17 @@ static void compute_xmm_offset(X86DecodedOp *op)
     }
 }
 
-static void gen_load_sse(DisasContext *s, TCGv temp, MemOp ot, int dest_ofs, bool aligned)
+static void gen_MOVDQ(DisasContext *s, X86DecodedInsn *decode);
+
+/* MOVDQA or VMOVDQA, the moves of a 16-byte atomic load or store. */
+static bool sse_atomic_move(DisasContext *s, X86DecodedInsn *decode)
+{
+    return decode->e.gen == gen_MOVDQ && (s->prefix & PREFIX_DATA) &&
+           (decode->b == 0x6f || decode->b == 0x7f);
+}
+
+static void gen_load_sse(DisasContext *s, TCGv temp, MemOp ot, int dest_ofs,
+                         bool aligned, bool atomic_move)
 {
     switch(ot) {
     case MO_8:
@@ -210,7 +220,7 @@ static void gen_load_sse(DisasContext *s, TCGv temp, MemOp ot, int dest_ofs, boo
         gen_ldq_env_A0(s, dest_ofs);
         break;
     case MO_128:
-        gen_ldo_env_A0(s, dest_ofs, aligned);
+        gen_ldo_env_A0(s, dest_ofs, aligned, atomic_move);
         break;
     case MO_256:
         gen_ldy_env_A0(s, dest_ofs, aligned);
@@ -306,7 +316,8 @@ static void gen_load(DisasContext *s, X86DecodedInsn *decode, int opn, TCGv v)
     load_vector:
         if (op->has_ea) {
             bool aligned = sse_needs_alignment(s, decode, op->ot);
-            gen_load_sse(s, v, op->ot, op->offset, aligned);
+            gen_load_sse(s, v, op->ot, op->offset, aligned,
+                         sse_atomic_move(s, decode));
         }
         break;
 
@@ -458,7 +469,7 @@ static void gen_store_sse(DisasContext *s, X86DecodedInsn *decode, int src_ofs)
         gen_stq_env_A0(s, src_ofs);
         break;
     case MO_128:
-        gen_sto_env_A0(s, src_ofs, aligned);
+        gen_sto_env_A0(s, src_ofs, aligned, sse_atomic_move(s, decode));
         break;
     case MO_256:
         gen_sty_env_A0(s, src_ofs, aligned);
@@ -4393,7 +4404,7 @@ static void gen_VEXTRACTx128(DisasContext *s, X86DecodedInsn *decode)
     int src_ofs = vector_elem_offset(&decode->op[1], MO_128, mask);
     if (decode->op[0].has_ea) {
         /* VEX-only instruction, no alignment requirements.  */
-        gen_sto_env_A0(s, src_ofs, false);
+        gen_sto_env_A0(s, src_ofs, false, false);
     } else {
         tcg_gen_gvec_mov(MO_64, decode->op[0].offset, src_ofs, 16, 16);
     }
