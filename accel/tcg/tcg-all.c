@@ -164,6 +164,9 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     }
 
     tcg_jcgen = cc->tcg_ops->jmp_cache_salt;
+#ifdef CONFIG_USER_ONLY
+    tcg_jc_ctx = tcg_jcgen && tcg_ijmp_inline;
+#endif
     page_init();
     tb_htable_init();
     tcg_init(s->tb_size * MiB, s->splitwx_enabled, max_threads);
@@ -233,6 +236,7 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 
 bool tcg_ijmp_inline;
 bool tcg_jcgen;
+bool tcg_jc_ctx;
 bool tcg_jc_keep_pcrel;
 
 static bool tcg_get_splitwx(Object *obj, Error **errp)
