@@ -4633,6 +4633,8 @@ dead_env_store_pass(TCGContext *s)
         case INDEX_op_qemu_st2:
         case INDEX_op_qemu_ld_vec:
         case INDEX_op_qemu_st_vec:
+        case INDEX_op_qemu_ld_x:
+        case INDEX_op_qemu_st_x:
             dse_keep_only(&dead, dse_scratch_lo, dse_scratch_hi);
             break;
         case INDEX_op_exit_tb:
@@ -6278,6 +6280,8 @@ static bool op_is_guest_access(TCGOpcode opc)
     case INDEX_op_qemu_st2:
     case INDEX_op_qemu_ld_vec:
     case INDEX_op_qemu_st_vec:
+    case INDEX_op_qemu_ld_x:
+    case INDEX_op_qemu_st_x:
         return true;
     default:
         return false;
@@ -10260,9 +10264,12 @@ static void pinned_alias_pass(TCGContext *s)
  * op that faults leaves its output register unwritten.  Not when the op
  * also stores the temp: a TB temp kept in memory across labels is read
  * from there after it dies in the mov.  Runs after liveness, whose results
- * it keeps up to date.  A vector result often reaches the global through
- * a chain of moves between temps: after a fold into a vector global, the
- * op before is tried again, back to the op that computes the value.
+ * it keeps up to date.  With tcg_lean, also for
+ * globals that aren't pinned (not a guest load), where it saves the
+ * register-to-register move.  A vector result often reaches the global
+ * through a chain of moves between temps: after a fold into a vector
+ * global, the op before is tried again, back to the op that computes
+ * the value.
  */
 static TCGTemp *pinned_fold(TCGContext *s, TCGOp *op)
 {
@@ -10274,7 +10281,7 @@ static TCGTemp *pinned_fold(TCGContext *s, TCGOp *op)
         (next->opc != INDEX_op_mov && next->opc != INDEX_op_mov_vec) ||
         op->opc == INDEX_op_call || def->nb_oargs != 1 ||
         ((def->flags & TCG_OPF_SIDE_EFFECTS) &&
-         op->opc != INDEX_op_qemu_ld)) {
+         op->opc != INDEX_op_qemu_ld && op->opc != INDEX_op_qemu_ld_vec)) {
         return NULL;
     }
     t = arg_temp(op->args[0]);
@@ -10283,7 +10290,15 @@ static TCGTemp *pinned_fold(TCGContext *s, TCGOp *op)
     if ((def->flags & TCG_OPF_VECTOR) && g->base_type < TCG_TYPE_V64) {
         return NULL;
     }
-    if (!g->pinned || arg_temp(next->args[1]) != t ||
+    /*
+     * x-lean: any global, but a guest load only into a pinned one: the
+     * register cache keeps other globals' values out of guest accesses.
+     * Vector ops only into a pinned global.
+     */
+    if (!(g->pinned || (tcg_lean && g->kind == TEMP_GLOBAL &&
+                        op->opc != INDEX_op_qemu_ld &&
+                        !(def->flags & TCG_OPF_VECTOR))) ||
+        arg_temp(next->args[1]) != t ||
         (t->kind != TEMP_EBB && t->kind != TEMP_TB) ||
         t->type != g->type || TCGOP_TYPE(next) != g->type ||
         !(next->life & (DEAD_ARG << 1)) || (op->life & SYNC_ARG)) {
@@ -11176,6 +11191,10 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         shladd_pass(s);
     }
 #endif
+    if (tcg_lean) {
+        /* Again, for the ops the passes above made; any global. */
+        pinned_fold_pass(s);
+    }
 
     if (s->nb_pinned) {
         pinned_fold_pass(s);
