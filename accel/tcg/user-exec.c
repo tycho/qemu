@@ -43,6 +43,7 @@
 #include "backend-ldst.h"
 #include "internal-common.h"
 #include "tb-internal.h"
+#include "tcg/startup.h"
 
 __thread uintptr_t helper_retaddr;
 
@@ -131,6 +132,28 @@ MMUAccessType adjust_signal_pc(uintptr_t *pc, bool is_write)
  * for some other kind of fault that should really be passed to the
  * guest, we'd end up in an infinite loop of retrying the faulting access.
  */
+bool tcg_tso_cross_fault(CPUState *cpu, uintptr_t fault_pc, uintptr_t host_pc)
+{
+    TranslationBlock *tb;
+    bool promoted;
+
+    if (!tcg_tso_cross_faults || !tcg_insn_is_acqrel_ldst(fault_pc)) {
+        return false;
+    }
+    tb = tcg_tb_lookup(host_pc);
+    if (!tb) {
+        return false;
+    }
+    cpu_restore_state_from_tb(cpu, tb, host_pc);
+    promoted = tcg_tso_cross_count(cpu->cc->get_pc(cpu));
+    /* A crossing promotes its insn at once: the next run has no LDAPR. */
+    g_assert(promoted);
+    mmap_lock();
+    tb_phys_invalidate(tb, -1);
+    mmap_unlock();
+    return true;
+}
+
 bool handle_sigsegv_accerr_write(CPUState *cpu, sigset_t *old_set,
                                  uintptr_t host_pc, vaddr guest_addr)
 {
