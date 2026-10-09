@@ -1670,67 +1670,6 @@ static const TCGLdstHelperParam ldst_helper_param = {
 };
 
 /*
- * An MO_ACQ_REL load of 2 to 8 bytes at any alignment, with no
- * data-dependent branch: LDAPR the first and last 8-byte words the access
- * touches, lo at A & ~7 and hi at (A + size - 1) & ~7, and combine them,
- * d = lo >> s | hi << (64 - s) with s = (A & 7) * 8.
- *
- *   - Both words are touched by the access, so nothing outside the
- *     page(s) it touches is read.  lo is read first, so an access
- *     crossing into a second page faults on the first page first, as
- *     x86 does.
- *   - In user mode a fault is reported at the host address that faulted,
- *     which for lo would be A & ~7 rather than A.  So first load the
- *     byte at A (into xzr): if A's page is inaccessible that faults, at
- *     A.  hi then faults, if at all, at the start of the second page,
- *     which is where x86 reports it.  (In system mode the softmmu lookup
- *     already checked the access at A.)
- *   - If the access is within one word, hi is lo: the bits of hi << (64 - s)
- *     are above the access and the extension drops them.  If s is 0 the
- *     access is 8-aligned, and d = lo | lo.
- *   - Two load-acquires order later accesses as one does.  The value of an
- *     access that spans two words is not single-copy atomic, which is not
- *     required of an access that is not aligned (MO_ATOM_IFALIGN); an
- *     aligned access reads one word.
- *
- * @host is not used after d is written, so d may be @host.
- */
-static void tcg_out_qemu_ld_acquire_any(TCGContext *s, MemOp memop,
-                                        TCGType ext, TCGReg d, TCGReg host)
-{
-    MemOp s_bits = memop & MO_SIZE;
-
-    if (!tcg_use_softmmu) {
-        /* ldrb wzr, [host]: fault at the access's address */
-        tcg_out_insn_ldst_uimm(s, Ildst_imm_LDRB, TCG_REG_XZR, host, 0);
-    }
-    tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_TMP1, host,
-                 (1 << s_bits) - 1);
-    tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I64, TCG_REG_TMP1,
-                     TCG_REG_TMP1, ~(uint64_t)7);
-    /* tmp0 = (host & 7) * 8 */
-    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_TMP0, host, 64 - 3, 3 - 1);
-    tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I64, d, host,
-                     ~(uint64_t)7);
-    /* Low word first: an access that faults faults on its lower page. */
-    tcg_out32(s, Ildapr_X | d << 5 | d);
-    tcg_out32(s, Ildapr_X | TCG_REG_TMP1 << 5 | TCG_REG_TMP1);
-    tcg_out_insn(s, rrr, LSRV, TCG_TYPE_I64, d, d, TCG_REG_TMP0);
-    tcg_out_insn(s, addsub_shift, SUB, TCG_TYPE_I64,
-                 TCG_REG_TMP0, TCG_REG_XZR, TCG_REG_TMP0);
-    tcg_out_insn(s, rrr, LSLV, TCG_TYPE_I64,
-                 TCG_REG_TMP1, TCG_REG_TMP1, TCG_REG_TMP0);
-    tcg_out_insn(s, logic_shift, ORR, TCG_TYPE_I64, d, d, TCG_REG_TMP1);
-    if (s_bits < MO_64) {
-        if (memop & MO_SIGN) {
-            tcg_out_sxt(s, ext, s_bits, d, d);
-        } else {
-            tcg_out_uxt(s, s_bits, d, d);
-        }
-    }
-}
-
-/*
  * The out-of-line path of an MO_ACQ_REL access that crosses a 16-byte
  * boundary (see tcg_out_acqrel_check), and in system mode also of its
  * TLB miss (see prepare_host_addr): call helper_tso_cross_ld/st, which
@@ -2123,7 +2062,14 @@ static void tcg_out_qemu_st_direct(TCGContext *s, MemOp memop,
 
 /*
  * An MO_ACQ_REL_CROSS access (of a promoted guest insn) that may cross
- * 16 bytes: use the branch-free forms instead of the check.
+ * 16 bytes, which LDAPR and STLR may not do: a plain access, which may,
+ * and a barrier.  A load is followed by the barrier a load-acquire
+ * stands for, ordering it before every later access; a store follows a
+ * barrier.  Neither is single-copy atomic across 16 bytes, which is not
+ * required of an access that is not aligned (MO_ATOM_IFALIGN).  In user
+ * mode a load that faults on its second page is reported at that page's
+ * first byte, where x86 reports it, as the hosts report the first byte
+ * that faulted.
  */
 static bool acqrel_cross(MemOp memop)
 {
@@ -2139,8 +2085,10 @@ static void tgen_qemu_ld(TCGContext *s, TCGType data_type, TCGReg data_reg,
     ldst = prepare_host_addr(s, &h, addr_reg, oi, true,
                              acqrel_onepath(get_memop(oi)));
     if (acqrel_cross(get_memop(oi))) {
-        tcg_out_qemu_ld_acquire_any(s, get_memop(oi), data_type, data_reg,
-                                    tcg_out_host_addr_reg(s, h));
+        tcg_out_qemu_ld_direct(s, get_memop(oi) &
+                               ~(MO_ACQ_REL | MO_ACQ_REL_CROSS),
+                               data_type, data_reg, h);
+        tcg_out_mb(s, TCG_MO_LD_LD | TCG_MO_LD_ST);
     } else if (get_memop(oi) & MO_ACQ_REL) {
         TCGReg host = tcg_out_host_addr_reg(s, h);
         TCGLabelQemuLdst *fb = tcg_out_acqrel_check(s, oi, addr_reg, true);
@@ -2176,7 +2124,6 @@ static void tgen_qemu_st(TCGContext *s, TCGType data_type, TCGReg data_reg,
     ldst = prepare_host_addr(s, &h, addr_reg, oi, false,
                              acqrel_onepath(get_memop(oi)));
     if (acqrel_cross(get_memop(oi))) {
-        /* Any alignment: a plain store after a barrier. */
         tcg_out_mb(s, TCG_MO_LD_ST | TCG_MO_ST_ST);
         tcg_out_qemu_st_direct(s, get_memop(oi), data_reg, h);
     } else if (get_memop(oi) & MO_ACQ_REL) {
