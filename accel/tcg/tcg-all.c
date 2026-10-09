@@ -96,6 +96,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-regcache", "on" },
         { "x-pin", "on" },
         { "x-lazyinc", "on" },
+        { "x-flags", "dead" },
         { "x-region", "on" },
         { "x-superblock", "4" },
         { "x-tblookup", "on" },
