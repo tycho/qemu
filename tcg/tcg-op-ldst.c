@@ -609,21 +609,37 @@ static bool tcg_ldst_i128_acqrel(MemOp memop)
 }
 
 /*
+ * Whether a 16-byte access is single-copy atomic as a whole: one required
+ * to be aligned whose atomicity covers all 16 bytes.  Such an access may
+ * be a 16-byte atomic load or store, which synchronizes (x86 with AVX,
+ * where libatomic uses aligned vector moves for them).
+ */
+static bool tcg_tso_atom_whole(MemOp memop)
+{
+    MemOp atom = memop & MO_ATOM_MASK;
+
+    return memop_alignment_bits(memop) >= MO_128 &&
+           (atom == MO_ATOM_IFALIGN || atom == MO_ATOM_WITHIN16);
+}
+
+/*
  * tcg_tso_vec_group: under TCG_TSO_ACQREL, guest accesses wider than 8
- * bytes that the guest doesn't make atomic (here: not required to be
- * 16-byte aligned) form runs.  Inside a run nothing orders them among
+ * bytes that the guest doesn't make atomic as a whole (not
+ * tcg_tso_atom_whole) form runs.  Inside a run nothing orders them among
  * themselves; the run's first store gets the barrier a store needs, and a
  * run with loads ends with the barrier a load needs after it, before the
  * next op that may access guest memory otherwise, call out or branch
  * (tcg_emit_op).  Every order between a run and other accesses holds,
  * since those are load-acquires and store-releases; only the order among
- * the run's own accesses is given up.  Aligned accesses, which may be
- * atomic and synchronizing, end the run and are ordered as usual.
+ * the run's own accesses is given up.  Accesses atomic as a whole, which
+ * may synchronize, end the run and are ordered as usual, and so are those
+ * the host can make acquires and releases themselves (tcg_ldst_i128_acqrel),
+ * which need no barrier at all.
  */
 static bool tcg_tso_grouped(MemOp memop)
 {
     return tcg_tso_vec_group && tcg_tso_mode == TCG_TSO_ACQREL &&
-           memop_alignment_bits(memop) < MO_128;
+           !tcg_tso_atom_whole(memop) && !tcg_ldst_i128_acqrel(memop);
 }
 
 void tcg_tso_run_end(void)
