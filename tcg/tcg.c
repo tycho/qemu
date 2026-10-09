@@ -4643,6 +4643,8 @@ dead_env_store_pass(TCGContext *s)
         case INDEX_op_qemu_st2:
         case INDEX_op_qemu_ld_vec:
         case INDEX_op_qemu_st_vec:
+        case INDEX_op_qemu_ld_x:
+        case INDEX_op_qemu_st_x:
             dse_keep_only(&dead, dse_scratch_lo, dse_scratch_hi);
             break;
         case INDEX_op_exit_tb:
@@ -6059,6 +6061,8 @@ static bool op_is_guest_access(TCGOpcode opc)
     case INDEX_op_qemu_st2:
     case INDEX_op_qemu_ld_vec:
     case INDEX_op_qemu_st_vec:
+    case INDEX_op_qemu_ld_x:
+    case INDEX_op_qemu_st_x:
         return true;
     default:
         return false;
@@ -9894,6 +9898,1105 @@ static const void *tcg_out_atomic_helper_args(TCGContext *s,
     tcg_out_helper_load_common_args(s, ldst, parm, info, next_arg);
     return atomic_helpers[aop][size];
 }
+
+/*
+ * Insert a store of the pinned vector global @p before @op (@st), or a
+ * load of it after @op.
+ */
+static void pinned_alias_sync(TCGContext *s, TCGOp *op, TCGTemp *p, bool st)
+{
+    TCGOp *x;
+
+    if (st) {
+        x = tcg_op_insert_before(s, op, INDEX_op_st_vec, TCG_TYPE_V128, 3);
+    } else {
+        x = tcg_op_insert_after(s, op, INDEX_op_ld_vec, TCG_TYPE_V128, 3);
+    }
+    x->args[0] = temp_arg(p);
+    x->args[1] = temp_arg(p->mem_base);
+    x->args[2] = p->mem_offset;
+}
+
+/*
+ * Whether @op computes its outputs from a temp that may point into env
+ * (@from_env): an op other than a load, a call or one with side effects,
+ * with such an input.
+ */
+static bool pinned_alias_derives(TCGOp *op, const bool *from_env)
+{
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+
+    if (op->opc == INDEX_op_call || dse_access_size(op) ||
+        (def->flags & TCG_OPF_SIDE_EFFECTS)) {
+        return false;
+    }
+    for (int i = 0; i < def->nb_iargs; i++) {
+        TCGTemp *a = arg_temp(op->args[def->nb_oargs + i]);
+
+        if (a && from_env[temp_idx(a)]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Pinned vector globals alias their env memory, but liveness can't sync
+ * a fixed register: store the register before an op that reads its
+ * memory or writes only part of it, and load it after an op that writes
+ * that memory.  Accesses through env plus a constant offset, or through
+ * a pointer set to env plus a constant since the last label, are
+ * compared with each global's bytes; through any other pointer computed
+ * from env, they may be any global's.  A pointer loaded from memory or
+ * returned by a helper doesn't point into env (front ends keep no
+ * pointers into env there).  Calls store and reload the pinned vector
+ * globals themselves (tcg_out_pinned_clobbered).  Runs before liveness;
+ * the ops it inserts lie between @op and the next op to visit, so it
+ * skips them.
+ */
+static void pinned_alias_pass(TCGContext *s)
+{
+    TCGTemp *env = tcgv_ptr_temp(tcg_env);
+    intptr_t *env_off = tcg_malloc(sizeof(intptr_t) * s->nb_temps);
+    bool *is_env = tcg_malloc(sizeof(bool) * s->nb_temps);
+    bool *from_env = tcg_malloc(sizeof(bool) * s->nb_temps);
+    bool *tb_from_env = tcg_malloc(sizeof(bool) * s->nb_temps);
+    bool changed = true;
+    TCGOp *op, *next;
+
+    /*
+     * The temps that some op computes from env, in any order: what a TB
+     * temp may hold at a label.  Elsewhere, from_env follows the ops in
+     * order: the front ends reuse EBB temps for unrelated values.
+     */
+    memset(tb_from_env, 0, sizeof(bool) * s->nb_temps);
+    tb_from_env[temp_idx(env)] = true;
+    while (changed) {
+        changed = false;
+        QTAILQ_FOREACH(op, &s->ops, link) {
+            const TCGOpDef *def = &tcg_op_defs[op->opc];
+
+            if (pinned_alias_derives(op, tb_from_env)) {
+                for (int i = 0; i < def->nb_oargs; i++) {
+                    TCGTemp *o = arg_temp(op->args[i]);
+
+                    changed |= !tb_from_env[temp_idx(o)];
+                    tb_from_env[temp_idx(o)] = true;
+                }
+            }
+        }
+    }
+
+    memset(is_env, 0, sizeof(bool) * s->nb_temps);
+    memcpy(from_env, tb_from_env, sizeof(bool) * s->nb_globals);
+    memset(from_env + s->nb_globals, 0,
+           sizeof(bool) * (s->nb_temps - s->nb_globals));
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        int size = dse_access_size(op);
+        bool known = true, store, derived;
+        intptr_t lo = 0;
+
+        if (op->opc == INDEX_op_set_label) {
+            memset(is_env, 0, sizeof(bool) * s->nb_temps);
+            for (int i = s->nb_globals; i < s->nb_temps; i++) {
+                from_env[i] = s->temps[i].kind == TEMP_TB && tb_from_env[i];
+            }
+            continue;
+        }
+        if (op->opc == INDEX_op_call) {
+            for (int i = 0; i < TCGOP_CALLO(op); i++) {
+                is_env[temp_idx(arg_temp(op->args[i]))] = false;
+                from_env[temp_idx(arg_temp(op->args[i]))] = false;
+            }
+            continue;
+        }
+        /* The address, before the op's outputs replace what we know. */
+        if (size) {
+            TCGTemp *base = arg_temp(op->args[1]);
+
+            lo = op->args[2];
+            if (base == env) {
+                /* As is. */
+            } else if (is_env[temp_idx(base)]) {
+                lo += env_off[temp_idx(base)];
+            } else if (from_env[temp_idx(base)]) {
+                known = false;
+            } else {
+                size = 0;
+            }
+        }
+        derived = pinned_alias_derives(op, from_env);
+        for (int i = 0; i < def->nb_oargs; i++) {
+            is_env[temp_idx(arg_temp(op->args[i]))] = false;
+            from_env[temp_idx(arg_temp(op->args[i]))] = derived;
+        }
+        if (op->opc == INDEX_op_add && arg_temp(op->args[1]) == env &&
+            arg_temp(op->args[2])->kind == TEMP_CONST) {
+            TCGTemp *d = arg_temp(op->args[0]);
+
+            is_env[temp_idx(d)] = true;
+            env_off[temp_idx(d)] = arg_temp(op->args[2])->val;
+        }
+        if (!size) {
+            continue;
+        }
+        store = def->nb_oargs == 0;
+        for (int i = 0; i < s->nb_pinned; i++) {
+            TCGTemp *p = s->pinned[i];
+            intptr_t plo = p->mem_offset, phi = plo + 16;
+
+            if (p->type != TCG_TYPE_V128 ||
+                (known && (lo >= phi || lo + size <= plo))) {
+                continue;
+            }
+            if (!store || !known || lo > plo || lo + size < phi) {
+                pinned_alias_sync(s, op, p, true);
+            }
+            if (store) {
+                pinned_alias_sync(s, op, p, false);
+            }
+        }
+    }
+}
+
+/*
+ * Compute values straight into the pinned globals they are moved to.
+ * Front ends compute into a temp and then move it to the guest register;
+ * for a pinned global that move is a host instruction.  When an op's only
+ * output is a temp that dies in a move (mov, or mov_vec for a vector
+ * global) to a pinned global right after it, the op writes the pinned
+ * global instead and the move goes.  Nothing runs
+ * between the two, so the global changes at the same point as before; an
+ * op that faults leaves its output register unwritten.  Not when the op
+ * also stores the temp: a TB temp kept in memory across labels is read
+ * from there after it dies in the mov.  Runs after liveness, whose results
+ * it keeps up to date.  With tcg_lean, also for
+ * globals that aren't pinned (not a guest load), where it saves the
+ * register-to-register move.  A vector result often reaches the global
+ * through a chain of moves between temps: after a fold into a vector
+ * global, the op before is tried again, back to the op that computes
+ * the value.
+ */
+static TCGTemp *pinned_fold(TCGContext *s, TCGOp *op)
+{
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+    TCGOp *next = QTAILQ_NEXT(op, link);
+    TCGTemp *t, *g;
+
+    if (!next ||
+        (next->opc != INDEX_op_mov && next->opc != INDEX_op_mov_vec) ||
+        op->opc == INDEX_op_call || def->nb_oargs != 1 ||
+        ((def->flags & TCG_OPF_SIDE_EFFECTS) &&
+         op->opc != INDEX_op_qemu_ld && op->opc != INDEX_op_qemu_ld_vec)) {
+        return NULL;
+    }
+    t = arg_temp(op->args[0]);
+    g = arg_temp(next->args[0]);
+    /* A vector op only into a vector global. */
+    if ((def->flags & TCG_OPF_VECTOR) && g->base_type < TCG_TYPE_V64) {
+        return NULL;
+    }
+    /*
+     * x-lean: any global, but a guest load only into a pinned one: the
+     * register cache keeps other globals' values out of guest accesses.
+     * Vector ops only into a pinned global.
+     */
+    if (!(g->pinned || (tcg_lean && g->kind == TEMP_GLOBAL &&
+                        op->opc != INDEX_op_qemu_ld &&
+                        !(def->flags & TCG_OPF_VECTOR))) ||
+        arg_temp(next->args[1]) != t ||
+        (t->kind != TEMP_EBB && t->kind != TEMP_TB) ||
+        t->type != g->type || TCGOP_TYPE(next) != g->type ||
+        !(next->life & (DEAD_ARG << 1)) || (op->life & SYNC_ARG)) {
+        return NULL;
+    }
+    op->args[0] = next->args[0];
+    op->life = (op->life & ~(DEAD_ARG | SYNC_ARG))
+               | (next->life & (DEAD_ARG | SYNC_ARG));
+    op->output_pref[0] = next->output_pref[0];
+    tcg_op_remove(s, next);
+    return g;
+}
+
+/* Whether @op names @t among its arguments. */
+static bool pinned_fold_refs(const TCGOp *op, const TCGTemp *t)
+{
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+
+    for (int i = 0; i < def->nb_oargs + def->nb_iargs; i++) {
+        if (arg_temp(op->args[i]) == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * A vector result moved to a pinned vector global a few ops later: front
+ * ends compute every part of an insn's result before they write any of
+ * it (so that a fault leaves the registers unwritten), e.g. both halves
+ * of a 256-bit AVX operation.  When the ops between, within the same
+ * insn, can't fault, exit or branch and use neither the temp nor the
+ * global, the op writes the global instead and the move goes.
+ */
+static TCGTemp *pinned_fold_far(TCGContext *s, TCGOp *op)
+{
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+    TCGTemp *t, *g;
+    TCGOp *mov, *x;
+    int n = 0;
+
+    if (op->opc == INDEX_op_call || def->nb_oargs != 1 ||
+        (def->flags & TCG_OPF_SIDE_EFFECTS)) {
+        return NULL;
+    }
+    t = arg_temp(op->args[0]);
+    if (t->base_type < TCG_TYPE_V64 ||
+        (t->kind != TEMP_EBB && t->kind != TEMP_TB) || (op->life & SYNC_ARG)) {
+        return NULL;
+    }
+    for (mov = QTAILQ_NEXT(op, link); mov; mov = QTAILQ_NEXT(mov, link)) {
+        const TCGOpDef *md = &tcg_op_defs[mov->opc];
+
+        if (mov->opc == INDEX_op_mov_vec && arg_temp(mov->args[1]) == t) {
+            break;
+        }
+        if (++n > 8 || mov->opc == INDEX_op_call ||
+            mov->opc == INDEX_op_insn_start ||
+            mov->opc == INDEX_op_set_label ||
+            (md->flags & (TCG_OPF_SIDE_EFFECTS | TCG_OPF_BB_END |
+                          TCG_OPF_COND_BRANCH | TCG_OPF_CALL_CLOBBER)) ||
+            pinned_fold_refs(mov, t)) {
+            return NULL;
+        }
+    }
+    if (!mov) {
+        return NULL;
+    }
+    g = arg_temp(mov->args[0]);
+    if (!g->pinned || g->base_type < TCG_TYPE_V64 || t->type != g->type ||
+        TCGOP_TYPE(mov) != g->type || !(mov->life & (DEAD_ARG << 1))) {
+        return NULL;
+    }
+    for (x = QTAILQ_NEXT(op, link); x != mov; x = QTAILQ_NEXT(x, link)) {
+        if (pinned_fold_refs(x, g)) {
+            return NULL;
+        }
+    }
+    op->args[0] = mov->args[0];
+    op->life = (op->life & ~(DEAD_ARG | SYNC_ARG))
+               | (mov->life & (DEAD_ARG | SYNC_ARG));
+    op->output_pref[0] = mov->output_pref[0];
+    tcg_op_remove(s, mov);
+    return g;
+}
+
+static void pinned_fold_pass(TCGContext *s)
+{
+    TCGOp *op, *prev;
+    TCGTemp *g;
+
+    for (op = QTAILQ_FIRST(&s->ops); op; op = QTAILQ_NEXT(op, link)) {
+        g = pinned_fold(s, op);
+        if (!g) {
+            g = pinned_fold_far(s, op);
+        }
+        while (g && g->base_type >= TCG_TYPE_V64 &&
+               (prev = QTAILQ_PREV(op, link)) &&
+               (g = pinned_fold(s, prev))) {
+            op = prev;
+        }
+    }
+}
+
+/*
+ * tcg_tblayout: whether control can continue from @op to the next op (a
+ * goto_tb does while unlinked: its reset address is the next insn).
+ */
+static bool op_falls_through(const TCGOp *op)
+{
+    switch (op->opc) {
+    case INDEX_op_br:
+    case INDEX_op_exit_tb:
+    case INDEX_op_goto_ptr:
+#ifdef TCG_TARGET_HAS_GOTO_TB_COLD
+    case INDEX_op_goto_tb_cold:
+#endif
+        return false;
+    default:
+        return true;
+    }
+}
+
+/*
+ * tcg_tblayout: move code emission between the hot part (the TB's own
+ * buffer) and the chunk's cold part.
+ */
+static void tb_layout_switch(TCGContext *s, bool cold, tcg_insn_unit **hot,
+                             tcg_insn_unit **cold_cur, void **hot_hw)
+{
+    if (cold) {
+        *hot = s->code_ptr;
+        *hot_hw = s->code_gen_highwater;
+        s->code_ptr = *cold_cur;
+        s->code_gen_highwater = (uint8_t *)s->lay_cold_end - TCG_HIGHWATER;
+    } else {
+        *cold_cur = s->code_ptr;
+        s->code_ptr = *hot;
+        s->code_gen_highwater = *hot_hw;
+    }
+    s->lay_cold_now = cold;
+}
+
+/*
+ * tcg_goto_tb_cold: if goto_tb slot @n, just emitted, is the first insn at
+ * a label that one conditional branch reaches, note that branch: linking
+ * the slot links it too (tb_target_set_jmp_target).
+ */
+static void tcg_note_cond_link(TCGContext *s, int n)
+{
+#ifdef TCG_TARGET_HAS_COND_LINK
+    TCGLabel *l = s->slot_label;
+    TCGRelocation *r;
+
+    if (!tcg_goto_tb_cold || !l || s->lay_cold_now ||
+        s->gen_tb->jmp_insn_offset[n] != s->slot_label_off) {
+        return;
+    }
+    r = QSIMPLEQ_FIRST(&l->relocs);
+    if (!r || QSIMPLEQ_NEXT(r, next) || !tcg_cond_link_reloc(r->type)) {
+        return;
+    }
+    s->gen_tb->jmp_cond[n] = tcg_ptr_byte_diff(r->ptr, s->code_buf) + 1;
+#endif
+}
+
+#if defined(TCG_TARGET_HAS_LDST_X) || defined(TCG_TARGET_HAS_SHLADD) || \
+    defined(TCG_TARGET_I32_OPS_ZEXT)
+/* Whether @op names @t among its arguments (inputs or outputs). */
+static bool op_uses_temp(const TCGOp *op, const TCGTemp *t)
+{
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+    int n = def->nb_oargs + def->nb_iargs;
+
+    if (op->opc == INDEX_op_call) {
+        return true;
+    }
+    for (int i = 0; i < n; i++) {
+        if (arg_temp(op->args[i]) == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * The op of kind @opc, at most a few ops before @op, that writes @t.  The
+ * ops between must neither use @t nor @a, @b (the values it is computed
+ * from, which then reach @op unchanged and unread), nor have side effects.
+ */
+static TCGOp *ldst_fold_def(TCGContext *s, TCGOp *op, TCGTemp *t,
+                            TCGOpcode opc)
+{
+    TCGOp *prev = op;
+
+    for (int n = 0; n < 4; n++) {
+        TCGTemp *a, *b;
+        const TCGOpDef *def;
+
+        prev = QTAILQ_PREV(prev, link);
+        if (!prev) {
+            return NULL;
+        }
+        if (prev->opc == opc && TCGOP_TYPE(prev) == TCG_TYPE_I64 &&
+            arg_temp(prev->args[0]) == t) {
+            a = arg_temp(prev->args[1]);
+            b = arg_temp(prev->args[2]);
+            for (TCGOp *mid = QTAILQ_NEXT(prev, link); mid != op;
+                 mid = QTAILQ_NEXT(mid, link)) {
+                if (op_uses_temp(mid, a) || op_uses_temp(mid, b)) {
+                    return NULL;
+                }
+            }
+            return prev;
+        }
+        def = &tcg_op_defs[prev->opc];
+        if (prev->opc == INDEX_op_insn_start || prev->opc == INDEX_op_call ||
+            (def->flags & (TCG_OPF_BB_END | TCG_OPF_SIDE_EFFECTS |
+                           TCG_OPF_CALL_CLOBBER)) ||
+            op_uses_temp(prev, t)) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+/* Arg @i of @from was dead there: so it is at arg @j of @to. */
+static void ldst_fold_life(TCGOp *to, int j, const TCGOp *from, int i)
+{
+    if (from->life & (DEAD_ARG << i)) {
+        to->life |= DEAD_ARG << j;
+    }
+}
+
+/*
+ * Remove @op, folded into a guest access.  Where its constant arg @ci
+ * died, it still dies there: the register allocator may hold it in a
+ * register, which it must give up before the next label.
+ */
+static void ldst_fold_remove(TCGContext *s, TCGOp *op, int ci)
+{
+    if (arg_temp(op->args[ci])->kind == TEMP_CONST &&
+        (op->life & (DEAD_ARG << ci))) {
+        TCGOp *d = tcg_op_insert_before(s, op, INDEX_op_discard,
+                                        TCGOP_TYPE(op), 1);
+
+        d->args[0] = op->args[ci];
+    }
+    tcg_op_remove(s, op);
+}
+
+#endif
+
+#ifdef TCG_TARGET_HAS_LDST_X
+/*
+ * x-lean: fold the address computation of a guest access into the access
+ * where the host can address base + (index << shift) or base + offset
+ * (qemu_ld_x, qemu_st_x).  Runs after liveness: the address temp must
+ * die at the access, and the ops that compute it come shortly before it,
+ * so that their inputs' liveness carries over to the access.
+ */
+static void ldst_fold_pass(TCGContext *s)
+{
+    TCGOp *op, *next;
+
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        bool is_ld = op->opc == INDEX_op_qemu_ld;
+        const int ai = 1;   /* the address, for loads and stores */
+        TCGOp *add, *shl;
+        TCGTemp *t, *base, *index;
+        MemOpIdx oi;
+        MemOp mop;
+        unsigned shift = 0;
+        int ofs = 0;
+
+        if ((op->opc != INDEX_op_qemu_ld && op->opc != INDEX_op_qemu_st) ||
+            TCGOP_TYPE(op) > TCG_TYPE_REG) {
+            continue;
+        }
+        oi = op->args[2];
+        mop = get_memop(oi);
+        t = arg_temp(op->args[ai]);
+        if (memop_alignment_bits(mop) ||
+            (t->kind != TEMP_EBB && t->kind != TEMP_TB) ||
+            !(op->life & (DEAD_ARG << ai))) {
+            continue;
+        }
+        add = ldst_fold_def(s, op, t, INDEX_op_add);
+        /* A TB temp's address may have to reach memory too (SYNC_ARG). */
+        if (!add || (add->life & SYNC_ARG)) {
+            continue;
+        }
+        base = arg_temp(add->args[1]);
+        index = arg_temp(add->args[2]);
+        shl = NULL;
+        if (index->kind == TEMP_CONST) {
+            int64_t v = index->val;
+
+            if (base->kind == TEMP_CONST) {
+                continue;
+            }
+            if (v >= -256 && v <= 255) {
+                ofs = v;
+            } else if (v > 0 &&
+                       !(v & ((1 << (mop & MO_SIZE)) - 1)) &&
+                       (v >> (mop & MO_SIZE)) <= 0xfff) {
+                /* A plain access: LDR/STR's scaled 12-bit offset. */
+                ofs = v >> (mop & MO_SIZE);
+                shift = TCG_LDST_X_SCALED;
+            } else {
+                continue;
+            }
+        } else {
+            if (base == t) {
+                /* add t, t, b with t = shl i, k right before. */
+                shl = ldst_fold_def(s, add, t, INDEX_op_shl);
+                if (!shl || (shl->life & SYNC_ARG) ||
+                    arg_temp(shl->args[2])->kind != TEMP_CONST) {
+                    continue;
+                }
+                shift = arg_temp(shl->args[2])->val;
+                if (shift != 0 && shift != (mop & MO_SIZE)) {
+                    continue;
+                }
+                base = index;
+                index = arg_temp(shl->args[1]);
+            }
+            if (base->kind == TEMP_CONST || index->kind == TEMP_CONST ||
+                base == t || index == t) {
+                continue;
+            }
+        }
+
+        /*
+         * The access becomes qemu_ld_x or qemu_st_x in place, so that
+         * anything that holds the op keeps it.  Its inputs' liveness is
+         * the address computation's.
+         */
+        tcg_debug_assert(op->nargs >= 4);
+        op->life &= is_ld ? DEAD_ARG | SYNC_ARG : DEAD_ARG;
+        op->opc = is_ld ? INDEX_op_qemu_ld_x : INDEX_op_qemu_st_x;
+        op->args[1] = temp_arg(base);
+        op->args[2] = temp_arg(index->kind == TEMP_CONST
+                               ? tcg_constant_internal(TCG_TYPE_I64, 0)
+                               : index);
+        op->args[3] = tcg_ldst_x_arg(oi, shift, ofs);
+        if (shl) {
+            ldst_fold_life(op, 1, add, 2);
+            ldst_fold_life(op, 2, shl, 1);
+        } else {
+            ldst_fold_life(op, 1, add, 1);
+            if (index->kind != TEMP_CONST) {
+                ldst_fold_life(op, 2, add, 2);
+            }
+        }
+        ldst_fold_remove(s, add, 2);
+        if (shl) {
+            ldst_fold_remove(s, shl, 2);
+        }
+    }
+}
+
+#endif
+
+bool tcg_lean_narrow32(void)
+{
+#ifdef TCG_TARGET_I32_OPS_ZEXT
+    return tcg_lean;
+#else
+    return false;
+#endif
+}
+
+#ifdef TCG_TARGET_I32_OPS_ZEXT
+/*
+ * x-lean: an operation whose only use is the zero-extension of its low 32
+ * bits (extract 0, 32) computes those bits as an I32 operation into the
+ * destination of the extension, which on this host zero-extends.  Only
+ * operations whose low 32 bits depend on the inputs' low 32 bits alone.
+ */
+static bool narrow32_op(const TCGOp *op)
+{
+    switch (op->opc) {
+    case INDEX_op_add:
+    case INDEX_op_sub:
+    case INDEX_op_mul:
+    case INDEX_op_and:
+    case INDEX_op_or:
+    case INDEX_op_xor:
+    case INDEX_op_andc:
+    case INDEX_op_orc:
+    case INDEX_op_eqv:
+    case INDEX_op_nand:
+    case INDEX_op_nor:
+    case INDEX_op_neg:
+    case INDEX_op_not:
+        return true;
+    case INDEX_op_shl:
+        return arg_temp(op->args[2])->kind == TEMP_CONST &&
+               arg_temp(op->args[2])->val < 32;
+    case INDEX_op_lea:
+        /* base + (index << sh) + imm, with sh and imm within 32 bits */
+        return op->args[3] < 32 && op->args[4] == (int32_t)op->args[4];
+    default:
+        return false;
+    }
+}
+
+/*
+ * The 32-bit class of a temp's value where it is read: the class of its
+ * latest definition (a 32-bit sign or zero extension, or neither), from a
+ * forward walk that forgets everything at a label, a call, and an op that
+ * leaves the block and may come back (call_tb: the callee writes globals).
+ * A global's class is unknown until the TB defines it.
+ */
+enum { N32_SEXT = 1, N32_ZEXT = 2 };
+
+static bool narrow32_consts(const TCGOp *x);
+
+static int narrow32_def_class(const TCGOp *op, const uint8_t *cls)
+{
+    TCGTemp *in;
+
+    if (TCGOP_TYPE(op) == TCG_TYPE_I32) {
+        switch (op->opc) {
+        case INDEX_op_extrl_i64_i32:
+        case INDEX_op_extrh_i64_i32:
+        case INDEX_op_ext_i32_i64:
+        case INDEX_op_extu_i32_i64:
+            break;
+        default:
+            /* An I32 op into an I64 temp (narrow32_pass): zero-extended. */
+            return N32_ZEXT;
+        }
+    }
+    switch (op->opc) {
+    case INDEX_op_mov:
+        in = arg_temp(op->args[1]);
+        if (in->kind == TEMP_CONST) {
+            return (in->val == (int32_t)in->val ? N32_SEXT : 0) |
+                   (in->val == (uint32_t)in->val ? N32_ZEXT : 0);
+        }
+        return cls[temp_idx(in)];
+    case INDEX_op_sextract:
+        return op->args[2] == 0 && op->args[3] <= 32 ? N32_SEXT : 0;
+    case INDEX_op_extract:
+        return op->args[2] + op->args[3] <= 32
+               ? N32_ZEXT | (op->args[3] < 32 ? N32_SEXT : 0) : 0;
+    case INDEX_op_ld8u:
+    case INDEX_op_ld16u:
+        return N32_ZEXT | N32_SEXT;
+    case INDEX_op_ld32u:
+    case INDEX_op_extu_i32_i64:
+        return N32_ZEXT;
+    case INDEX_op_ld8s:
+    case INDEX_op_ld16s:
+    case INDEX_op_ld32s:
+    case INDEX_op_ext_i32_i64:
+        return N32_SEXT;
+    default:
+        return 0;
+    }
+}
+
+/* Whether @arg's value is a 32-bit extension of class @c here. */
+static bool narrow32_is(const uint8_t *cls, TCGArg arg, int c)
+{
+    TCGTemp *ts = arg_temp(arg);
+
+    if (ts->kind == TEMP_CONST) {
+        return c == N32_SEXT ? ts->val == (int32_t)ts->val
+                             : ts->val == (uint32_t)ts->val;
+    }
+    return cls[temp_idx(ts)] & c;
+}
+
+/*
+ * A 64-bit brcond of two sign-extended values orders them as their low
+ * 32 bits do, signed or unsigned; of two zero-extended values, for
+ * equality and unsigned order.  The arguments stay: only the compare's
+ * width changes.
+ */
+static void narrow32_brcond(const uint8_t *cls, TCGOp *op)
+{
+    TCGCond cond = op->args[2];
+
+    if (TCGOP_TYPE(op) != TCG_TYPE_I64 || !narrow32_consts(op) ||
+        !tcg_op_supported(op->opc, TCG_TYPE_I32, 0)) {
+        return;
+    }
+    if ((narrow32_is(cls, op->args[0], N32_SEXT) &&
+         narrow32_is(cls, op->args[1], N32_SEXT)) ||
+        (narrow32_is(cls, op->args[0], N32_ZEXT) &&
+         narrow32_is(cls, op->args[1], N32_ZEXT) && !is_signed_cond(cond))) {
+        TCGOP_TYPE(op) = TCG_TYPE_I32;
+    }
+}
+
+/*
+ * The forward walk: narrows brconds, and returns the shifts right by a
+ * constant below 32 of a 32-bit extension (sar of a sign extension, shr of
+ * a zero extension), whose low 32 bits are those of the 32-bit shift of
+ * the low 32 bits.
+ */
+/*
+ * The classes set since the last reset are listed in @set (@n of them,
+ * room for nb_temps): a reset clears those, or every class once the list
+ * is full.
+ */
+static void narrow32_reset(TCGContext *s, uint8_t *cls, uint16_t *set,
+                           unsigned *n)
+{
+    if (*n < s->nb_temps) {
+        for (unsigned i = 0; i < *n; i++) {
+            cls[set[i]] = 0;
+        }
+    } else {
+        memset(cls, 0, s->nb_temps);
+    }
+    *n = 0;
+}
+
+static GHashTable *narrow32_walk(TCGContext *s)
+{
+    uint8_t *cls = tcg_malloc(s->nb_temps);
+    uint16_t *set = tcg_malloc(s->nb_temps * sizeof(uint16_t));
+    unsigned nset = 0;
+    GHashTable *shifts = NULL;
+    TCGOp *op;
+
+    memset(cls, 0, s->nb_temps);
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        int nb_o;
+
+        if (def->flags & TCG_OPF_BB_EXIT) {
+            narrow32_reset(s, cls, set, &nset);
+            continue;
+        }
+        switch (op->opc) {
+        case INDEX_op_set_label:
+        case INDEX_op_call:
+            narrow32_reset(s, cls, set, &nset);
+            continue;
+        case INDEX_op_discard:
+            cls[temp_idx(arg_temp(op->args[0]))] = 0;
+            continue;
+        case INDEX_op_brcond:
+            narrow32_brcond(cls, op);
+            break;
+        case INDEX_op_sar:
+        case INDEX_op_shr:
+            if (TCGOP_TYPE(op) == TCG_TYPE_I64 &&
+                arg_temp(op->args[2])->kind == TEMP_CONST &&
+                arg_temp(op->args[2])->val < 32 &&
+                narrow32_is(cls, op->args[1],
+                            op->opc == INDEX_op_sar ? N32_SEXT : N32_ZEXT)) {
+                if (!shifts) {
+                    shifts = g_hash_table_new(NULL, NULL);
+                }
+                g_hash_table_add(shifts, op);
+            }
+            break;
+        default:
+            break;
+        }
+        nb_o = op->opc == INDEX_op_call ? TCGOP_CALLO(op) : def->nb_oargs;
+        for (int i = 0; i < nb_o; i++) {
+            size_t t = temp_idx(arg_temp(op->args[i]));
+            uint8_t c = nb_o == 1 && op->opc != INDEX_op_call
+                        ? narrow32_def_class(op, cls) : 0;
+
+            if (c && !cls[t] && nset < s->nb_temps) {
+                set[nset++] = t;
+            } else if (c && !cls[t]) {
+                nset = s->nb_temps;     /* full: the next reset clears all */
+            }
+            cls[t] = c;
+        }
+    }
+    return shifts;
+}
+
+/*
+ * A 32-bit extension t = ext(x) whose value dies at a following I32 op,
+ * which reads only t's low 32 bits: that op reads x instead, if the ops
+ * in between (at most NARROW32_WINDOW; no label, call or branch) touch
+ * neither t nor x.  An op in between that reads x may be where x dies
+ * (x86 imul r, r: two extensions of the register the product replaces):
+ * x read after that would be gone, from a register freed there.
+ */
+#define NARROW32_WINDOW 4
+
+static bool narrow32_writes(const TCGOp *w, TCGTemp *ts)
+{
+    for (int i = 0; i < tcg_op_defs[w->opc].nb_oargs; i++) {
+        if (arg_temp(w->args[i]) == ts) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool narrow32_reads(const TCGOp *w, TCGTemp *ts)
+{
+    const TCGOpDef *d = &tcg_op_defs[w->opc];
+
+    for (int i = d->nb_oargs; i < d->nb_oargs + d->nb_iargs; i++) {
+        if (arg_temp(w->args[i]) == ts) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Whether an I32 op reads each of its inputs for the low 32 bits only: not
+ * a guest access (its address has the guest's address width) nor a host
+ * load or store (its base is a host pointer).
+ */
+static bool narrow32_low_inputs(const TCGOp *u)
+{
+    if (tcg_op_defs[u->opc].flags & TCG_OPF_SIDE_EFFECTS) {
+        return false;
+    }
+    switch (u->opc) {
+    case INDEX_op_ld8u:
+    case INDEX_op_ld8s:
+    case INDEX_op_ld16u:
+    case INDEX_op_ld16s:
+    case INDEX_op_ld32u:
+    case INDEX_op_ld32s:
+    case INDEX_op_ld:
+    case INDEX_op_st8:
+    case INDEX_op_st16:
+    case INDEX_op_st32:
+    case INDEX_op_st:
+        return false;
+    default:
+        return true;
+    }
+}
+
+static void narrow32_bypass(TCGContext *s)
+{
+    TCGOp *op, *next;
+
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        TCGOp *u = next;
+        const TCGOpDef *ud;
+        TCGTemp *t, *x;
+        int n, uses = 0;
+        bool ok = true;
+
+        if ((op->opc != INDEX_op_extract && op->opc != INDEX_op_sextract) ||
+            TCGOP_TYPE(op) != TCG_TYPE_I64 || op->args[2] != 0 ||
+            op->args[3] != 32) {
+            continue;
+        }
+        t = arg_temp(op->args[0]);
+        x = arg_temp(op->args[1]);
+        if ((t->kind != TEMP_EBB && t->kind != TEMP_TB) ||
+            (op->life & (SYNC_ARG << 0))) {
+            continue;
+        }
+        for (n = 0; u && n < NARROW32_WINDOW; n++, u = QTAILQ_NEXT(u, link)) {
+            if (u->opc == INDEX_op_set_label || u->opc == INDEX_op_call ||
+                (tcg_op_defs[u->opc].flags &
+                 (TCG_OPF_BB_END | TCG_OPF_BB_EXIT)) ||
+                narrow32_writes(u, t)) {
+                u = NULL;
+                break;
+            }
+            if (narrow32_reads(u, t)) {
+                break;
+            }
+            if (narrow32_writes(u, x) || narrow32_reads(u, x)) {
+                u = NULL;
+                break;
+            }
+        }
+        if (!u || n == NARROW32_WINDOW || TCGOP_TYPE(u) != TCG_TYPE_I32 ||
+            !narrow32_low_inputs(u)) {
+            continue;
+        }
+        switch (u->opc) {
+        case INDEX_op_extrh_i64_i32:
+        case INDEX_op_ext_i32_i64:
+        case INDEX_op_extu_i32_i64:
+            continue;
+        default:
+            break;
+        }
+        ud = &tcg_op_defs[u->opc];
+        for (int i = ud->nb_oargs; i < ud->nb_oargs + ud->nb_iargs; i++) {
+            if (arg_temp(u->args[i]) == t) {
+                ok &= (u->life & (DEAD_ARG << i)) != 0;
+                uses++;
+            } else if (arg_temp(u->args[i]) == x) {
+                ok = false;     /* keep x's life simple */
+            }
+        }
+        if (!ok || !uses) {
+            continue;
+        }
+        for (int i = ud->nb_oargs; i < ud->nb_oargs + ud->nb_iargs; i++) {
+            if (arg_temp(u->args[i]) == t) {
+                u->args[i] = temp_arg(x);
+                u->life &= ~(DEAD_ARG << i);
+                if (op->life & (DEAD_ARG << 1)) {
+                    u->life |= DEAD_ARG << i;
+                }
+            }
+        }
+        tcg_op_remove(s, op);
+    }
+}
+
+/*
+ * The constants of an I32 op are sign-extended from 32 bits, as the
+ * backend matches and encodes them: an I64 constant whose high half
+ * isn't the sign of its low half (0x00000000ffffffff) would be encoded
+ * as some other value.
+ */
+static bool narrow32_consts(const TCGOp *x)
+{
+    const TCGOpDef *def = &tcg_op_defs[x->opc];
+
+    for (int i = def->nb_oargs; i < def->nb_oargs + def->nb_iargs; i++) {
+        TCGTemp *ts = arg_temp(x->args[i]);
+
+        if (ts->kind == TEMP_CONST && ts->val != (int32_t)ts->val) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * The op before @op that defines @t, if no op between them names @t or
+ * @dst, faults, leaves the block or starts another guest insn: the def
+ * may then write @dst itself.
+ */
+static TCGOp *narrow32_def(TCGOp *op, TCGTemp *t, TCGTemp *dst)
+{
+    TCGOp *prev = op;
+
+    for (int n = 0; n < 16; n++) {
+        const TCGOpDef *def;
+
+        prev = QTAILQ_PREV(prev, link);
+        if (!prev) {
+            return NULL;
+        }
+        def = &tcg_op_defs[prev->opc];
+        if (def->nb_oargs == 1 && arg_temp(prev->args[0]) == t) {
+            return prev;
+        }
+        if (prev->opc == INDEX_op_insn_start || prev->opc == INDEX_op_call ||
+            (def->flags & (TCG_OPF_BB_END | TCG_OPF_SIDE_EFFECTS |
+                           TCG_OPF_CALL_CLOBBER)) ||
+            op_uses_temp(prev, t) || op_uses_temp(prev, dst)) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static void narrow32_pass(TCGContext *s)
+{
+    TCGOp *op, *next;
+    GHashTable *shifts = narrow32_walk(s);
+
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        TCGOp *x = QTAILQ_PREV(op, link);
+        TCGOp *mov = NULL;
+        TCGTemp *t;
+
+        if (op->opc != INDEX_op_extract || TCGOP_TYPE(op) != TCG_TYPE_I64 ||
+            op->args[2] != 0 || op->args[3] != 32 || !x ||
+            !(op->life & (DEAD_ARG << 1))) {
+            continue;
+        }
+        t = arg_temp(op->args[1]);
+        if (t->kind != TEMP_EBB && t->kind != TEMP_TB) {
+            continue;
+        }
+        /*
+         * Through a copy whose source dies there: mov t, u.  Neither t nor
+         * the copy's result may have to reach memory (SYNC_ARG): a TB temp
+         * read in a later block keeps its full value there.
+         */
+        if (x->opc == INDEX_op_mov && arg_temp(x->args[0]) == t &&
+            (x->life & (DEAD_ARG << 1)) && !(x->life & SYNC_ARG)) {
+            mov = x;
+            t = arg_temp(mov->args[1]);
+            x = QTAILQ_PREV(mov, link);
+            if (!x || (t->kind != TEMP_EBB && t->kind != TEMP_TB)) {
+                continue;
+            }
+        } else if (arg_temp(x->args[0]) != t) {
+            /* Earlier, past ops that don't touch t or the destination. */
+            x = narrow32_def(op, t, arg_temp(op->args[0]));
+            if (!x) {
+                continue;
+            }
+        }
+        if (TCGOP_TYPE(x) != TCG_TYPE_I64 || (x->life & SYNC_ARG) ||
+            !(narrow32_op(x) || (shifts && g_hash_table_contains(shifts, x))) ||
+            arg_temp(x->args[0]) != t || !narrow32_consts(x) ||
+            !tcg_op_supported(x->opc, TCG_TYPE_I32, 0)) {
+            continue;
+        }
+        if (mov) {
+            tcg_op_remove(s, mov);
+        }
+        TCGOP_TYPE(x) = TCG_TYPE_I32;
+        x->args[0] = op->args[0];
+        x->life = (x->life & ~(DEAD_ARG | SYNC_ARG)) |
+                  (op->life & (DEAD_ARG | SYNC_ARG));
+        x->output_pref[0] = op->output_pref[0];
+        tcg_op_remove(s, op);
+    }
+    if (shifts) {
+        g_hash_table_destroy(shifts);
+    }
+    narrow32_bypass(s);
+}
+#endif
+
+#ifdef TCG_TARGET_HAS_SHLADD
+/*
+ * x-lean: shl t, a, $k feeding add r, t, b (or b, t), where t dies, is
+ * shladd r, a, b, k: the host's add with a shifted operand.  The add may
+ * be an I32 op (narrow32_pass): its low 32 bits depend on those of
+ * (a << k) alone.
+ */
+static void shladd_pass(TCGContext *s)
+{
+    TCGOp *op, *next;
+
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        TCGOp *x = NULL, *sa;
+        TCGTemp *t = NULL, *a, *other;
+        unsigned k;
+        int ti;
+
+        if (op->opc != INDEX_op_add) {
+            continue;
+        }
+        for (ti = 1; ti <= 2; ti++) {
+            t = arg_temp(op->args[ti]);
+            if ((t->kind == TEMP_EBB || t->kind == TEMP_TB) &&
+                (op->life & (DEAD_ARG << ti)) &&
+                arg_temp(op->args[3 - ti]) != t) {
+                x = ldst_fold_def(s, op, t, INDEX_op_shl);
+                if (x) {
+                    break;
+                }
+            }
+        }
+        /* A TB temp's shifted value may have to reach memory too. */
+        if (!x || (x->life & SYNC_ARG) ||
+            arg_temp(x->args[2])->kind != TEMP_CONST) {
+            continue;
+        }
+        k = arg_temp(x->args[2])->val;
+        a = arg_temp(x->args[1]);
+        other = arg_temp(op->args[3 - ti]);
+        if (k == 0 || k >= (TCGOP_TYPE(op) == TCG_TYPE_I32 ? 32 : 64) ||
+            a->kind == TEMP_CONST || other->kind == TEMP_CONST || a == t) {
+            continue;
+        }
+        sa = tcg_op_insert_before(s, op, INDEX_op_shladd, TCGOP_TYPE(op), 4);
+        sa->args[0] = op->args[0];
+        sa->args[1] = temp_arg(a);
+        sa->args[2] = temp_arg(other);
+        sa->args[3] = k;
+        sa->life = op->life & (DEAD_ARG | SYNC_ARG);
+        sa->output_pref[0] = op->output_pref[0];
+        if ((x->life & (DEAD_ARG << 1)) && a != other) {
+            sa->life |= DEAD_ARG << 1;
+        }
+        if (op->life & (DEAD_ARG << (3 - ti))) {
+            sa->life |= DEAD_ARG << 2;
+        }
+        tcg_op_remove(s, op);
+        ldst_fold_remove(s, x, 2);
+    }
+}
+#endif
 
 int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 {
