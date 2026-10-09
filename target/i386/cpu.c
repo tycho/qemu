@@ -9424,9 +9424,9 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
 
     /*
      * tcg_tsc_counter: a constant-rate TSC shared by all vCPUs (invariant
-     * TSC), in system mode with IA32_TSC_ADJUST, and on Intel CPUs its rate
-     * in leaf 0x15: 1 GHz, as the crystal, which is also the local APIC's
-     * bus clock.
+     * TSC), in system mode with IA32_TSC_ADJUST, and its rate in leaf 0x15
+     * whatever the vendor: 1 GHz, as the crystal, which is also the local
+     * APIC's bus clock.
      */
     if (tcg_enabled() && tcg_tsc_counter) {
 #ifndef CONFIG_USER_ONLY
@@ -9436,7 +9436,7 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
 #endif
         if (index == 0x80000007) {
             *edx |= CPUID_APM_INVTSC;
-        } else if (index == 0x15 && IS_INTEL_CPU(env)) {
+        } else if (index == 0x15) {
             *eax = 1;
             *ebx = 1;
             *ecx = NANOSECONDS_PER_SECOND;
@@ -9925,14 +9925,8 @@ void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
     x86_cpu_adjust_feat_level(cpu, FEAT_SVM);
     x86_cpu_adjust_feat_level(cpu, FEAT_XSAVE);
 
-    /*
-     * tcg_tsc_counter describes the TSC in CPUID[0x15], which is Intel's.
-     * Not on other vendors: a leaf above the maximum returns the highest
-     * basic leaf, and leaf 0x15 is the same for every subleaf, so a guest
-     * that walks the subleaves of an extended leaf the CPU doesn't have
-     * (Windows 11 on an AMD CPU, 0x80000026) would never see the end.
-     */
-    if (tcg_enabled() && tcg_tsc_counter && IS_INTEL_CPU(env)) {
+    /* tcg_tsc_counter describes the TSC in CPUID[0x15], whatever the vendor */
+    if (tcg_enabled() && tcg_tsc_counter) {
         x86_cpu_adjust_level(cpu, &cpu->env.cpuid_min_level, 0x15);
     }
 
