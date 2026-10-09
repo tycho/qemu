@@ -308,6 +308,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     }
     tb->cs_base = s.cs_base;
     tb->flags = s.flags;
+    tb->chain_dead_in = false;
     tb->cflags = s.cflags;
     tb_set_page_addr0(tb, phys_pc);
     tb_set_page_addr1(tb, -1);

@@ -2715,6 +2715,19 @@ void tcg_gen_goto_tb(unsigned idx)
     tcg_gen_op1i(INDEX_op_goto_tb, 0, idx);
 }
 
+void tcg_gen_goto_tb_dead(unsigned idx, unsigned exit_idx)
+{
+    tcg_debug_assert(!(tcg_ctx->gen_tb->cflags & CF_NO_GOTO_TB));
+    tcg_debug_assert(idx <= TB_EXIT_IDXMAX && idx != TB_EXIT_REQUESTED);
+#ifdef CONFIG_DEBUG_TCG
+    tcg_debug_assert((tcg_ctx->goto_tb_issue_mask & (1 << idx)) == 0);
+    tcg_ctx->goto_tb_issue_mask |= 1 << idx;
+#endif
+    plugin_gen_disable_mem_helpers();
+    tcg_gen_op2(INDEX_op_goto_tb_dead, 0, idx, exit_idx);
+    tcg_ctx->chain_dead_used = true;
+}
+
 void tcg_gen_lookup_and_goto_ptr(void)
 {
     TCGv_ptr ptr;
