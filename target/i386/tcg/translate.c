@@ -120,6 +120,14 @@ typedef struct DisasContext {
     uint8_t evex3;
     uint8_t evex4;
     bool jmp_opt; /* use direct block chaining for direct jumps */
+    /*
+     * tcg_flags_dead: the last op before the first insn; whether CC_OP
+     * has left the TB's entry state, and whether nothing read that state
+     * before (the TB is chain_dead_in).
+     */
+    TCGOp *cc_entry_op;
+    bool cc_entry_done;
+    bool cc_entry_dead;
     bool cc_op_dirty;
 
     CCOp cc_op;  /* current CC operation */
@@ -356,9 +364,26 @@ static uint8_t cc_op_live(CCOp op)
     return result;
 }
 
+/* x-flags=dead: in user mode, and not with RF or single-stepping. */
+static bool use_flags_dead(DisasContext *s)
+{
+#ifdef CONFIG_USER_ONLY
+    return tcg_flags_dead && s->jmp_opt;
+#else
+    return false;
+#endif
+}
+
 static void set_cc_op_1(DisasContext *s, CCOp op, bool dirty)
 {
     int dead;
+
+    if (!s->cc_entry_done && s->cc_op == CC_OP_DYNAMIC &&
+        op != CC_OP_DYNAMIC) {
+        s->cc_entry_done = true;
+        s->cc_entry_dead = use_flags_dead(s) && !cc_op_lazy(op) &&
+                           !tcg_chain_dead_read_since(s->cc_entry_op);
+    }
 
     if (s->cc_op == op) {
         return;
@@ -2254,6 +2279,16 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
 
     if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)) {
         /* jump to same page: we can use a direct jump */
+        int dslot = tb_num + 4;
+
+        /*
+         * x-flags=dead: first a jump that the main loop links only to a
+         * TB that overwrites the condition codes, before they are stored;
+         * in TBs with slots to spare.
+         */
+        if (use_flags_dead(s) && dslot <= TB_EXIT_IDXMAX) {
+            tcg_gen_goto_tb_dead(dslot, tb_num);
+        }
         tcg_gen_goto_tb(tb_num);
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
             tcg_gen_movi_tl(cpu_eip, new_eip);
@@ -3628,6 +3663,11 @@ void tcg_x86_init(void)
     cpu_cc_dst2 = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, cc_dst2),
                                      "cc_dst2");
     cpu_eip = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, eip), eip_name);
+    tcg_chain_dead_add(tcgv_i32_temp(cpu_cc_op));
+    tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_dst));
+    tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_src));
+    tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_src2));
+    tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_dst2));
 
     for (i = 0; i < CPU_NB_EREGS; ++i) {
         cpu_regs[i] = tcg_global_mem_new(tcg_env,
@@ -3710,6 +3750,10 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
 
 static void i386_tr_tb_start(DisasContextBase *db, CPUState *cpu)
 {
+    DisasContext *dc = container_of(db, DisasContext, base);
+
+    dc->cc_entry_op = tcg_last_op();
+    dc->cc_entry_done = dc->cc_entry_dead = false;
 }
 
 static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
@@ -3794,6 +3838,8 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
+
+    dc->base.tb->chain_dead_in = dc->cc_entry_done && dc->cc_entry_dead;
 
     switch (dc->base.is_jmp) {
     case DISAS_NORETURN:
