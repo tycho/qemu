@@ -90,6 +90,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-tso", "auto" },
         { "x-tso-vec", "none" },
         { "x-tso-stack", "on" },
+        { "x-lean", "on" },
         { "x-ssefp", "auto" },
         { "x-simd", "on" },
         { "x-regcache", "on" },
