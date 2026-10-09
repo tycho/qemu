@@ -251,16 +251,25 @@ static void gen_inline_lookup(TCGv_i64 pc, uint64_t cs_base, uint32_t flags)
         tcg_gen_brcondi_ptr(TCG_COND_NE, jc, 0, miss);
     }
 
-    tcg_gen_ld_i64(t64, tb, offsetof(TranslationBlock, cs_base));
-    tcg_gen_brcondi_i64(TCG_COND_NE, t64, cs_base, miss);
-    tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, flags));
-    tcg_gen_brcondi_i32(TCG_COND_NE, t32, flags, miss);
+    if (tcg_jc_ctx) {
+        /*
+         * The cache holds TBs for this TB's state only (tcg_jc_ctx); still,
+         * an entry may be a TB invalidated since, which must not run.
+         */
+        tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, cflags));
+        tcg_gen_brcondi_i32(TCG_COND_TSTNE, t32, CF_INVALID, miss);
+    } else {
+        tcg_gen_ld_i64(t64, tb, offsetof(TranslationBlock, cs_base));
+        tcg_gen_brcondi_i64(TCG_COND_NE, t64, cs_base, miss);
+        tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, flags));
+        tcg_gen_brcondi_i32(TCG_COND_NE, t32, flags, miss);
 
-    /* curr_cflags(); a stale TB has CF_INVALID set and never matches. */
-    tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, cflags));
-    tcg_gen_ld_i32(cf, tcg_env,
-                   offsetof(CPUState, tcg_cflags) - sizeof(CPUState));
-    tcg_gen_brcond_i32(TCG_COND_NE, t32, cf, miss);
+        /* curr_cflags(); a stale TB has CF_INVALID set and never matches. */
+        tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, cflags));
+        tcg_gen_ld_i32(cf, tcg_env,
+                       offsetof(CPUState, tcg_cflags) - sizeof(CPUState));
+        tcg_gen_brcond_i32(TCG_COND_NE, t32, cf, miss);
+    }
 
     tcg_gen_ld_ptr(tb, tb, offsetof(TranslationBlock, tc.ptr));
     tcg_gen_goto_ptr(tb);

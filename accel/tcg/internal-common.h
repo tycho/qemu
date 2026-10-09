@@ -34,6 +34,13 @@ extern bool tcg_ijmp_inline;
 extern bool tcg_jcgen;
 
 /*
+ * tcg_jc_ctx: the jump cache holds only TBs for one TB state at a time
+ * (CPUJumpCache.ctx_*), so the generated lookup compares only the key.
+ * Set in user mode with tcg_jcgen and the inline lookup.
+ */
+extern bool tcg_jc_ctx;
+
+/*
  * tcg_jc_keep_pcrel: invalidating a CF_PCREL TB leaves the vCPUs' jump
  * caches alone instead of flushing them all (see tb_jmp_cache_inval_tb).
  */
