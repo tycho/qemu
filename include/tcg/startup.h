@@ -46,6 +46,14 @@ extern TCGTsoMode tcg_tso_mode;
 extern bool tcg_tso_vec_group;
 
 /*
+ * x-tso-vec=none: guest accesses the front end marks as moving vector or
+ * floating-point register data (TCGContext.ldst_vector) get no
+ * memory-order constraint, unless the guest makes them atomic as a whole.
+ * Implies tcg_tso_vec_group for the remaining wide accesses.
+ */
+extern bool tcg_tso_vec_none;
+
+/*
  * In qemu-user, guest accesses the front end marks as thread-private
  * (TCGContext.ldst_private: x86 RSP-based and implicit stack accesses)
  * get no memory-order constraint (accel property x-tso-stack).
