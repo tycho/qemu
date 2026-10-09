@@ -662,15 +662,21 @@ static void tcg_set_pause(Object *obj, const char *value, Error **errp)
 
 static char *tcg_get_flags(Object *obj, Error **errp)
 {
-    return g_strdup(tcg_flags_guess ? "guess" : "off");
+    return g_strdup(tcg_flags_guess ? "guess" :
+                    tcg_flags_dead ? "dead" : "off");
 }
 
 static void tcg_set_flags(Object *obj, const char *value, Error **errp)
 {
     if (!strcmp(value, "guess")) {
         tcg_flags_guess = true;
+        tcg_flags_dead = false;
+    } else if (!strcmp(value, "dead")) {
+        tcg_flags_guess = false;
+        tcg_flags_dead = true;
     } else if (!strcmp(value, "off")) {
         tcg_flags_guess = false;
+        tcg_flags_dead = false;
     } else {
         error_setg(errp, "Invalid 'x-flags' value: %s", value);
     }
@@ -895,8 +901,9 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                   tcg_set_flags);
     object_class_property_set_description(oc, "x-flags",
         "Guest condition codes at block entry: off (compute them with the "
-        "front end's helper) or guess (inline code for the state the "
-        "block was translated in, tested at run time)");
+        "front end's helper), guess (inline code for the state the "
+        "block was translated in, tested at run time) or dead (user "
+        "mode: not stored on jumps to blocks that write them first)");
 
     object_class_property_add_bool(oc, "x-lazyinc",
                                    tcg_get_lazy_incdec,

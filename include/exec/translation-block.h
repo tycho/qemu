@@ -142,6 +142,13 @@ struct TranslationBlock {
      */
     uint16_t jmp_call;
 #define TB_JMP_RET_LANDING (1u << TB_JMP_SLOTS)
+    /*
+     * For a goto_tb slot, 1 + the slot of its tcg_gen_goto_tb_dead(), or 0;
+     * and whether this TB writes the chain-dead globals before it reads
+     * them, so that jumps to it may skip storing them.
+     */
+    uint8_t jmp_dead[TB_JMP_SLOTS];
+    bool chain_dead_in;
 
     /*
      * Each TB has a NULL-terminated list (jmp_list_head) of incoming jumps.
