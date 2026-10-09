@@ -33,6 +33,13 @@ extern bool tcg_ijmp_inline;
  */
 extern bool tcg_jcgen;
 
+/*
+ * tcg_jc_ctx: the jump cache holds only TBs for one TB state at a time
+ * (CPUJumpCache.ctx_*), so the generated lookup compares only the key.
+ * Set in user mode with tcg_jcgen and the inline lookup.
+ */
+extern bool tcg_jc_ctx;
+
 extern bool icount_align_option;
 
 /*
