@@ -5356,7 +5356,12 @@ static void gen_VMOVLPx_st(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i64 t = tcg_temp_new_i64();
 
-    tcg_gen_ld_i64(t, OP_PTR2, offsetof(ZMMReg, ZMM_Q(0)));
+    if (tcg_ssefp_native) {
+        tcg_gen_ld_i64(t, tcg_env, ZMM_OFFSET(decode->op[2].n) +
+                       offsetof(ZMMReg, ZMM_Q(0)));
+    } else {
+        tcg_gen_ld_i64(t, OP_PTR2, offsetof(ZMMReg, ZMM_Q(0)));
+    }
     tcg_gen_qemu_st_i64(t, s->A0, s->mem_index, MO_LEUQ);
 }
 
@@ -5403,7 +5408,13 @@ static void gen_VMOVSS_st(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i32 tmp = tcg_temp_new_i32();
 
-    tcg_gen_ld_i32(tmp, OP_PTR2, offsetof(ZMMReg, ZMM_L(0)));
+    if (tcg_ssefp_native) {
+        /* Element 0 of the register itself, rather than through a pointer. */
+        tcg_gen_ld_i32(tmp, tcg_env, ZMM_OFFSET(decode->op[2].n) +
+                       offsetof(ZMMReg, ZMM_L(0)));
+    } else {
+        tcg_gen_ld_i32(tmp, OP_PTR2, offsetof(ZMMReg, ZMM_L(0)));
+    }
     tcg_gen_qemu_st_i32(tmp, s->A0, s->mem_index, MO_LEUL);
 }
 
