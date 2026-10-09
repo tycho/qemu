@@ -88,6 +88,8 @@ DEF(sar, 1, 2, 0, TCG_OPF_INT)
 DEF(setcond, 1, 2, 1, TCG_OPF_INT)
 DEF(sextract, 1, 1, 2, TCG_OPF_INT)
 DEF(shl, 1, 2, 0, TCG_OPF_INT)
+/* (arg1 << arg3) + arg2, arg3 a constant shift; no generator (x-lean). */
+DEF(shladd, 1, 2, 1, TCG_OPF_INT)
 DEF(shr, 1, 2, 0, TCG_OPF_INT)
 DEF(smax, 1, 2, 0, TCG_OPF_INT)
 DEF(smin, 1, 2, 0, TCG_OPF_INT)

@@ -60,7 +60,8 @@ void tcg_prologue_init(void);
  * guest accesses whose address is a register plus a shifted register or
  * an offset use the host's addressing modes (qemu_ld_x, qemu_st_x); an
  * operation whose result is only zero-extended from 32 bits is a 32-bit
- * operation.
+ * operation; a shift feeding an add is an add with a shifted operand
+ * (shladd).
  */
 extern bool tcg_lean;
 

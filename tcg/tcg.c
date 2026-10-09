@@ -1061,6 +1061,13 @@ typedef struct TCGOutOpQemuLdSt {
                 TCGReg addr, MemOpIdx oi);
 } TCGOutOpQemuLdSt;
 
+/* shladd: @a0 = (@a1 << @shift) + @a2. */
+typedef struct TCGOutOpShlAdd {
+    TCGOutOp base;
+    void (*out)(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                TCGReg a2, unsigned shift);
+} TCGOutOpShlAdd;
+
 /*
  * qemu_ld_x, qemu_st_x: the guest address is @base + (@index << shift), or
  * @base + offset with @index the constant 0 (tcg_ldst_x_arg).
@@ -1107,6 +1114,12 @@ typedef struct TCGOutOpSubtract {
 } TCGOutOpSubtract;
 
 #include "tcg-target.c.inc"
+
+#ifndef TCG_TARGET_HAS_SHLADD
+static const TCGOutOpShlAdd outop_shladd = {
+    .base.static_constraint = C_NotImplemented,
+};
+#endif
 
 #ifndef TCG_TARGET_HAS_LDST_X
 static const TCGOutOpQemuLdStX outop_qemu_ld_x = {
@@ -1229,6 +1242,7 @@ static const TCGOutOp * const all_outop[NB_OPS] = {
     OUTOP(INDEX_op_qemu_st, TCGOutOpQemuLdSt, outop_qemu_st),
     OUTOP(INDEX_op_qemu_ld_x, TCGOutOpQemuLdStX, outop_qemu_ld_x),
     OUTOP(INDEX_op_qemu_st_x, TCGOutOpQemuLdStX, outop_qemu_st_x),
+    OUTOP(INDEX_op_shladd, TCGOutOpShlAdd, outop_shladd),
     OUTOP(INDEX_op_qemu_st2, TCGOutOpQemuLdSt2, outop_qemu_st2),
     OUTOP(INDEX_op_rems, TCGOutOpBinary, outop_rems),
     OUTOP(INDEX_op_remu, TCGOutOpBinary, outop_remu),
@@ -2392,7 +2406,9 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         goto do_lookup;
 
     case INDEX_op_qemu_ld_x:
-(type <= TCG_TYPE_REG);
+    case INDEX_op_qemu_st_x:
+    case INDEX_op_shladd:
+        tcg_debug_assert(type <= TCG_TYPE_REG);
         goto do_lookup;
 
     case INDEX_op_add:
@@ -5771,6 +5787,15 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         }
         break;
 
+    case INDEX_op_shladd:
+        {
+            const TCGOutOpShlAdd *out = &outop_shladd;
+
+            out->out(s, type, new_args[0], new_args[1], new_args[2],
+                     new_args[3]);
+        }
+        break;
+
     case INDEX_op_qemu_ld_x:
     case INDEX_op_qemu_st_x:
         {
@@ -6624,7 +6649,7 @@ static void tcg_out_st_helper_args(TCGContext *s, const TCGLabelQemuLdst *ldst,
     tcg_out_helper_load_common_args(s, ldst, parm, info, next_arg);
 }
 
-#ifdef TCG_TARGET_HAS_LDST_X
+#if defined(TCG_TARGET_HAS_LDST_X) || defined(TCG_TARGET_HAS_SHLADD)
 /* Whether @op names @t among its arguments (inputs or outputs). */
 static bool op_uses_temp(const TCGOp *op, const TCGTemp *t)
 {
@@ -6884,6 +6909,66 @@ static void narrow32_pass(TCGContext *s)
 }
 #endif
 
+#ifdef TCG_TARGET_HAS_SHLADD
+/*
+ * x-lean: shl t, a, $k feeding add r, t, b (or b, t), where t dies, is
+ * shladd r, a, b, k: the host's add with a shifted operand.  The add may
+ * be an I32 op (narrow32_pass): its low 32 bits depend on those of
+ * (a << k) alone.
+ */
+static void shladd_pass(TCGContext *s)
+{
+    TCGOp *op, *next;
+
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        TCGOp *x = NULL, *sa;
+        TCGTemp *t = NULL, *a, *other;
+        unsigned k;
+        int ti;
+
+        if (op->opc != INDEX_op_add) {
+            continue;
+        }
+        for (ti = 1; ti <= 2; ti++) {
+            t = arg_temp(op->args[ti]);
+            if ((t->kind == TEMP_EBB || t->kind == TEMP_TB) &&
+                (op->life & (DEAD_ARG << ti)) &&
+                arg_temp(op->args[3 - ti]) != t) {
+                x = ldst_fold_def(s, op, t, INDEX_op_shl);
+                if (x) {
+                    break;
+                }
+            }
+        }
+        if (!x || arg_temp(x->args[2])->kind != TEMP_CONST) {
+            continue;
+        }
+        k = arg_temp(x->args[2])->val;
+        a = arg_temp(x->args[1]);
+        other = arg_temp(op->args[3 - ti]);
+        if (k == 0 || k >= (TCGOP_TYPE(op) == TCG_TYPE_I32 ? 32 : 64) ||
+            a->kind == TEMP_CONST || other->kind == TEMP_CONST || a == t) {
+            continue;
+        }
+        sa = tcg_op_insert_before(s, op, INDEX_op_shladd, TCGOP_TYPE(op), 4);
+        sa->args[0] = op->args[0];
+        sa->args[1] = temp_arg(a);
+        sa->args[2] = temp_arg(other);
+        sa->args[3] = k;
+        sa->life = op->life & (DEAD_ARG | SYNC_ARG);
+        sa->output_pref[0] = op->output_pref[0];
+        if ((x->life & (DEAD_ARG << 1)) && a != other) {
+            sa->life |= DEAD_ARG << 1;
+        }
+        if (op->life & (DEAD_ARG << (3 - ti))) {
+            sa->life |= DEAD_ARG << 2;
+        }
+        tcg_op_remove(s, op);
+        tcg_op_remove(s, x);
+    }
+}
+#endif
+
 int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 {
     int i, num_insns;
@@ -6953,6 +7038,11 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 #ifdef TCG_TARGET_I32_OPS_ZEXT
     if (tcg_lean) {
         narrow32_pass(s);
+    }
+#endif
+#ifdef TCG_TARGET_HAS_SHLADD
+    if (tcg_lean) {
+        shladd_pass(s);
     }
 #endif
 

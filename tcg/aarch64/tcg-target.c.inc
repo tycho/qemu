@@ -1975,6 +1975,20 @@ static void tgen_qemu_st_x(TCGContext *s, TCGType type, TCGReg data,
     }
 }
 
+/* x-lean: shladd as ADD (shifted register). */
+#define TCG_TARGET_HAS_SHLADD
+static void tgen_shladd(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                        TCGReg a2, unsigned shift)
+{
+    tcg_out32(s, Iaddsub_shift_ADD | (type == TCG_TYPE_I64) << 31 |
+              a1 << 16 | shift << 10 | a2 << 5 | a0);
+}
+
+static const TCGOutOpShlAdd outop_shladd = {
+    .base.static_constraint = C_O1_I2(r, r, r),
+    .out = tgen_shladd,
+};
+
 static const TCGOutOpQemuLdStX outop_qemu_ld_x = {
     .base.static_constraint = C_O1_I2(r, r, rz),
     .out = tgen_qemu_ld_x,
