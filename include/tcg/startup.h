@@ -65,6 +65,14 @@ void tcg_prologue_init(void);
 extern bool tcg_flags_guess;
 
 /*
+ * tcg_flags_dead: in user mode, a TB leaves the guest's condition codes
+ * unstored when it jumps to a TB that writes them before reading them
+ * (tcg_gen_goto_tb_dead).  A fault before that write then shows the
+ * earlier ones in the signal frame.  Set by x-flags=dead.
+ */
+extern bool tcg_flags_dead;
+
+/*
  * x86 guests: INC and DEC after an unknown flags state (a TB's first
  * flag producer) keep the earlier state for CF instead of computing it.
  */

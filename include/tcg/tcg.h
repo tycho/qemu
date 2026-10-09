@@ -389,6 +389,10 @@ struct TCGContext {
     struct TCGLabelPoolData *pool_labels;
 
     TCGLabel *exitreq_label;
+    /* The chain-dead globals (tcg_chain_dead_add); used by this TB. */
+    TCGTemp *chain_dead[8];
+    int nb_chain_dead;
+    bool chain_dead_used;
 
 #ifdef CONFIG_PLUGIN
     /*
