@@ -22,6 +22,7 @@
 #include "trace.h"
 #include "disas/disas.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 #include "exec/mmap-lock.h"
 #include "tb-internal.h"
 #include "exec/tb-flush.h"
@@ -620,6 +621,33 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
  * Called by generic code at e.g. cpu reset after cpu creation,
  * therefore we must be prepared to allocate the jump cache.
  */
+void tcg_retstack_reset(CPUState *cpu)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+    if (jc && jc->retring) {
+        memset(jc->retring, 0, TCG_RETSTACK_SIZE);
+        *(uintptr_t *)((char *)cpu_env(cpu) + tcg_retsp_off) =
+            (uintptr_t)jc->retring + TCG_RETSTACK_SIZE / 2;
+    }
+}
+
+uintptr_t tcg_retstack_fault(CPUState *cpu, uintptr_t addr)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    uintptr_t page = qemu_real_host_page_size(), ring;
+
+    if (!jc || !jc->retring) {
+        return 0;
+    }
+    ring = (uintptr_t)jc->retring;
+    if (addr + page < ring || addr >= ring + TCG_RETSTACK_SIZE + page ||
+        (addr >= ring && addr < ring + TCG_RETSTACK_SIZE)) {
+        return 0;
+    }
+    return ring + TCG_RETSTACK_SIZE / 2;
+}
+
 void tcg_flush_jmp_cache(CPUState *cpu)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
@@ -628,6 +656,7 @@ void tcg_flush_jmp_cache(CPUState *cpu)
     if (unlikely(jc == NULL)) {
         return;
     }
+    tcg_retstack_reset(cpu);
 
     if (tcg_jcgen) {
         uint64_t salt = qatomic_read(&jc->salt) + TB_JMP_SALT_STEP;

@@ -38,6 +38,13 @@ static inline uintptr_t host_signal_pc(host_sigcontext *uc)
     return uc->uc_mcontext.pc;
 }
 
+#define HOST_SIGNAL_SET_XREG
+static inline void host_signal_set_xreg(host_sigcontext *uc, int n,
+                                        uint64_t val)
+{
+    uc->uc_mcontext.regs[n] = val;
+}
+
 static inline void host_signal_set_pc(host_sigcontext *uc, uintptr_t pc)
 {
     uc->uc_mcontext.pc = pc;
