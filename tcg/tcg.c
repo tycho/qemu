@@ -6655,7 +6655,7 @@ static void tcg_out_st_helper_args(TCGContext *s, const TCGLabelQemuLdst *ldst,
     tcg_out_helper_load_common_args(s, ldst, parm, info, next_arg);
 }
 
-#ifdef TCG_TARGET_HAS_LDST_X
+#if defined(TCG_TARGET_HAS_LDST_X) || defined(TCG_TARGET_SHL_ADD_LEA)
 /* Whether @op names @t among its arguments (inputs or outputs). */
 static bool op_uses_temp(const TCGOp *op, const TCGTemp *t)
 {
@@ -6975,6 +6975,73 @@ static void narrow32_pass(TCGContext *s)
 }
 #endif
 
+#ifdef TCG_TARGET_SHL_ADD_LEA
+/*
+ * x-lean: shl t, a, $k feeding add r, t, b (or b, t), where t dies, is
+ * lea r, b, a, k, 0: the host's add with a shifted operand.  The add may
+ * be an I32 op (narrow32_pass): its low 32 bits depend on those of
+ * (a << k) alone.
+ */
+static void shl_add_lea_pass(TCGContext *s)
+{
+    TCGOp *op, *next;
+
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        TCGOp *x = NULL, *lea;
+        TCGTemp *t = NULL, *a, *other;
+        TCGType type;
+        unsigned k;
+        int ti;
+
+        if (op->opc != INDEX_op_add) {
+            continue;
+        }
+        for (ti = 1; ti <= 2; ti++) {
+            t = arg_temp(op->args[ti]);
+            if ((t->kind == TEMP_EBB || t->kind == TEMP_TB) &&
+                (op->life & (DEAD_ARG << ti)) &&
+                arg_temp(op->args[3 - ti]) != t) {
+                x = ldst_fold_def(s, op, t, INDEX_op_shl);
+                if (x) {
+                    break;
+                }
+            }
+        }
+        /* A TB temp's shifted value may have to reach memory too. */
+        if (!x || (x->life & SYNC_ARG) ||
+            arg_temp(x->args[2])->kind != TEMP_CONST) {
+            continue;
+        }
+        type = TCGOP_TYPE(op);
+        k = arg_temp(x->args[2])->val;
+        a = arg_temp(x->args[1]);
+        other = arg_temp(op->args[3 - ti]);
+        if (k == 0 || k >= (type == TCG_TYPE_I32 ? 32 : 64) ||
+            !TCG_TARGET_lea_sh_valid(type, k) ||
+            !tcg_op_supported(INDEX_op_lea, type, 0) ||
+            a->kind == TEMP_CONST || other->kind == TEMP_CONST || a == t) {
+            continue;
+        }
+        lea = tcg_op_insert_before(s, op, INDEX_op_lea, type, 5);
+        lea->args[0] = op->args[0];
+        lea->args[1] = temp_arg(other);
+        lea->args[2] = temp_arg(a);
+        lea->args[3] = k;
+        lea->args[4] = 0;
+        lea->life = op->life & (DEAD_ARG | SYNC_ARG);
+        lea->output_pref[0] = op->output_pref[0];
+        if (op->life & (DEAD_ARG << (3 - ti))) {
+            lea->life |= DEAD_ARG << 1;
+        }
+        if ((x->life & (DEAD_ARG << 1)) && a != other) {
+            lea->life |= DEAD_ARG << 2;
+        }
+        tcg_op_remove(s, op);
+        ldst_fold_remove(s, x, 2);
+    }
+}
+#endif
+
 int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 {
     int i, num_insns;
@@ -7050,6 +7117,11 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 #ifdef TCG_TARGET_I32_OPS_ZEXT
     if (tcg_lean) {
         narrow32_pass(s);
+    }
+#endif
+#ifdef TCG_TARGET_SHL_ADD_LEA
+    if (tcg_lean) {
+        shl_add_lea_pass(s);
     }
 #endif
 
