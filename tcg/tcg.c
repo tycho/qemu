@@ -4682,10 +4682,12 @@ static void la_global_kill(TCGContext *s, int ng)
  * label keep values in registers instead:
  * - XLBL_INHERIT: reached only by one earlier branch and not by
  *   fall-through, and one side of that branch goes on to a loop's back
- *   edge.  The label inherits the allocator's state at its branch; each
- *   side of the branch stores, at its own start, the globals it needs in
- *   memory, so the side that loops keeps its registers.  (When both sides
- *   leave the TB, storing once before the branch is cheaper.)
+ *   edge, or the TB has goto_tb_dead exits.  The label inherits the
+ *   allocator's state at its branch; each side of the branch stores, at
+ *   its own start, the globals it needs in memory, so the side that loops
+ *   keeps its registers, and a side that leaves through goto_tb_dead
+ *   stores the chain-dead globals only after it.  (Otherwise, when both
+ *   sides leave the TB, storing once before the branch is cheaper.)
  * - XLBL_LOOP: a loop header (TCGLabel.loop, set by the translator)
  *   reached by one later br.  The globals live into the loop are loaded
  *   into registers before the label and kept there across the back edge;
@@ -4800,6 +4802,8 @@ static bool xblk_classify(TCGContext *s)
             any = true;
         }
     }
+    /* goto_tb_dead: each side of a branch stores what it exits with. */
+    any |= s->chain_dead_used;
     if (!any) {
         return false;
     }
@@ -4808,7 +4812,7 @@ static bool xblk_classify(TCGContext *s)
             continue;
         }
         if (l->xbranch && l->xseen && !l->loop && l->xfwd && !l->xfalls
-            && (s->xblk_region
+            && (s->xblk_region || s->chain_dead_used
                 || xblk_reaches_loop(l->xset)
                 || (op_falls_through(l->xbranch)
                     && xblk_reaches_loop(l->xbranch)))) {
