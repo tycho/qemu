@@ -240,6 +240,36 @@ static void gen_load_sse(DisasContext *s, TCGv temp, MemOp ot, int dest_ofs, boo
     }
 }
 
+static bool fp_native_s(TCGOpcode opc, unsigned vece);
+
+/*
+ * A 32- or 64-bit SSE memory operand with x-ssefp=native: besides the
+ * copy in xmm_t0, keep the loaded value as a vector (op->scalar), so that
+ * a scalar operation takes it from a register instead of from memory just
+ * written.
+ */
+static bool gen_load_sse_scalar(DisasContext *s, X86DecodedOp *op, TCGv temp)
+{
+    TCGv_i64 t;
+
+    if ((op->ot != MO_32 && op->ot != MO_64) ||
+        !fp_native_s(INDEX_op_movs_vec, op->ot)) {
+        return false;
+    }
+    op->scalar = tcg_temp_new_vec(TCG_TYPE_V128);
+    if (op->ot == MO_32) {
+        gen_op_ld_v(s, MO_32, temp, s->A0);
+        tcg_gen_st32_tl(temp, tcg_env, op->offset);
+        tcg_gen_dup_tl_vec(MO_32, op->scalar, temp);
+    } else {
+        t = tcg_temp_new_i64();
+        tcg_gen_qemu_ld_i64(t, s->A0, s->mem_index, MO_LEUQ);
+        tcg_gen_st_i64(t, tcg_env, op->offset);
+        tcg_gen_dup_i64_vec(MO_64, op->scalar, t);
+    }
+    return true;
+}
+
 static bool sse_needs_alignment(DisasContext *s, X86DecodedInsn *decode, MemOp ot)
 {
     switch (decode->e.vex_class) {
@@ -323,6 +353,9 @@ static void gen_load(DisasContext *s, X86DecodedInsn *decode, int opn, TCGv v)
 
     case X86_OP_SSE:
         compute_xmm_offset(op);
+        if (op->has_ea && gen_load_sse_scalar(s, op, v)) {
+            break;
+        }
     load_vector:
         if (op->has_ea) {
             bool aligned = sse_needs_alignment(s, decode, op->ot);
@@ -659,8 +692,8 @@ static bool fp_native_s(TCGOpcode opc, unsigned vece)
 
 /*
  * Operand n of a scalar operation: all 128 bits of a register, or a scalar
- * that the decoder loaded from memory, which is duplicated so that the
- * host's load is no wider than the store it follows.
+ * that the decoder loaded from memory, duplicated: the value the decoder
+ * kept, or else a load no wider than the store it follows.
  */
 static TCGv_vec fp_scalar_operand(X86DecodedInsn *decode, int n,
                                   unsigned vece)
@@ -668,7 +701,9 @@ static TCGv_vec fp_scalar_operand(X86DecodedInsn *decode, int n,
     X86DecodedOp *op = &decode->op[n];
     TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
 
-    if (op->has_ea) {
+    if (op->has_ea && op->scalar && op->ot == vece) {
+        tcg_gen_mov_vec(v, op->scalar);
+    } else if (op->has_ea) {
         tcg_gen_dup_mem_vec(vece, v, tcg_env, op->offset);
     } else {
         tcg_gen_ld_vec(v, tcg_env, ZMM_OFFSET(op->n) + xmm_offset(MO_128));
@@ -6869,7 +6904,12 @@ static void gen_VMOVLPx_st(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i64 t = tcg_temp_new_i64();
 
-    tcg_gen_ld_i64(t, OP_PTR2, offsetof(ZMMReg, ZMM_Q(0)));
+    if (tcg_ssefp_native) {
+        tcg_gen_ld_i64(t, tcg_env, ZMM_OFFSET(decode->op[2].n) +
+                       offsetof(ZMMReg, ZMM_Q(0)));
+    } else {
+        tcg_gen_ld_i64(t, OP_PTR2, offsetof(ZMMReg, ZMM_Q(0)));
+    }
     tcg_gen_qemu_st_i64(t, s->A0, s->mem_index, MO_LEUQ);
 }
 
@@ -6916,7 +6956,13 @@ static void gen_VMOVSS_st(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGv_i32 tmp = tcg_temp_new_i32();
 
-    tcg_gen_ld_i32(tmp, OP_PTR2, offsetof(ZMMReg, ZMM_L(0)));
+    if (tcg_ssefp_native) {
+        /* Element 0 of the register itself, rather than through a pointer. */
+        tcg_gen_ld_i32(tmp, tcg_env, ZMM_OFFSET(decode->op[2].n) +
+                       offsetof(ZMMReg, ZMM_L(0)));
+    } else {
+        tcg_gen_ld_i32(tmp, OP_PTR2, offsetof(ZMMReg, ZMM_L(0)));
+    }
     tcg_gen_qemu_st_i32(tmp, s->A0, s->mem_index, MO_LEUL);
 }
 
