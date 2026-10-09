@@ -125,6 +125,13 @@ struct TranslationBlock {
      */
 #define TB_JMP_OFFSET_INVALID 0xffff /* indicates no jump generated */
     uint16_t jmp_reset_offset[2]; /* offset of original jump target */
+    /*
+     * For a goto_tb slot, 1 + the slot of its tcg_gen_goto_tb_dead(), or 0;
+     * and whether this TB writes the chain-dead globals before it reads
+     * them, so that jumps to it may skip storing them.
+     */
+    uint8_t jmp_dead[2];
+    bool chain_dead_in;
     uint16_t jmp_insn_offset[2];  /* offset of direct jump insn */
     uintptr_t jmp_target_addr[2]; /* target address */
 
