@@ -3277,6 +3277,11 @@ static const int pp_prefix[4] = {
  * Convert one instruction. s->base.is_jmp is set if the translation must
  * be stopped.
  */
+static bool op_is_vector(X86DecodedOp *op)
+{
+    return op->unit == X86_OP_SSE || op->unit == X86_OP_MMX;
+}
+
 static void disas_insn(DisasContext *s, CPUState *cpu)
 {
     CPUX86State *env = cpu_env(cpu);
@@ -3704,6 +3709,14 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
     if (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea) {
         /* An RSP-based operand is in this thread's stack (x-tso-stack). */
         tcg_ctx->ldst_private = decode.mem.base == R_ESP;
+        /* Data to or from an MMX or SSE register (x-tso-vec=none). */
+        tcg_ctx->ldst_vector = op_is_vector(&decode.op[0]) ||
+                               op_is_vector(&decode.op[1]) ||
+                               op_is_vector(&decode.op[2]);
+    }
+    if (decode.e.gen == gen_x87) {
+        /* Data to or from an x87 register (x-tso-vec=none). */
+        tcg_ctx->ldst_vector = true;
     }
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&
         (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea)) {
