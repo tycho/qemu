@@ -10579,12 +10579,13 @@ static void ldst_fold_pass(TCGContext *s)
         if (index->kind == TEMP_CONST) {
             int64_t v = index->val;
 
-            if (base->kind == TEMP_CONST) {
+            if (base->kind == TEMP_CONST ||
+                ((mop & MO_ACQ_REL) && !tcg_tso_cross_faults)) {
                 continue;
             }
             if (v >= -256 && v <= 255) {
                 ofs = v;
-            } else if (v > 0 &&
+            } else if (!(mop & MO_ACQ_REL) && v > 0 &&
                        !(v & ((1 << (mop & MO_SIZE)) - 1)) &&
                        (v >> (mop & MO_SIZE)) <= 0xfff) {
                 /* A plain access: LDR/STR's scaled 12-bit offset. */
@@ -10593,6 +10594,9 @@ static void ldst_fold_pass(TCGContext *s)
             } else {
                 continue;
             }
+        } else if (mop & MO_ACQ_REL && !(mop & MO_ACQ_REL_CROSS)) {
+            /* LDAPR, STLR: no register offset. */
+            continue;
         } else {
             if (base == t) {
                 /* add t, t, b with t = shl i, k right before. */
