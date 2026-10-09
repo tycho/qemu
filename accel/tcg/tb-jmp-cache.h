@@ -47,6 +47,11 @@ typedef struct CPUJumpCache {
         TranslationBlock *tb;
         vaddr pc;
     } array[TB_JMP_CACHE_SIZE];
+    /*
+     * tcg_retstack: the return stack's ring, cleared with the cache: its
+     * host code is for the TB state of the cache.
+     */
+    void *retring;
 } CPUJumpCache;
 
 #define TB_JMP_SALT_STEP (1ull << 48)
