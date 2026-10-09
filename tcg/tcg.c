@@ -5260,8 +5260,44 @@ static void la_global_kill(TCGContext *s, int ng)
     }
 }
 
-/* liveness analysis: the list of the globals in @seen, in index order. */
-static void la_list_globals(TCGContext *s, const unsigned long *seen)
+/*
+ * Cross-block register allocation (tcg_region).  TCG's base model keeps
+ * every global in memory at every label.  With tcg_region, two kinds of
+ * label keep values in registers instead:
+ * - XLBL_INHERIT: reached only by one earlier branch and not by
+ *   fall-through, and one side of that branch goes on to a loop's back
+ *   edge, or the TB has goto_tb_dead exits.  The label inherits the
+ *   allocator's state at its branch; each side of the branch stores, at
+ *   its own start, the globals it needs in memory, so the side that loops
+ *   keeps its registers, and a side that leaves through goto_tb_dead
+ *   stores the chain-dead globals only after it.  (Otherwise, when both
+ *   sides leave the TB, storing once before the branch is cheaper.)
+ * - XLBL_LOOP: a loop header (TCGLabel.loop, set by the translator)
+ *   reached by one later br.  The globals live into the loop are loaded
+ *   into registers before the label and kept there across the back edge;
+ *   the exits store the ones the loop writes.
+ * - XLBL_REGION: a block of a multi-block region (TCGLabel.region, set by
+ *   the translator), reached by any number of branches and by
+ *   fall-through.  Every region label has the same entry state: the
+ *   region's homes (the globals the TB reads most) each in its own
+ *   register, perhaps newer than memory, every other global in memory.
+ *   Branches into the region put the homes the label needs in place and
+ *   store nothing else; the code after the label stores the homes it needs
+ *   in memory (as after an XLBL_INHERIT label).  Liveness sees that fixed
+ *   state at every such branch, so no fixpoint is needed.  In a TB with
+ *   region labels, any label reached only by one earlier branch is
+ *   XLBL_INHERIT (side exits store only on their own path).
+ * Other labels keep the base model.
+ */
+enum { XLBL_CLASSIC, XLBL_INHERIT, XLBL_LOOP, XLBL_REGION };
+
+typedef struct XblkLoopReg {
+    TCGTemp *ts;
+    TCGReg reg;
+    bool written;               /* by some op of the loop */
+} XblkLoopReg;
+
+static TCGLabel *op_branch_label(const TCGOp *op)
 {
     int ng = s->nb_globals;
 
@@ -5384,6 +5420,8 @@ static bool xblk_classify(TCGContext *s)
             any = true;
         }
     }
+    /* goto_tb_dead: each side of a branch stores what it exits with. */
+    any |= s->chain_dead_used;
     if (!any) {
         return false;
     }
@@ -5392,7 +5430,7 @@ static bool xblk_classify(TCGContext *s)
             continue;
         }
         if (l->xbranch && l->xseen && !l->loop && l->xfwd && !l->xfalls
-            && (s->xblk_region
+            && (s->xblk_region || s->chain_dead_used
                 || xblk_reaches_loop(l->xset)
                 || (op_falls_through(l->xbranch)
                     && xblk_reaches_loop(l->xbranch)))) {
