@@ -2374,6 +2374,8 @@ typedef struct CPUArchState {
 
     /* The earlier operation's CC_DST, for CC_OP_INCL* and CC_OP_DECL*. */
     target_ulong cc_dst2;
+    /* The top of the return stack (tcg_gen_push_ret). */
+    uintptr_t retsp;
 } CPUX86State;
 
 /**

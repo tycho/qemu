@@ -35,6 +35,7 @@
 #include "exec/translation-block.h"
 #include "exec/cputlb.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
 #include "exec/log.h"
@@ -1439,6 +1440,17 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
 
     cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
     cpu->tb_jmp_cache->gsalt = TB_JMP_GSALT_BASE;
+    if (tcg_retstack && tcg_retsp_off) {
+        size_t page = qemu_real_host_page_size();
+        char *p = mmap(NULL, TCG_RETSTACK_SIZE + 2 * page, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        if (p != MAP_FAILED &&
+            !mprotect(p + page, TCG_RETSTACK_SIZE, PROT_READ | PROT_WRITE)) {
+            cpu->tb_jmp_cache->retring = p + page;
+            tcg_retstack_reset(cpu);
+        }
+    }
     tlb_init(cpu);
 #ifndef CONFIG_USER_ONLY
     tcg_iommu_init_notifier_list(cpu);

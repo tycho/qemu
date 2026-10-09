@@ -986,6 +986,18 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
         /* suppress any remaining jumps to this TB */
         tb_jmp_unlink(tb);
 
+        /*
+         * A host return may still enter a TB that pushed its return
+         * landing (tcg_gen_push_ret): its own jumps lead to its exits.
+         */
+        if (tb->jmp_call) {
+            for (int n = 0; n < ARRAY_SIZE(tb->jmp_reset_offset); n++) {
+                if (tb->jmp_reset_offset[n] != TB_JMP_OFFSET_INVALID) {
+                    tb_reset_jump(tb, n);
+                }
+            }
+        }
+
         qatomic_set(&tb_ctx.tb_phys_invalidate_count,
                     tb_ctx.tb_phys_invalidate_count + 1);
     }

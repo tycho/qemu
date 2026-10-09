@@ -135,6 +135,13 @@ struct TranslationBlock {
     uint16_t jmp_reset_offset[TB_JMP_SLOTS]; /* offset of original target */
     uint16_t jmp_insn_offset[TB_JMP_SLOTS];  /* offset of direct jump insn */
     uintptr_t jmp_target_addr[TB_JMP_SLOTS]; /* target address */
+    /*
+     * The goto_tb slots that leave by a host call (tcg_gen_call_tb), and
+     * TB_JMP_RET_LANDING if host returns may enter the TB
+     * (tcg_gen_push_ret).
+     */
+    uint16_t jmp_call;
+#define TB_JMP_RET_LANDING (1u << TB_JMP_SLOTS)
 
     /*
      * Each TB has a NULL-terminated list (jmp_list_head) of incoming jumps.
