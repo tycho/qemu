@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/memalign.h"
 #include "qemu/qemu-print.h"
 #include "qapi/error.h"
 #include "qapi/type-helpers.h"
@@ -33,6 +34,7 @@
 #include "exec/mmap-lock.h"
 #include "exec/translation-block.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
 #include "exec/log.h"
@@ -1138,6 +1140,35 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
     tcg_update_cflags(cpu);
 
     cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
+    if (tcg_retstack && tcg_retsp_off) {
+        size_t page = qemu_real_host_page_size();
+        char *p = mmap(NULL, TCG_RETSTACK_SIZE + 2 * page, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        if (p != MAP_FAILED &&
+            !mprotect(p + page, TCG_RETSTACK_SIZE, PROT_READ | PROT_WRITE)) {
+            cpu->tb_jmp_cache->retring = p + page;
+            tcg_retstack_reset(cpu);
+        } else {
+            if (p != MAP_FAILED) {
+                munmap(p, TCG_RETSTACK_SIZE + 2 * page);
+            }
+            /*
+             * Generated code pushes and pops with the top in
+             * tcg_retstack_reg, so it needs a ring.  Before the prologue
+             * has taken a register for it, the return stack goes off for
+             * good; after, this vCPU can't run.
+             */
+            if (tcg_retstack_reg < 0) {
+                tcg_retstack = false;
+            } else {
+                qemu_vfree(cpu->tb_jmp_cache);
+                cpu->tb_jmp_cache = NULL;
+                error_setg(errp, "no memory for the return stack's ring");
+                return false;
+            }
+        }
+    }
     tlb_init(cpu);
 #ifndef CONFIG_USER_ONLY
     tcg_iommu_init_notifier_list(cpu);
@@ -1148,6 +1179,17 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
 }
 
 /* undo the initializations in reverse order */
+static void tb_jmp_cache_free(CPUJumpCache *jc)
+{
+    if (jc->retring) {
+        /* Mapped with a guard page at each end. */
+        size_t page = qemu_real_host_page_size();
+
+        munmap((char *)jc->retring - page, TCG_RETSTACK_SIZE + 2 * page);
+    }
+    g_free(jc);
+}
+
 void tcg_exec_unrealizefn(CPUState *cpu)
 {
 #ifndef CONFIG_USER_ONLY
@@ -1155,5 +1197,5 @@ void tcg_exec_unrealizefn(CPUState *cpu)
 #endif /* !CONFIG_USER_ONLY */
 
     tlb_destroy(cpu);
-    g_free_rcu(cpu->tb_jmp_cache, rcu);
+    call_rcu(cpu->tb_jmp_cache, tb_jmp_cache_free, rcu);
 }

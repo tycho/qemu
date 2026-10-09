@@ -1163,6 +1163,11 @@ static const TCGOutOp outop_retstack = {
 static const TCGOutOp outop_retstack = {
     .static_constraint = C_NotImplemented,
 };
+
+bool tcg_retstack_access(uintptr_t pc)
+{
+    return false;
+}
 #endif
 
 static const TCGOutOpLoad outop_ld = {
