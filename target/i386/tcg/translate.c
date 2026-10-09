@@ -2297,6 +2297,7 @@ static void
 gen_eob(DisasContext *s, int mode)
 {
     bool inhibit_reset;
+    TCGLabel *req = NULL;
 
     gen_update_cc_op(s);
 
@@ -2320,20 +2321,27 @@ gen_eob(DisasContext *s, int mode)
     } else if ((mode == DISAS_JUMP || mode == DISAS_JUMP_FAR) &&
                /* give irqs a chance to happen */
                !inhibit_reset) {
+        req = translator_edge_check(&s->base, s->base.pc_first);
         gen_lookup_and_goto_ptr(s, mode);
     } else if (inhibit_reset && exit_irq_only(s) &&
                (mode == DISAS_EOB_NEXT || mode == DISAS_EOB_INHIBIT_IRQ ||
                 mode == DISAS_JUMP || mode == DISAS_JUMP_FAR)) {
         /* The shadow is over: leave only if an interrupt may be taken. */
         gen_exit_if_irq_pending(s, false);
+        req = translator_edge_check(&s->base, s->base.pc_first);
         tcg_gen_lookup_and_goto_ptr();
     } else if (mode == DISAS_EOB_INHIBIT_IRQ && exit_irq_only(s)) {
         /*
          * No interrupt is taken in the shadow (x86_cpu_interrupts_enabled
          * checks HF_INHIBIT_IRQ): chain to its block.
          */
+        req = translator_edge_check(&s->base, s->base.pc_first);
         tcg_gen_lookup_and_goto_ptr();
     } else {
+        tcg_gen_exit_tb(NULL, 0);
+    }
+    if (req) {
+        gen_set_label(req);
         tcg_gen_exit_tb(NULL, 0);
     }
 
@@ -2412,7 +2420,12 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
     } else if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)
                && translator_goto_tb_slot(&s->base, &tb_num)) {
         /* jump to same page: we can use a direct jump */
+        TCGLabel *req = translator_edge_check(&s->base, new_pc);
+
         tcg_gen_goto_tb(tb_num);
+        if (req) {
+            gen_set_label(req);
+        }
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
             tcg_gen_movi_tl(cpu_eip, new_eip);
         }
@@ -4301,6 +4314,7 @@ static const TranslatorOps i386_tr_ops = {
     .translate_insn     = i386_tr_translate_insn,
     .tb_stop            = i386_tr_tb_stop,
     .block_start        = i386_tr_block_start,
+    .edge_checks        = true,
 };
 
 void x86_translate_code(CPUState *cpu, TranslationBlock *tb,

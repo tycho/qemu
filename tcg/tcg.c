@@ -4236,10 +4236,7 @@ reachable_code_pass(TCGContext *s)
         case INDEX_op_set_label:
             label = arg_label(op->args[0]);
 
-            /*
-             * Note that the first op in the TB is always a load,
-             * so there is always something before a label.
-             */
+            /* A label may be the TB's first op. */
             op_prev = QTAILQ_PREV(op, link);
 
             /*
@@ -4248,7 +4245,7 @@ reachable_code_pass(TCGContext *s)
              * Do this before branch to next optimization, so that the
              * middle label is out of the way.
              */
-            if (op_prev->opc == INDEX_op_set_label) {
+            if (op_prev && op_prev->opc == INDEX_op_set_label) {
                 move_label_uses(label, arg_label(op_prev->args[0]));
                 tcg_op_remove(s, op_prev);
                 op_prev = QTAILQ_PREV(op, link);
@@ -4261,7 +4258,7 @@ reachable_code_pass(TCGContext *s)
              * processing the branch because any dead code between the branch
              * and label had not yet been removed.
              */
-            if (op_prev->opc == INDEX_op_br &&
+            if (op_prev && op_prev->opc == INDEX_op_br &&
                 label == arg_label(op_prev->args[0])) {
                 tcg_op_remove(s, op_prev);
                 /* Fall through means insns become live again.  */
@@ -4655,7 +4652,7 @@ static bool xblk_classify(TCGContext *s)
             l = arg_label(op->args[0]);
             l->xseen = true;
             l->xset = op;
-            l->xfalls = prev && op_falls_through(prev);
+            l->xfalls = !prev || op_falls_through(prev);
         } else {
             l = op_branch_label(op);
             if (l && op == l->xbranch) {

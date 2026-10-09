@@ -92,6 +92,11 @@ struct DisasContextBase {
     struct TranslatorRegion *region;
     bool region_capable;
     unsigned goto_tb_used;
+    /*
+     * Whether the exit request is checked on the TB's backward and
+     * indirect exits instead of at its entry (translator_edge_check).
+     */
+    bool edge_checks;
 
     /*
      * Record insn data that we cannot read directly from host memory.
@@ -143,6 +148,12 @@ typedef struct TranslatorOps {
      * state of a TB entry.  Targets without it don't form regions.
      */
     void (*block_start)(DisasContextBase *db, CPUState *cpu);
+    /*
+     * Whether the target calls translator_edge_check() on every exit that
+     * goes to another TB without the main loop, so that TBs need not
+     * check the exit request at their entry.
+     */
+    bool edge_checks;
 } TranslatorOps;
 
 /**
@@ -279,6 +290,23 @@ bool translator_goto_tb_slot(DisasContextBase *db, int *slot);
  * the first page, or in a multi-block region its second page too.
  */
 bool translator_in_tb_pages(const DisasContextBase *db, vaddr addr);
+
+/**
+ * translator_edge_check
+ * @db: Disassembly context
+ * @dest: the destination of a jump to another TB; for an indirect jump,
+ *        db->pc_first
+ *
+ * With db->edge_checks, a TB doesn't check the exit request at its entry;
+ * its exits do, where a chain of TBs may close a cycle: a direct jump to
+ * @dest at or before the TB's start (every cycle of TBs has such a jump,
+ * from the one that starts last), and an indirect jump.  Emit that check
+ * and return the label it branches to when an exit is requested, at which
+ * the caller leaves to the main loop with the guest state of @dest (as
+ * for an unchained jump).  Otherwise return NULL and emit nothing.  The
+ * guest state must be up to date as for a jump between TBs.
+ */
+TCGLabel *translator_edge_check(DisasContextBase *db, vaddr dest);
 
 /**
  * translator_io_start
