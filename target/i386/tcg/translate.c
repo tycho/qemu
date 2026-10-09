@@ -24,6 +24,7 @@
 #include "exec/translation-block.h"
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-op-gvec.h"
+#include "tcg/startup.h"
 #include "exec/translator.h"
 #include "exec/target_page.h"
 #include "fpu/softfloat.h"
@@ -120,6 +121,13 @@ typedef struct DisasContext {
     uint8_t evex4;
     bool jmp_opt; /* use direct block chaining for direct jumps */
     bool jmp_direct; /* the TB ends in a direct jump to another page */
+    /*
+     * The return stack (tcg_retstack): the TB ends in a near CALL, whose
+     * return address is rs_next, or in a near RET.
+     */
+    bool rs_call;
+    bool rs_ret;
+    target_ulong rs_next;
     bool cc_op_dirty;
 
     CCOp cc_op;  /* current CC operation */
@@ -2051,6 +2059,53 @@ static void gen_bnd_jmp(DisasContext *s)
 }
 
 /*
+ * Whether a near CALL or RET at the end of the TB uses the return stack:
+ * under the same conditions as the inline lookup of the next TB.
+ */
+static bool use_retstack(DisasContext *s)
+{
+    return tcg_retstack_reg >= 0 && s->jmp_opt &&
+           !(tb_cflags(s->base.tb) & (CF_PCREL | CF_NO_GOTO_PTR)) &&
+           s->flags == s->base.tb->flags &&
+           !(s->flags & (HF_RF_MASK | HF_MPX_IU_MASK)) &&
+           translator_use_inline_lookup(&s->base);
+}
+
+/* The pc of the return address of the CALL that ends the TB. */
+static target_ulong rs_next_pc(DisasContext *s)
+{
+    return CODE64(s) ? s->rs_next : (uint32_t)(s->rs_next + s->cs_base);
+}
+
+/*
+ * The return landing, where the host returns to after the guest RET to
+ * the CALL's return address: chain to it through goto_tb @slot, or look
+ * it up if @slot is negative.
+ */
+static void gen_ret_landing(DisasContext *s, TCGLabel *land, int slot)
+{
+    gen_set_label(land);
+    if (slot >= 0) {
+        tcg_gen_goto_tb(slot);
+        tcg_gen_movi_tl(cpu_eip, s->rs_next);
+        tcg_gen_exit_tb(s->base.tb, slot);
+    } else {
+        /* No goto_tb slot for it: look it up. */
+        tcg_gen_movi_tl(cpu_eip, s->rs_next);
+        translator_lookup_and_goto_ptr(&s->base,
+                                       tcg_constant_i64(rs_next_pc(s)),
+                                       s->cs_base, s->flags, false);
+    }
+}
+
+/* A goto_tb slot for the return landing other than @used, or -1. */
+static int ret_landing_slot(DisasContext *s, int used)
+{
+    return translator_use_goto_tb(&s->base, rs_next_pc(s))
+           ? (used < 0 ? 0 : used ^ 1) : -1;
+}
+
+/*
  * Look up the next TB after a near jump.  The CPU state is then the one
  * this TB was translated for: an insn that changes the hflags or CS ends
  * the TB by returning to the main loop, or updates s->flags.  The
@@ -2093,6 +2148,7 @@ static void
 gen_eob(DisasContext *s, int mode)
 {
     bool inhibit_reset;
+    TCGLabel *land = NULL;
 
     gen_update_cc_op(s);
 
@@ -2116,10 +2172,26 @@ gen_eob(DisasContext *s, int mode)
     } else if ((mode == DISAS_JUMP || mode == DISAS_JUMP_FAR) &&
                /* give irqs a chance to happen */
                !inhibit_reset) {
+        if (mode == DISAS_JUMP && s->rs_ret && use_retstack(s)) {
+            TCGv_i64 key = tcg_temp_new_i64();
+
+            tcg_gen_extu_tl_i64(key, cpu_eip);
+            tcg_gen_ret_tb(key);
+        } else if (mode == DISAS_JUMP && s->rs_call && use_retstack(s)) {
+            /* The lookup leaves by a host call; land comes after it. */
+            land = gen_new_label();
+            tcg_gen_push_ret(tcg_constant_i64(s->rs_next), gen_new_label(),
+                             land);
+        }
         gen_lookup_and_goto_ptr(s, mode);
+        tcg_gen_push_ret_done();
     } else {
         tcg_gen_exit_tb(NULL, 0);
     }
+    if (land) {
+        gen_ret_landing(s, land, ret_landing_slot(s, -1));
+    }
+    s->rs_call = s->rs_ret = false;
 
     s->base.is_jmp = DISAS_NORETURN;
 }
@@ -2160,6 +2232,27 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
         }
     } else if (!CODE64(s)) {
         new_pc = (uint32_t)(new_eip + s->cs_base);
+    }
+
+    /*
+     * A CALL with the return stack: push the return, then leave through
+     * a goto_tb slot that calls, so the host predicts the return to the
+     * landing that follows.  Through the lookup, gen_eob does the same.
+     */
+    if (s->rs_call && use_retstack(s) && use_goto_tb &&
+        translator_use_goto_tb(&s->base, new_pc)) {
+        TCGLabel *land = gen_new_label();
+        TCGLabel *reset = gen_new_label();
+
+        s->rs_call = false;
+        tcg_gen_push_ret(tcg_constant_i64(s->rs_next), land, NULL);
+        tcg_gen_call_tb(tb_num, reset);
+        gen_ret_landing(s, land, ret_landing_slot(s, tb_num));
+        gen_set_label(reset);
+        tcg_gen_movi_tl(cpu_eip, new_eip);
+        tcg_gen_exit_tb(s->base.tb, tb_num);
+        s->base.is_jmp = DISAS_NORETURN;
+        return;
     }
 
     if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)) {
@@ -3537,6 +3630,10 @@ void tcg_x86_init(void)
     cpu_cc_src2 = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, cc_src2),
                                      "cc_src2");
     cpu_eip = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, eip), eip_name);
+    tcg_retsp_off = offsetof(CPUX86State, retsp);
+#ifdef TARGET_X86_64
+    tcg_retstack_addr64 = true;
+#endif
 
     for (i = 0; i < CPU_NB_EREGS; ++i) {
         cpu_regs[i] = tcg_global_mem_new(tcg_env,
@@ -3606,6 +3703,7 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->cpuid_7_1_eax_features = env->features[FEAT_7_1_EAX];
     dc->cpuid_xsave_features = env->features[FEAT_XSAVE];
     dc->jmp_direct = false;
+    dc->rs_call = dc->rs_ret = false;
     dc->jmp_opt = !((cflags & CF_NO_GOTO_TB) ||
                     (flags & (HF_RF_MASK | HF_TF_MASK | HF_INHIBIT_IRQ_MASK)));
 
