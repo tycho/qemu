@@ -8924,6 +8924,30 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         }
         break;
 
+    case INDEX_op_shladd:
+        {
+            const TCGOutOpShlAdd *out = &outop_shladd;
+
+            out->out(s, type, new_args[0], new_args[1], new_args[2],
+                     new_args[3]);
+        }
+        break;
+
+    case INDEX_op_qemu_ld_x:
+    case INDEX_op_qemu_st_x:
+        {
+            const TCGOutOpQemuLdStX *out =
+                container_of(all_outop[op->opc], TCGOutOpQemuLdStX, base);
+            TCGTemp *its = arg_temp(op->args[2]);
+            /* A constant 0 index may be in a register an earlier op set. */
+            bool index_zero = const_args[2] ||
+                              (its->kind == TEMP_CONST && its->val == 0);
+
+            out->out(s, type, new_args[0], new_args[1], new_args[2],
+                     index_zero, new_args[3]);
+        }
+        break;
+
     case INDEX_op_qemu_atomic:
         {
             const TCGOutOpQemuAtomic *out = &outop_qemu_atomic;
@@ -10404,12 +10428,13 @@ static void ldst_fold_pass(TCGContext *s)
         if (index->kind == TEMP_CONST) {
             int64_t v = index->val;
 
-            if (base->kind == TEMP_CONST) {
+            if (base->kind == TEMP_CONST ||
+                ((mop & MO_ACQ_REL) && !tcg_tso_cross_faults)) {
                 continue;
             }
             if (v >= -256 && v <= 255) {
                 ofs = v;
-            } else if (v > 0 &&
+            } else if (!(mop & MO_ACQ_REL) && v > 0 &&
                        !(v & ((1 << (mop & MO_SIZE)) - 1)) &&
                        (v >> (mop & MO_SIZE)) <= 0xfff) {
                 /* A plain access: LDR/STR's scaled 12-bit offset. */
@@ -10418,6 +10443,9 @@ static void ldst_fold_pass(TCGContext *s)
             } else {
                 continue;
             }
+        } else if (mop & MO_ACQ_REL && !(mop & MO_ACQ_REL_CROSS)) {
+            /* LDAPR, STLR: no register offset. */
+            continue;
         } else {
             if (base == t) {
                 /* add t, t, b with t = shl i, k right before. */
