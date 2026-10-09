@@ -3063,6 +3063,9 @@ static void tcg_out_qemu_ldst_vec(TCGContext *s, TCGReg data,
  * host address, so a guest access can use the host's addressing modes:
  * base + (index << shift), with shift 0 or the access size, or base + a
  * signed 9-bit or unsigned scaled 12-bit offset (qemu_ld_x, qemu_st_x).
+ * Ordered accesses take only the 9-bit offset: LDAPUR and STLUR
+ * (FEAT_LRCPC2), without a crossing check, which needs
+ * tcg_tso_cross_faults.
  */
 #define TCG_TARGET_HAS_LDST_X
 
@@ -3111,6 +3114,18 @@ static AArch64Insn st_insn(MemOp mop)
     return insn[mop & MO_SIZE];
 }
 
+/* An ordered access at base + @ofs: LDAPUR/STLUR, or add then LDAPR/STLR. */
+static TCGReg tcg_out_rcpc_base(TCGContext *s, TCGReg base, int ofs)
+{
+    if (ofs) {
+        tcg_out_insn_addsub_imm(s, ofs < 0 ? Iaddsub_imm_SUBI
+                                           : Iaddsub_imm_ADDI,
+                                1, TCG_REG_TMP2, base, ofs < 0 ? -ofs : ofs);
+        return TCG_REG_TMP2;
+    }
+    return base;
+}
+
 /*
  * The offset form's index is the constant 0, which arrives as XZR, or as a
  * register when an earlier op has loaded the constant into one: an offset
@@ -3125,12 +3140,45 @@ static void tgen_qemu_ld_x(TCGContext *s, TCGType type, TCGReg data,
     unsigned shift = tcg_ldst_x_shift(arg);
     int ofs = tcg_ldst_x_ofs(arg);
 
+    if ((mop & MO_ACQ_REL) && !(mop & MO_ACQ_REL_CROSS)) {
+        static const uint32_t ldapur[4] = {
+            0x19400000, 0x59400000, 0x99400000, 0xd9400000
+        };
+        uint32_t insn = 0;
+
+        tcg_debug_assert(index == TCG_REG_XZR);
+        if (ofs && have_lrcpc2) {
+            switch (mop & MO_SSIZE) {
+            case MO_SB:
+                insn = type ? Ildapurs_BX : Ildapurs_BW;
+                break;
+            case MO_SW:
+                insn = type ? Ildapurs_HX : Ildapurs_HW;
+                break;
+            case MO_SL:
+                insn = Ildapurs_WX;
+                break;
+            default:
+                insn = ldapur[mop & MO_SIZE];
+                break;
+            }
+            tcg_out32(s, insn | (ofs & 0x1ff) << 12 | base << 5 | data);
+            return;
+        }
+        tcg_out_qemu_ld_acquire(s, mop, type, data,
+                                tcg_out_rcpc_base(s, base, ofs));
+        return;
+    }
     if (shift == TCG_LDST_X_SCALED) {
         tcg_out_insn_ldst_uimm(s, ld_insn(mop, type), data, base, ofs);
     } else if (index != TCG_REG_XZR && !ofs) {
         tcg_out_ldst_rx(s, ld_insn(mop, type), data, base, index, shift);
     } else {
         tcg_out_insn_ldst_imm(s, ld_insn(mop, type), data, base, ofs);
+    }
+    if (mop & MO_ACQ_REL_CROSS) {
+        /* A promoted crossing load: the barrier a load-acquire stands for. */
+        tcg_out_mb(s, TCG_MO_LD_LD | TCG_MO_LD_ST);
     }
 }
 
@@ -3142,6 +3190,23 @@ static void tgen_qemu_st_x(TCGContext *s, TCGType type, TCGReg data,
     unsigned shift = tcg_ldst_x_shift(arg);
     int ofs = tcg_ldst_x_ofs(arg);
 
+    if ((mop & MO_ACQ_REL) && !(mop & MO_ACQ_REL_CROSS)) {
+        static const uint32_t stlur[4] = {
+            0x19000000, 0x59000000, 0x99000000, 0xd9000000
+        };
+
+        tcg_debug_assert(index == TCG_REG_XZR);
+        if (ofs && have_lrcpc2) {
+            tcg_out32(s, stlur[mop & MO_SIZE] | (ofs & 0x1ff) << 12 |
+                      base << 5 | data);
+            return;
+        }
+        tcg_out_qemu_st_release(s, mop, data, tcg_out_rcpc_base(s, base, ofs));
+        return;
+    }
+    if (mop & MO_ACQ_REL_CROSS) {
+        tcg_out_mb(s, TCG_MO_LD_ST | TCG_MO_ST_ST);
+    }
     if (shift == TCG_LDST_X_SCALED) {
         tcg_out_insn_ldst_uimm(s, st_insn(mop), data, base, ofs);
     } else if (index != TCG_REG_XZR && !ofs) {
