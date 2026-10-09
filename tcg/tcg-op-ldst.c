@@ -115,6 +115,8 @@ static void gen_st_i64(TCGv_i64 v, TCGTemp *addr, MemOpIdx oi)
     gen_ldst1(INDEX_op_qemu_st, TCG_TYPE_I64, tcgv_i64_temp(v), addr, oi);
 }
 
+static bool tcg_tso_atom_whole(MemOp memop);
+
 /*
  * Guest accesses that get no memory-order constraint:
  *
@@ -124,6 +126,13 @@ static void gen_st_i64(TCGv_i64 v, TCGTemp *addr, MemOpIdx oi)
  *     release by this thread still orders these accesses before it; what
  *     is lost is the order of this thread's own stack accesses against its
  *     other accesses, as other threads would see it.
+ *
+ *   - x-tso-vec=none: accesses the front end marks as moving data to or
+ *     from the guest's vector or floating-point registers
+ *     (TCGContext.ldst_vector), unless the guest makes the access atomic
+ *     as a whole (a 16-byte atomic may synchronize).  Code that shares
+ *     vector data between threads hands it over with a synchronizing
+ *     access of its own, which keeps its order.
  */
 static bool tcg_ldst_unordered_class(MemOp memop)
 {
@@ -132,7 +141,8 @@ static bool tcg_ldst_unordered_class(MemOp memop)
         return true;
     }
 #endif
-    return false;
+    return tcg_tso_vec_none && tcg_ctx->ldst_vector &&
+           !tcg_tso_atom_whole(memop);
 }
 
 /* The guest access being generated gets no memory-order constraint. */
