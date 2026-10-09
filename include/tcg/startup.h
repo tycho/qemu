@@ -72,6 +72,15 @@ extern bool tcg_tso_stack;
 bool tcg_tso_cross_count(uint64_t pc);
 bool tcg_tso_cross_promoted(uint64_t pc);
 
+/*
+ * User mode: the host's alignment-fault handler deals with MO_ACQ_REL
+ * accesses that cross 16 bytes (LDAPR and STLR fault on them), so the
+ * backend emits no inline check.  tcg_insn_is_acqrel_ldst tells whether
+ * the generated insn at host address @pc is such an access.
+ */
+extern bool tcg_tso_cross_faults;
+bool tcg_insn_is_acqrel_ldst(uintptr_t pc);
+
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);
 

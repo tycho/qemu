@@ -274,6 +274,8 @@ bool tcg_tso_cross_count(uint64_t pc)
     return n >= TSO_PROMOTE_THRESHOLD;
 }
 
+bool tcg_tso_cross_faults;
+
 bool tcg_tso_cross_promoted(uint64_t pc)
 {
     unsigned n;
@@ -1148,6 +1150,15 @@ typedef struct TCGOutOpSubtract {
 } TCGOutOpSubtract;
 
 #include "tcg-target.c.inc"
+
+bool tcg_insn_is_acqrel_ldst(uintptr_t pc)
+{
+#ifdef TCG_TARGET_ACQREL_LDST_INSN
+    return tcg_target_insn_is_acqrel_ldst(*(const uint32_t *)pc);
+#else
+    return false;
+#endif
+}
 
 #ifndef CONFIG_TCG_INTERPRETER
 /* Validate CPUTLBDescFast placement. */
