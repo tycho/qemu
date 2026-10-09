@@ -43,6 +43,7 @@
 #include "backend-ldst.h"
 #include "internal-common.h"
 #include "tb-internal.h"
+#include "accel/tcg/host-fp.h"
 #include "tcg/startup.h"
 
 __thread uintptr_t helper_retaddr;
@@ -145,7 +146,11 @@ bool tcg_tso_cross_fault(CPUState *cpu, uintptr_t fault_pc, uintptr_t host_pc)
         return false;
     }
     cpu_restore_state_from_tb(cpu, tb, host_pc);
-    promoted = tcg_tso_cross_count(cpu->cc->get_pc(cpu));
+    {
+        /* The site table is a GHashTable, which uses host floating point. */
+        TCG_HOST_FP_SUSPEND_GUARD(cpu);
+        promoted = tcg_tso_cross_count(cpu->cc->get_pc(cpu));
+    }
     /* A crossing promotes its insn at once: the next run has no LDAPR. */
     g_assert(promoted);
     mmap_lock();
