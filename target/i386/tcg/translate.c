@@ -2141,15 +2141,16 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
 
 /*
  * tcg_tsc_counter: RDTSC (and RDTSCP's TSC) without a helper: the host
- * counter scaled to the guest's 1 GHz TSC (host/counter.h), plus the
- * vCPU's offset (and SVM's, as helper_rdtsc).  With @ordered the counter
- * isn't read before earlier instructions complete.  The helper stays for
- * the SVM intercept, icount, and, checked at run time outside ring 0,
- * CR4.TSD.  Returns false, emitting nothing, where the helper is needed.
+ * counter scaled to the guest's 1 GHz TSC (host/counter.h), in system
+ * mode plus the vCPU's offset (and SVM's, as helper_rdtsc).  With @ordered
+ * the counter isn't read before earlier instructions complete.  The
+ * helper stays for the SVM intercept, icount, and, checked at run time
+ * outside ring 0, CR4.TSD.  Returns false, emitting nothing, where the
+ * helper is needed.
  */
 static bool gen_tsc_counter(DisasContext *s, bool ordered)
 {
-#if HOST_COUNTER_SUPPORTED && !defined(CONFIG_USER_ONLY)
+#if HOST_COUNTER_SUPPORTED
     TCGLabel *slow = NULL, *done;
     TCGv_i64 t, o;
 
@@ -2158,6 +2159,7 @@ static bool gen_tsc_counter(DisasContext *s, bool ordered)
         !tcg_op_supported(INDEX_op_host_counter, TCG_TYPE_I64, 0)) {
         return false;
     }
+#ifndef CONFIG_USER_ONLY
     if (CPL(s) != 0) {
         TCGv cr4 = tcg_temp_new();
 
@@ -2166,6 +2168,7 @@ static bool gen_tsc_counter(DisasContext *s, bool ordered)
         tcg_gen_andi_tl(cr4, cr4, CR4_TSD_MASK);
         tcg_gen_brcondi_tl(TCG_COND_NE, cr4, 0, slow);
     }
+#endif
 
     t = tcg_temp_new_i64();
     o = tcg_temp_new_i64();
@@ -2176,10 +2179,12 @@ static bool gen_tsc_counter(DisasContext *s, bool ordered)
     } else if (host_counter_mult != 1) {
         tcg_gen_muli_i64(t, t, host_counter_mult);
     }
+#ifndef CONFIG_USER_ONLY
     tcg_gen_ld_i64(o, tcg_env, offsetof(CPUX86State, tsc_counter_offset));
     tcg_gen_add_i64(t, t, o);
     tcg_gen_ld_i64(o, tcg_env, offsetof(CPUX86State, tsc_offset));
     tcg_gen_add_i64(t, t, o);
+#endif
     tcg_gen_extr_i64_tl(cpu_regs[R_EAX], cpu_regs[R_EDX], t);
 
     if (slow) {

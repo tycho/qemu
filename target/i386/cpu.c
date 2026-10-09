@@ -9346,16 +9346,19 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         break;
     }
 
-#ifndef CONFIG_USER_ONLY
     /*
      * tcg_tsc_counter: a constant-rate TSC shared by all vCPUs (invariant
-     * TSC), with IA32_TSC_ADJUST, and on Intel CPUs its rate in leaf 0x15:
-     * 1 GHz, as the crystal, which is also the local APIC's bus clock.
+     * TSC), in system mode with IA32_TSC_ADJUST, and on Intel CPUs its rate
+     * in leaf 0x15: 1 GHz, as the crystal, which is also the local APIC's
+     * bus clock.
      */
     if (tcg_enabled() && tcg_tsc_counter) {
+#ifndef CONFIG_USER_ONLY
         if (index == 7 && count == 0) {
             *ebx |= CPUID_7_0_EBX_TSC_ADJUST;
-        } else if (index == 0x80000007) {
+        }
+#endif
+        if (index == 0x80000007) {
             *edx |= CPUID_APM_INVTSC;
         } else if (index == 0x15 && IS_INTEL_CPU(env)) {
             *eax = 1;
@@ -9364,7 +9367,6 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
             *edx = 0;
         }
     }
-#endif
 }
 
 static void x86_cpu_set_sgxlepubkeyhash(CPUX86State *env)
@@ -9847,7 +9849,6 @@ void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
     x86_cpu_adjust_feat_level(cpu, FEAT_SVM);
     x86_cpu_adjust_feat_level(cpu, FEAT_XSAVE);
 
-#ifndef CONFIG_USER_ONLY
     /*
      * tcg_tsc_counter describes the TSC in CPUID[0x15], which is Intel's.
      * Not on other vendors: a leaf above the maximum returns the highest
@@ -9858,7 +9859,6 @@ void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
     if (tcg_enabled() && tcg_tsc_counter && IS_INTEL_CPU(env)) {
         x86_cpu_adjust_level(cpu, &cpu->env.cpuid_min_level, 0x15);
     }
-#endif
 
     /* Intel Processor Trace requires CPUID[0x14] */
     if ((env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_INTEL_PT)) {
