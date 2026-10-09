@@ -561,6 +561,11 @@ void tcg_gen_extract_vec_i64(unsigned vece, TCGv_i64 r, TCGv_vec a,
  */
 void tcg_gen_insert_vec_i64(unsigned vece, TCGv_vec r, TCGv_vec a,
                             TCGv_i64 b, unsigned idx);
+/*
+ * Element 0 (of size vece) the low bits of @b, every other element zero.
+ * No fallback: check tcg_can_emit_vec_op(INDEX_op_movz_vec) first.
+ */
+void tcg_gen_movz_vec_i64(unsigned vece, TCGv_vec r, TCGv_i64 b);
 void tcg_gen_dupi_vec(unsigned vece, TCGv_vec, uint64_t);
 void tcg_gen_add_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_sub_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
