@@ -55,4 +55,11 @@ void tcg_register_thread(void);
  */
 void tcg_prologue_init(void);
 
+/*
+ * x-lean: leaner code for common guest patterns, where the host allows:
+ * guest accesses whose address is a register plus a shifted register or
+ * an offset use the host's addressing modes (qemu_ld_x, qemu_st_x).
+ */
+extern bool tcg_lean;
+
 #endif
