@@ -389,6 +389,11 @@ struct TCGContext {
     struct TCGLabelPoolData *pool_labels;
 
     TCGLabel *exitreq_label;
+    /* The reset label of each call_tb slot (tcg_gen_call_tb), or NULL. */
+    TCGLabel *call_tb_reset[8];
+    /* tcg_gen_push_ret() for a call that leaves through goto_ptr. */
+    TCGLabel *call_ret, *call_land;
+    bool call_ret_set;
 
 #ifdef CONFIG_PLUGIN
     /*
