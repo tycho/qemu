@@ -27,10 +27,6 @@
  */
 typedef struct CPUJumpCache {
     struct rcu_head rcu;
-    struct {
-        TranslationBlock *tb;
-        vaddr pc;
-    } array[TB_JMP_CACHE_SIZE];
     /*
      * tcg_jcgen: entries store pc ^ salt, and a flush moves the salt on
      * instead of clearing every entry.  The salt lives in bits 48-63,
@@ -46,6 +42,18 @@ typedef struct CPUJumpCache {
      * is set in gsalt and clear in salt, so the two never meet.
      */
     uint64_t gsalt;
+    /*
+     * tcg_jc_ctx: the TB state (cs_base, flags, cflags) every entry under
+     * the current salt was made for.  A lookup in another state moves the
+     * salt on first, so the generated lookup needn't compare them.
+     */
+    uint64_t ctx_cs_base;
+    uint32_t ctx_flags;
+    uint32_t ctx_cflags;
+    struct {
+        TranslationBlock *tb;
+        vaddr pc;
+    } array[TB_JMP_CACHE_SIZE];
 } CPUJumpCache;
 
 #define TB_JMP_SALT_STEP (1ull << 48)

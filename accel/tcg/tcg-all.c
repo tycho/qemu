@@ -273,6 +273,8 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #ifndef CONFIG_USER_ONLY
     tcg_jc_global = tcg_jcgen && tcg_ijmp_inline &&
                     tcg_cr3_flush == TCG_CR3_FLUSH_NONGLOBAL;
+#else
+    tcg_jc_ctx = tcg_jcgen && tcg_ijmp_inline;
 #endif
     page_init();
     tb_htable_init();
@@ -345,6 +347,7 @@ bool tcg_ijmp_inline;
 bool tcg_jcgen;
 bool tcg_jc_keep_pcrel;
 bool tcg_jc_global;
+bool tcg_jc_ctx;
 
 bool tcg_iolast;
 bool tcg_mmio_lockless;

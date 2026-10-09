@@ -28,6 +28,7 @@
 #include "accel/tcg/host-fp.h"
 #include "trace.h"
 #include "disas/disas.h"
+#include "exec/tb-flush.h"
 #include "exec/cpu-interrupt.h"
 #include "exec/page-protection.h"
 #include "exec/mmap-lock.h"
@@ -230,6 +231,13 @@ static inline bool tb_jmp_cache_key_match(CPUJumpCache *jc, vaddr key,
            (tcg_jc_global && key == (pc ^ qatomic_read(&jc->gsalt)));
 }
 
+/* tcg_jc_ctx: whether the jump cache holds TBs for state @s. */
+static inline bool tb_jmp_cache_ctx_match(CPUJumpCache *jc, TCGTBCPUState s)
+{
+    return jc->ctx_cs_base == s.cs_base && jc->ctx_flags == s.flags &&
+           jc->ctx_cflags == s.cflags;
+}
+
 /*
  * tcg_jcgen: whether the jump-cache entry for @tb at @pc may outlive a
  * flush of non-global translations: its code is on one page, which the
@@ -278,6 +286,23 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
                tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
         goto hit;
+    }
+
+    /*
+     * tcg_jc_ctx: entries are made only for the TB state of the current
+     * salt; in another state, move the salt on first.  The generated
+     * lookup runs in the state its TB was made for (the front end sends a
+     * TB that changes it to the helper), which is then the cache's.
+     */
+    if (tcg_jc_ctx && !tb_jmp_cache_ctx_match(jc, s)) {
+        /* A one-off state (a TB of a single insn, say) isn't cached. */
+        if (s.cflags & CF_COUNT_MASK) {
+            return tb_htable_lookup(cpu, s);
+        }
+        tcg_flush_jmp_cache(cpu);
+        jc->ctx_cs_base = s.cs_base;
+        jc->ctx_flags = s.flags;
+        jc->ctx_cflags = s.cflags;
     }
 
     tb = tb_htable_lookup(cpu, s);
@@ -1308,9 +1333,11 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                  */
                 h = tb_jmp_cache_hash_func(s.pc);
                 jc = cpu->tb_jmp_cache;
-                jc->array[h].pc = tb_jmp_cache_key(jc, s.pc,
-                                    tb_jmp_cache_global(cpu, tb, s.pc));
-                qatomic_set(&jc->array[h].tb, tb);
+                if (!tcg_jc_ctx || tb_jmp_cache_ctx_match(jc, s)) {
+                    jc->array[h].pc = tb_jmp_cache_key(jc, s.pc,
+                                        tb_jmp_cache_global(cpu, tb, s.pc));
+                    qatomic_set(&jc->array[h].tb, tb);
+                }
             }
 
 #ifndef CONFIG_USER_ONLY

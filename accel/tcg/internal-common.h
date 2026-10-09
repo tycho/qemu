@@ -68,6 +68,13 @@ extern unsigned tcg_tlb_grow;
  */
 extern bool tcg_jc_global;
 
+/*
+ * The jump cache holds only TBs for one TB state at a time
+ * (CPUJumpCache.ctx_*): set in user mode with tcg_jcgen and the inline
+ * lookup, whose generated code then compares only the key.
+ */
+extern bool tcg_jc_ctx;
+
 extern bool icount_align_option;
 
 /*
