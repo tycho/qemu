@@ -51,7 +51,7 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
     TCGv_i32 count = NULL;
     TCGOp *icount_start_insn = NULL;
 
-    if ((cflags & CF_USE_ICOUNT) || !(cflags & CF_NOIRQ)) {
+    if ((cflags & CF_USE_ICOUNT) || !(cflags & CF_NOIRQ || db->edge_checks)) {
         count = tcg_temp_new_i32();
         tcg_gen_ld_i32(count, tcg_env,
                        offsetof(CPUState, neg.icount_decr.u32) -
@@ -75,7 +75,7 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
      * should have ensured we don't run more instructions than the
      * budget.
      */
-    if (cflags & CF_NOIRQ) {
+    if ((cflags & CF_NOIRQ) || db->edge_checks) {
         tcg_ctx->exitreq_label = NULL;
     } else {
         tcg_ctx->exitreq_label = gen_new_label();
@@ -107,6 +107,22 @@ static void gen_tb_end(const TranslationBlock *tb, uint32_t cflags,
         gen_set_label(tcg_ctx->exitreq_label);
         tcg_gen_exit_tb(tb, TB_EXIT_REQUESTED);
     }
+}
+
+TCGLabel *translator_edge_check(DisasContextBase *db, vaddr dest)
+{
+    TCGLabel *exit;
+    TCGv_i32 count;
+
+    if (!db->edge_checks || dest > db->pc_first) {
+        return NULL;
+    }
+    exit = gen_new_label();
+    count = tcg_temp_new_i32();
+    tcg_gen_ld_i32(count, tcg_env,
+                   offsetof(CPUState, neg.icount_decr.u32) - sizeof(CPUState));
+    tcg_gen_brcondi_i32(TCG_COND_LT, count, 0, exit);
+    return exit;
 }
 
 bool translator_loop_back(DisasContextBase *db, vaddr dest)
@@ -205,6 +221,16 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     db->record_start = 0;
     db->record_len = 0;
     db->code_mmuidx = cpu_mmu_index(cpu, true);
+    /*
+     * In user mode, nothing needs an exit request seen sooner than a
+     * cycle of TBs takes: the checks go on the exits that may close one.
+     */
+#ifdef CONFIG_USER_ONLY
+    db->edge_checks = tcg_region && ops->edge_checks &&
+                      !(cflags & (CF_NOIRQ | CF_USE_ICOUNT));
+#else
+    db->edge_checks = false;
+#endif
 
     ops->init_disas_context(db, cpu);
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
@@ -224,7 +250,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
      * check.
      */
     db->loop_label = NULL;
-    if (tcg_region && !plugin_enabled && tcg_ctx->exitreq_label
+    if (tcg_region && !plugin_enabled
+        && (tcg_ctx->exitreq_label || db->edge_checks)
         && !(cflags & CF_USE_ICOUNT)) {
         db->loop_label = gen_new_label();
         db->loop_label->loop = true;
