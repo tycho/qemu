@@ -237,6 +237,7 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
     __attribute__((unused));
 
 TCGContext tcg_init_ctx;
+bool tcg_lean;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
@@ -1060,6 +1061,16 @@ typedef struct TCGOutOpQemuLdSt {
                 TCGReg addr, MemOpIdx oi);
 } TCGOutOpQemuLdSt;
 
+/*
+ * qemu_ld_x, qemu_st_x: the guest address is @base + (@index << shift), or
+ * @base + offset with @index the constant 0 (tcg_ldst_x_arg).
+ */
+typedef struct TCGOutOpQemuLdStX {
+    TCGOutOp base;
+    void (*out)(TCGContext *s, TCGType type, TCGReg data, TCGReg base,
+                TCGReg index, bool index_zero, TCGArg arg);
+} TCGOutOpQemuLdStX;
+
 typedef struct TCGOutOpQemuLdSt2 {
     TCGOutOp base;
     void (*out)(TCGContext *s, TCGType type, TCGReg dlo, TCGReg dhi,
@@ -1096,6 +1107,15 @@ typedef struct TCGOutOpSubtract {
 } TCGOutOpSubtract;
 
 #include "tcg-target.c.inc"
+
+#ifndef TCG_TARGET_HAS_LDST_X
+static const TCGOutOpQemuLdStX outop_qemu_ld_x = {
+    .base.static_constraint = C_NotImplemented,
+};
+static const TCGOutOpQemuLdStX outop_qemu_st_x = {
+    .base.static_constraint = C_NotImplemented,
+};
+#endif
 
 #ifndef CONFIG_TCG_INTERPRETER
 /* Validate CPUTLBDescFast placement. */
@@ -1207,6 +1227,8 @@ static const TCGOutOp * const all_outop[NB_OPS] = {
     OUTOP(INDEX_op_qemu_ld, TCGOutOpQemuLdSt, outop_qemu_ld),
     OUTOP(INDEX_op_qemu_ld2, TCGOutOpQemuLdSt2, outop_qemu_ld2),
     OUTOP(INDEX_op_qemu_st, TCGOutOpQemuLdSt, outop_qemu_st),
+    OUTOP(INDEX_op_qemu_ld_x, TCGOutOpQemuLdStX, outop_qemu_ld_x),
+    OUTOP(INDEX_op_qemu_st_x, TCGOutOpQemuLdStX, outop_qemu_st_x),
     OUTOP(INDEX_op_qemu_st2, TCGOutOpQemuLdSt2, outop_qemu_st2),
     OUTOP(INDEX_op_rems, TCGOutOpBinary, outop_rems),
     OUTOP(INDEX_op_remu, TCGOutOpBinary, outop_remu),
@@ -2369,6 +2391,11 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         tcg_debug_assert(type == TCG_TYPE_I128);
         goto do_lookup;
 
+    case INDEX_op_qemu_ld_x:
+    case INDEX_op_qemu_st_x:
+        tcg_debug_assert(type <= TCG_TYPE_REG);
+        goto do_lookup;
+
     case INDEX_op_add:
     case INDEX_op_and:
     case INDEX_op_brcond:
@@ -2929,9 +2956,12 @@ void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs)
             case INDEX_op_qemu_st:
             case INDEX_op_qemu_ld2:
             case INDEX_op_qemu_st2:
+            case INDEX_op_qemu_ld_x:
+            case INDEX_op_qemu_st_x:
                 {
                     const char *s_al, *s_tlb, *s_op, *s_at;
-                    MemOpIdx oi = op->args[k++];
+                    TCGArg xarg = op->args[k];
+                    MemOpIdx oi = (MemOpIdx)op->args[k++];
                     MemOp mop = get_memop(oi);
                     unsigned ix = get_mmuidx(oi);
 
@@ -2949,6 +2979,17 @@ void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs)
                     } else {
                         mop = get_memop(oi);
                         col += ne_fprintf(f, ",$0x%x,%u", mop, ix);
+                    }
+                    if (c == INDEX_op_qemu_ld_x || c == INDEX_op_qemu_st_x) {
+                        unsigned xs = tcg_ldst_x_shift(xarg);
+
+                        if (xs == TCG_LDST_X_SCALED) {
+                            col += ne_fprintf(f, ",ofs %d*size",
+                                              tcg_ldst_x_ofs(xarg));
+                        } else {
+                            col += ne_fprintf(f, ",lsl %u,ofs %d", xs,
+                                              tcg_ldst_x_ofs(xarg));
+                        }
                     }
                     i = 1;
                 }
@@ -5731,6 +5772,17 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         }
         break;
 
+    case INDEX_op_qemu_ld_x:
+    case INDEX_op_qemu_st_x:
+        {
+            const TCGOutOpQemuLdStX *out =
+                container_of(all_outop[op->opc], TCGOutOpQemuLdStX, base);
+
+            out->out(s, type, new_args[0], new_args[1], new_args[2],
+                     const_args[2], new_args[3]);
+        }
+        break;
+
     case INDEX_op_qemu_ld2:
     case INDEX_op_qemu_st2:
         {
@@ -6573,6 +6625,205 @@ static void tcg_out_st_helper_args(TCGContext *s, const TCGLabelQemuLdst *ldst,
     tcg_out_helper_load_common_args(s, ldst, parm, info, next_arg);
 }
 
+#ifdef TCG_TARGET_HAS_LDST_X
+/* Whether @op names @t among its arguments (inputs or outputs). */
+static bool op_uses_temp(const TCGOp *op, const TCGTemp *t)
+{
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+    int n = def->nb_oargs + def->nb_iargs;
+
+    if (op->opc == INDEX_op_call) {
+        return true;
+    }
+    for (int i = 0; i < n; i++) {
+        if (arg_temp(op->args[i]) == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * The op of kind @opc, at most a few ops before @op, that writes @t.  The
+ * ops between must neither use @t nor @a, @b (the values it is computed
+ * from, which then reach @op unchanged and unread), nor have side effects.
+ */
+static TCGOp *ldst_fold_def(TCGContext *s, TCGOp *op, TCGTemp *t,
+                            TCGOpcode opc)
+{
+    TCGOp *prev = op;
+
+    for (int n = 0; n < 4; n++) {
+        TCGTemp *a, *b;
+        const TCGOpDef *def;
+
+        prev = QTAILQ_PREV(prev, link);
+        if (!prev) {
+            return NULL;
+        }
+        if (prev->opc == opc && TCGOP_TYPE(prev) == TCG_TYPE_I64 &&
+            arg_temp(prev->args[0]) == t) {
+            a = arg_temp(prev->args[1]);
+            b = arg_temp(prev->args[2]);
+            for (TCGOp *mid = QTAILQ_NEXT(prev, link); mid != op;
+                 mid = QTAILQ_NEXT(mid, link)) {
+                if (op_uses_temp(mid, a) || op_uses_temp(mid, b)) {
+                    return NULL;
+                }
+            }
+            return prev;
+        }
+        def = &tcg_op_defs[prev->opc];
+        if (prev->opc == INDEX_op_insn_start || prev->opc == INDEX_op_call ||
+            (def->flags & (TCG_OPF_BB_END | TCG_OPF_SIDE_EFFECTS |
+                           TCG_OPF_CALL_CLOBBER)) ||
+            op_uses_temp(prev, t)) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+/* Arg @i of @from was dead there: so it is at arg @j of @to. */
+static void ldst_fold_life(TCGOp *to, int j, const TCGOp *from, int i)
+{
+    if (from->life & (DEAD_ARG << i)) {
+        to->life |= DEAD_ARG << j;
+    }
+}
+
+/*
+ * Remove @op, folded into a guest access.  Where its constant arg @ci
+ * died, it still dies there: the register allocator may hold it in a
+ * register, which it must give up before the next label.
+ */
+static void ldst_fold_remove(TCGContext *s, TCGOp *op, int ci)
+{
+    if (arg_temp(op->args[ci])->kind == TEMP_CONST &&
+        (op->life & (DEAD_ARG << ci))) {
+        TCGOp *d = tcg_op_insert_before(s, op, INDEX_op_discard,
+                                        TCGOP_TYPE(op), 1);
+
+        d->args[0] = op->args[ci];
+    }
+    tcg_op_remove(s, op);
+}
+
+#endif
+
+#ifdef TCG_TARGET_HAS_LDST_X
+/*
+ * x-lean: fold the address computation of a guest access into the access
+ * where the host can address base + (index << shift) or base + offset
+ * (qemu_ld_x, qemu_st_x).  Runs after liveness: the address temp must
+ * die at the access, and the ops that compute it come shortly before it,
+ * so that their inputs' liveness carries over to the access.
+ */
+static void ldst_fold_pass(TCGContext *s)
+{
+    TCGOp *op, *next;
+
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        bool is_ld = op->opc == INDEX_op_qemu_ld;
+        const int ai = 1;   /* the address, for loads and stores */
+        TCGOp *add, *shl;
+        TCGTemp *t, *base, *index;
+        MemOpIdx oi;
+        MemOp mop;
+        unsigned shift = 0;
+        int ofs = 0;
+        TCGOp *x;
+
+        if ((op->opc != INDEX_op_qemu_ld && op->opc != INDEX_op_qemu_st) ||
+            TCGOP_TYPE(op) > TCG_TYPE_REG) {
+            continue;
+        }
+        oi = op->args[2];
+        mop = get_memop(oi);
+        t = arg_temp(op->args[ai]);
+        if (memop_alignment_bits(mop) ||
+            (t->kind != TEMP_EBB && t->kind != TEMP_TB) ||
+            !(op->life & (DEAD_ARG << ai))) {
+            continue;
+        }
+        add = ldst_fold_def(s, op, t, INDEX_op_add);
+        if (!add) {
+            continue;
+        }
+        base = arg_temp(add->args[1]);
+        index = arg_temp(add->args[2]);
+        shl = NULL;
+        if (index->kind == TEMP_CONST) {
+            int64_t v = index->val;
+
+            if (base->kind == TEMP_CONST) {
+                continue;
+            }
+            if (v >= -256 && v <= 255) {
+                ofs = v;
+            } else if (v > 0 &&
+                       !(v & ((1 << (mop & MO_SIZE)) - 1)) &&
+                       (v >> (mop & MO_SIZE)) <= 0xfff) {
+                /* A plain access: LDR/STR's scaled 12-bit offset. */
+                ofs = v >> (mop & MO_SIZE);
+                shift = TCG_LDST_X_SCALED;
+            } else {
+                continue;
+            }
+        } else {
+            if (base == t) {
+                /* add t, t, b with t = shl i, k right before. */
+                shl = ldst_fold_def(s, add, t, INDEX_op_shl);
+                if (!shl || arg_temp(shl->args[2])->kind != TEMP_CONST) {
+                    continue;
+                }
+                shift = arg_temp(shl->args[2])->val;
+                if (shift != 0 && shift != (mop & MO_SIZE)) {
+                    continue;
+                }
+                base = index;
+                index = arg_temp(shl->args[1]);
+            }
+            if (base->kind == TEMP_CONST || index->kind == TEMP_CONST ||
+                base == t || index == t) {
+                continue;
+            }
+        }
+
+        x = tcg_op_insert_before(s, op, is_ld ? INDEX_op_qemu_ld_x
+                                              : INDEX_op_qemu_st_x,
+                                 TCGOP_TYPE(op), 4);
+        x->args[0] = op->args[0];
+        x->args[1] = temp_arg(base);
+        x->args[2] = temp_arg(index->kind == TEMP_CONST
+                              ? tcg_constant_internal(TCG_TYPE_I64, 0)
+                              : index);
+        x->args[3] = tcg_ldst_x_arg(oi, shift, ofs);
+        x->life = op->life & (is_ld ? (DEAD_ARG | SYNC_ARG) : DEAD_ARG);
+        x->output_pref[0] = op->output_pref[0];
+        if (shl) {
+            ldst_fold_life(x, 1, add, 2);
+            ldst_fold_life(x, 2, shl, 1);
+        } else {
+            ldst_fold_life(x, 1, add, 1);
+            if (index->kind != TEMP_CONST) {
+                ldst_fold_life(x, 2, add, 2);
+            }
+        }
+        if (!is_ld) {
+            /* The stored value is arg 0 of a store. */
+            ldst_fold_life(x, 0, op, 0);
+        }
+        tcg_op_remove(s, op);
+        ldst_fold_remove(s, add, 2);
+        if (shl) {
+            ldst_fold_remove(s, shl, 2);
+        }
+    }
+}
+
+#endif
+
 int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 {
     int i, num_insns;
@@ -6612,6 +6863,12 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     tcg_optimize(s);
 
     reachable_code_pass(s);
+#ifdef TCG_TARGET_HAS_LDST_X
+    /* ldst_fold_pass's zero index: no temp is made after liveness. */
+    if (tcg_lean) {
+        tcg_constant_internal(TCG_TYPE_I64, 0);
+    }
+#endif
     liveness_pass_0(s);
     liveness_pass_1(s);
 
@@ -6633,6 +6890,12 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             liveness_pass_1(s);
         }
     }
+
+#ifdef TCG_TARGET_HAS_LDST_X
+    if (tcg_lean && s->addr_type == TCG_TYPE_I64 && tcg_target_ldst_x_ok()) {
+        ldst_fold_pass(s);
+    }
+#endif
 
     if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)
                  && qemu_log_in_addr_range(pc_start))) {
