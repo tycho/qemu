@@ -1935,6 +1935,7 @@ void tcg_prologue_init(void)
 
 void tcg_func_start(TCGContext *s)
 {
+    s->chain_dead_used = false;
     tcg_pool_reset(s);
     s->nb_temps = s->nb_globals;
 
@@ -2325,6 +2326,7 @@ TCGTemp *tcgv_i32_temp(TCGv_i32 v)
  * Test the runtime variable that controls each opcode.
  */
 bool tcg_flags_guess;
+bool tcg_flags_dead;
 bool tcg_lazy_incdec;
 
 bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
@@ -3734,6 +3736,92 @@ static void la_bb_end(TCGContext *s, int ng, int nt)
 }
 
 /* liveness analysis: sync globals back to memory.  */
+void tcg_chain_dead_add(TCGTemp *ts)
+{
+    tcg_debug_assert(tcg_ctx->nb_chain_dead < ARRAY_SIZE(tcg_ctx->chain_dead));
+    tcg_ctx->chain_dead[tcg_ctx->nb_chain_dead++] = ts;
+    ts->chain_dead = tcg_ctx->nb_chain_dead;
+}
+
+static int temp_chain_dead_index(TCGContext *s, TCGTemp *ts)
+{
+    return (int)ts->chain_dead - 1;
+}
+
+bool tcg_chain_dead_read_since(TCGOp *after)
+{
+    TCGContext *s = tcg_ctx;
+    TCGOp *op = after ? QTAILQ_NEXT(after, link) : QTAILQ_FIRST(&s->ops);
+    unsigned written = 0;
+
+    for (; op; op = QTAILQ_NEXT(op, link)) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        int nb_o, nb_i, k;
+
+        /*
+         * A label only joins paths: every path from the TB's start to
+         * here falls through the ops before it.
+         */
+        if (op->opc == INDEX_op_insn_start || op->opc == INDEX_op_set_label) {
+            continue;
+        }
+        if (op->opc == INDEX_op_discard) {
+            k = temp_chain_dead_index(s, arg_temp(op->args[0]));
+            written |= k >= 0 ? 1u << k : 0;
+            continue;
+        }
+        if (def->flags & (TCG_OPF_BB_END | TCG_OPF_BB_EXIT)) {
+            return true;
+        }
+        if (op->opc == INDEX_op_call) {
+            if (!(tcg_call_flags(op) & TCG_CALL_NO_READ_GLOBALS)) {
+                return true;
+            }
+            nb_o = TCGOP_CALLO(op);
+            nb_i = TCGOP_CALLI(op);
+        } else {
+            nb_o = def->nb_oargs;
+            nb_i = def->nb_iargs;
+        }
+        for (int i = nb_o; i < nb_o + nb_i; i++) {
+            TCGTemp *ts = arg_temp(op->args[i]);
+
+            k = ts ? temp_chain_dead_index(s, ts) : -1;
+            if (k >= 0 && !(written & (1u << k))) {
+                return true;
+            }
+        }
+        for (int i = 0; i < nb_o; i++) {
+            k = temp_chain_dead_index(s, arg_temp(op->args[i]));
+            written |= k >= 0 ? 1u << k : 0;
+        }
+    }
+    return false;
+}
+
+/*
+ * liveness analysis: goto_tb_dead.  It may leave the TB: the other
+ * globals are synced as at a conditional branch; the chain-dead ones
+ * need not be in memory here, and their values stay live for the exit
+ * after it, which stores them (tcg_reg_alloc_chain_store).
+ */
+static void la_chain_dead(TCGContext *s, int ng)
+{
+    for (int i = 0; i < ng; i++) {
+        TCGTemp *ts = &s->temps[i];
+        int state = ts->state;
+
+        if (temp_chain_dead_index(s, ts) >= 0) {
+            ts->state = 0;
+        } else {
+            ts->state = state | TS_MEM;
+            if (state == TS_DEAD) {
+                la_reset_pref(ts);
+            }
+        }
+    }
+}
+
 static void la_global_sync(TCGContext *s, int ng)
 {
     int i;
@@ -4036,6 +4124,10 @@ liveness_pass_1(TCGContext *s)
             break;
         case INDEX_op_insn_start:
             assert_carry_dead(s);
+            break;
+        case INDEX_op_goto_tb_dead:
+            assert_carry_dead(s);
+            la_chain_dead(s, nb_globals);
             break;
         case INDEX_op_discard:
             /* mark the temporary as dead */
@@ -4636,6 +4728,23 @@ static void temp_sync(TCGContext *s, TCGTemp *ts, TCGRegSet allocated_regs,
     }
     if (free_or_dead) {
         temp_free_or_dead(s, ts, free_or_dead);
+    }
+}
+
+/*
+ * At goto_tb_dead (@dead false): store the globals other than the
+ * chain-dead ones; at the exits after it (@dead true): the chain-dead ones.
+ */
+static void tcg_reg_alloc_chain_store(TCGContext *s, bool dead)
+{
+    for (int i = 0; i < s->nb_globals; i++) {
+        TCGTemp *ts = &s->temps[i];
+
+        if (ts->kind == TEMP_GLOBAL && !ts->mem_coherent &&
+            !temp_readonly(ts) &&
+            (temp_chain_dead_index(s, ts) >= 0) == dead) {
+            temp_sync(s, ts, s->reserved_regs, 0, 0);
+        }
     }
 }
 
@@ -6653,6 +6762,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     tb->jmp_reset_offset[1] = TB_JMP_OFFSET_INVALID;
     tb->jmp_insn_offset[0] = TB_JMP_OFFSET_INVALID;
     tb->jmp_insn_offset[1] = TB_JMP_OFFSET_INVALID;
+    memset(tb->jmp_dead, 0, sizeof(tb->jmp_dead));
 
     tcg_reg_alloc_start(s);
 
@@ -6727,9 +6837,20 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             tcg_reg_alloc_call(s, op);
             break;
         case INDEX_op_exit_tb:
+            if (s->chain_dead_used) {
+                tcg_reg_alloc_chain_store(s, true);
+            }
             tcg_out_exit_tb(s, op->args[0]);
             break;
         case INDEX_op_goto_tb:
+            if (s->chain_dead_used) {
+                tcg_reg_alloc_chain_store(s, true);
+            }
+            tcg_out_goto_tb(s, op->args[0]);
+            break;
+        case INDEX_op_goto_tb_dead:
+            tcg_reg_alloc_chain_store(s, false);
+            s->gen_tb->jmp_dead[op->args[1]] = op->args[0] + 1;
             tcg_out_goto_tb(s, op->args[0]);
             break;
         case INDEX_op_br:

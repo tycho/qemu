@@ -279,6 +279,8 @@ typedef struct TCGTemp {
     unsigned int mem_allocated:1;
     unsigned int temp_allocated:1;
     unsigned int temp_subindex:2;
+    /* 1 + its index in TCGContext.chain_dead, or 0 (tcg_chain_dead_add). */
+    unsigned int chain_dead:4;
 
     int64_t val;
     struct TCGTemp *mem_base;
@@ -389,6 +391,10 @@ struct TCGContext {
     struct TCGLabelPoolData *pool_labels;
 
     TCGLabel *exitreq_label;
+    /* The chain-dead globals (tcg_chain_dead_add); used by this TB. */
+    TCGTemp *chain_dead[8];
+    int nb_chain_dead;
+    bool chain_dead_used;
 
 #ifdef CONFIG_PLUGIN
     /*
