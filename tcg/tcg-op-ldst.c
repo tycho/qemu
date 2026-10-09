@@ -171,6 +171,18 @@ static MemOp tcg_gen_ldst_order(TCGBar type)
     return 0;
 }
 
+/*
+ * x-tso-vec=group: a guest load promoted for crossing 16 bytes
+ * (MO_ACQ_REL_CROSS) is unaligned in practice, which the guest doesn't
+ * make atomic: like a wide access that isn't atomic as a whole, it joins
+ * the run of grouped accesses (tcg_tso_grouped) as a plain load, ordered
+ * where the run ends.
+ */
+static bool tcg_tso_ld_grouped(MemOp order)
+{
+    return tcg_tso_vec_group && (order & MO_ACQ_REL_CROSS);
+}
+
 static TCGTemp *tci_extend_addr(TCGTemp *addr)
 {
 #ifdef CONFIG_TCG_INTERPRETER
@@ -293,8 +305,13 @@ static void tcg_gen_qemu_ld_i32_int(TCGv_i32 val, TCGTemp *addr,
     MemOpIdx orig_oi, oi;
     TCGv_i64 copy_addr;
     TCGTemp *addr_new;
+    bool group;
 
     order = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
+    group = tcg_tso_ld_grouped(order);
+    if (group) {
+        order = 0;
+    }
     orig_memop = memop = tcg_canonicalize_memop(memop, 0, 0);
     orig_oi = make_memop_idx(memop, idx);
     memop |= order;
@@ -311,7 +328,14 @@ static void tcg_gen_qemu_ld_i32_int(TCGv_i32 val, TCGTemp *addr,
 
     addr_new = tci_extend_addr(addr);
     copy_addr = plugin_maybe_preserve_addr(addr);
+    if (group) {
+        tcg_ctx->tso_run_emit = true;
+    }
     gen_ldst1(INDEX_op_qemu_ld, TCG_TYPE_I32, tcgv_i32_temp(val), addr_new, oi);
+    if (group) {
+        tcg_ctx->tso_run_emit = false;
+        tcg_ctx->tso_run_ld = true;
+    }
 
     if ((orig_memop ^ memop) & MO_BSWAP) {
         switch (orig_memop & MO_SIZE) {
@@ -397,8 +421,13 @@ static void tcg_gen_qemu_ld_i64_int(TCGv_i64 val, TCGTemp *addr,
     MemOpIdx orig_oi, oi;
     TCGv_i64 copy_addr;
     TCGTemp *addr_new;
+    bool group;
 
     order = tcg_gen_ldst_order(TCG_MO_LD_LD | TCG_MO_ST_LD);
+    group = tcg_tso_ld_grouped(order);
+    if (group) {
+        order = 0;
+    }
     orig_memop = memop = tcg_canonicalize_memop(memop, 1, 0);
     orig_oi = make_memop_idx(memop, idx);
     memop |= order;
@@ -415,7 +444,14 @@ static void tcg_gen_qemu_ld_i64_int(TCGv_i64 val, TCGTemp *addr,
 
     addr_new = tci_extend_addr(addr);
     copy_addr = plugin_maybe_preserve_addr(addr);
+    if (group) {
+        tcg_ctx->tso_run_emit = true;
+    }
     gen_ld_i64(val, addr_new, oi);
+    if (group) {
+        tcg_ctx->tso_run_emit = false;
+        tcg_ctx->tso_run_ld = true;
+    }
 
     if ((orig_memop ^ memop) & MO_BSWAP) {
         int flags = (orig_memop & MO_SIGN
