@@ -471,15 +471,21 @@ static void tcg_set_tso_stack(Object *obj, bool value, Error **errp)
 
 static char *tcg_get_tso_vec(Object *obj, Error **errp)
 {
-    return g_strdup(tcg_tso_vec_group ? "group" : "strict");
+    return g_strdup(tcg_tso_vec_none ? "none" :
+                    tcg_tso_vec_group ? "group" : "strict");
 }
 
 static void tcg_set_tso_vec(Object *obj, const char *value, Error **errp)
 {
     if (!strcmp(value, "strict")) {
         tcg_tso_vec_group = false;
+        tcg_tso_vec_none = false;
     } else if (!strcmp(value, "group")) {
         tcg_tso_vec_group = true;
+        tcg_tso_vec_none = false;
+    } else if (!strcmp(value, "none")) {
+        tcg_tso_vec_group = true;
+        tcg_tso_vec_none = true;
     } else {
         error_setg(errp, "Invalid 'x-tso-vec' value: %s", value);
     }
@@ -777,7 +783,9 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-tso-vec",
         "Guest accesses wider than 8 bytes the guest doesn't make atomic: "
         "strict (each ordered, default), group (with x-tso=acqrel, "
-        "barriers only where a run of them begins and ends: not exact)");
+        "barriers only where a run of them begins and ends: not exact), "
+        "none (as group, and accesses to and from vector and "
+        "floating-point registers unordered unless atomic: not exact)");
 
     object_class_property_add_bool(oc, "x-tso-stack",
                                    tcg_get_tso_stack, tcg_set_tso_stack);

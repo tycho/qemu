@@ -2219,7 +2219,12 @@ static TCGLabelQemuLdst *tcg_out_acqrel_check(TCGContext *s, MemOpIdx oi,
     unsigned s_bits = memop & MO_SIZE;
     TCGLabelQemuLdst *lb;
 
-    if (!acqrel_may_cross(memop) || acqrel_onepath(memop)) {
+    /*
+     * With tcg_tso_cross_faults, the crossing access faults instead and the
+     * fault handler promotes it (tcg_target_insn_is_acqrel_ldst).
+     */
+    if (!acqrel_may_cross(memop) || acqrel_onepath(memop) ||
+        tcg_tso_cross_faults) {
         return NULL;
     }
     tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I32, TCG_REG_TMP0,
@@ -2236,6 +2241,19 @@ static TCGLabelQemuLdst *tcg_out_acqrel_check(TCGContext *s, MemOpIdx oi,
     lb->label_ptr[0] = s->code_ptr;
     tcg_out_insn(s, bcond_imm, B_C, TCG_COND_GTU, 0);
     return lb;
+}
+
+/*
+ * The insns an MO_ACQ_REL access of more than a byte is emitted as, which
+ * raise an alignment fault when the access crosses 16 bytes: LDAPR and
+ * STLR, and LDAPUR, LDAPURS and STLUR (any size).
+ */
+#define TCG_TARGET_ACQREL_LDST_INSN
+static bool tcg_target_insn_is_acqrel_ldst(uint32_t insn)
+{
+    return (insn & 0x3ffffc00) == 0x38bfc000 ||     /* LDAPR */
+           (insn & 0x3ffffc00) == 0x089ffc00 ||     /* STLR */
+           (insn & 0x3f200c00) == 0x19000000;       /* LDAPUR*, STLUR */
 }
 
 /* Form the host address in one register, for insns without indexing. */

@@ -522,6 +522,15 @@ struct TCGContext {
      * gives such accesses no memory-order constraint.
      */
     bool ldst_private;
+    /*
+     * The guest accesses being generated move data to or from the guest's
+     * vector or floating-point registers.  Set by the front end, cleared at
+     * the start of each insn; with x-tso-vec=none they get no memory-order
+     * constraint unless atomic as a whole.
+     */
+    bool ldst_vector;
+    /* The guest access being generated gets no memory-order constraint. */
+    bool ldst_unordered;
 
     /* Exit to translator on overflow. */
     sigjmp_buf jmp_trans;

@@ -58,6 +58,14 @@ extern TCGTsoMode tcg_tso_mode;
 extern bool tcg_tso_vec_group;
 
 /*
+ * x-tso-vec=none: guest accesses the front end marks as moving vector or
+ * floating-point register data (TCGContext.ldst_vector) get no
+ * memory-order constraint, unless the guest makes them atomic as a whole.
+ * Implies tcg_tso_vec_group for the remaining wide accesses.
+ */
+extern bool tcg_tso_vec_none;
+
+/*
  * In qemu-user, guest accesses the front end marks as thread-private
  * (TCGContext.ldst_private: x86 RSP-based and implicit stack accesses)
  * get no memory-order constraint (accel property x-tso-stack).
@@ -75,6 +83,15 @@ extern bool tcg_tso_stack;
  */
 bool tcg_tso_cross_count(uint64_t pc);
 bool tcg_tso_cross_promoted(uint64_t pc);
+
+/*
+ * User mode: the host's alignment-fault handler deals with MO_ACQ_REL
+ * accesses that cross 16 bytes (LDAPR and STLR fault on them), so the
+ * backend emits no inline check.  tcg_insn_is_acqrel_ldst tells whether
+ * the generated insn at host address @pc is such an access.
+ */
+extern bool tcg_tso_cross_faults;
+bool tcg_insn_is_acqrel_ldst(uintptr_t pc);
 
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);

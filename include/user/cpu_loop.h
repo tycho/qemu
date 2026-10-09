@@ -47,6 +47,22 @@ bool handle_sigsegv_accerr_write(CPUState *cpu, sigset_t *old_set,
                                  uintptr_t host_pc, vaddr guest_addr);
 
 /**
+ * tcg_tso_cross_fault: handle an alignment fault in generated code
+ * @cpu: the cpu context
+ * @fault_pc: the host pc of the faulting insn
+ * @host_pc: the host pc, adjusted for the signal
+ *
+ * With tcg_tso_cross_faults, an MO_ACQ_REL guest access that crosses a
+ * 16-byte boundary faults (LDAPR, STLR) instead of being checked inline.
+ * If the insn at @fault_pc is such an access, promote its guest insn,
+ * invalidate its TB and leave the cpu state at the start of the guest insn.
+ *
+ * Return true if the fault has been handled, and the guest insn should be
+ * executed again (cpu_loop_exit_noexc).
+ */
+bool tcg_tso_cross_fault(CPUState *cpu, uintptr_t fault_pc, uintptr_t host_pc);
+
+/**
  * tb_lazysync_unwind:
  * @host_pc: the host pc of a signal in generated code
  * @regs: the host registers at the signal, indexed by TCGReg, each as

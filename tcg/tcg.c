@@ -260,6 +260,7 @@ bool tcg_iopl_runtime;
 TCGTsoMode tcg_tso_mode;
 bool tcg_tso_stack;
 bool tcg_tso_vec_group;
+bool tcg_tso_vec_none;
 
 /*
  * A guest insn is promoted (see tcg_tso_cross_count) once its MO_ACQ_REL
@@ -290,6 +291,8 @@ bool tcg_tso_cross_count(uint64_t pc)
     qemu_mutex_unlock(&tso_cross_lock);
     return n >= TSO_PROMOTE_THRESHOLD;
 }
+
+bool tcg_tso_cross_faults;
 
 bool tcg_tso_cross_promoted(uint64_t pc)
 {
@@ -1215,6 +1218,15 @@ static void tcg_out_pinned_st(TCGContext *s);
 static void tcg_out_pinned_ld(TCGContext *s);
 
 #include "tcg-target.c.inc"
+
+bool tcg_insn_is_acqrel_ldst(uintptr_t pc)
+{
+#ifdef TCG_TARGET_ACQREL_LDST_INSN
+    return tcg_target_insn_is_acqrel_ldst(*(const uint32_t *)pc);
+#else
+    return false;
+#endif
+}
 
 #ifndef TCG_TARGET_NB_PIN_REGS
 #define TCG_TARGET_NB_PIN_REGS 0
@@ -3888,7 +3900,8 @@ TCGOp *tcg_emit_op(TCGOpcode opc, unsigned nargs)
      * guest memory otherwise, call out or leave the straight-line code.
      */
     if (unlikely(tcg_ctx->tso_run_ld || tcg_ctx->tso_run_st) &&
-        !tcg_ctx->tso_run_emit && !tcg_ctx->emit_before_op &&
+        !tcg_ctx->tso_run_emit && !tcg_ctx->ldst_unordered &&
+        !tcg_ctx->emit_before_op &&
         opc != INDEX_op_mb &&
         (tcg_op_defs[opc].flags &
          (TCG_OPF_BB_END | TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS))) {

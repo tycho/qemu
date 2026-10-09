@@ -809,6 +809,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
          */
         tcg_ctx->insn_pc = db->pc_next;
         tcg_ctx->ldst_private = false;
+        tcg_ctx->ldst_vector = false;
         tcg_ctx->gen_insn_pc[db->num_insns - 1] = db->pc_next;
         ops->translate_insn(db, cpu);
 
