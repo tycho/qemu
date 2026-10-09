@@ -62,6 +62,27 @@ void tcg_prologue_init(void);
 extern bool tcg_tbpack;
 
 /*
+ * tcg_retstack: guest calls and returns through a return stack in host
+ * code (tcg_gen_push_ret).  The front end sets tcg_retsp_off, the offset
+ * in env where the stack's top is kept outside generated code, and
+ * tcg_retstack_addr64 if all its guest addresses are 64-bit; the backend
+ * sets tcg_retstack_reg, the host register that holds the top in
+ * generated code, if it has one to spare, else -1.
+ */
+extern bool tcg_retstack;
+extern intptr_t tcg_retsp_off;
+extern int tcg_retstack_reg;
+extern bool tcg_retstack_addr64;
+#define TCG_RETSTACK_SIZE (16 * 1024)
+void tcg_retstack_reset(CPUState *cpu);
+/*
+ * A fault at @addr in generated code: if it is on a guard page of @cpu's
+ * return stack (pushed or popped past an end), the top to retry with,
+ * else 0.
+ */
+uintptr_t tcg_retstack_fault(CPUState *cpu, uintptr_t addr);
+
+/*
  * tcg_tb_flags_canon: targets leave out of a TB's flags the state that
  * can't change its code in the current mode, so one TB serves them all
  * (x86: SS.B in 64-bit code).

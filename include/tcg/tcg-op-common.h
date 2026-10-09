@@ -74,6 +74,28 @@ void tcg_gen_exit_tb(const TranslationBlock *tb, unsigned idx);
  */
 void tcg_gen_goto_tb(unsigned idx);
 
+/*
+ * A return stack in host code (tcg_retstack_reg): a ring of pairs of a
+ * guest return address (@key) and the host code that continues there,
+ * whose top the backend keeps in a register.
+ *
+ * tcg_gen_push_ret() - push @key with the host address of label @ret,
+ *   which the caller sets where execution continues after the call
+ *   returns (with the guest state of that return, as at a TB entry).
+ *   With @call, the goto_ptr ops until tcg_gen_push_ret_done() leave by
+ *   a host call, the first followed by @ret, all leading to @call.
+ * tcg_gen_call_tb() - leave the TB through goto_tb slot @idx by a host
+ *   call, so that the host predicts the return to the next op; @reset is
+ *   where the slot leads while unlinked (the code that leaves to the main
+ *   loop), set by the caller after the code at the return.
+ * tcg_gen_ret_tb() - pop the top pair; if its key is @key, return to its
+ *   host code, else continue.
+ */
+void tcg_gen_push_ret(TCGv_i64 key, TCGLabel *ret, TCGLabel *call);
+void tcg_gen_push_ret_done(void);
+void tcg_gen_call_tb(unsigned idx, TCGLabel *reset);
+void tcg_gen_ret_tb(TCGv_i64 key);
+
 /**
  * tcg_gen_lookup_and_goto_ptr() - look up the current TB, jump to it if valid
  * @addr: Guest address of the target TB

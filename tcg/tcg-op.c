@@ -2715,6 +2715,46 @@ void tcg_gen_goto_tb(unsigned idx)
     tcg_gen_op1i(INDEX_op_goto_tb, 0, idx);
 }
 
+void tcg_gen_push_ret(TCGv_i64 key, TCGLabel *ret, TCGLabel *call)
+{
+    TCGOp *op = tcg_gen_op2(INDEX_op_push_ret, TCG_TYPE_I64,
+                            tcgv_i64_arg(key), label_arg(ret));
+
+    add_as_label_use(ret, op);
+    tcg_ctx->call_ret = ret;
+    tcg_ctx->call_land = call;
+    tcg_ctx->call_ret_set = false;
+}
+
+void tcg_gen_push_ret_done(void)
+{
+    if (tcg_ctx->call_land && !tcg_ctx->call_ret_set) {
+        gen_set_label(tcg_ctx->call_ret);
+    }
+    tcg_ctx->call_land = NULL;
+}
+
+void tcg_gen_call_tb(unsigned idx, TCGLabel *reset)
+{
+    TCGOp *op;
+
+    tcg_debug_assert(!(tcg_ctx->gen_tb->cflags & CF_NO_GOTO_TB));
+    tcg_debug_assert(idx <= TB_EXIT_IDXMAX && idx != TB_EXIT_REQUESTED);
+#ifdef CONFIG_DEBUG_TCG
+    tcg_debug_assert((tcg_ctx->goto_tb_issue_mask & (1 << idx)) == 0);
+    tcg_ctx->goto_tb_issue_mask |= 1 << idx;
+#endif
+    plugin_gen_disable_mem_helpers();
+    op = tcg_gen_op2(INDEX_op_call_tb, 0, idx, label_arg(reset));
+    add_as_label_use(reset, op);
+}
+
+void tcg_gen_ret_tb(TCGv_i64 key)
+{
+    plugin_gen_disable_mem_helpers();
+    tcg_gen_op1(INDEX_op_ret_tb, TCG_TYPE_I64, tcgv_i64_arg(key));
+}
+
 void tcg_gen_lookup_and_goto_ptr(void)
 {
     TCGv_ptr ptr;
@@ -2747,5 +2787,15 @@ void tcg_gen_lookup_jc_and_goto_ptr(TCGv_i64 pc, uint64_t cs_base,
 
 void tcg_gen_goto_ptr(TCGv_ptr ptr)
 {
+    /* After tcg_gen_push_ret() for a call: leave by a host call. */
+    if (tcg_ctx->call_land) {
+        tcg_gen_op1i(INDEX_op_call_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
+        if (!tcg_ctx->call_ret_set) {
+            gen_set_label(tcg_ctx->call_ret);
+            tcg_ctx->call_ret_set = true;
+        }
+        tcg_gen_br(tcg_ctx->call_land);
+        return;
+    }
     tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
 }

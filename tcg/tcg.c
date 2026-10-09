@@ -238,6 +238,10 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 
 TCGContext tcg_init_ctx;
 bool tcg_tbpack;
+bool tcg_retstack;
+intptr_t tcg_retsp_off;
+int tcg_retstack_reg = -1;
+bool tcg_retstack_addr64;
 bool tcg_tb_flags_canon;
 __thread TCGContext *tcg_ctx;
 
@@ -1145,6 +1149,16 @@ static const TCGOutOp outop_goto_ptr = {
     .static_constraint = C_O0_I1(r),
 };
 
+#ifdef TCG_TARGET_HAS_RETSTACK
+static const TCGOutOp outop_retstack = {
+    .static_constraint = C_O0_I1(r),
+};
+#else
+static const TCGOutOp outop_retstack = {
+    .static_constraint = C_NotImplemented,
+};
+#endif
+
 static const TCGOutOpLoad outop_ld = {
     .base.static_constraint = C_O1_I1(r, r),
     .out = tcg_out_ld,
@@ -1239,6 +1253,9 @@ static const TCGOutOp * const all_outop[NB_OPS] = {
     OUTOP(INDEX_op_xor, TCGOutOpBinary, outop_xor),
 
     [INDEX_op_goto_ptr] = &outop_goto_ptr,
+    [INDEX_op_push_ret] = &outop_retstack,
+    [INDEX_op_call_ptr] = &outop_retstack,
+    [INDEX_op_ret_tb] = &outop_retstack,
 };
 
 #undef OUTOP
@@ -1957,6 +1974,8 @@ void tcg_func_start(TCGContext *s)
 
     s->nb_ops = 0;
     s->nb_labels = 0;
+    s->call_ret = s->call_land = NULL;
+    s->call_ret_set = false;
     s->current_frame_offset = s->frame_start;
 
 #ifdef CONFIG_DEBUG_TCG
@@ -2365,6 +2384,17 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_goto_tb:
     case INDEX_op_goto_ptr:
         return true;
+
+    case INDEX_op_call_tb:
+#ifdef TCG_TARGET_HAS_RETSTACK
+        return true;
+#else
+        return false;
+#endif
+    case INDEX_op_push_ret:
+    case INDEX_op_call_ptr:
+    case INDEX_op_ret_tb:
+        goto do_lookup;
 
     case INDEX_op_qemu_ld:
     case INDEX_op_qemu_st:
@@ -3474,6 +3504,10 @@ void tcg_op_remove(TCGContext *s, TCGOp *op)
     case INDEX_op_brcond:
         remove_label_use(op, 3);
         break;
+    case INDEX_op_push_ret:
+    case INDEX_op_call_tb:
+        remove_label_use(op, 1);
+        break;
     default:
         break;
     }
@@ -3571,6 +3605,10 @@ static void move_label_uses(TCGLabel *to, TCGLabel *from)
             break;
         case INDEX_op_brcond:
             op->args[3] = label_arg(to);
+            break;
+        case INDEX_op_push_ret:
+        case INDEX_op_call_tb:
+            op->args[1] = label_arg(to);
             break;
         default:
             g_assert_not_reached();
@@ -5800,6 +5838,18 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         tcg_out_goto_ptr(s, new_args[0]);
         break;
 
+#ifdef TCG_TARGET_HAS_RETSTACK
+    case INDEX_op_push_ret:
+        tcg_out_push_ret(s, new_args[0], arg_label(new_args[1]));
+        break;
+    case INDEX_op_call_ptr:
+        tcg_out_call_ptr(s, new_args[0]);
+        break;
+    case INDEX_op_ret_tb:
+        tcg_out_ret_tb(s, new_args[0]);
+        break;
+#endif
+
     default:
         tcg_debug_assert(def->flags & TCG_OPF_VECTOR);
         tcg_out_vec_op(s, op->opc, type - TCG_TYPE_V64,
@@ -6657,6 +6707,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     tb->jmp_reset_offset[1] = TB_JMP_OFFSET_INVALID;
     tb->jmp_insn_offset[0] = TB_JMP_OFFSET_INVALID;
     tb->jmp_insn_offset[1] = TB_JMP_OFFSET_INVALID;
+    tb->jmp_call = 0;
+    memset(s->call_tb_reset, 0, sizeof(s->call_tb_reset));
 
     tcg_reg_alloc_start(s);
 
@@ -6736,6 +6788,13 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         case INDEX_op_goto_tb:
             tcg_out_goto_tb(s, op->args[0]);
             break;
+#ifdef TCG_TARGET_HAS_RETSTACK
+        case INDEX_op_call_tb:
+            tcg_debug_assert(op->args[0] < ARRAY_SIZE(s->call_tb_reset));
+            s->call_tb_reset[op->args[0]] = arg_label(op->args[1]);
+            tcg_out_call_tb(s, op->args[0]);
+            break;
+#endif
         case INDEX_op_br:
             tcg_out_br(s, arg_label(op->args[0]));
             break;
@@ -6781,6 +6840,18 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     }
     if (!tcg_resolve_relocs(s)) {
         return -2;
+    }
+
+    /* A call_tb slot, while unlinked, leads to its reset label. */
+    for (int n = 0; n < ARRAY_SIZE(tb->jmp_reset_offset); n++) {
+        TCGLabel *l = s->call_tb_reset[n];
+
+        if (l) {
+            tcg_debug_assert(l->has_value);
+            tb->jmp_reset_offset[n] =
+                tcg_ptr_byte_diff(l->u.value_ptr,
+                                  tcg_splitwx_to_rx(s->code_buf));
+        }
     }
 
 #ifndef CONFIG_TCG_INTERPRETER
