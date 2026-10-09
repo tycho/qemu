@@ -4192,6 +4192,8 @@ dead_env_store_pass(TCGContext *s)
         case INDEX_op_qemu_st2:
         case INDEX_op_qemu_ld_vec:
         case INDEX_op_qemu_st_vec:
+        case INDEX_op_qemu_ld_x:
+        case INDEX_op_qemu_st_x:
             dse_keep_only(&dead, dse_scratch_lo, dse_scratch_hi);
             break;
         case INDEX_op_exit_tb:
@@ -5216,6 +5218,8 @@ static bool op_is_guest_access(TCGOpcode opc)
     case INDEX_op_qemu_st2:
     case INDEX_op_qemu_ld_vec:
     case INDEX_op_qemu_st_vec:
+    case INDEX_op_qemu_ld_x:
+    case INDEX_op_qemu_st_x:
         return true;
     default:
         return false;
@@ -8721,7 +8725,9 @@ static void tcg_out_st_helper_args(TCGContext *s, const TCGLabelQemuLdst *ldst,
  * the op writes the pinned global instead and the mov goes.  Nothing runs
  * between the two, so the global changes at the same point as before; an
  * op that faults leaves its output register unwritten.  Runs after
- * liveness, whose results it keeps up to date.
+ * liveness, whose results it keeps up to date.  With tcg_lean, also for
+ * globals that aren't pinned (not a guest load), where it saves the
+ * register-to-register move.
  */
 static void pinned_fold_pass(TCGContext *s)
 {
@@ -8741,7 +8747,13 @@ static void pinned_fold_pass(TCGContext *s)
         }
         t = arg_temp(op->args[0]);
         g = arg_temp(next->args[0]);
-        if (!g->pinned || arg_temp(next->args[1]) != t ||
+        /*
+         * x-lean: any global, but a guest load only into a pinned one: the
+         * register cache keeps other globals' values out of guest accesses.
+         */
+        if (!(g->pinned || (tcg_lean && g->kind == TEMP_GLOBAL &&
+                            op->opc != INDEX_op_qemu_ld)) ||
+            arg_temp(next->args[1]) != t ||
             (t->kind != TEMP_EBB && t->kind != TEMP_TB) ||
             t->type != g->type || TCGOP_TYPE(next) != g->type ||
             !(next->life & (DEAD_ARG << 1))) {
@@ -9179,6 +9191,10 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         shladd_pass(s);
     }
 #endif
+    if (tcg_lean) {
+        /* Again, for the ops the passes above made; any global. */
+        pinned_fold_pass(s);
+    }
 
     if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP_OPT)
                  && qemu_log_in_addr_range(pc_start))) {
