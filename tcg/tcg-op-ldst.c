@@ -1103,29 +1103,37 @@ static void qemu_st_vec_ordered(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
 void tcg_gen_qemu_ld_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
                              MemOp memop, TCGType addr_type)
 {
+    ldst_begin(memop);
     qemu_ld_vec_ordered(val, addr, memop, NULL, NULL, 0, idx, addr_type);
+    ldst_end();
 }
 
 void tcg_gen_qemu_st_vec_chk(TCGv_vec val, TCGTemp *addr, TCGArg idx,
                              MemOp memop, TCGType addr_type)
 {
+    ldst_begin(memop);
     qemu_st_vec_ordered(val, addr, memop, NULL, NULL, 0, idx, addr_type);
+    ldst_end();
 }
 
 void tcg_gen_qemu_ld_vec2_chk(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
                               TCGv_vec hi, TCGTemp *addr_hi, MemOp memop_hi,
                               TCGArg idx, TCGType addr_type)
 {
+    ldst_begin(memop_lo);
     qemu_ld_vec_ordered(lo, addr_lo, memop_lo, hi, addr_hi, memop_hi, idx,
                         addr_type);
+    ldst_end();
 }
 
 void tcg_gen_qemu_st_vec2_chk(TCGv_vec lo, TCGTemp *addr_lo, MemOp memop_lo,
                               TCGv_vec hi, TCGTemp *addr_hi, MemOp memop_hi,
                               TCGArg idx, TCGType addr_type)
 {
+    ldst_begin(memop_lo);
     qemu_st_vec_ordered(lo, addr_lo, memop_lo, hi, addr_hi, memop_hi, idx,
                         addr_type);
+    ldst_end();
 }
 
 static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
