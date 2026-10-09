@@ -2512,6 +2512,117 @@ static void tcg_out_qemu_ldst_vec(TCGContext *s, TCGReg data,
     }
 }
 
+/*
+ * x-lean: in user mode without a guest base the guest address is the
+ * host address, so a guest access can use the host's addressing modes:
+ * base + (index << shift), with shift 0 or the access size, or base + a
+ * signed 9-bit or unsigned scaled 12-bit offset (qemu_ld_x, qemu_st_x).
+ */
+#define TCG_TARGET_HAS_LDST_X
+
+/* A 32-bit operation zero-extends its result to the 64-bit register. */
+#define TCG_TARGET_I32_OPS_ZEXT
+static bool tcg_target_ldst_x_ok(void)
+{
+    return !tcg_use_softmmu && !guest_base;
+}
+
+/* LDR/STR (register offset), the index shifted by the access size or 0. */
+static void tcg_out_ldst_rx(TCGContext *s, AArch64Insn insn, TCGReg rd,
+                            TCGReg base, TCGReg index, unsigned shift)
+{
+    tcg_out32(s, insn | ldst_imm_to_reg | index << 16 | 0x6000 |
+              (shift ? 1 << 12 : 0) | base << 5 | (rd & 0x1f));
+}
+
+static AArch64Insn ld_insn(MemOp mop, TCGType ext)
+{
+    switch (mop & MO_SSIZE) {
+    case MO_UB:
+        return Ildst_imm_LDRB;
+    case MO_SB:
+        return ext ? Ildst_imm_LDRSBX : Ildst_imm_LDRSBW;
+    case MO_UW:
+        return Ildst_imm_LDRH;
+    case MO_SW:
+        return ext ? Ildst_imm_LDRSHX : Ildst_imm_LDRSHW;
+    case MO_UL:
+        return Ildst_imm_LDRW;
+    case MO_SL:
+        return Ildst_imm_LDRSWX;
+    case MO_UQ:
+        return Ildst_imm_LDRX;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static AArch64Insn st_insn(MemOp mop)
+{
+    static const AArch64Insn insn[4] = {
+        Ildst_imm_STRB, Ildst_imm_STRH, Ildst_imm_STRW, Ildst_imm_STRX
+    };
+    return insn[mop & MO_SIZE];
+}
+
+static void tgen_qemu_ld_x(TCGContext *s, TCGType type, TCGReg data,
+                           TCGReg base, TCGReg index, bool index_zero,
+                           TCGArg arg)
+{
+    MemOp mop = get_memop(tcg_ldst_x_oi(arg));
+    unsigned shift = tcg_ldst_x_shift(arg);
+    int ofs = tcg_ldst_x_ofs(arg);
+
+    if (shift == TCG_LDST_X_SCALED) {
+        tcg_out_insn_ldst_uimm(s, ld_insn(mop, type), data, base, ofs);
+    } else if (index != TCG_REG_XZR) {
+        tcg_out_ldst_rx(s, ld_insn(mop, type), data, base, index, shift);
+    } else {
+        tcg_out_insn_ldst_imm(s, ld_insn(mop, type), data, base, ofs);
+    }
+}
+
+static void tgen_qemu_st_x(TCGContext *s, TCGType type, TCGReg data,
+                           TCGReg base, TCGReg index, bool index_zero,
+                           TCGArg arg)
+{
+    MemOp mop = get_memop(tcg_ldst_x_oi(arg));
+    unsigned shift = tcg_ldst_x_shift(arg);
+    int ofs = tcg_ldst_x_ofs(arg);
+
+    if (shift == TCG_LDST_X_SCALED) {
+        tcg_out_insn_ldst_uimm(s, st_insn(mop), data, base, ofs);
+    } else if (index != TCG_REG_XZR) {
+        tcg_out_ldst_rx(s, st_insn(mop), data, base, index, shift);
+    } else {
+        tcg_out_insn_ldst_imm(s, st_insn(mop), data, base, ofs);
+    }
+}
+
+/* x-lean: shladd as ADD (shifted register). */
+#define TCG_TARGET_HAS_SHLADD
+static void tgen_shladd(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                        TCGReg a2, unsigned shift)
+{
+    tcg_out32(s, Iaddsub_shift_ADD | (type == TCG_TYPE_I64) << 31 |
+              a1 << 16 | shift << 10 | a2 << 5 | a0);
+}
+
+static const TCGOutOpShlAdd outop_shladd = {
+    .base.static_constraint = C_O1_I2(r, r, r),
+    .out = tgen_shladd,
+};
+
+static const TCGOutOpQemuLdStX outop_qemu_ld_x = {
+    .base.static_constraint = C_O1_I2(r, r, rz),
+    .out = tgen_qemu_ld_x,
+};
+
+static const TCGOutOpQemuLdStX outop_qemu_st_x = {
+    .base.static_constraint = C_O0_I3(rz, r, rz),
+    .out = tgen_qemu_st_x,
+};
+
 static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
                                    TCGReg addr_reg, MemOpIdx oi, bool is_ld)
 {

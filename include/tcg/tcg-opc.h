@@ -90,6 +90,8 @@ DEF(sar, 1, 2, 0, TCG_OPF_INT)
 DEF(setcond, 1, 2, 1, TCG_OPF_INT)
 DEF(sextract, 1, 1, 2, TCG_OPF_INT)
 DEF(shl, 1, 2, 0, TCG_OPF_INT)
+/* (arg1 << arg3) + arg2, arg3 a constant shift; no generator (x-lean). */
+DEF(shladd, 1, 2, 1, TCG_OPF_INT)
 DEF(shr, 1, 2, 0, TCG_OPF_INT)
 DEF(smax, 1, 2, 0, TCG_OPF_INT)
 DEF(smin, 1, 2, 0, TCG_OPF_INT)
@@ -135,6 +137,9 @@ DEF(qemu_ld_vec, 1, 1, 1,
     TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_VECTOR)
 DEF(qemu_st_vec, 0, 2, 1,
     TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_VECTOR)
+/* Guest access at base + (index << shift) or base + offset: tcg_ldst_x_arg. */
+DEF(qemu_ld_x, 1, 2, 1, TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_INT)
+DEF(qemu_st_x, 0, 3, 1, TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_INT)
 
 /* Host vector support.  */
 

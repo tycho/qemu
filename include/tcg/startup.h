@@ -330,4 +330,14 @@ extern TCGCR3Flush tcg_cr3_flush;
  */
 extern bool tcg_pcid;
 
+/*
+ * x-lean: leaner code for common guest patterns, where the host allows:
+ * guest accesses whose address is a register plus a shifted register or
+ * an offset use the host's addressing modes (qemu_ld_x, qemu_st_x); an
+ * operation whose result is only zero-extended from 32 bits is a 32-bit
+ * operation; a shift feeding an add is an add with a shifted operand
+ * (shladd).
+ */
+extern bool tcg_lean;
+
 #endif

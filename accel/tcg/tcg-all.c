@@ -736,6 +736,16 @@ static void tcg_set_pcid(Object *obj, bool value, Error **errp)
     tcg_pcid = value;
 }
 
+static bool tcg_get_lean(Object *obj, Error **errp)
+{
+    return tcg_lean;
+}
+
+static void tcg_set_lean(Object *obj, bool value, Error **errp)
+{
+    tcg_lean = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -911,6 +921,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "x-pcid", tcg_get_pcid, tcg_set_pcid);
     object_class_property_set_description(oc, "x-pcid",
         "x86: offer process-context identifiers (CPUID PCID and INVPCID)");
+
+    object_class_property_add_bool(oc, "x-lean", tcg_get_lean, tcg_set_lean);
+    object_class_property_set_description(oc, "x-lean",
+        "Leaner code for common guest patterns where the host allows: "
+        "guest accesses use the host's addressing modes (qemu-user), "
+        "32-bit operations and shifted-operand adds");
 }
 
 static const TypeInfo tcg_accel_type = {
