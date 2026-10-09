@@ -84,6 +84,9 @@
 #ifndef TCG_TARGET_HAS_extract_vec
 #define TCG_TARGET_HAS_extract_vec      0
 #endif
+#ifndef TCG_TARGET_HAS_movz_vec
+#define TCG_TARGET_HAS_movz_vec         0
+#endif
 #ifndef TCG_TARGET_HAS_insert_vec
 #define TCG_TARGET_HAS_insert_vec       0
 #endif
