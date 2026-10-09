@@ -1895,6 +1895,9 @@ static const TCGOutOpQemuLdSt outop_qemu_st = {
  * signed 9-bit or unsigned scaled 12-bit offset (qemu_ld_x, qemu_st_x).
  */
 #define TCG_TARGET_HAS_LDST_X
+
+/* A 32-bit operation zero-extends its result to the 64-bit register. */
+#define TCG_TARGET_I32_OPS_ZEXT
 static bool tcg_target_ldst_x_ok(void)
 {
     return !tcg_use_softmmu && !guest_base;

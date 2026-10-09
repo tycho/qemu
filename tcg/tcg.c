@@ -6824,6 +6824,109 @@ static void ldst_fold_pass(TCGContext *s)
 
 #endif
 
+#ifdef TCG_TARGET_I32_OPS_ZEXT
+/*
+ * x-lean: an operation whose only use is the zero-extension of its low 32
+ * bits (extract 0, 32) computes those bits as an I32 operation into the
+ * destination of the extension, which on this host zero-extends.  Only
+ * operations whose low 32 bits depend on the inputs' low 32 bits alone.
+ */
+static bool narrow32_op(const TCGOp *op)
+{
+    switch (op->opc) {
+    case INDEX_op_add:
+    case INDEX_op_sub:
+    case INDEX_op_mul:
+    case INDEX_op_and:
+    case INDEX_op_or:
+    case INDEX_op_xor:
+    case INDEX_op_andc:
+    case INDEX_op_orc:
+    case INDEX_op_eqv:
+    case INDEX_op_nand:
+    case INDEX_op_nor:
+    case INDEX_op_neg:
+    case INDEX_op_not:
+        return true;
+    case INDEX_op_shl:
+        return arg_temp(op->args[2])->kind == TEMP_CONST &&
+               arg_temp(op->args[2])->val < 32;
+    default:
+        return false;
+    }
+}
+
+/*
+ * The constants of an I32 op are sign-extended from 32 bits, as the
+ * backend matches and encodes them: an I64 constant whose high half
+ * isn't the sign of its low half (0x00000000ffffffff) would be encoded
+ * as some other value.
+ */
+static bool narrow32_consts(const TCGOp *x)
+{
+    const TCGOpDef *def = &tcg_op_defs[x->opc];
+
+    for (int i = def->nb_oargs; i < def->nb_oargs + def->nb_iargs; i++) {
+        TCGTemp *ts = arg_temp(x->args[i]);
+
+        if (ts->kind == TEMP_CONST && ts->val != (int32_t)ts->val) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void narrow32_pass(TCGContext *s)
+{
+    TCGOp *op, *next;
+
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        TCGOp *x = QTAILQ_PREV(op, link);
+        TCGOp *mov = NULL;
+        TCGTemp *t;
+
+        if (op->opc != INDEX_op_extract || TCGOP_TYPE(op) != TCG_TYPE_I64 ||
+            op->args[2] != 0 || op->args[3] != 32 || !x ||
+            !(op->life & (DEAD_ARG << 1))) {
+            continue;
+        }
+        t = arg_temp(op->args[1]);
+        if (t->kind != TEMP_EBB && t->kind != TEMP_TB) {
+            continue;
+        }
+        /*
+         * Through a copy whose source dies there: mov t, u.  Neither t nor
+         * the copy's result may have to reach memory (SYNC_ARG): a TB temp
+         * read in a later block keeps its full value there.
+         */
+        if (x->opc == INDEX_op_mov && arg_temp(x->args[0]) == t &&
+            (x->life & (DEAD_ARG << 1)) && !(x->life & SYNC_ARG)) {
+            mov = x;
+            t = arg_temp(mov->args[1]);
+            x = QTAILQ_PREV(mov, link);
+            if (!x || (t->kind != TEMP_EBB && t->kind != TEMP_TB)) {
+                continue;
+            }
+        }
+        if (TCGOP_TYPE(x) != TCG_TYPE_I64 || (x->life & SYNC_ARG) ||
+            !narrow32_op(x) ||
+            arg_temp(x->args[0]) != t || !narrow32_consts(x) ||
+            !tcg_op_supported(x->opc, TCG_TYPE_I32, 0)) {
+            continue;
+        }
+        if (mov) {
+            tcg_op_remove(s, mov);
+        }
+        TCGOP_TYPE(x) = TCG_TYPE_I32;
+        x->args[0] = op->args[0];
+        x->life = (x->life & ~(DEAD_ARG | SYNC_ARG)) |
+                  (op->life & (DEAD_ARG | SYNC_ARG));
+        x->output_pref[0] = op->output_pref[0];
+        tcg_op_remove(s, op);
+    }
+}
+#endif
+
 int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 {
     int i, num_insns;
@@ -6894,6 +6997,11 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 #ifdef TCG_TARGET_HAS_LDST_X
     if (tcg_lean && s->addr_type == TCG_TYPE_I64 && tcg_target_ldst_x_ok()) {
         ldst_fold_pass(s);
+    }
+#endif
+#ifdef TCG_TARGET_I32_OPS_ZEXT
+    if (tcg_lean) {
+        narrow32_pass(s);
     }
 #endif
 

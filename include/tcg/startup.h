@@ -58,7 +58,9 @@ void tcg_prologue_init(void);
 /*
  * x-lean: leaner code for common guest patterns, where the host allows:
  * guest accesses whose address is a register plus a shifted register or
- * an offset use the host's addressing modes (qemu_ld_x, qemu_st_x).
+ * an offset use the host's addressing modes (qemu_ld_x, qemu_st_x); an
+ * operation whose result is only zero-extended from 32 bits is a 32-bit
+ * operation.
  */
 extern bool tcg_lean;
 
