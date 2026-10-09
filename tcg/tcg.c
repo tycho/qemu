@@ -2830,6 +2830,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_frecpes_vec:
     case INDEX_op_frsqrtes_vec:
         return has_type && TCG_TARGET_HAS_fp_vec;
+    case INDEX_op_movz_vec:
+        return has_type && TCG_TARGET_HAS_movz_vec;
 
     default:
         if (op < INDEX_op_last_generic) {

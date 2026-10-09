@@ -425,6 +425,16 @@ void tcg_gen_insert_vec_i64(unsigned vece, TCGv_vec r, TCGv_vec a,
               temp_arg(at), tcgv_i64_arg(b), idx);
 }
 
+void tcg_gen_movz_vec_i64(unsigned vece, TCGv_vec r, TCGv_i64 b)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_movz_vec,
+                                         rt->base_type, vece) > 0);
+    vec_gen_2(INDEX_op_movz_vec, rt->base_type, vece, temp_arg(rt),
+              tcgv_i64_arg(b));
+}
+
 void tcg_gen_dup_i32_vec(unsigned vece, TCGv_vec r, TCGv_i32 a)
 {
     TCGArg ri = tcgv_vec_arg(r);

@@ -4260,6 +4260,11 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                   | (a2 << (vece + 1) | 1 << vece) << 16
                   | (a1 & 0x1f) << 5 | (a0 & 0x1f));
         break;
+    case INDEX_op_movz_vec:
+        /* FMOV (general) to S or D zeroes the rest of the register. */
+        tcg_out32(s, (vece == MO_64 ? Ifmov_DX : 0x1e270000)
+                  | (a1 & 0x1f) << 5 | (a0 & 0x1f));
+        break;
     case INDEX_op_insert_vec:
         /* INS from a general register (XZR for zero); a1 is a0. */
         tcg_out32(s, 0x4e001c00
@@ -4740,6 +4745,8 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
 int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
 {
     switch (opc) {
+    case INDEX_op_movz_vec:
+        return vece == MO_32 || vece == MO_64;
     case INDEX_op_extract_vec:
     case INDEX_op_insert_vec:
     case INDEX_op_add_vec:
@@ -5002,6 +5009,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I1(r, w);
     case INDEX_op_insert_vec:
         return C_O1_I2(w, 0, rz);
+    case INDEX_op_movz_vec:
+        return C_O1_I1(w, r);
     case INDEX_op_st_vec:
         return C_O0_I2(w, r);
     case INDEX_op_concat_i64_vec:

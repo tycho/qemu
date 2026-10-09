@@ -4228,8 +4228,13 @@ static void gen_zext_to_xmm(DisasContext *s, X86DecodedInsn *decode,
     int vec_len = vector_len(s, decode);
     TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
 
-    tcg_gen_insert_vec_i64(ot, v, tcg_constant_vec(TCG_TYPE_V128, MO_64, 0),
-                           t, 0);
+    if (tcg_can_emit_vec_op(INDEX_op_movz_vec, TCG_TYPE_V128, ot) > 0) {
+        tcg_gen_movz_vec_i64(ot, v, t);
+    } else {
+        tcg_gen_insert_vec_i64(ot, v,
+                               tcg_constant_vec(TCG_TYPE_V128, MO_64, 0),
+                               t, 0);
+    }
     tcg_gen_st_vec(v, tcg_env, decode->op[0].offset);
     if (vec_len > 16) {
         tcg_gen_gvec_dup_imm(MO_64, decode->op[0].offset + 16,
