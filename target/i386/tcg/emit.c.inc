@@ -1386,10 +1386,42 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
 }
 
 UNARY_FP_INT_SSE(VCVTDQ2PS, cvtdq2ps, tcg_gen_scvtf_vec, INDEX_op_scvtf_vec)
-UNARY_FP_INT_SSE(VCVTPS2DQ, cvtps2dq, gen_cvtps2dq_vec, INDEX_op_frintx_vec,
+/*
+ * With frint32_vec, the rounding gives x86's 0x80000000 for a NaN or an
+ * out-of-range value itself, which then converts exactly.
+ */
+static void gen_cvtps2dq_frint32(unsigned vece, TCGv_vec d, TCGv_vec a)
+{
+    tcg_gen_frint32_vec(vece, d, a, TCG_FRINT_CURRENT);
+    tcg_gen_fcvtzs_vec(vece, d, d);
+}
+
+static void gen_cvttps2dq_frint32(unsigned vece, TCGv_vec d, TCGv_vec a)
+{
+    tcg_gen_frint32_vec(vece, d, a, TCG_FRINT_ZERO);
+    tcg_gen_fcvtzs_vec(vece, d, d);
+}
+
+UNARY_FP_INT_SSE(VCVTPS2DQ_vec, cvtps2dq, gen_cvtps2dq_vec,
+                 INDEX_op_frintx_vec, INDEX_op_fcvtzs_vec, INDEX_op_cmp_vec,
+                 INDEX_op_shli_vec)
+UNARY_FP_INT_SSE(VCVTTPS2DQ_vec, cvttps2dq, gen_cvttps2dq_vec,
                  INDEX_op_fcvtzs_vec, INDEX_op_cmp_vec, INDEX_op_shli_vec)
-UNARY_FP_INT_SSE(VCVTTPS2DQ, cvttps2dq, gen_cvttps2dq_vec,
-                 INDEX_op_fcvtzs_vec, INDEX_op_cmp_vec, INDEX_op_shli_vec)
+
+#define FRINT32_SSE(uname, fn)                                                \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    static const TCGOpcode list[] = {                                         \
+        INDEX_op_frint32_vec, INDEX_op_fcvtzs_vec, 0                          \
+    };                                                                        \
+    static const GVecGen2 g = { .fniv = fn, .opt_opc = list, .vece = MO_32 }; \
+                                                                              \
+    if (!gen_fp_native_2(s, decode, &g)) {                                    \
+        gen_##uname##_vec(s, decode);                                         \
+    }                                                                         \
+}
+FRINT32_SSE(VCVTPS2DQ, gen_cvtps2dq_frint32)
+FRINT32_SSE(VCVTTPS2DQ, gen_cvttps2dq_frint32)
 UNARY_INT_SSE(VCVTPH2PS, cvtph2ps)
 
 
