@@ -4649,6 +4649,7 @@ dead_env_store_pass(TCGContext *s)
             break;
         case INDEX_op_exit_tb:
         case INDEX_op_goto_tb:
+        case INDEX_op_goto_tb_cold:
         case INDEX_op_goto_ptr:
             dead.n = 0;
             if (dse_scratch_lo < dse_scratch_hi) {
@@ -5312,10 +5313,16 @@ static TCGLabel *op_branch_label(const TCGOp *op)
 /* liveness analysis: list the globals that the ops name. */
 static void la_find_globals(TCGContext *s)
 {
-    int ng = s->nb_globals;
-    size_t size = BITS_TO_LONGS(ng) * sizeof(unsigned long);
-    unsigned long *seen = tcg_malloc(size);
-    TCGOp *op;
+    switch (op->opc) {
+    case INDEX_op_br:
+    case INDEX_op_exit_tb:
+    case INDEX_op_goto_ptr:
+    case INDEX_op_goto_tb_cold:
+        return false;
+    default:
+        return true;
+    }
+}
 
 /*
  * Units (tcg_units): a conditional jump between two blocks of a unit is a
@@ -5367,6 +5374,7 @@ static bool xblk_reaches_loop(const TCGOp *op)
             return arg_label(op->args[0])->xkind == XLBL_LOOP;
         case INDEX_op_exit_tb:
         case INDEX_op_goto_tb:
+        case INDEX_op_goto_tb_cold:
         case INDEX_op_goto_ptr:
             return false;
         default:
@@ -11447,6 +11455,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             }
             if (s->boundary_in) {
                 tcg_reg_alloc_boundary_place(s);
+            }
+            if (s->chain_dead_used) {
+                tcg_reg_alloc_chain_store(s, true);
             }
             tcg_debug_assert(op->args[0] < ARRAY_SIZE(s->call_tb_reset));
             s->call_tb_reset[op->args[0]] = arg_label(op->args[1]);
