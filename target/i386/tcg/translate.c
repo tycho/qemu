@@ -164,7 +164,6 @@ typedef struct DisasContext {
 
     /* TCG local temps */
     TCGv cc_srcT;
-    TCGv unit_srcT;     /* cc_srcT at the labels of a unit (units) */
     TCGv A0;
     TCGv T0;
     TCGv T1;
@@ -497,13 +496,12 @@ static void gen_unit_edge_cc(DisasContext *s, TCGLabel *l)
         gen_update_cc_op(s);
         return;
     }
-    if (cc_op_live(e) & USES_CC_SRCT) {
-        if (!s->unit_srcT) {
-            s->unit_srcT = tcg_temp_new();
-        }
-        if (s->cc_srcT != s->unit_srcT) {
-            tcg_gen_mov_tl(s->unit_srcT, s->cc_srcT);
-        }
+    /*
+     * SUB's cc_srcT crosses the label in cc_src2, which no SUB state uses:
+     * a global stays live at region labels, a TB temp would not.
+     */
+    if ((cc_op_live(e) & USES_CC_SRCT) && s->cc_srcT != cpu_cc_src2) {
+        tcg_gen_mov_tl(cpu_cc_src2, s->cc_srcT);
     }
 }
 
@@ -4442,7 +4440,6 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->A0 = tcg_temp_new();
 
     dc->cc_srcT = NULL;
-    dc->unit_srcT = NULL;
 }
 
 static void i386_tr_tb_start(DisasContextBase *db, CPUState *cpu)
@@ -4610,7 +4607,7 @@ static void i386_tr_block_start(DisasContextBase *dcbase, CPUState *cpu)
     dc->cc_op = st;
     dc->cc_op_dirty = st != CC_OP_DYNAMIC;
     dc->cc_op_guess = CC_OP_DYNAMIC;
-    dc->cc_srcT = cc_op_live(st) & USES_CC_SRCT ? dc->unit_srcT : NULL;
+    dc->cc_srcT = cc_op_live(st) & USES_CC_SRCT ? cpu_cc_src2 : NULL;
     dc->pc = dc->base.pc_next;
     dc->pc_save = dc->base.pc_next;
 }
