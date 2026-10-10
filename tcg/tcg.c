@@ -1133,6 +1133,7 @@ typedef struct TCGOutOpSubtract {
 
 static void tcg_out_pinned_st(TCGContext *s);
 static void tcg_out_pinned_ld(TCGContext *s);
+static void tcg_out_pinned_clobbered(TCGContext *s, bool store);
 
 #include "tcg-target.c.inc"
 
@@ -1177,6 +1178,29 @@ static void tcg_out_pinned_ld(TCGContext *s)
         TCGTemp *ts = s->pinned[i];
 
         tcg_out_ld(s, ts->type, ts->reg, ts->mem_base->reg, ts->mem_offset);
+    }
+}
+
+/*
+ * Store (@store) or load the pinned globals in registers that a call
+ * clobbers, to or from their env slots: around calls out of generated
+ * code that don't otherwise store or load them.
+ */
+static void tcg_out_pinned_clobbered(TCGContext *s, bool store)
+{
+    for (int i = 0; i < s->nb_pinned; i++) {
+        TCGTemp *ts = s->pinned[i];
+
+        if (!tcg_regset_test_reg(tcg_target_call_clobber_regs, ts->reg)) {
+            continue;
+        }
+        if (store) {
+            tcg_out_st(s, ts->type, ts->reg, ts->mem_base->reg,
+                       ts->mem_offset);
+        } else {
+            tcg_out_ld(s, ts->type, ts->reg, ts->mem_base->reg,
+                       ts->mem_offset);
+        }
     }
 }
 
@@ -6731,7 +6755,7 @@ static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
      * sync them if they might be read.
      */
     if (info->flags & TCG_CALL_NO_READ_GLOBALS) {
-        /* Nothing to do */
+        tcg_out_pinned_clobbered(s, true);
     } else {
         tcg_out_pinned_st(s);
     }
@@ -6761,6 +6785,8 @@ static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
                          TCG_CALL_NO_WRITE_GLOBALS))) {
         /* The helper may have written them. */
         tcg_out_pinned_ld(s);
+    } else {
+        tcg_out_pinned_clobbered(s, false);
     }
 
     /* Assign output registers and emit moves if needed.  */
