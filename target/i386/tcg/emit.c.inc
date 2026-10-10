@@ -1444,9 +1444,9 @@ static void gen_frint_vec(unsigned vece, TCGv_vec d, TCGv_vec a,
 /*
  * With x-ssefp=native, ROUND* on the host FPU, which runs in the guest's
  * MXCSR mode: imm8 bit 2 rounds in that mode (signaling inexact unless
- * bit 3 is set), else bits 1:0 give the mode, with bit 3 set only; a given
- * mode that signals inexact keeps the helper.  *mode is the frint_vec
- * mode, or -1 for frintx_vec.
+ * bit 3 is set), else bits 1:0 give the mode (signaling inexact unless bit
+ * 3 is set: TCG_FRINT_EXACT).  *mode is the frint_vec mode, or -1 for
+ * frintx_vec.
  */
 static bool fp_native_round_mode(X86DecodedInsn *decode, int64_t *mode)
 {
@@ -1454,10 +1454,8 @@ static bool fp_native_round_mode(X86DecodedInsn *decode, int64_t *mode)
 
     if (imm & 4) {
         *mode = imm & 8 ? TCG_FRINT_CURRENT : -1;
-    } else if (imm & 8) {
-        *mode = imm & 3;
     } else {
-        return false;
+        *mode = (imm & 3) | (imm & 8 ? 0 : TCG_FRINT_EXACT);
     }
     return true;
 }
