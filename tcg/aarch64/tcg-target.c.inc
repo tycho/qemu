@@ -1924,13 +1924,18 @@ static void tcg_out_ldst_save(TCGContext *s, TCGRegSet regs, bool restore,
 
 /* tcg_lazysync: store the dirty globals before the slow path's call. */
 /*
- * Registers for pinned globals (tcg_temp_pin): callee-saved, so helpers
- * keep them, and not otherwise reserved (x28 holds guest_base).
+ * Registers for pinned globals (tcg_temp_pin): the callee-saved ones not
+ * otherwise reserved (x28 holds guest_base or the return stack), which
+ * helpers keep, then caller-saved ones above the argument registers, which
+ * are stored around calls and reloaded after them
+ * (tcg_out_pinned_clobbered).
  */
-#define TCG_TARGET_NB_PIN_REGS 8
+#define TCG_TARGET_NB_PIN_REGS 16
 static const TCGReg tcg_target_pin_regs[TCG_TARGET_NB_PIN_REGS] = {
     TCG_REG_X20, TCG_REG_X21, TCG_REG_X22, TCG_REG_X23,
     TCG_REG_X24, TCG_REG_X25, TCG_REG_X26, TCG_REG_X27,
+    TCG_REG_X8, TCG_REG_X9, TCG_REG_X10, TCG_REG_X11,
+    TCG_REG_X12, TCG_REG_X13, TCG_REG_X14, TCG_REG_X15,
 };
 
 static void tcg_out_ldst_writeback(TCGContext *s, TCGLabelQemuLdst *lb)
@@ -2013,6 +2018,7 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     tcg_out_ldst_save(s, lb->save_regs, false, 0);
     tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
+    tcg_out_pinned_clobbered(s, false);
     if (lb->type == TCG_TYPE_V128) {
         /* The Int128 result in X0:X1 goes to the vector. */
         tcg_out_insn(s, fmov, DX, lb->datalo_reg, TCG_REG_X0);
@@ -2054,6 +2060,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
         tcg_out_st_helper_args(s, lb, &ldst_helper_param);
     }
     tcg_out_call_int(s, qemu_st_helpers[opc & MO_SIZE]);
+    tcg_out_pinned_clobbered(s, false);
     tcg_out_ldst_save(s, lb->save_regs, true, 0);
     tcg_out_goto(s, lb->raddr);
     return true;
