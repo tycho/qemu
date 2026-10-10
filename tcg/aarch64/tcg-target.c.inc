@@ -645,6 +645,9 @@ typedef enum {
     Iqrrr_e_TRN2      = 0x0e006800,
     Iqrrr_e_ZIP2      = 0x0e007800,
     Iqrrr_e_ADDP      = 0x0e20bc00,
+    Iqrrr_e_SDOT      = 0x0e809400,  /* FEAT_DotProd */
+    Iqrrr_e_UDOT      = 0x2e809400,  /* FEAT_DotProd */
+    Iqrrr_e_USDOT     = 0x0e809c00,  /* FEAT_I8MM */
     Iqrrr_e_SABD      = 0x0e207400,
     Iqrrr_e_UABD      = 0x2e207400,
     Iqrrr_e_URHADD    = 0x2e201400,
@@ -3663,6 +3666,16 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_addp_vec:
         tcg_out_insn_qrrr_e(s, Iqrrr_e_ADDP, 1, vece, a0, a1, a2);
         break;
+    case INDEX_op_sdot4_vec:
+        /* The accumulator is both the first input and the output. */
+        tcg_out_insn_qrrr_e(s, Iqrrr_e_SDOT, 1, MO_32, a0, a2, args[3]);
+        break;
+    case INDEX_op_udot4_vec:
+        tcg_out_insn_qrrr_e(s, Iqrrr_e_UDOT, 1, MO_32, a0, a2, args[3]);
+        break;
+    case INDEX_op_usdot4_vec:
+        tcg_out_insn_qrrr_e(s, Iqrrr_e_USDOT, 1, MO_32, a0, a2, args[3]);
+        break;
     case INDEX_op_narrow_vec:
         tcg_out_narrow_vec(s, vece, a0, a1, a2, args[3]);
         break;
@@ -4055,6 +4068,13 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
         return type == TCG_TYPE_V128 && vece <= MO_32;
     case INDEX_op_addp_vec:
         return type == TCG_TYPE_V128;
+    case INDEX_op_sdot4_vec:
+    case INDEX_op_udot4_vec:
+        return type == TCG_TYPE_V128 && vece == MO_32 &&
+               (cpuinfo & CPUINFO_DOTPROD);
+    case INDEX_op_usdot4_vec:
+        return type == TCG_TYPE_V128 && vece == MO_32 &&
+               (cpuinfo & CPUINFO_I8MM);
 
     default:
         return 0;
@@ -4187,6 +4207,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_abd_vec:
     case INDEX_op_avgr_vec:
         return C_O1_I2(w, w, w);
+    case INDEX_op_sdot4_vec:
+    case INDEX_op_udot4_vec:
+    case INDEX_op_usdot4_vec:
+        return C_O1_I3(w, 0, w, w);
     case INDEX_op_widen_vec:
     case INDEX_op_addlp_vec:
         return C_O1_I1(w, w);
