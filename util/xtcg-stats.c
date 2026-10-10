@@ -47,6 +47,11 @@ static const char * const stat_names[XS__COUNT] = {
     [XS_JIT_TO_EXEC] = "jit_to_exec",
     [XS_JIT_TO_WRITE] = "jit_to_write",
     [XS_JIT_FLIPS] = "jit_flips",
+    [XS_SF_HARD] = "sf_hard",
+    [XS_SF_SOFT_PE] = "sf_soft_pe_clear",
+    [XS_SF_SOFT_RC] = "sf_soft_rounding",
+    [XS_SF_SOFT_INPUT] = "sf_soft_input",
+    [XS_SF_SOFT_RESULT] = "sf_soft_result",
 };
 
 static const char * const hist_names[XH__COUNT] = {
@@ -56,6 +61,7 @@ static const char * const hist_names[XH__COUNT] = {
     [XH_EXCP] = "exception_index",
     [XH_TLB_FILL_BITS] = "tlb_fill.size_bits",
     [XH_TLB_FILL_MMUIDX] = "tlb_fill.mmu_idx",
+    [XH_SSEFP] = "ssefp",
 };
 
 static bool dumped;
