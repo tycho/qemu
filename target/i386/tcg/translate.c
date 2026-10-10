@@ -2539,6 +2539,10 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
     target_ulong new_eip = new_pc - s->cs_base;
 
     assert(!s->cc_op_dirty || unit_cc(s));
+    if (s->rs_call) {
+        /* A CALL never branches within the TB. */
+        gen_update_cc_op(s);
+    }
 
     /* In 64-bit mode, operand size is fixed at 64 bits. */
     if (!CODE64(s)) {
