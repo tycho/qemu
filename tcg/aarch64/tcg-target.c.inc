@@ -4838,7 +4838,13 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                 [TCG_FRINT_ZERO] = Iqrr_e_FRINTZ,
                 [TCG_FRINT_CURRENT] = Iqrr_e_FRINTI,
             };
-            tcg_out_insn_qrr_e(s, frint[a2], is_q, fsz, a0, a1);
+
+            /* FRINTX signals inexact for any non-integral input. */
+            if (a2 & TCG_FRINT_EXACT) {
+                tcg_out_insn(s, qrr_e, FRINTX, is_q, fsz, TCG_VEC_TMP0, a1);
+            }
+            tcg_out_insn_qrr_e(s, frint[a2 & ~TCG_FRINT_EXACT], is_q, fsz,
+                               a0, a1);
         }
         break;
     case INDEX_op_fmla_vec:
@@ -4909,7 +4915,12 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                 [TCG_FRINT_ZERO] = Ifp_rr_FRINTZ,
                 [TCG_FRINT_CURRENT] = Ifp_rr_FRINTI,
             };
-            tcg_out_insn_fp_rr(s, frint[args[3]], fsz, a0, a2);
+
+            if (args[3] & TCG_FRINT_EXACT) {
+                tcg_out_insn(s, fp_rr, FRINTX, fsz, TCG_VEC_TMP0, a2);
+            }
+            tcg_out_insn_fp_rr(s, frint[args[3] & ~TCG_FRINT_EXACT], fsz,
+                               a0, a2);
         }
         break;
     case INDEX_op_frecpes_vec:

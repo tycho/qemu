@@ -715,13 +715,19 @@ void tcg_gen_fcmp_vec(TCGCond cond, unsigned vece, TCGv_vec r,
 void tcg_gen_scvtf_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
 void tcg_gen_fcvtzs_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
 void tcg_gen_frintx_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
-/* How frint_vec rounds: to nearest even, down, up, toward zero, or as set. */
+/*
+ * How frint_vec rounds: to nearest even, down, up, toward zero, or as set.
+ * With TCG_FRINT_EXACT added to one of the first four, the rounding also
+ * signals inexact, as frintx_vec does, where the result differs from the
+ * input.
+ */
 typedef enum {
     TCG_FRINT_NEAREST,
     TCG_FRINT_DOWN,
     TCG_FRINT_UP,
     TCG_FRINT_ZERO,
     TCG_FRINT_CURRENT,
+    TCG_FRINT_EXACT = 8,
 } TCGFrint;
 void tcg_gen_frint_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGFrint mode);
 /*
