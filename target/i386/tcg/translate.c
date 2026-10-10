@@ -164,6 +164,7 @@ typedef struct DisasContext {
 
     /* TCG local temps */
     TCGv cc_srcT;
+    TCGv unit_srcT;     /* cc_srcT at the labels of a unit (units) */
     TCGv A0;
     TCGv T0;
     TCGv T1;
@@ -447,6 +448,41 @@ static void gen_update_cc_op(DisasContext *s)
     if (s->cc_op_dirty) {
         tcg_gen_movi_i32(cpu_cc_op, s->cc_op);
         s->cc_op_dirty = false;
+    }
+}
+
+/* Measurement only (XTCG_UNITS_CC): jumps within a unit carry cc_op. */
+static bool unit_cc(DisasContext *s)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("XTCG_UNITS_CC") != NULL;
+    }
+    return on && s->base.region;
+}
+
+/*
+ * A jump to region label @l: store cc_op unless the label's block starts
+ * with this static cc_op, and with SUB's cc_srcT in the unit's temp.
+ */
+static void gen_unit_edge_cc(DisasContext *s, TCGLabel *l)
+{
+    int32_t st = s->cc_op == CC_OP_DYNAMIC || cc_op_lazy(s->cc_op)
+                 ? CC_OP_DYNAMIC : s->cc_op;
+    int32_t e = translator_region_edge(&s->base, l, st, CC_OP_DYNAMIC);
+
+    if (e == CC_OP_DYNAMIC) {
+        gen_update_cc_op(s);
+        return;
+    }
+    if (cc_op_live(e) & USES_CC_SRCT) {
+        if (!s->unit_srcT) {
+            s->unit_srcT = tcg_temp_new();
+        }
+        if (s->cc_srcT != s->unit_srcT) {
+            tcg_gen_mov_tl(s->unit_srcT, s->cc_srcT);
+        }
     }
 }
 
@@ -1400,7 +1436,9 @@ static inline void gen_jcc(DisasContext *s, int b, TCGLabel *l1)
      * the cc_op to CC_OP_EFLAGS (because it's CC_OP_DYNAMIC or because
      * it's cheaper to just compute the flags)!
      */
-    gen_update_cc_op(s);
+    if (!unit_cc(s)) {
+        gen_update_cc_op(s);
+    }
     tcg_gen_brcond_tl(cc.cond, cc.reg, cc.reg2, l1);
 }
 
@@ -1999,12 +2037,15 @@ static void gen_st_modrm(DisasContext *s, X86DecodedInsn *decode, MemOp ot)
 static void gen_conditional_jump_labels(DisasContext *s, target_long diff,
                                         TCGLabel *not_taken, TCGLabel *taken)
 {
+    bool dirty = s->cc_op_dirty;
+
     if (not_taken) {
         gen_set_label(not_taken);
     }
     gen_jmp_rel_csize(s, 0, 1);
 
     gen_set_label(taken);
+    s->cc_op_dirty = dirty;
     gen_jmp_rel(s, s->dflag, diff, 0);
 }
 
@@ -2491,7 +2532,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
     target_ulong new_pc = s->pc + diff;
     target_ulong new_eip = new_pc - s->cs_base;
 
-    assert(!s->cc_op_dirty);
+    assert(!s->cc_op_dirty || unit_cc(s));
 
     /* In 64-bit mode, operand size is fixed at 64 bits. */
     if (!CODE64(s)) {
@@ -2568,6 +2609,9 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
              */
             TCGLabel *exit = backward ? gen_new_label() : NULL;
 
+            if (unit_cc(s)) {
+                gen_unit_edge_cc(s, l);
+            }
             if (exit) {
                 translator_exit_check(&s->base, exit);
             }
@@ -2579,6 +2623,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
             gen_set_label(exit);
         }
     }
+    gen_update_cc_op(s);
 
     if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)
         && translator_loop_back(&s->base, new_pc)) {
@@ -4366,6 +4411,7 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->A0 = tcg_temp_new();
 
     dc->cc_srcT = NULL;
+    dc->unit_srcT = NULL;
 }
 
 static void i386_tr_tb_start(DisasContextBase *db, CPUState *cpu)
@@ -4526,10 +4572,14 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
 static void i386_tr_block_start(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
+    int32_t st = unit_cc(dc)
+                 ? translator_region_block_state(dcbase, CC_OP_DYNAMIC)
+                 : CC_OP_DYNAMIC;
 
-    dc->cc_op = CC_OP_DYNAMIC;
-    dc->cc_op_dirty = false;
-    dc->cc_srcT = NULL;
+    dc->cc_op = st;
+    dc->cc_op_dirty = st != CC_OP_DYNAMIC;
+    dc->cc_op_guess = CC_OP_DYNAMIC;
+    dc->cc_srcT = cc_op_live(st) & USES_CC_SRCT ? dc->unit_srcT : NULL;
     dc->pc = dc->base.pc_next;
     dc->pc_save = dc->base.pc_next;
 }

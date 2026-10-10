@@ -270,6 +270,20 @@ struct TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
  */
 bool translator_region_backward(DisasContextBase *db, vaddr dest);
 
+/*
+ * Measurement only (units): the target state at region label @l, for a
+ * jump that reaches it with state @st.  The first jump to a block fixes
+ * its entry state; a jump with the same state returns it (the label
+ * needs nothing stored); a block whose state is @dyn returns @dyn (the
+ * jump stores its state).  A jump with another state retranslates the
+ * unit with that block's entry state @dyn.
+ */
+int32_t translator_region_edge(DisasContextBase *db, struct TCGLabel *l,
+                               int32_t st, int32_t dyn);
+
+/* The entry state of the region block being started, or @dyn. */
+int32_t translator_region_block_state(DisasContextBase *db, int32_t dyn);
+
 /**
  * translator_goto_tb_slot:
  * @db: Disassembly context

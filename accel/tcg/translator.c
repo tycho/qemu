@@ -224,7 +224,27 @@ typedef struct TranslatorRegion {
     vaddr end;                  /* the end of the highest block */
     vaddr pc[REGION_MAX_BLOCKS];
     TCGLabel *label[REGION_MAX_BLOCKS];
+    int32_t state[REGION_MAX_BLOCKS];   /* entry state (units) */
 } TranslatorRegion;
+
+#define REGION_STATE_UNSET   INT32_MIN
+#define REGION_STATE_DYN     (INT32_MIN + 1)
+#define REGION_DEMOTE_MAX    32
+
+/* Blocks whose entry state is dynamic in the next try of this unit. */
+static __thread vaddr region_demoted[REGION_DEMOTE_MAX];
+static __thread int region_n_demoted;
+static __thread bool region_redo;
+
+static bool region_is_demoted(vaddr pc)
+{
+    for (int i = 0; i < region_n_demoted; i++) {
+        if (region_demoted[i] == pc) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static GMutex region_lock;              /* static: needs no init */
 static GHashTable *region_heads;        /* promoted heads, under region_lock */
@@ -400,6 +420,10 @@ int translator_region_judge(TranslatorRegionVerdict *v, int max)
 
 bool translator_region_overflow(void)
 {
+    if (region_redo) {
+        region_redo = false;
+        return true;
+    }
     if (region_cap < 0) {
         /* A plain TB: halve its insns as usual. */
         return false;
@@ -438,6 +462,8 @@ void translator_region_reset(void)
     region_cap = 0;
     region_tried = 0;
     region_reject = false;
+    region_redo = false;
+    region_n_demoted = 0;
 }
 
 static bool region_page_ok(const DisasContextBase *db, vaddr pc)
@@ -492,10 +518,53 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
         return NULL;
     }
     r->pc[r->n] = dest;
+    r->state[r->n] = (!r->unit || region_is_demoted(dest))
+                     ? REGION_STATE_DYN : REGION_STATE_UNSET;
     r->label[r->n] = gen_new_label();
     r->label[r->n]->region = true;
     region_tried = r->n + 1;
     return r->label[r->n++];
+}
+
+int32_t translator_region_edge(DisasContextBase *db, TCGLabel *l,
+                               int32_t st, int32_t dyn)
+{
+    TranslatorRegion *r = db->region;
+    int i;
+
+    for (i = 0; i < r->n && r->label[i] != l; i++) {
+        continue;
+    }
+    if (i == r->n || r->state[i] == REGION_STATE_DYN) {
+        return dyn;
+    }
+    if (r->state[i] == REGION_STATE_UNSET) {
+        r->state[i] = st == dyn ? REGION_STATE_DYN : st;
+        return st;
+    }
+    if (r->state[i] == st) {
+        return st;
+    }
+    /* Another state: try again with this block's entry dynamic. */
+    if (region_n_demoted < REGION_DEMOTE_MAX) {
+        region_demoted[region_n_demoted++] = r->pc[i];
+        region_redo = true;
+    } else {
+        region_reject = true;
+    }
+    siglongjmp(tcg_ctx->jmp_trans, -2);
+}
+
+int32_t translator_region_block_state(DisasContextBase *db, int32_t dyn)
+{
+    TranslatorRegion *r = db->region;
+    int32_t st;
+
+    if (!r || r->next < 1) {
+        return dyn;
+    }
+    st = r->state[r->next - 1];
+    return st == REGION_STATE_UNSET || st == REGION_STATE_DYN ? dyn : st;
 }
 
 bool translator_region_backward(DisasContextBase *db, vaddr dest)
@@ -846,6 +915,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         r->unit = unit;
         r->page2 = -1;
         r->n = r->next = 1;
+        r->state[0] = REGION_STATE_DYN;     /* entered from outside */
         r->backedges = 0;
         r->stubbing = false;
         r->block_insns = 0;

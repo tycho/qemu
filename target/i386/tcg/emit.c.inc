@@ -4035,9 +4035,13 @@ static void gen_Jcc(DisasContext *s, X86DecodedInsn *decode)
          * condition, so that going round again falls through to the
          * back edge (one taken branch per iteration instead of two).
          */
+        bool dirty;
+
         gen_jcc(s, (decode->b & 0xf) ^ 1, taken);
+        dirty = s->cc_op_dirty;
         gen_jmp_rel(s, s->dflag, decode->immediate, 0);
         gen_set_label(taken);
+        s->cc_op_dirty = dirty;
         gen_jmp_rel_csize(s, 0, 1);
         return;
     }
@@ -4056,7 +4060,9 @@ static void gen_JCXZ(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_JMP(DisasContext *s, X86DecodedInsn *decode)
 {
-    gen_update_cc_op(s);
+    if (!unit_cc(s)) {
+        gen_update_cc_op(s);
+    }
     gen_jmp_rel(s, s->dflag, decode->immediate, 0);
 }
 
