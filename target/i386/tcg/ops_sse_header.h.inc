@@ -75,6 +75,12 @@ SSE_HELPER_W(pavgw, FAVG)
 
 DEF_HELPER_4(glue(pmuludq, SUFFIX), void, env, Reg, Reg, Reg)
 DEF_HELPER_4(glue(pmaddwd, SUFFIX), void, env, Reg, Reg, Reg)
+#if SHIFT >= 1
+DEF_HELPER_4(glue(vpdpbusd, SUFFIX), void, env, Reg, Reg, Reg)
+DEF_HELPER_4(glue(vpdpbusds, SUFFIX), void, env, Reg, Reg, Reg)
+DEF_HELPER_4(glue(vpdpwssd, SUFFIX), void, env, Reg, Reg, Reg)
+DEF_HELPER_4(glue(vpdpwssds, SUFFIX), void, env, Reg, Reg, Reg)
+#endif
 
 DEF_HELPER_4(glue(psadbw, SUFFIX), void, env, Reg, Reg, Reg)
 #if SHIFT < 2
