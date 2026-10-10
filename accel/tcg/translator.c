@@ -818,6 +818,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     TCGOp *icount_start_insn;
     TCGOp *loop_op = NULL;
     bool plugin_enabled;
+    bool is_head;
 #ifndef CONFIG_USER_ONLY
     TCGOp *first_insn_start = NULL;
 #endif
@@ -881,15 +882,17 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         db->region_capable = tcg_superblock && ops->block_start
                              && tb_page_addr0(tb) != -1
                              && !(cflags & CF_COUNT_MASK);
-        if (db->region_capable && units_blocks() <= 1) {
+        if (db->region_capable) {
             translator_region_sampler_start();
         }
     }
+    is_head = db->region_capable && region_cap >= 0
+              && translator_region_is_head(tb_page_addr0(tb));
     if (db->region_capable && region_cap >= 0
-        && (units_blocks() > 1
-            || translator_region_is_head(tb_page_addr0(tb)))) {
+        && (units_blocks() > 1 || is_head)) {
         TranslatorRegion *r = tcg_malloc(sizeof(*r));
-        bool unit = units_blocks() > 1;
+        /* A sampled loop head is a region as before; any other TB a unit. */
+        bool unit = !is_head;
         bool kept = unit;
 
         if (!unit) {
