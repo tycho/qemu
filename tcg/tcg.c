@@ -4162,8 +4162,61 @@ static bool la_xblk_label(TCGContext *s, TCGOp *op, int nt)
 #define XBLK_REGION_INT 8
 
 /*
+ * The loop depth of each op, in op order: a region label and the last
+ * branch back to it bound a loop.  NULL without backward branches.
+ */
+static uint8_t *xblk_loop_depth(TCGContext *s, int *nops, int **lstart,
+                                int **lend)
+{
+    int *lpos = tcg_malloc(s->nb_labels * sizeof(*lpos));
+    int *last = tcg_malloc(s->nb_labels * sizeof(*last));
+    int16_t *diff;
+    uint8_t *depth;
+    bool any = false;
+    int i = 0, d = 0;
+    TCGOp *op;
+
+    for (int k = 0; k < s->nb_labels; k++) {
+        lpos[k] = last[k] = -1;
+    }
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        TCGLabel *b = op_branch_label(op);
+
+        if (op->opc == INDEX_op_set_label) {
+            lpos[arg_label(op->args[0])->id] = i;
+        } else if (b && b->region && lpos[b->id] >= 0) {
+            last[b->id] = i;
+            any = true;
+        }
+        i++;
+    }
+    *nops = i;
+    *lstart = lpos;
+    *lend = last;
+    if (!any) {
+        return NULL;
+    }
+    diff = tcg_malloc((i + 1) * sizeof(*diff));
+    memset(diff, 0, (i + 1) * sizeof(*diff));
+    for (int k = 0; k < s->nb_labels; k++) {
+        if (last[k] >= 0) {
+            diff[lpos[k]]++;
+            diff[last[k] + 1]--;
+        }
+    }
+    depth = tcg_malloc(i);
+    for (int k = 0; k < i; k++) {
+        d += diff[k];
+        depth[k] = MIN(d, 3);
+    }
+    return depth;
+}
+
+/*
  * Before liveness: the region's homes, the globals its ops use most, each
- * given a register of its own for the whole TB.
+ * given a register of its own for the whole TB.  With units, uses in a
+ * loop count 16 times per loop around them, and the globals some loop
+ * reads before it writes them, whose values go round it, come first.
  */
 static void xblk_region_homes(TCGContext *s)
 {
@@ -4173,7 +4226,68 @@ static void xblk_region_homes(TCGContext *s)
     int npend = 0;
     TCGRegSet vregs, taken = s->reserved_regs;
     int vec_budget = -XBLK_VEC_SPARE, nint = 0, nvec = 0, n = 0;
+    int int_budget = XBLK_REGION_INT, nops = 0, opi = -1;
+    int *lstart = NULL, *lend = NULL;
+    uint8_t *depth = NULL;
+    bool *carried = NULL;
     TCGOp *op;
+
+    if (tcg_units) {
+        /* Homes for the loops: their values gain most from registers. */
+        depth = xblk_loop_depth(s, &nops, &lstart, &lend);
+        int_budget = 10;
+    }
+    if (depth) {
+        /*
+         * The globals some loop reads before it writes them: their values
+         * go round the loop, so they gain most from a register.
+         */
+        uint8_t *seen = tcg_malloc(s->nb_globals);
+
+        carried = tcg_malloc(s->nb_globals * sizeof(*carried));
+        memset(carried, 0, s->nb_globals * sizeof(*carried));
+        for (int k = 0; k < s->nb_labels; k++) {
+            int i = 0;
+
+            if (lend[k] < 0) {
+                continue;
+            }
+            memset(seen, 0, s->nb_globals);
+            QTAILQ_FOREACH(op, &s->ops, link) {
+                const TCGOpDef *def = &tcg_op_defs[op->opc];
+                int no, ni;
+
+                if (i < lstart[k] || op->opc == INDEX_op_discard) {
+                    i++;
+                    continue;
+                }
+                if (i++ > lend[k]) {
+                    break;
+                }
+                if (op->opc == INDEX_op_call) {
+                    no = TCGOP_CALLO(op);
+                    ni = TCGOP_CALLI(op);
+                } else if (op->opc == INDEX_op_set_label
+                           || op->opc == INDEX_op_insn_start) {
+                    continue;
+                } else {
+                    no = def->nb_oargs;
+                    ni = def->nb_iargs;
+                }
+                /* Inputs before outputs: an op reads before it writes. */
+                for (int j = 0; j < no + ni; j++) {
+                    int a = j < ni ? no + j : j - ni;
+                    TCGTemp *ts = arg_temp(op->args[a]);
+                    size_t idx = ts ? temp_idx(ts) : SIZE_MAX;
+
+                    if (idx < s->nb_globals && !seen[idx]) {
+                        seen[idx] = 1;
+                        carried[idx] |= a >= no;
+                    }
+                }
+            }
+        }
+    }
 
     /*
      * Count reads, and writes that a branch or label follows before any
@@ -4184,6 +4298,7 @@ static void xblk_region_homes(TCGContext *s)
     memset(uses, 0, s->nb_globals * sizeof(*uses));
     QTAILQ_FOREACH(op, &s->ops, link) {
         const TCGOpDef *def = &tcg_op_defs[op->opc];
+        uint32_t w = depth ? 1u << (4 * depth[++opi]) : 1;
         int no, ni;
 
         if (op->opc == INDEX_op_set_label
@@ -4191,8 +4306,9 @@ static void xblk_region_homes(TCGContext *s)
             bool exits = def->flags & TCG_OPF_BB_EXIT;
 
             for (int k = 0; k < npend; k++) {
-                if (!exits && uses[pend[k]] < UINT32_MAX) {
-                    uses[pend[k]]++;
+                if (!exits) {
+                    uses[pend[k]] = MIN((uint64_t)uses[pend[k]] + w,
+                                        UINT32_MAX);
                 }
             }
             npend = 0;
@@ -4216,7 +4332,7 @@ static void xblk_region_homes(TCGContext *s)
                 continue;
             }
             if (k >= no) {
-                uses[idx] += uses[idx] < UINT32_MAX;
+                uses[idx] = MIN((uint64_t)uses[idx] + w, UINT32_MAX);
             } else if (npend < s->nb_globals) {
                 pend[npend++] = idx;
             }
@@ -4225,7 +4341,12 @@ static void xblk_region_homes(TCGContext *s)
     for (int i = 0; i < s->nb_globals; i++) {
         int j = i;
 
-        while (j > 0 && uses[order[j - 1]] < uses[i]) {
+        while (j > 0
+               && (carried
+                   ? (carried[order[j - 1]] < carried[i]
+                      || (carried[order[j - 1]] == carried[i]
+                          && uses[order[j - 1]] < uses[i]))
+                   : uses[order[j - 1]] < uses[i])) {
             order[j] = order[j - 1];
             j--;
         }
@@ -4245,7 +4366,7 @@ static void xblk_region_homes(TCGContext *s)
         switch (ts->type) {
         case TCG_TYPE_I32:
         case TCG_TYPE_I64:
-            if (nint >= XBLK_REGION_INT) {
+            if (nint >= int_budget) {
                 continue;
             }
             break;
