@@ -1,4 +1,5 @@
 DEF_HELPER_FLAGS_4(cc_compute_all, TCG_CALL_NO_RWG_SE, tl, tl, tl, tl, int)
+DEF_HELPER_2(rep_fast, i32, env, i32)
 DEF_HELPER_FLAGS_4(cc_compute_c, TCG_CALL_NO_RWG_SE, tl, tl, tl, tl, int)
 DEF_HELPER_FLAGS_3(cc_compute_nz, TCG_CALL_NO_RWG_SE, tl, tl, tl, int)
 DEF_HELPER_FLAGS_5(cc_compute_all2, TCG_CALL_NO_RWG_SE, tl, tl, tl, tl, tl, int)

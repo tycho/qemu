@@ -338,6 +338,7 @@ TCGCR3Flush tcg_cr3_flush;
 bool tcg_pcid;
 
 bool tcg_lean;
+bool tcg_repstr;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
