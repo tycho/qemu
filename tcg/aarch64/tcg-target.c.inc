@@ -3244,6 +3244,19 @@ static void tcg_out_goto_tb_cold(TCGContext *s, int which)
 }
 
 /*
+ * A goto_tb slot of one branch that continues with the next insn while
+ * unlinked (goto_tb_dead in tcg_goto_tb_cold TBs): no trampoline, so a TB
+ * out of branch range is never linked to it.
+ */
+static void tcg_out_goto_tb_next(TCGContext *s, int which)
+{
+    set_jmp_insn_offset(s, which);
+    s->gen_tb->jmp_cold |= 1u << which;
+    tcg_out_insn(s, branch, B, 1);
+    set_jmp_reset_offset(s, which);
+}
+
+/*
  * TB structs and cold code out of the code stream (tcg_tblayout): the
  * trampolines reach a struct anywhere in the region, cold code builds its
  * constants in place.
@@ -3432,9 +3445,13 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     if (tb->jmp_cold & (1u << n)) {
         uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
 
-        /* To the TB, or by way of the trampoline before the reset label. */
+        /*
+         * To the TB, or by way of the trampoline before the reset label,
+         * or for a slot without one (its reset is the next insn) to it.
+         */
         if (d_offset != sextract64(d_offset, 0, 28)) {
-            d_offset = reset - tramp_size(tb, n) - jmp_rx;
+            d_offset = reset - (reset == jmp_rx + 4 ? 0 : tramp_size(tb, n))
+                       - jmp_rx;
         }
         insn = deposit32(Ibranch_B, 0, 26, d_offset >> 2);
         qatomic_set((uint32_t *)jmp_rw, insn);
