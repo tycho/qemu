@@ -10319,10 +10319,11 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
 
     /*
      * Under TCG the guest sees no hypervisor (no CPUID hypervisor bit, no
-     * TCG signature leaf) unless asked for +hypervisor: software that
-     * notices one may change its behaviour.
+     * TCG signature leaf) unless asked for +hypervisor, or given the
+     * Hyper-V interface (x-hyperv), whose leaves need the bit: software
+     * that notices one may change its behaviour.
      */
-    if (tcg_enabled() &&
+    if (tcg_enabled() && !x86_tcg_hyperv(cpu) &&
         !(env->user_features[FEAT_1_ECX] & CPUID_EXT_HYPERVISOR)) {
         env->features[FEAT_1_ECX] &= ~CPUID_EXT_HYPERVISOR;
         cpu->expose_tcg = false;
