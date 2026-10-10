@@ -4037,7 +4037,7 @@ static void gen_Jcc(DisasContext *s, X86DecodedInsn *decode)
          */
         bool dirty;
 
-        gen_jcc(s, (decode->b & 0xf) ^ 1, taken);
+        gen_jcc_1(s, (decode->b & 0xf) ^ 1, taken, unit_cc(s));
         dirty = s->cc_op_dirty;
         gen_jmp_rel(s, s->dflag, decode->immediate, 0);
         gen_set_label(taken);
@@ -4045,7 +4045,7 @@ static void gen_Jcc(DisasContext *s, X86DecodedInsn *decode)
         gen_jmp_rel_csize(s, 0, 1);
         return;
     }
-    gen_jcc(s, decode->b & 0xf, taken);
+    gen_jcc_1(s, decode->b & 0xf, taken, unit_cc(s));
     gen_conditional_jump_labels(s, decode->immediate, NULL, taken);
 }
 

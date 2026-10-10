@@ -1427,19 +1427,25 @@ static inline void gen_jcc_noeob(DisasContext *s, int b, TCGLabel *l1)
    value 'b'. In the fast case, T0 is guaranteed not to be used.
    One or both of the branches will call gen_jmp_rel, so ensure
    cc_op is clean.  */
-static inline void gen_jcc(DisasContext *s, int b, TCGLabel *l1)
+static inline void gen_jcc_1(DisasContext *s, int b, TCGLabel *l1, bool keep)
 {
     CCPrepare cc = gen_prepare_cc(s, b, NULL);
 
     /*
      * Note that this must be _after_ gen_prepare_cc, because it can change
      * the cc_op to CC_OP_EFLAGS (because it's CC_OP_DYNAMIC or because
-     * it's cheaper to just compute the flags)!
+     * it's cheaper to just compute the flags)!  With @keep, each jump that
+     * follows stores it as its destination needs (units).
      */
-    if (!unit_cc(s)) {
+    if (!keep) {
         gen_update_cc_op(s);
     }
     tcg_gen_brcond_tl(cc.cond, cc.reg, cc.reg2, l1);
+}
+
+static inline void gen_jcc(DisasContext *s, int b, TCGLabel *l1)
+{
+    gen_jcc_1(s, b, l1, false);
 }
 
 static void gen_stos(DisasContext *s, MemOp ot, TCGv dshift)
