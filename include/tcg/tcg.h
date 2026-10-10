@@ -121,6 +121,8 @@ struct TCGLabel {
     void *snap;                 /* the allocator's state at the branch */
     void *loopregs;             /* XLBL_LOOP: the globals kept in registers */
     int nb_loopregs;
+    /* 1 + the goto_tb_cold slot whose unlinked path starts here, or 0. */
+    uint8_t cold_slot;
 };
 
 typedef struct TCGPool {

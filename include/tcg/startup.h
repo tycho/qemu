@@ -245,6 +245,13 @@ extern bool tcg_tbpack;
  * generated code, if it has one to spare, else -1.
  */
 extern bool tcg_retstack;
+
+/*
+ * tcg_goto_tb_cold: a goto_tb's unlinked path goes to the end of the TB,
+ * so that the TB's code on its linked paths is contiguous and each goto_tb
+ * is one branch where the backend allows (TCG_TARGET_HAS_GOTO_TB_COLD).
+ */
+extern bool tcg_goto_tb_cold;
 extern intptr_t tcg_retsp_off;
 extern int tcg_retstack_reg;
 extern bool tcg_retstack_addr64;

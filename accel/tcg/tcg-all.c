@@ -611,6 +611,7 @@ static void tcg_set_tblookup(Object *obj, bool value, Error **errp)
     tcg_jc_keep_pcrel = value;
     tcg_tb_flags_canon = value;
     tcg_retstack = value;
+    tcg_goto_tb_cold = value;
 }
 
 static bool tcg_get_addr32(Object *obj, Error **errp)

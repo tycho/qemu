@@ -149,6 +149,13 @@ struct TranslationBlock {
      */
     uint8_t jmp_dead[TB_JMP_SLOTS];
     bool chain_dead_in;
+    /*
+     * The goto_tb slots whose unlinked path is out of line, at the TB's
+     * end (tcg_goto_tb_cold): a slot is one direct branch, to the TB it
+     * is linked to if in range, else to a trampoline right before its
+     * reset address, else to the reset address.
+     */
+    uint8_t jmp_cold;
 
     /*
      * Each TB has a NULL-terminated list (jmp_list_head) of incoming jumps.
