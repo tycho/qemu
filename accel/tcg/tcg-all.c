@@ -256,6 +256,16 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
     qatomic_set(&one_insn_per_tb, value);
 }
 
+static bool tcg_get_repstr(Object *obj, Error **errp)
+{
+    return tcg_repstr;
+}
+
+static void tcg_set_repstr(Object *obj, bool value, Error **errp)
+{
+    tcg_repstr = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -286,6 +296,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                    tcg_set_one_insn_per_tb);
     object_class_property_set_description(oc, "one-insn-per-tb",
         "Only put one guest insn in each translation block");
+
+    object_class_property_add_bool(oc, "x-repstr", tcg_get_repstr,
+                                   tcg_set_repstr);
+    object_class_property_set_description(oc, "x-repstr",
+        "x86 REP STOS and REP MOVS a page at a time with the host's widest "
+        "stores, as with fast string operations (default off)");
 }
 
 static const TypeInfo tcg_accel_type = {
