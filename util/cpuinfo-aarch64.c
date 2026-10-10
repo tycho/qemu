@@ -40,6 +40,9 @@
 # ifndef HWCAP2_I8MM
 #  define HWCAP2_I8MM 0
 # endif
+# ifndef HWCAP2_FRINT
+#  define HWCAP2_FRINT 0
+# endif
 #endif
 #ifdef CONFIG_ELF_AUX_INFO
 #include <sys/auxv.h>
@@ -105,6 +108,7 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= (hwcap2 & HWCAP2_AFP ? CPUINFO_AFP : 0);
     info |= (hwcap2 & HWCAP2_RPRES ? CPUINFO_RPRES : 0);
     info |= (hwcap2 & HWCAP2_I8MM ? CPUINFO_I8MM : 0);
+    info |= (hwcap2 & HWCAP2_FRINT ? CPUINFO_FRINTTS : 0);
 #endif
 #ifdef CONFIG_DARWIN
     info |= sysctl_for_bool("hw.optional.arm.FEAT_LSE") * CPUINFO_LSE;
@@ -114,6 +118,7 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= sysctl_for_bool("hw.optional.arm.FEAT_SHA1") * CPUINFO_SHA1;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_DotProd") * CPUINFO_DOTPROD;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_I8MM") * CPUINFO_I8MM;
+    info |= sysctl_for_bool("hw.optional.arm.FEAT_FRINTTS") * CPUINFO_FRINTTS;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_BTI") * CPUINFO_BTI;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_CSSC") * CPUINFO_CSSC;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_LRCPC") * CPUINFO_LRCPC;
