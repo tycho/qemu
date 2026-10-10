@@ -235,6 +235,7 @@ typedef struct TranslatorRegion {
 static __thread vaddr region_demoted[REGION_DEMOTE_MAX];
 static __thread int region_n_demoted;
 static __thread bool region_redo;
+uint64_t xtcg_unit_redos;
 
 static bool region_is_demoted(vaddr pc)
 {
@@ -549,6 +550,7 @@ int32_t translator_region_edge(DisasContextBase *db, TCGLabel *l,
     if (region_n_demoted < REGION_DEMOTE_MAX) {
         region_demoted[region_n_demoted++] = r->pc[i];
         region_redo = true;
+        qatomic_inc(&xtcg_unit_redos);
     } else {
         region_reject = true;
     }
