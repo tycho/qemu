@@ -324,6 +324,11 @@ bool tcg_vecglobal;
 bool tcg_ymmglobal;
 bool tcg_vregs_all;
 bool tcg_region;
+
+/* Measurement only (XTCG_TBSTATS): ns per translation phase. */
+bool xtcg_ph_on;
+uint64_t xtcg_ph_ns[5];
+uint64_t xtcg_ct[4];   /* temps, globals, snaps, obligations */
 unsigned tcg_superblock;
 bool tcg_tbpack;
 bool tcg_retstack;
@@ -9373,10 +9378,6 @@ static void shladd_pass(TCGContext *s)
 }
 #endif
 
-/* Measurement only (XTCG_TBSTATS): ns per translation phase. */
-bool xtcg_ph_on;
-uint64_t xtcg_ph_ns[5];
-uint64_t xtcg_ct[4];   /* temps, globals, snaps, obligations */
 
 static int64_t xtcg_ph_mark(int64_t t0, int i)
 {
