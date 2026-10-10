@@ -202,7 +202,29 @@ typedef struct TranslatorRegion {
     vaddr end;                  /* the end of the highest block */
     vaddr pc[REGION_MAX_BLOCKS];
     TCGLabel *label[REGION_MAX_BLOCKS];
+    vaddr bend[REGION_MAX_BLOCKS];      /* the end of each block translated */
 } TranslatorRegion;
+
+/*
+ * Loop headers inside a block of a unit's last try: each starts a block of
+ * its own in the next try.  The code before a loop often falls into its
+ * header; the unit would translate the first iteration inline there and
+ * the body again at the target of the back edge.
+ */
+#define REGION_SPLIT_MAX 32
+static __thread vaddr region_split[REGION_SPLIT_MAX];
+static __thread int region_n_split;
+static __thread bool region_resplit;    /* retry with region_split */
+
+static bool region_is_split(vaddr pc)
+{
+    for (int i = 0; i < region_n_split; i++) {
+        if (region_split[i] == pc) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static GMutex region_lock;              /* static: needs no init */
 static GHashTable *region_heads;        /* promoted heads, under region_lock */
@@ -378,6 +400,10 @@ int translator_region_judge(TranslatorRegionVerdict *v, int max)
 
 bool translator_region_overflow(void)
 {
+    if (region_resplit) {
+        region_resplit = false;
+        return true;
+    }
     if (region_cap < 0) {
         /* A plain TB: halve its insns as usual. */
         return false;
@@ -416,6 +442,8 @@ void translator_region_reset(void)
     region_cap = 0;
     region_tried = 0;
     region_reject = false;
+    region_resplit = false;
+    region_n_split = 0;
 }
 
 static bool region_page_ok(const DisasContextBase *db, vaddr pc)
@@ -447,6 +475,7 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
                                    bool *backward)
 {
     TranslatorRegion *r = db->region;
+    int at;
 
     *backward = false;
     if (!r || r->stubbing) {
@@ -467,17 +496,43 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
             return r->label[i];
         }
     }
+    for (int i = 0; r->unit && i < r->next; i++) {
+        /*
+         * A block translated covers [pc, bend); the current one runs to the
+         * jump being translated, at db->pc_next.
+         */
+        bool inside = i == r->next - 1
+                      ? dest > r->pc[i] && dest <= db->pc_next
+                      : dest > r->pc[i] && dest < r->bend[i];
+
+        if (inside) {
+            /* A jump into a block already translated: split it there. */
+            if (region_n_split < REGION_SPLIT_MAX) {
+                region_split[region_n_split++] = dest;
+                region_resplit = true;
+            } else {
+                region_reject = true;
+            }
+            siglongjmp(tcg_ctx->jmp_trans, -2);
+        }
+    }
     if (r->n == (region_cap ? region_cap
                  : r->unit ? tcg_units : REGION_MAX_BLOCKS)
         || !region_page_ok(db, dest)
         || (!r->unit && !translator_region_has_run(r->cpu, db->tb, dest))) {
         return NULL;
     }
-    r->pc[r->n] = dest;
-    r->label[r->n] = gen_new_label();
-    r->label[r->n]->region = true;
-    region_tried = r->n + 1;
-    return r->label[r->n++];
+    /* A block split off follows the one it was split from. */
+    at = r->unit && region_is_split(dest) ? r->next : r->n;
+    memmove(&r->pc[at + 1], &r->pc[at], (r->n - at) * sizeof(r->pc[0]));
+    memmove(&r->label[at + 1], &r->label[at],
+            (r->n - at) * sizeof(r->label[0]));
+    r->pc[at] = dest;
+    r->label[at] = gen_new_label();
+    r->label[at]->region = true;
+    r->n++;
+    region_tried = r->n;
+    return r->label[at];
 }
 
 bool translator_region_backward(DisasContextBase *db, vaddr dest)
@@ -735,6 +790,12 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             }
             break;
         }
+
+        /* A loop header split off starts a block: jump (fall) into it. */
+        if (db->region && region_n_split && region_is_split(db->pc_next)) {
+            db->is_jmp = DISAS_TOO_MANY;
+            break;
+        }
     }
 
     /* Emit code to exit the TB, as indicated by db->is_jmp.  */
@@ -743,6 +804,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         TranslatorRegion *r = db->region;
 
         r->end = MAX(r->end, db->pc_next);
+        r->bend[r->next - 1] = db->pc_next;
         if (r->next < r->n) {
             /*
              * The next block of the region.  Once the insn budget is spent,
