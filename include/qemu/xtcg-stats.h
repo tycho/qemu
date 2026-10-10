@@ -58,6 +58,12 @@ typedef enum XtcgStat {
     XS_JIT_TO_EXEC,         /* qemu_thread_jit_execute calls */
     XS_JIT_TO_WRITE,        /* qemu_thread_jit_write calls */
     XS_JIT_FLIPS,           /* ... that changed this thread's mode */
+    /* softfloat scalar ops with a hardfloat path (CH-10, CH-13) */
+    XS_SF_HARD,             /* computed on the host FPU */
+    XS_SF_SOFT_PE,          /* soft: inexact not yet set */
+    XS_SF_SOFT_RC,          /* soft: rounding mode not nearest-even */
+    XS_SF_SOFT_INPUT,       /* soft: an input not zero or normal */
+    XS_SF_SOFT_RESULT,      /* soft: tiny result (or broken host fma) */
     XS__COUNT
 } XtcgStat;
 
@@ -69,10 +75,25 @@ typedef enum XtcgHist {
     XH_EXCP,                /* exception_index, see xtcg_excp_bucket() */
     XH_TLB_FILL_BITS,       /* log2(TLB entries) of the mmu_idx at a fill */
     XH_TLB_FILL_MMUIDX,     /* mmu_idx of each fill */
+    XH_SSEFP,               /* x86 packed FP: op * 8 + outcome, see below */
     XH__COUNT
 } XtcgHist;
 
 #define XTCG_HIST_BUCKETS 128
+
+/* XH_SSEFP operations and outcomes (x-ssefp=vec wrappers). */
+enum {
+    XSSE_ADD, XSSE_SUB, XSSE_MUL, XSSE_DIV, XSSE_MIN, XSSE_MAX, XSSE_CMP,
+    XSSE_SQRT, XSSE_FMA, XSSE_CVTDQ2PS, XSSE_CVTPS2DQ, XSSE_CVTTPS2DQ,
+};
+enum {
+    XSSE_VEC,               /* vector path taken */
+    XSSE_FB_PE,             /* fallback: inexact not yet set */
+    XSSE_FB_RC,             /* fallback: rounding mode not nearest-even */
+    XSSE_FB_NANINF,         /* fallback: a NaN or infinity input */
+    XSSE_FB_DENORM,         /* fallback: a denormal input */
+    XSSE_FB_RESULT,         /* fallback: result or range check */
+};
 
 extern bool xtcg_stats;
 extern uint64_t xtcg_stat[XS__COUNT];
