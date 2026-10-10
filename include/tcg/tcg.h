@@ -108,6 +108,8 @@ struct TCGLabel {
     QSIMPLEQ_HEAD(, TCGLabelUse) branches;
     QSIMPLEQ_HEAD(, TCGRelocation) relocs;
     QSIMPLEQ_ENTRY(TCGLabel) next;
+    /* 1 + the goto_tb_cold slot whose unlinked path starts here, or 0. */
+    uint8_t cold_slot;
 };
 
 typedef struct TCGPool {
