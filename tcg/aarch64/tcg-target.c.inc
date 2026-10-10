@@ -1992,11 +1992,13 @@ static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
         tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X4, lb->site);
         tcg_out_call_int(s, (const void *)helper_tso_cross_ld);
+        tcg_out_pinned_clobbered(s, false);
         tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
     } else {
         tcg_out_st_helper_args(s, lb, &ldst_helper_param);
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X5, lb->site);
         tcg_out_call_int(s, (const void *)helper_tso_cross_st);
+        tcg_out_pinned_clobbered(s, false);
     }
     tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
     tcg_out_goto(s, lb->raddr);
