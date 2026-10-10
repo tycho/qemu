@@ -2308,17 +2308,23 @@ static target_ulong rs_next_pc(DisasContext *s)
 
 /*
  * The return landing, where the host returns to after the guest RET to
- * the CALL's return address: chain to it through goto_tb @slot, or leave
- * to the main loop if @slot is negative.
+ * the CALL's return address: chain to it through goto_tb @slot, or look
+ * it up if @slot is negative.
  */
 static void gen_ret_landing(DisasContext *s, TCGLabel *land, int slot)
 {
     gen_set_label(land);
     if (slot >= 0) {
         tcg_gen_goto_tb(slot);
+        tcg_gen_movi_tl(cpu_eip, s->rs_next);
+        tcg_gen_exit_tb(s->base.tb, slot);
+    } else {
+        /* No goto_tb slot for it: look it up. */
+        tcg_gen_movi_tl(cpu_eip, s->rs_next);
+        translator_lookup_and_goto_ptr(&s->base,
+                                       tcg_constant_i64(rs_next_pc(s)),
+                                       s->cs_base, s->flags, false);
     }
-    tcg_gen_movi_tl(cpu_eip, s->rs_next);
-    tcg_gen_exit_tb(slot >= 0 ? s->base.tb : NULL, slot >= 0 ? slot : 0);
 }
 
 /* A goto_tb slot for the return landing other than @used, or -1. */
