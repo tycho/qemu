@@ -24,6 +24,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "system/tcg.h"
 #include "exec/replay-core.h"
 #include "exec/icount.h"
@@ -266,23 +267,35 @@ static void tcg_set_region(Object *obj, bool value, Error **errp)
     tcg_region = value;
 }
 
-static void tcg_get_superblock(Object *obj, Visitor *v, const char *name,
-                               void *opaque, Error **errp)
-{
-    uint32_t value = tcg_superblock;
+/* Units of up to this many blocks with x-superblock=units. */
+#define TCG_UNIT_BLOCKS 3
 
-    visit_type_uint32(v, name, &value, errp);
+/* Profile samples a loop needs with x-superblock=units. */
+#define TCG_UNIT_SAMPLES 4
+
+static char *tcg_get_superblock(Object *obj, Error **errp)
+{
+    if (tcg_units) {
+        return g_strdup("units");
+    }
+    return g_strdup_printf("%u", tcg_superblock);
 }
 
-static void tcg_set_superblock(Object *obj, Visitor *v, const char *name,
-                               void *opaque, Error **errp)
+static void tcg_set_superblock(Object *obj, const char *value, Error **errp)
 {
-    uint32_t value;
+    uint64_t n;
 
-    if (!visit_type_uint32(v, name, &value, errp)) {
+    if (!strcmp(value, "units")) {
+        tcg_superblock = TCG_UNIT_SAMPLES;
+        tcg_units = TCG_UNIT_BLOCKS;
         return;
     }
-    tcg_superblock = value;
+    if (qemu_strtou64(value, NULL, 0, &n) < 0 || n > UINT32_MAX) {
+        error_setg(errp, "x-superblock: a number of samples, or 'units'");
+        return;
+    }
+    tcg_superblock = n;
+    tcg_units = 0;
 }
 
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
@@ -323,12 +336,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "chaining to itself, keeping the loop's guest registers in host "
         "registers (not with plugins or icount)");
 
-    object_class_property_add(oc, "x-superblock", "uint32",
-        tcg_get_superblock, tcg_set_superblock, NULL, NULL);
+    object_class_property_add_str(oc, "x-superblock",
+                                  tcg_get_superblock, tcg_set_superblock);
     object_class_property_set_description(oc, "x-superblock",
         "With x-region: after this many profile samples (one per ms) in a "
         "loop, translate the loop's blocks that have run as one translation "
-        "block (0: never, the default)");
+        "block (0: never, the default); 'units': 4 samples, and in user "
+        "mode every other translation block holds the blocks it reaches by "
+        "direct jumps, up to 3");
 }
 
 static const TypeInfo tcg_accel_type = {
