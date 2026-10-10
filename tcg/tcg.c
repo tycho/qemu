@@ -6449,7 +6449,8 @@ static void tcg_reg_alloc_chain_store(TCGContext *s, bool dead)
     for (int i = 0; i < s->nb_globals; i++) {
         TCGTemp *ts = &s->temps[i];
 
-        if (ts->kind == TEMP_GLOBAL &&
+        if (ts->kind == TEMP_GLOBAL && !ts->mem_coherent &&
+            !temp_readonly(ts) &&
             (temp_chain_dead_index(s, ts) >= 0) == dead) {
             temp_sync(s, ts, s->reserved_regs, 0, 0);
         }
