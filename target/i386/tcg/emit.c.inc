@@ -1552,19 +1552,83 @@ VINT_BINARY(PMADDWD, pmaddwd, gen_helper_pmaddwd_mmx,
             vint_can(INDEX_op_mulw_vec, MO_16)
             && vint_can(INDEX_op_addp_vec, MO_32),
             vint_pmaddwd, 0)
-#define VNNI_SSE(uname, lname)                                                \
+/*
+ * AVX-VNNI with tcg_vint: VPDPBUSD as a mixed-sign byte dot product into
+ * the destination, VPDPBUSDS as one into zero added with saturation (four
+ * byte products can't overflow), VPDPWSSD as PMADDWD added to it.
+ * VPDPWSSDS keeps the helper: its two products may sum to 2^31.
+ */
+enum { VNNI_BUSD, VNNI_BUSDS, VNNI_WSSD };
+
+static bool gen_vnni_host(DisasContext *s, X86DecodedInsn *decode, int kind)
+{
+    int lanes = vector_len(s, decode) / 16;
+    TCGv_vec r[2];
+
+    switch (kind) {
+    case VNNI_BUSDS:
+        if (!vint_can(INDEX_op_ssadd_vec, MO_32)) {
+            return false;
+        }
+        /* fall through */
+    case VNNI_BUSD:
+        if (!vint_can(INDEX_op_usdot4_vec, MO_32)) {
+            return false;
+        }
+        break;
+    case VNNI_WSSD:
+        if (!vint_can(INDEX_op_mulw_vec, MO_16) ||
+            !vint_can(INDEX_op_addp_vec, MO_32)) {
+            return false;
+        }
+        break;
+    }
+    for (int l = 0; l < lanes; l++) {
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        r[l] = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_ld_vec(r[l], tcg_env, decode->op[0].offset + 16 * l);
+        tcg_gen_ld_vec(a, tcg_env, decode->op[1].offset + 16 * l);
+        tcg_gen_ld_vec(b, tcg_env, decode->op[2].offset + 16 * l);
+        switch (kind) {
+        case VNNI_BUSD:
+            tcg_gen_usdot4_vec(r[l], r[l], a, b);
+            break;
+        case VNNI_BUSDS:
+            tcg_gen_usdot4_vec(t, tcg_constant_vec(TCG_TYPE_V128, MO_32, 0),
+                               a, b);
+            tcg_gen_ssadd_vec(MO_32, r[l], r[l], t);
+            break;
+        case VNNI_WSSD:
+            vint_pmaddwd(t, a, b, 0);
+            tcg_gen_add_vec(MO_32, r[l], r[l], t);
+            break;
+        }
+    }
+    for (int l = 0; l < lanes; l++) {
+        tcg_gen_st_vec(r[l], tcg_env, decode->op[0].offset + 16 * l);
+    }
+    return true;
+}
+
+#define VNNI_SSE(uname, lname, kind)                                          \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
 {                                                                             \
+    if ((kind) >= 0 && gen_vnni_host(s, decode, kind)) {                      \
+        return;                                                               \
+    }                                                                         \
     if (!s->vex_l) {                                                          \
         gen_helper_##lname##_xmm(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);         \
     } else {                                                                  \
         gen_helper_##lname##_ymm(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);         \
     }                                                                         \
 }
-VNNI_SSE(VPDPBUSD, vpdpbusd)
-VNNI_SSE(VPDPBUSDS, vpdpbusds)
-VNNI_SSE(VPDPWSSD, vpdpwssd)
-VNNI_SSE(VPDPWSSDS, vpdpwssds)
+VNNI_SSE(VPDPBUSD, vpdpbusd, VNNI_BUSD)
+VNNI_SSE(VPDPBUSDS, vpdpbusds, VNNI_BUSDS)
+VNNI_SSE(VPDPWSSD, vpdpwssd, VNNI_WSSD)
+VNNI_SSE(VPDPWSSDS, vpdpwssds, -1)
 
 VINT_BINARY(PMULHUW, pmulhuw, gen_helper_pmulhuw_mmx,
             vint_can(INDEX_op_mulw_vec, MO_16)
