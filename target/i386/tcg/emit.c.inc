@@ -1552,6 +1552,20 @@ VINT_BINARY(PMADDWD, pmaddwd, gen_helper_pmaddwd_mmx,
             vint_can(INDEX_op_mulw_vec, MO_16)
             && vint_can(INDEX_op_addp_vec, MO_32),
             vint_pmaddwd, 0)
+#define VNNI_SSE(uname, lname)                                                \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    if (!s->vex_l) {                                                          \
+        gen_helper_##lname##_xmm(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);         \
+    } else {                                                                  \
+        gen_helper_##lname##_ymm(tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);         \
+    }                                                                         \
+}
+VNNI_SSE(VPDPBUSD, vpdpbusd)
+VNNI_SSE(VPDPBUSDS, vpdpbusds)
+VNNI_SSE(VPDPWSSD, vpdpwssd)
+VNNI_SSE(VPDPWSSDS, vpdpwssds)
+
 VINT_BINARY(PMULHUW, pmulhuw, gen_helper_pmulhuw_mmx,
             vint_can(INDEX_op_mulw_vec, MO_16)
             && vint_can(INDEX_op_narrow_vec, MO_16),
