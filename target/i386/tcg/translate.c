@@ -2513,6 +2513,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
          * through the slot of an ordinary call.  Either way one host call.
          */
         dead = use_flags_dead(s) && tcg_region && !tcg_flags_dead_fwd &&
+               !tcg_flags_dead_nocall &&
                (s->base.region ? translator_goto_tb_slot(&s->base, &dslot)
                                : dslot <= TB_EXIT_IDXMAX);
         if (dead) {

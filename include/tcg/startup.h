@@ -335,6 +335,7 @@ extern bool tcg_flags_guess;
  */
 extern bool tcg_flags_dead;
 extern bool tcg_flags_dead_fwd;
+extern bool tcg_flags_dead_nocall;
 
 /*
  * x86 guests: INC and DEC after an unknown flags state (a TB's first
