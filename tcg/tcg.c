@@ -4070,19 +4070,6 @@ TCGOp *tcg_op_insert_after(TCGContext *s, TCGOp *old_op,
     return new_op;
 }
 
-/* Whether every use of @l is a br or brcond. */
-static bool label_uses_only_br(TCGLabel *l)
-{
-    TCGLabelUse *u;
-
-    QSIMPLEQ_FOREACH(u, &l->branches, next) {
-        if (u->op->opc != INDEX_op_br && u->op->opc != INDEX_op_brcond) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static void move_label_uses(TCGLabel *to, TCGLabel *from)
 {
     TCGLabelUse *u;
@@ -4428,22 +4415,6 @@ reachable_code_pass(TCGContext *s)
                 tcg_op_remove(s, op_prev);
                 /* Fall through means insns become live again.  */
                 dead = false;
-            }
-
-            /*
-             * Units (tcg_units): a label whose code is a lone br, as at a
-             * conditional jump between two blocks of a unit, passes its
-             * branches on to the br's label.  The conditional branch then
-             * goes straight to its block and the other side falls through.
-             */
-            if (tcg_units && !label->region && !label->loop) {
-                TCGOp *after = QTAILQ_NEXT(op, link);
-                TCGLabel *to = after && after->opc == INDEX_op_br
-                               ? arg_label(after->args[0]) : NULL;
-
-                if (to && to != label && label_uses_only_br(label)) {
-                    move_label_uses(to, label);
-                }
             }
 
             if (QSIMPLEQ_EMPTY(&label->branches)) {
