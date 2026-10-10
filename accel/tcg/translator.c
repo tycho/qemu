@@ -193,8 +193,27 @@ typedef struct RegionTrial {
     uint32_t flags, cflags;
 } RegionTrial;
 
+/*
+ * Measurement only (XTCG_UNITS=N): every TB is a unit of up to N blocks,
+ * following direct jumps at or after its start on its page and the next,
+ * whether or not they have run.
+ */
+static int units_max = -1;
+
+static int units_blocks(void)
+{
+    if (units_max < 0) {
+        const char *e = getenv("XTCG_UNITS");
+
+        units_max = e ? MIN(MAX(atoi(e), 0), REGION_MAX_BLOCKS) : 0;
+    }
+    return units_max;
+}
+
 typedef struct TranslatorRegion {
     CPUState *cpu;
+    bool unit;                  /* a unit (XTCG_UNITS), not a sampled region */
+    int8_t page2;               /* the next page executable: -1 unknown */
     int n;                      /* blocks so far */
     int next;                   /* the next block to translate */
     int backedges;              /* jumps back to a block already translated */
@@ -422,10 +441,22 @@ void translator_region_reset(void)
 static bool region_page_ok(const DisasContextBase *db, vaddr pc)
 {
     vaddr first = db->pc_first & TARGET_PAGE_MASK;
+    TranslatorRegion *r = db->region;
 
-    return pc >= db->pc_first
-           && ((pc & TARGET_PAGE_MASK) == first
-               || (pc & TARGET_PAGE_MASK) == first + TARGET_PAGE_SIZE);
+    if (pc < db->pc_first) {
+        return false;
+    }
+    if ((pc & TARGET_PAGE_MASK) == first) {
+        return true;
+    }
+    if ((pc & TARGET_PAGE_MASK) != first + TARGET_PAGE_SIZE) {
+        return false;
+    }
+    if (r && r->unit && r->page2 < 0) {
+        r->page2 = get_page_addr_code_probe(cpu_env(r->cpu),
+                                            first + TARGET_PAGE_SIZE) != -1;
+    }
+    return !(r && r->unit) || r->page2;
 }
 
 TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
@@ -452,9 +483,10 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
             return r->label[i];
         }
     }
-    if (r->n == (region_cap ? region_cap : REGION_MAX_BLOCKS)
+    if (r->n == (region_cap ? region_cap
+                 : r->unit ? units_blocks() : REGION_MAX_BLOCKS)
         || !region_page_ok(db, dest)
-        || !translator_region_has_run(r->cpu, db->tb, dest)) {
+        || (!r->unit && !translator_region_has_run(r->cpu, db->tb, dest))) {
         return NULL;
     }
     r->pc[r->n] = dest;
@@ -778,18 +810,22 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         db->region_capable = tcg_superblock && ops->block_start
                              && tb_page_addr0(tb) != -1
                              && !(cflags & CF_COUNT_MASK);
-        if (db->region_capable) {
+        if (db->region_capable && units_blocks() <= 1) {
             translator_region_sampler_start();
         }
     }
     if (db->region_capable && region_cap >= 0
-        && translator_region_is_head(tb_page_addr0(tb))) {
+        && (units_blocks() > 1
+            || translator_region_is_head(tb_page_addr0(tb)))) {
         TranslatorRegion *r = tcg_malloc(sizeof(*r));
-        bool kept;
+        bool unit = units_blocks() > 1;
+        bool kept = unit;
 
-        g_mutex_lock(&region_lock);
-        kept = region_set_contains(region_kept, tb_page_addr0(tb));
-        g_mutex_unlock(&region_lock);
+        if (!unit) {
+            g_mutex_lock(&region_lock);
+            kept = region_set_contains(region_kept, tb_page_addr0(tb));
+            g_mutex_unlock(&region_lock);
+        }
         g_free(region_cur_trial);
         region_cur_trial = NULL;
         if (!kept) {
@@ -805,6 +841,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         }
 
         r->cpu = cpu;
+        r->unit = unit;
+        r->page2 = -1;
         r->n = r->next = 1;
         r->backedges = 0;
         r->stubbing = false;
@@ -915,7 +953,13 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             goto next_block;
         }
         db->pc_next = r->end;
-        if (r->n == 1 || !r->backedges) {
+        if (r->unit && r->n == 1) {
+            /* A plain TB: its start is the loop label again. */
+            db->loop_label->region = false;
+            db->loop_label->loop = true;
+        } else if (r->unit) {
+            /* A unit gains without a cycle. */
+        } else if (r->n == 1 || !r->backedges) {
             /* Nothing to gain: translate the head as a plain TB. */
             region_drop(tb_page_addr0(tb));
             region_reject = true;
