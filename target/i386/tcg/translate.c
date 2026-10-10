@@ -24,6 +24,7 @@
 #include "exec/translation-block.h"
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-op-gvec.h"
+#include "tcg/startup.h"
 #include "exec/translator.h"
 #include "exec/target_page.h"
 #include "fpu/softfloat.h"
@@ -1383,6 +1384,8 @@ static void gen_outs(DisasContext *s, MemOp ot, TCGv dshift)
 }
 
 #define REP_MAX 65535
+/* Bytes from which x-repstr's bulk path is worth its call. */
+#define REP_FAST_MIN 256
 
 static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
                        void (*fn)(DisasContext *s, MemOp ot, TCGv dshift),
@@ -1391,6 +1394,8 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     TCGLabel *last = gen_new_label();
     TCGLabel *loop = gen_new_label();
     TCGLabel *done = gen_new_label();
+    TCGLabel *slow = gen_new_label();
+    TCGLabel *reenter = NULL;
 
     target_ulong cx_mask = MAKE_64BIT_MASK(0, 8 << s->aflag);
     TCGv cx_next = tcg_temp_new();
@@ -1427,6 +1432,33 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
 
     /* Any iteration at all?  */
     tcg_gen_brcondi_tl(TCG_COND_TSTEQ, cpu_regs[R_ECX], cx_mask, done);
+
+    /*
+     * x-repstr: REP STOS and REP MOVS in bulk first (helper_rep_fast);
+     * with something done and more to do, run the instruction again (the
+     * exit request is checked on the way); with nothing done, the loop
+     * below.
+     */
+    if (tcg_repstr && can_loop && !is_repz_nz && s->aflag >= MO_32 &&
+        !s->base.plugin_enabled && (fn == gen_stos || fn == gen_movs)) {
+        TCGv_i32 progress = tcg_temp_new_i32();
+        int src_seg = s->override < 0 ? R_DS : s->override;
+        /* Segment bases as gen_lea_v_seg_dest() adds them. */
+        uint32_t desc = ot | s->aflag << 2 | (fn == gen_movs) << 4 |
+                        src_seg << 5 | ADDSEG(s) << 8 |
+                        (src_seg >= R_FS || ADDSEG(s)) << 9 |
+                        CODE64(s) << 10 | s->mem_index << 11;
+
+        reenter = gen_new_label();
+        /* Short strings are cheaper element by element. */
+        tcg_gen_brcondi_tl(TCG_COND_LTU, cpu_regs[R_ECX],
+                           REP_FAST_MIN >> ot, slow);
+        gen_helper_rep_fast(progress, tcg_env, tcg_constant_i32(desc));
+        tcg_gen_brcondi_i32(TCG_COND_EQ, progress, 0, slow);
+        tcg_gen_brcondi_tl(TCG_COND_TSTEQ, cpu_regs[R_ECX], cx_mask, done);
+        tcg_gen_br(reenter);
+        gen_set_label(slow);
+    }
 
     /*
      * From now on we operate on the value of CX/ECX/RCX that will be written
@@ -1473,6 +1505,9 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
      * but the last.  Set it here before giving the main loop a chance to
      * execute.  (For faults, seg_helper.c sets the flag as usual).
      */
+    if (reenter) {
+        gen_set_label(reenter);
+    }
     if (!had_rf) {
         gen_set_eflags(s, RF_MASK);
     }
