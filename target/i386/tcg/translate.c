@@ -2558,26 +2558,40 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
         /* jump to same page: we can use a direct jump */
         TCGLabel *req = translator_edge_check(&s->base, new_pc);
         int dslot = s->base.region ? 4 : tb_num + 4;
+        bool dead = false;
 
         /*
          * x-flags=dead: first a jump that the main loop links only to a
          * TB that overwrites the condition codes, before they are stored;
-         * in TBs with slots to spare, and not on a jump that checks the
-         * exit request.
+         * in TBs with slots to spare.
          */
-        if (use_flags_dead(s) && !req &&
+        if (use_flags_dead(s) &&
             (s->base.region ? translator_goto_tb_slot(&s->base, &dslot)
                             : dslot <= TB_EXIT_IDXMAX)) {
             tcg_gen_goto_tb_dead(dslot, tb_num);
+            dead = true;
         }
         tcg_gen_goto_tb(tb_num);
-        if (req) {
+        if (req && !dead) {
             gen_set_label(req);
+            req = NULL;
         }
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
             tcg_gen_movi_tl(cpu_eip, new_eip);
         }
         tcg_gen_exit_tb(s->base.tb, tb_num);
+        if (req) {
+            /*
+             * With goto_tb_dead, the exit request's own exit, reached only
+             * from its check, so that the condition codes are stored on
+             * its path alone.
+             */
+            gen_set_label(req);
+            if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
+                tcg_gen_movi_tl(cpu_eip, new_eip);
+            }
+            tcg_gen_exit_tb(s->base.tb, tb_num);
+        }
         s->base.is_jmp = DISAS_NORETURN;
     } else {
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
