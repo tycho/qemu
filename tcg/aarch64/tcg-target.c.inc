@@ -2890,6 +2890,19 @@ static void tcg_out_goto_tb_cold(TCGContext *s, int which)
     tcg_out_insn(s, branch, B, 0);
 }
 
+/*
+ * A goto_tb slot of one branch that continues with the next insn while
+ * unlinked (goto_tb_dead in tcg_goto_tb_cold TBs): no trampoline, so a TB
+ * out of branch range is never linked to it.
+ */
+static void tcg_out_goto_tb_next(TCGContext *s, int which)
+{
+    set_jmp_insn_offset(s, which);
+    s->gen_tb->jmp_cold |= 1u << which;
+    tcg_out_insn(s, branch, B, 1);
+    set_jmp_reset_offset(s, which);
+}
+
 static void tcg_out_goto_tb_tramp(TCGContext *s, int which)
 {
     intptr_t i_off = tcg_pcrel_diff(s, (void *)get_jmp_target_addr(s, which));
@@ -2991,9 +3004,12 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     if (tb->jmp_cold & (1u << n)) {
         uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
 
-        /* To the TB, or by way of the trampoline before the reset label. */
+        /*
+         * To the TB, or by way of the trampoline before the reset label,
+         * or for a slot without one (its reset is the next insn) to it.
+         */
         if (d_offset != sextract64(d_offset, 0, 28)) {
-            d_offset = reset - 8 - jmp_rx;
+            d_offset = reset - (reset == jmp_rx + 4 ? 0 : 8) - jmp_rx;
         }
         insn = deposit32(Ibranch_B, 0, 26, d_offset >> 2);
         qatomic_set((uint32_t *)jmp_rw, insn);

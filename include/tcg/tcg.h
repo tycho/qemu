@@ -469,6 +469,8 @@ struct TCGContext {
     TCGTemp *chain_dead[8];
     int nb_chain_dead;
     bool chain_dead_used;
+    /* This TB's goto_tb slots are single branches (tcg_goto_tb_cold). */
+    bool goto_tb_cold;
 
 #ifdef CONFIG_PLUGIN
     /*

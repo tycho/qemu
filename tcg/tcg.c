@@ -4274,6 +4274,7 @@ dead_env_store_pass(TCGContext *s)
             break;
         case INDEX_op_exit_tb:
         case INDEX_op_goto_tb:
+        case INDEX_op_goto_tb_cold:
         case INDEX_op_goto_ptr:
             dead.n = 0;
             if (dse_scratch_lo < dse_scratch_hi) {
@@ -4841,6 +4842,7 @@ static bool op_falls_through(const TCGOp *op)
     case INDEX_op_br:
     case INDEX_op_exit_tb:
     case INDEX_op_goto_ptr:
+    case INDEX_op_goto_tb_cold:
         return false;
     default:
         return true;
@@ -4859,6 +4861,7 @@ static bool xblk_reaches_loop(const TCGOp *op)
             return arg_label(op->args[0])->xkind == XLBL_LOOP;
         case INDEX_op_exit_tb:
         case INDEX_op_goto_tb:
+        case INDEX_op_goto_tb_cold:
         case INDEX_op_goto_ptr:
             return false;
         default:
@@ -9405,6 +9408,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         dead_env_store_pass(s);
     }
 
+    s->goto_tb_cold = tcg_goto_tb_cold;
     if (tcg_goto_tb_cold) {
         goto_tb_cold_pass(s);
     }
@@ -9618,10 +9622,20 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         case INDEX_op_goto_tb_dead:
             tcg_reg_alloc_chain_store(s, false);
             s->gen_tb->jmp_dead[op->args[1]] = op->args[0] + 1;
+#ifdef TCG_TARGET_HAS_GOTO_TB_COLD
+            if (s->goto_tb_cold) {
+                /* One branch, to the next insn while unlinked. */
+                tcg_out_goto_tb_next(s, op->args[0]);
+                break;
+            }
+#endif
             tcg_out_goto_tb(s, op->args[0]);
             break;
 #ifdef TCG_TARGET_HAS_GOTO_TB_COLD
         case INDEX_op_goto_tb_cold:
+            if (s->chain_dead_used) {
+                tcg_reg_alloc_chain_store(s, true);
+            }
             tcg_debug_assert(op->args[0] < ARRAY_SIZE(s->call_tb_reset));
             s->call_tb_reset[op->args[0]] = arg_label(op->args[1]);
             arg_label(op->args[1])->cold_slot = op->args[0] + 1;
