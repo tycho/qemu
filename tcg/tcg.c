@@ -2385,6 +2385,12 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_goto_ptr:
         return true;
 
+    case INDEX_op_goto_tb_cold:
+#ifdef TCG_TARGET_HAS_GOTO_TB_COLD
+        return true;
+#else
+        return false;
+#endif
     case INDEX_op_call_tb:
 #ifdef TCG_TARGET_HAS_RETSTACK
         return true;
@@ -3506,6 +3512,7 @@ void tcg_op_remove(TCGContext *s, TCGOp *op)
         break;
     case INDEX_op_push_ret:
     case INDEX_op_call_tb:
+    case INDEX_op_goto_tb_cold:
         remove_label_use(op, 1);
         break;
     default:
@@ -3608,6 +3615,7 @@ static void move_label_uses(TCGLabel *to, TCGLabel *from)
             break;
         case INDEX_op_push_ret:
         case INDEX_op_call_tb:
+        case INDEX_op_goto_tb_cold:
             op->args[1] = label_arg(to);
             break;
         default:
@@ -3616,6 +3624,78 @@ static void move_label_uses(TCGLabel *to, TCGLabel *from)
     }
 
     QSIMPLEQ_CONCAT(&to->branches, &from->branches);
+}
+
+/*
+ * tcg_goto_tb_cold: move each goto_tb's unlinked path (the ops after it up
+ * to its exit_tb) to the end of the TB, behind a label the slot branches
+ * to while unlinked; the goto_tb becomes goto_tb_cold.
+ */
+bool tcg_goto_tb_cold;
+
+static void goto_tb_cold_pass(TCGContext *s)
+{
+#ifdef TCG_TARGET_HAS_GOTO_TB_COLD
+    TCGOp *op, *next, *last = QTAILQ_LAST(&s->ops);
+    bool done = false;
+
+    for (op = QTAILQ_FIRST(&s->ops); op && !done; op = next) {
+        TCGOp *p, *end = NULL, *cold, *after;
+        TCGLabel *l;
+
+        next = QTAILQ_NEXT(op, link);
+        done = op == last;
+        if (op->opc != INDEX_op_goto_tb) {
+            continue;
+        }
+        for (p = next; p; p = QTAILQ_NEXT(p, link)) {
+            const TCGOpDef *def = &tcg_op_defs[p->opc];
+
+            if (p->opc == INDEX_op_exit_tb) {
+                end = p;
+                break;
+            }
+            if (p->opc == INDEX_op_set_label ||
+                p->opc == INDEX_op_insn_start || p->opc == INDEX_op_call ||
+                (def->flags & (TCG_OPF_BB_END | TCG_OPF_BB_EXIT |
+                               TCG_OPF_COND_BRANCH))) {
+                break;
+            }
+            if (p == last) {
+                break;
+            }
+        }
+        if (!end) {
+            continue;
+        }
+        l = gen_new_label();
+        cold = tcg_op_insert_before(s, op, INDEX_op_goto_tb_cold, 0, 2);
+        cold->args[0] = op->args[0];
+        cold->args[1] = label_arg(l);
+        {
+            TCGLabelUse *u = tcg_malloc(sizeof(TCGLabelUse));
+
+            u->op = cold;
+            QSIMPLEQ_INSERT_TAIL(&l->branches, u, next);
+        }
+        after = QTAILQ_NEXT(end, link);
+        done = done || end == last;
+        /* The label, then the unlinked path, at the end. */
+        gen_set_label(l);
+        for (p = next;; p = cold) {
+            bool was_end = p == end;
+
+            cold = QTAILQ_NEXT(p, link);
+            QTAILQ_REMOVE(&s->ops, p, link);
+            QTAILQ_INSERT_TAIL(&s->ops, p, link);
+            if (was_end) {
+                break;
+            }
+        }
+        tcg_op_remove(s, op);
+        next = done ? NULL : after;
+    }
+#endif
 }
 
 /* Reachable analysis : remove unreachable code.  */
@@ -6668,6 +6748,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 
     tcg_optimize(s);
 
+    if (tcg_goto_tb_cold) {
+        goto_tb_cold_pass(s);
+    }
     reachable_code_pass(s);
     liveness_pass_0(s);
     liveness_pass_1(s);
@@ -6708,6 +6791,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     tb->jmp_insn_offset[0] = TB_JMP_OFFSET_INVALID;
     tb->jmp_insn_offset[1] = TB_JMP_OFFSET_INVALID;
     tb->jmp_call = 0;
+    tb->jmp_cold = 0;
     memset(s->call_tb_reset, 0, sizeof(s->call_tb_reset));
 
     tcg_reg_alloc_start(s);
@@ -6776,6 +6860,11 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             break;
         case INDEX_op_set_label:
             tcg_reg_alloc_bb_end(s, s->reserved_regs);
+#ifdef TCG_TARGET_HAS_GOTO_TB_COLD
+            if (arg_label(op->args[0])->cold_slot) {
+                tcg_out_goto_tb_tramp(s, arg_label(op->args[0])->cold_slot - 1);
+            }
+#endif
             tcg_out_label(s, arg_label(op->args[0]));
             break;
         case INDEX_op_call:
@@ -6788,6 +6877,14 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         case INDEX_op_goto_tb:
             tcg_out_goto_tb(s, op->args[0]);
             break;
+#ifdef TCG_TARGET_HAS_GOTO_TB_COLD
+        case INDEX_op_goto_tb_cold:
+            tcg_debug_assert(op->args[0] < ARRAY_SIZE(s->call_tb_reset));
+            s->call_tb_reset[op->args[0]] = arg_label(op->args[1]);
+            arg_label(op->args[1])->cold_slot = op->args[0] + 1;
+            tcg_out_goto_tb_cold(s, op->args[0]);
+            break;
+#endif
 #ifdef TCG_TARGET_HAS_RETSTACK
         case INDEX_op_call_tb:
             tcg_debug_assert(op->args[0] < ARRAY_SIZE(s->call_tb_reset));
@@ -6842,7 +6939,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         return -2;
     }
 
-    /* A call_tb slot, while unlinked, leads to its reset label. */
+    /* A call_tb or goto_tb_cold slot, while unlinked, leads to its label. */
     for (int n = 0; n < ARRAY_SIZE(tb->jmp_reset_offset); n++) {
         TCGLabel *l = s->call_tb_reset[n];
 
