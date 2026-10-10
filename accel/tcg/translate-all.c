@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
 
 #include "trace.h"
 #include "disas/disas.h"
@@ -368,7 +369,47 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
 }
 
 /* Called with mmap_lock held for user mode emulation.  */
+/* Measurement only (XTCG_TBSTATS): translation totals at exit. */
+static uint64_t xs_tbs, xs_insns, xs_code, xs_ns;
+static bool xs_on;
+
+void xtcg_tbstats_print(void);
+
+void xtcg_tbstats_print(void)
+{
+    if (!xs_on) {
+        return;
+    }
+    fprintf(stderr, "xtcg-tbstats tbs %" PRIu64 " insns %" PRIu64
+            " code %" PRIu64 " ns %" PRIu64 "\n",
+            xs_tbs, xs_insns, xs_code, xs_ns);
+}
+
+static TranslationBlock *tb_gen_code_1(CPUState *cpu, TCGTBCPUState s);
+
 TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+{
+    static int on = -1;
+    int64_t t0;
+    TranslationBlock *tb;
+
+    if (on < 0) {
+        on = getenv("XTCG_TBSTATS") != NULL;
+        xs_on = on;
+    }
+    if (!on) {
+        return tb_gen_code_1(cpu, s);
+    }
+    t0 = get_clock();
+    tb = tb_gen_code_1(cpu, s);
+    qatomic_add(&xs_ns, get_clock() - t0);
+    qatomic_inc(&xs_tbs);
+    qatomic_add(&xs_insns, tb->icount);
+    qatomic_add(&xs_code, tb->tc.size);
+    return tb;
+}
+
+static TranslationBlock *tb_gen_code_1(CPUState *cpu, TCGTBCPUState s)
 {
     CPUArchState *env = cpu_env(cpu);
     TranslationBlock *tb, *existing_tb;

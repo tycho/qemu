@@ -17,6 +17,8 @@
  *  along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+
+void xtcg_tbstats_print(void);
 #include "tcg/perf.h"
 #include "gdbstub/syscalls.h"
 #include "qemu.h"
@@ -35,4 +37,5 @@ void preexit_cleanup(CPUArchState *env, int code)
         gdb_exit(code);
         qemu_plugin_user_exit();
         perf_exit();
+        xtcg_tbstats_print();
 }
