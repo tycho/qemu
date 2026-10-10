@@ -664,6 +664,7 @@ static void tcg_set_pause(Object *obj, const char *value, Error **errp)
 static char *tcg_get_flags(Object *obj, Error **errp)
 {
     return g_strdup(tcg_flags_guess ? "guess" :
+                    tcg_flags_dead_fwd ? "deadfwd" :
                     tcg_flags_dead ? "dead" : "off");
 }
 
@@ -672,12 +673,14 @@ static void tcg_set_flags(Object *obj, const char *value, Error **errp)
     if (!strcmp(value, "guess")) {
         tcg_flags_guess = true;
         tcg_flags_dead = false;
-    } else if (!strcmp(value, "dead")) {
+    } else if (!strcmp(value, "dead") || !strcmp(value, "deadfwd")) {
         tcg_flags_guess = false;
         tcg_flags_dead = true;
+        tcg_flags_dead_fwd = !strcmp(value, "deadfwd");
     } else if (!strcmp(value, "off")) {
         tcg_flags_guess = false;
         tcg_flags_dead = false;
+        tcg_flags_dead_fwd = false;
     } else {
         error_setg(errp, "Invalid 'x-flags' value: %s", value);
     }

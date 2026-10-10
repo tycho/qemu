@@ -2512,7 +2512,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
          * calls the code after the landing, which stores them and leaves
          * through the slot of an ordinary call.  Either way one host call.
          */
-        dead = use_flags_dead(s) && tcg_region &&
+        dead = use_flags_dead(s) && tcg_region && !tcg_flags_dead_fwd &&
                (s->base.region ? translator_goto_tb_slot(&s->base, &dslot)
                                : dslot <= TB_EXIT_IDXMAX);
         if (dead) {
@@ -2586,7 +2586,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
          * TB that overwrites the condition codes, before they are stored;
          * in TBs with slots to spare.
          */
-        if (use_flags_dead(s) &&
+        if (use_flags_dead(s) && (!req || !tcg_flags_dead_fwd) &&
             (s->base.region ? translator_goto_tb_slot(&s->base, &dslot)
                             : dslot <= TB_EXIT_IDXMAX)) {
             tcg_gen_goto_tb_dead(dslot, tb_num);

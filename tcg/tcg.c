@@ -2674,6 +2674,7 @@ TCGTemp *tcgv_i32_temp(TCGv_i32 v)
  */
 bool tcg_flags_guess;
 bool tcg_flags_dead;
+bool tcg_flags_dead_fwd;
 bool tcg_lazy_incdec;
 
 bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)

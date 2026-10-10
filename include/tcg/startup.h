@@ -334,6 +334,7 @@ extern bool tcg_flags_guess;
  * earlier ones in the signal frame.  Set by x-flags=dead.
  */
 extern bool tcg_flags_dead;
+extern bool tcg_flags_dead_fwd;
 
 /*
  * x86 guests: INC and DEC after an unknown flags state (a TB's first
