@@ -7399,16 +7399,16 @@ static void max_x86_cpu_realize(DeviceState *dev, Error **errp)
 {
     Object *obj = OBJECT(dev);
 
+    /*
+     * AMD family 0x15 (with AuthenticAMD), model 0: a family whose base
+     * instruction sets software takes for granted, and a model no released
+     * CPU has, so that nothing applies a real model's quirks; what
+     * Windows on Arm's x64 emulator shows.
+     */
     if (!object_property_get_int(obj, "family", &error_abort)) {
-        if (X86_CPU(obj)->env.features[FEAT_8000_0001_EDX] & CPUID_EXT2_LM) {
-            object_property_set_int(obj, "family", 15, &error_abort);
-            object_property_set_int(obj, "model", 107, &error_abort);
-            object_property_set_int(obj, "stepping", 1, &error_abort);
-        } else {
-            object_property_set_int(obj, "family", 6, &error_abort);
-            object_property_set_int(obj, "model", 6, &error_abort);
-            object_property_set_int(obj, "stepping", 3, &error_abort);
-        }
+        object_property_set_int(obj, "family", 0x15, &error_abort);
+        object_property_set_int(obj, "model", 0, &error_abort);
+        object_property_set_int(obj, "stepping", 1, &error_abort);
     }
 
     x86_cpu_realizefn(dev, errp);
@@ -10341,6 +10341,17 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
     x86_cpu_expand_features(cpu, &local_err);
     if (local_err) {
         goto out;
+    }
+
+    /*
+     * Under TCG the guest sees no hypervisor (no CPUID hypervisor bit, no
+     * TCG signature leaf) unless asked for +hypervisor: software that
+     * notices one may change its behaviour.
+     */
+    if (tcg_enabled() &&
+        !(env->user_features[FEAT_1_ECX] & CPUID_EXT_HYPERVISOR)) {
+        env->features[FEAT_1_ECX] &= ~CPUID_EXT_HYPERVISOR;
+        cpu->expose_tcg = false;
     }
 
     /*
