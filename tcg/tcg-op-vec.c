@@ -342,6 +342,36 @@ void tcg_gen_addp_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
               tcgv_vec_arg(a), tcgv_vec_arg(b));
 }
 
+static void do_dot4(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c,
+                    TCGOpcode opc)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(tcgv_vec_temp(a)->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(tcgv_vec_temp(b)->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(tcgv_vec_temp(c)->base_type == TCG_TYPE_V128);
+    tcg_assert_listed_vecop(opc);
+    tcg_debug_assert(tcg_can_emit_vec_op(opc, TCG_TYPE_V128, MO_32) > 0);
+    vec_gen_4(opc, TCG_TYPE_V128, MO_32, temp_arg(rt), tcgv_vec_arg(a),
+              tcgv_vec_arg(b), tcgv_vec_arg(c));
+}
+
+void tcg_gen_sdot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c)
+{
+    do_dot4(r, a, b, c, INDEX_op_sdot4_vec);
+}
+
+void tcg_gen_udot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c)
+{
+    do_dot4(r, a, b, c, INDEX_op_udot4_vec);
+}
+
+void tcg_gen_usdot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c)
+{
+    do_dot4(r, a, b, c, INDEX_op_usdot4_vec);
+}
+
 void tcg_gen_narrow_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
                         TCGNarrow kind, unsigned shift, bool round)
 {

@@ -2482,6 +2482,10 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_mulw_vec;
     case INDEX_op_addp_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_addp_vec;
+    case INDEX_op_sdot4_vec:
+    case INDEX_op_udot4_vec:
+    case INDEX_op_usdot4_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_dot4_vec;
     case INDEX_op_narrow_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_narrow_vec;
     case INDEX_op_abd_vec:
