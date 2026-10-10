@@ -455,11 +455,25 @@ static void gen_update_cc_op(DisasContext *s)
 static bool unit_cc(DisasContext *s)
 {
     static int on = -1;
+    static unsigned bits, val;
 
     if (on < 0) {
+        const char *b = getenv("XTCG_CC_BISECT");
+
         on = getenv("XTCG_UNITS_CC") != NULL;
+        if (b) {
+            sscanf(b, "%u:%u", &bits, &val);
+        }
     }
-    return on && s->base.region;
+    if (!on || !s->base.region) {
+        return false;
+    }
+    if (bits) {
+        uint64_t h = (uint64_t)s->base.pc_first * 0x9e3779b97f4a7c15ull;
+
+        return (h >> 40 & ((1u << bits) - 1)) == val;
+    }
+    return true;
 }
 
 /*
