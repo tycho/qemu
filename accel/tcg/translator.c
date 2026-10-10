@@ -247,6 +247,20 @@ static __thread int region_n_demoted;
 static __thread bool region_redo;
 uint64_t xtcg_unit_redos;
 
+/* Loop headers left out of the next try of this unit. */
+static __thread vaddr region_excluded[REGION_DEMOTE_MAX];
+static __thread int region_n_excluded;
+
+static bool region_is_excluded(vaddr pc)
+{
+    for (int i = 0; i < region_n_excluded; i++) {
+        if (region_excluded[i] == pc) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool region_is_demoted(vaddr pc)
 {
     for (int i = 0; i < region_n_demoted; i++) {
@@ -475,6 +489,7 @@ void translator_region_reset(void)
     region_reject = false;
     region_redo = false;
     region_n_demoted = 0;
+    region_n_excluded = 0;
 }
 
 static bool region_page_ok(const DisasContextBase *db, vaddr pc)
@@ -514,6 +529,22 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
                 return NULL;
             }
             /* Already translated (or being translated): a cycle closes. */
+            if (r->unit && i < r->next && getenv("XTCG_UNITS_LOOPHDR")) {
+                /*
+                 * Measurement only: a loop header starts its own TB, so
+                 * self-loops and sampled regions see the loops they see
+                 * without units.
+                 */
+                if (i == 0) {
+                    region_reject = true;
+                } else if (region_n_excluded < REGION_DEMOTE_MAX) {
+                    region_excluded[region_n_excluded++] = r->pc[i];
+                    region_redo = true;
+                } else {
+                    region_reject = true;
+                }
+                siglongjmp(tcg_ctx->jmp_trans, -2);
+            }
             if (r->unit && i < r->next && units_fwd()) {
                 /* Measurement only: loops stay between TBs. */
                 return NULL;
@@ -526,8 +557,9 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
             return r->label[i];
         }
     }
-    if (r->n == (region_cap ? region_cap
-                 : r->unit ? units_blocks() : REGION_MAX_BLOCKS)
+    if ((r->unit && region_is_excluded(dest))
+        || r->n == (region_cap ? region_cap
+                    : r->unit ? units_blocks() : REGION_MAX_BLOCKS)
         || !region_page_ok(db, dest)
         || (!r->unit && !translator_region_has_run(r->cpu, db->tb, dest))) {
         return NULL;
