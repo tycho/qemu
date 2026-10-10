@@ -446,6 +446,24 @@ void translator_region_reset(void)
     region_n_split = 0;
 }
 
+/*
+ * Whether a breakpoint is set on @page.  A breakpoint on a TB's own page
+ * makes the TB one insn (check_for_breakpoints), but a region reaches
+ * the next page too: a block there would run past the breakpoint.
+ * Inserting one invalidates the TBs on its page, regions included.
+ */
+static bool region_page_has_breakpoint(CPUState *cpu, vaddr page)
+{
+    CPUBreakpoint *bp;
+
+    QTAILQ_FOREACH(bp, &cpu->breakpoints, entry) {
+        if ((bp->pc & TARGET_PAGE_MASK) == page) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool region_page_ok(const DisasContextBase *db, vaddr pc)
 {
     vaddr first = db->pc_first & TARGET_PAGE_MASK;
@@ -458,6 +476,9 @@ static bool region_page_ok(const DisasContextBase *db, vaddr pc)
         return true;
     }
     if ((pc & TARGET_PAGE_MASK) != first + TARGET_PAGE_SIZE) {
+        return false;
+    }
+    if (r && region_page_has_breakpoint(r->cpu, first + TARGET_PAGE_SIZE)) {
         return false;
     }
     /*
