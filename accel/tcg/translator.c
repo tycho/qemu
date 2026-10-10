@@ -212,6 +212,16 @@ static int units_blocks(void)
     return units_max;
 }
 
+static bool units_fwd(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("XTCG_UNITS_FWD") != NULL;
+    }
+    return on;
+}
+
 typedef struct TranslatorRegion {
     CPUState *cpu;
     bool unit;                  /* a unit (XTCG_UNITS), not a sampled region */
@@ -504,6 +514,10 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
                 return NULL;
             }
             /* Already translated (or being translated): a cycle closes. */
+            if (r->unit && i < r->next && units_fwd()) {
+                /* Measurement only: loops stay between TBs. */
+                return NULL;
+            }
             *backward = i < r->next;
             r->backedges += *backward;
             if (*backward && region_cur_trial) {
@@ -573,7 +587,7 @@ bool translator_region_backward(DisasContextBase *db, vaddr dest)
 {
     TranslatorRegion *r = db->region;
 
-    if (!r || r->stubbing) {
+    if (!r || r->stubbing || (r->unit && units_fwd())) {
         return false;
     }
     for (int i = 0; i < r->next; i++) {
