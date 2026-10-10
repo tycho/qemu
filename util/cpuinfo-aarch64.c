@@ -19,6 +19,12 @@
 # ifndef HWCAP2_CSSC
 #  define HWCAP2_CSSC 0  /* added in glibc 2.38 */
 # endif
+# ifndef HWCAP_ASIMDDP
+#  define HWCAP_ASIMDDP 0
+# endif
+# ifndef HWCAP2_I8MM
+#  define HWCAP2_I8MM 0
+# endif
 #endif
 #ifdef CONFIG_ELF_AUX_INFO
 #include <sys/auxv.h>
@@ -73,10 +79,12 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= (hwcap & HWCAP_AES ? CPUINFO_AES : 0);
     info |= (hwcap & HWCAP_PMULL ? CPUINFO_PMULL : 0);
     info |= (hwcap & HWCAP_SHA1 ? CPUINFO_SHA1 : 0);
+    info |= (hwcap & HWCAP_ASIMDDP ? CPUINFO_DOTPROD : 0);
 
     unsigned long hwcap2 = qemu_getauxval(AT_HWCAP2);
     info |= (hwcap2 & HWCAP2_BTI ? CPUINFO_BTI : 0);
     info |= (hwcap2 & HWCAP2_CSSC ? CPUINFO_CSSC : 0);
+    info |= (hwcap2 & HWCAP2_I8MM ? CPUINFO_I8MM : 0);
 #endif
 #ifdef CONFIG_DARWIN
     info |= sysctl_for_bool("hw.optional.arm.FEAT_LSE") * CPUINFO_LSE;
@@ -84,6 +92,8 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= sysctl_for_bool("hw.optional.arm.FEAT_AES") * CPUINFO_AES;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_PMULL") * CPUINFO_PMULL;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_SHA1") * CPUINFO_SHA1;
+    info |= sysctl_for_bool("hw.optional.arm.FEAT_DotProd") * CPUINFO_DOTPROD;
+    info |= sysctl_for_bool("hw.optional.arm.FEAT_I8MM") * CPUINFO_I8MM;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_BTI") * CPUINFO_BTI;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_CSSC") * CPUINFO_CSSC;
 #endif
