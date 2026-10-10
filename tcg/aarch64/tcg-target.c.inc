@@ -688,6 +688,8 @@ typedef enum {
     Iqrr_e_SCVTF      = 0x0e21d800,
     Iqrr_e_FCVTZS     = 0x0ea1b800,
     Iqrr_e_FRINTX     = 0x2e219800,
+    Iqrr_e_FRINT32X   = 0x2e21e800,  /* FEAT_FRINTTS */
+    Iqrr_e_FRINT32Z   = 0x0e21e800,  /* FEAT_FRINTTS */
     Iqrr_e_FRINTN     = 0x0e218800,
     Iqrr_e_FRINTM     = 0x0e219800,
     Iqrr_e_FRINTP     = 0x0ea18800,
@@ -3557,6 +3559,11 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_frintx_vec:
         tcg_out_insn(s, qrr_e, FRINTX, is_q, fsz, a0, a1);
         break;
+    case INDEX_op_frint32_vec:
+        tcg_out_insn_qrr_e(s, a2 == TCG_FRINT_ZERO ? Iqrr_e_FRINT32Z
+                                                   : Iqrr_e_FRINT32X,
+                           is_q, fsz, a0, a1);
+        break;
     case INDEX_op_frint_vec:
         {
             static const AArch64Insn frint[] = {
@@ -3806,6 +3813,9 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
          */
         return type == TCG_TYPE_V128 && vece >= MO_32
                && (cpuinfo & CPUINFO_AFP);
+    case INDEX_op_frint32_vec:
+        return type == TCG_TYPE_V128 && vece >= MO_32
+               && (cpuinfo & CPUINFO_AFP) && (cpuinfo & CPUINFO_FRINTTS);
 
     case INDEX_op_frecpe_vec:
     case INDEX_op_frsqrte_vec:
@@ -3964,6 +3974,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_abs_vec:
     case INDEX_op_shli_vec:
     case INDEX_op_shri_vec:
+    case INDEX_op_frint32_vec:
     case INDEX_op_sari_vec:
         return C_O1_I1(w, w);
     case INDEX_op_ld_vec:
