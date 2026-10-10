@@ -450,15 +450,22 @@ void translator_region_reset(void)
 }
 
 /*
- * Whether a breakpoint is set on @page.  A breakpoint on a TB's own page
- * makes the TB one insn (check_for_breakpoints), but a region reaches
- * the next page too: a block there would run past the breakpoint.
- * Inserting one invalidates the TBs on its page, regions included.
+ * Whether a breakpoint may stop code on @page.  A breakpoint on a TB's own
+ * page makes the TB one insn (check_for_breakpoints), and setting one
+ * invalidates nothing, so nothing stops a region's code on the next page
+ * at a breakpoint set there, before or after the region was translated.
+ * In user mode, the next page is used only without a gdbstub, which could
+ * set one at any time; in system mode, only while none is set there.
  */
 static bool region_page_has_breakpoint(CPUState *cpu, vaddr page)
 {
     CPUBreakpoint *bp;
 
+#ifdef CONFIG_USER_ONLY
+    if (gdb_may_set_breakpoints()) {
+        return true;
+    }
+#endif
     QTAILQ_FOREACH(bp, &cpu->breakpoints, entry) {
         if ((bp->pc & TARGET_PAGE_MASK) == page) {
             return true;
