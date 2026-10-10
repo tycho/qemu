@@ -2499,18 +2499,40 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
         TCGLabel *land = gen_new_label();
         TCGLabel *reset = gen_new_label();
         TCGLabel *req;
+        int dslot = s->base.region ? 4 : tb_num + 4;
+        bool dead;
 
         s->rs_call = false;
         tcg_gen_push_ret(tcg_constant_i64(s->rs_next), land, NULL);
         req = translator_edge_check(&s->base, new_pc);
-        tcg_gen_call_tb(tb_num, reset);
+
+        /*
+         * x-flags=dead: the call through a slot that the main loop links
+         * only to a TB that overwrites the condition codes; unlinked, it
+         * calls the code after the landing, which stores them and leaves
+         * through the slot of an ordinary call.  Either way one host call.
+         */
+        dead = use_flags_dead(s) && tcg_region &&
+               (s->base.region ? translator_goto_tb_slot(&s->base, &dslot)
+                               : dslot <= TB_EXIT_IDXMAX);
+        if (dead) {
+            tcg_gen_call_tb_dead(dslot, tb_num, reset);
+        } else {
+            tcg_gen_call_tb(tb_num, reset);
+        }
         gen_ret_landing(s, land, ret_landing_slot(s, tb_num));
         gen_set_label(reset);
-        if (req) {
-            gen_set_label(req);
+        if (dead) {
+            tcg_gen_goto_tb(tb_num);
         }
         tcg_gen_movi_tl(cpu_eip, new_eip);
         tcg_gen_exit_tb(s->base.tb, tb_num);
+        if (req) {
+            /* Its own exit, so that the condition codes are stored here. */
+            gen_set_label(req);
+            tcg_gen_movi_tl(cpu_eip, new_eip);
+            tcg_gen_exit_tb(s->base.tb, tb_num);
+        }
         s->base.is_jmp = DISAS_NORETURN;
         return;
     }
@@ -2562,22 +2584,29 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
         /*
          * x-flags=dead: first a jump that the main loop links only to a
          * TB that overwrites the condition codes, before they are stored;
-         * in TBs with slots to spare, and not on a jump that checks the
-         * exit request.
+         * in TBs with slots to spare.
          */
-        if (use_flags_dead(s) && !req &&
+        if (use_flags_dead(s) &&
             (s->base.region ? translator_goto_tb_slot(&s->base, &dslot)
                             : dslot <= TB_EXIT_IDXMAX)) {
             tcg_gen_goto_tb_dead(dslot, tb_num);
         }
         tcg_gen_goto_tb(tb_num);
-        if (req) {
-            gen_set_label(req);
-        }
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
             tcg_gen_movi_tl(cpu_eip, new_eip);
         }
         tcg_gen_exit_tb(s->base.tb, tb_num);
+        if (req) {
+            /*
+             * The exit request's own exit, reached only from its check,
+             * so that the condition codes are stored on its path alone.
+             */
+            gen_set_label(req);
+            if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
+                tcg_gen_movi_tl(cpu_eip, new_eip);
+            }
+            tcg_gen_exit_tb(s->base.tb, tb_num);
+        }
         s->base.is_jmp = DISAS_NORETURN;
     } else {
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {

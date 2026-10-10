@@ -2713,6 +2713,7 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return true;
 
     case INDEX_op_call_tb:
+    case INDEX_op_call_tb_dead:
 #ifdef TCG_TARGET_HAS_RETSTACK
         return true;
 #else
@@ -3931,6 +3932,9 @@ void tcg_op_remove(TCGContext *s, TCGOp *op)
     case INDEX_op_call_tb:
         remove_label_use(op, 1);
         break;
+    case INDEX_op_call_tb_dead:
+        remove_label_use(op, 2);
+        break;
     default:
         break;
     }
@@ -4046,6 +4050,9 @@ static void move_label_uses(TCGLabel *to, TCGLabel *from)
         case INDEX_op_push_ret:
         case INDEX_op_call_tb:
             op->args[1] = label_arg(to);
+            break;
+        case INDEX_op_call_tb_dead:
+            op->args[2] = label_arg(to);
             break;
         default:
             g_assert_not_reached();
@@ -4687,7 +4694,9 @@ static void la_global_kill(TCGContext *s, int ng)
  *   its own start, the globals it needs in memory, so the side that loops
  *   keeps its registers, and a side that leaves through goto_tb_dead
  *   stores the chain-dead globals only after it.  (Otherwise, when both
- *   sides leave the TB, storing once before the branch is cheaper.)
+ *   sides leave the TB, storing once before the branch is cheaper.)  The
+ *   reset label of a call_tb_dead is one too: reached by the call, after
+ *   the code at its return.
  * - XLBL_LOOP: a loop header (TCGLabel.loop, set by the translator)
  *   reached by one later br.  The globals live into the loop are loaded
  *   into registers before the label and kept there across the back edge;
@@ -4720,6 +4729,8 @@ static TCGLabel *op_branch_label(const TCGOp *op)
         return arg_label(op->args[0]);
     case INDEX_op_brcond:
         return arg_label(op->args[3]);
+    case INDEX_op_call_tb_dead:
+        return arg_label(op->args[2]);
     default:
         return NULL;
     }
@@ -4967,6 +4978,32 @@ static void la_region_state(TCGContext *s, int nt, bool cond)
         if (home) {
             *la_temp_pref(ts) = (TCGRegSet)1 << s->xblk_home[i];
         } else if (st & TS_DEAD) {
+            la_reset_pref(ts);
+        }
+    }
+}
+
+/*
+ * liveness analysis: call_tb_dead.  It leaves the TB: the other globals
+ * in memory; the chain-dead ones need not be, and their values stay live
+ * for its reset label (an XLBL_INHERIT one), which stores them.
+ */
+static void la_call_tb_dead(TCGContext *s, TCGOp *op, int ng, int nt)
+{
+    TCGLabel *l = arg_label(op->args[2]);
+
+    la_func_end(s, ng, nt);
+    if (!s->xblk || l->xkind != XLBL_INHERIT || l->xbranch != op ||
+        !l->live_in) {
+        return;
+    }
+    for (int i = 0; i < ng; i++) {
+        TCGTemp *ts = &s->temps[i];
+        int tk = l->live_in[i];
+
+        if (temp_chain_dead_index(s, ts) >= 0 &&
+            (!(tk & TS_DEAD) || (tk & TS_MEM))) {
+            ts->state = 0;
             la_reset_pref(ts);
         }
     }
@@ -5649,6 +5686,10 @@ liveness_pass_1(TCGContext *s)
         case INDEX_op_goto_tb_dead:
             assert_carry_dead(s);
             la_chain_dead(s, nb_globals);
+            break;
+        case INDEX_op_call_tb_dead:
+            assert_carry_dead(s);
+            la_call_tb_dead(s, op, nb_globals, nb_temps);
             break;
         case INDEX_op_discard:
             /* mark the temporary as dead */
@@ -9504,6 +9545,24 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             tcg_debug_assert(op->args[0] < ARRAY_SIZE(s->call_tb_reset));
             s->call_tb_reset[op->args[0]] = arg_label(op->args[1]);
             tcg_out_call_tb(s, op->args[0]);
+            break;
+        case INDEX_op_call_tb_dead:
+            {
+                TCGLabel *l = arg_label(op->args[2]);
+
+                tcg_debug_assert(op->args[0] < ARRAY_SIZE(s->call_tb_reset));
+                tcg_reg_alloc_chain_store(s, false);
+                if (s->xblk && l->xkind == XLBL_INHERIT && l->xbranch == op
+                    && l->live_in) {
+                    l->snap = xblk_snap(s);
+                } else {
+                    tcg_reg_alloc_chain_store(s, true);
+                }
+                s->call_tb_reset[op->args[0]] = l;
+                s->gen_tb->jmp_dead[op->args[1]] = op->args[0] + 1;
+                tcg_out_call_tb(s, op->args[0]);
+                xblk_forget(s);
+            }
             break;
 #endif
         case INDEX_op_br:

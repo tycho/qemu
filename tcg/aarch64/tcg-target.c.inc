@@ -2896,7 +2896,8 @@ static void tcg_out_push_ret(TCGContext *s, TCGReg key, TCGLabel *ret)
 
 /*
  * A goto_tb slot that leaves by BL, so that the host's return predictor
- * expects the return to the next insn.  Unlinked, a B to the reset label.
+ * expects the return to the next insn: to the TB it is linked to, else to
+ * its reset label (which may go on to the callee: tcg_gen_call_tb_dead).
  */
 static void tcg_out_call_tb(TCGContext *s, int which)
 {
@@ -2904,7 +2905,7 @@ static void tcg_out_call_tb(TCGContext *s, int which)
     s->gen_tb->jmp_call |= 1u << which;
     tcg_out_reloc(s, s->code_ptr, R_AARCH64_JUMP26,
                   s->call_tb_reset[which], 0);
-    tcg_out_insn(s, branch, B, 0);
+    tcg_out_insn(s, branch, BL, 0);
 }
 
 /* goto_ptr by a call: BL to a BR, so that the return is predicted too. */
@@ -2940,12 +2941,11 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     if (tb->jmp_call & (1u << n)) {
         uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
 
-        /* A call slot: BL to a TB in range, else B to its exit. */
-        if (d_addr != reset && d_offset == sextract64(d_offset, 0, 28)) {
-            insn = deposit32(Ibranch_BL, 0, 26, d_offset >> 2);
-        } else {
-            insn = deposit32(Ibranch_B, 0, 26, (reset - jmp_rx) >> 2);
+        /* A call slot: BL to a TB in range, else to its reset label. */
+        if (d_offset != sextract64(d_offset, 0, 28)) {
+            d_offset = reset - jmp_rx;
         }
+        insn = deposit32(Ibranch_BL, 0, 26, d_offset >> 2);
         qatomic_set((uint32_t *)jmp_rw, insn);
         flush_idcache_range(jmp_rx, jmp_rw, 4);
         return;

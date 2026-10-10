@@ -114,10 +114,17 @@ void tcg_gen_ret_tb(TCGv_i64 key);
  *   chain-dead globals need not be in memory; the main loop links @idx
  *   along with the slot @exit_idx of the tcg_gen_goto_tb() that follows,
  *   and only to a TB that is chain_dead_in.  Unlinked, it continues.
+ * tcg_gen_call_tb_dead() - tcg_gen_call_tb() through slot @idx, where
+ *   the chain-dead globals need not be in memory: the main loop links it
+ *   along with the slot @exit_idx, and only to a TB that is chain_dead_in.
+ *   Unlinked, it calls @reset, which the caller sets after the code at
+ *   the return; there they are as at the call, and the code that follows
+ *   leaves through slot @exit_idx.
  */
 void tcg_chain_dead_add(TCGTemp *ts);
 bool tcg_chain_dead_read_since(TCGOp *after);
 void tcg_gen_goto_tb_dead(unsigned idx, unsigned exit_idx);
+void tcg_gen_call_tb_dead(unsigned idx, unsigned exit_idx, TCGLabel *reset);
 
 /**
  * tcg_gen_lookup_and_goto_ptr() - look up the current TB, jump to it if valid
