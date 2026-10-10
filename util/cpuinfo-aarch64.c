@@ -25,6 +25,9 @@
 # ifndef HWCAP2_RPRES
 #  define HWCAP2_RPRES 0  /* added in glibc 2.35 */
 # endif
+# ifndef HWCAP2_FRINT
+#  define HWCAP2_FRINT 0
+# endif
 #endif
 #ifdef CONFIG_ELF_AUX_INFO
 #include <sys/auxv.h>
@@ -84,12 +87,14 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= (hwcap2 & HWCAP2_CSSC ? CPUINFO_CSSC : 0);
     info |= (hwcap2 & HWCAP2_AFP ? CPUINFO_AFP : 0);
     info |= (hwcap2 & HWCAP2_RPRES ? CPUINFO_RPRES : 0);
+    info |= (hwcap2 & HWCAP2_FRINT ? CPUINFO_FRINTTS : 0);
 #endif
 #ifdef CONFIG_DARWIN
     info |= sysctl_for_bool("hw.optional.arm.FEAT_LSE") * CPUINFO_LSE;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_LSE2") * CPUINFO_LSE2;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_AES") * CPUINFO_AES;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_PMULL") * CPUINFO_PMULL;
+    info |= sysctl_for_bool("hw.optional.arm.FEAT_FRINTTS") * CPUINFO_FRINTTS;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_BTI") * CPUINFO_BTI;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_CSSC") * CPUINFO_CSSC;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_AFP") * CPUINFO_AFP;
