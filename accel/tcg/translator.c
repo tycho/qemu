@@ -330,6 +330,9 @@ int translator_region_try_is_head(tb_page_addr_t head)
 
 bool translator_region_promote(tb_page_addr_t head)
 {
+    if (getenv("XTCG_NOPROMOTE")) {
+        return false;
+    }
     bool added = false;
 
     g_mutex_lock(&region_lock);
