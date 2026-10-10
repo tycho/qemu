@@ -348,6 +348,7 @@ void page_init(void)
  */
 extern bool xtcg_ph_on;
 extern uint64_t xtcg_ph_ns[5];
+extern uint64_t xtcg_ct[4];
 
 static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
                            vaddr pc, void *host_pc,
@@ -395,6 +396,9 @@ void xtcg_tbstats_print(void)
             " opt %" PRIu64 " live %" PRIu64 " emit %" PRIu64 "\n",
             xs_tbs, xs_insns, xs_code, xs_ns, xtcg_ph_ns[0], xtcg_ph_ns[1],
             xtcg_ph_ns[2], xtcg_ph_ns[3]);
+    fprintf(stderr, "xtcg-tbstats temps %" PRIu64 " globals %" PRIu64
+            " snaps %" PRIu64 " obligations %" PRIu64 "\n",
+            xtcg_ct[0], xtcg_ct[1], xtcg_ct[2], xtcg_ct[3]);
 }
 
 static TranslationBlock *tb_gen_code_1(CPUState *cpu, TCGTBCPUState s);

@@ -6792,6 +6792,9 @@ typedef struct XblkSnap {
 
 static XblkSnap *xblk_snap(TCGContext *s)
 {
+    if (xtcg_ph_on) {
+        xtcg_ct[2]++;
+    }
     XblkSnap *sn = tcg_malloc(sizeof(*sn) + s->nb_temps * sizeof(sn->t[0]));
 
     memcpy(sn->reg_to_temp, s->reg_to_temp, sizeof(sn->reg_to_temp));
@@ -6825,6 +6828,9 @@ static void xblk_restore(TCGContext *s, const XblkSnap *sn)
  */
 static void xblk_obligations(TCGContext *s, const uint8_t *state)
 {
+    if (xtcg_ph_on) {
+        xtcg_ct[3]++;
+    }
     for (int i = 0; i < s->nb_temps; i++) {
         TCGTemp *ts = &s->temps[i];
 
@@ -9370,6 +9376,7 @@ static void shladd_pass(TCGContext *s)
 /* Measurement only (XTCG_TBSTATS): ns per translation phase. */
 bool xtcg_ph_on;
 uint64_t xtcg_ph_ns[5];
+uint64_t xtcg_ct[4];   /* temps, globals, snaps, obligations */
 
 static int64_t xtcg_ph_mark(int64_t t0, int i)
 {
@@ -9756,6 +9763,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 
     if (xtcg_ph_on) {
         xtcg_ph_mark(xt, 3);
+        xtcg_ct[0] += s->nb_temps;
+        xtcg_ct[1] += s->nb_globals;
     }
     return tcg_current_code_size(s);
 }
