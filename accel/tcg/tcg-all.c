@@ -477,7 +477,8 @@ static void tcg_set_tso_stack(Object *obj, bool value, Error **errp)
 
 static char *tcg_get_tso_vec(Object *obj, Error **errp)
 {
-    return g_strdup(tcg_tso_vec_none ? "none" :
+    return g_strdup(tcg_tso_vec_atomic ? "atomic" :
+                    tcg_tso_vec_none ? "none" :
                     tcg_tso_vec_group ? "group" : "strict");
 }
 
@@ -489,12 +490,14 @@ static void tcg_set_tso_vec(Object *obj, const char *value, Error **errp)
     } else if (!strcmp(value, "group")) {
         tcg_tso_vec_group = true;
         tcg_tso_vec_none = false;
-    } else if (!strcmp(value, "none")) {
+    } else if (!strcmp(value, "none") || !strcmp(value, "atomic")) {
         tcg_tso_vec_group = true;
         tcg_tso_vec_none = true;
     } else {
         error_setg(errp, "Invalid 'x-tso-vec' value: %s", value);
+        return;
     }
+    tcg_tso_vec_atomic = !strcmp(value, "atomic");
 }
 
 static bool tcg_get_simd(Object *obj, Error **errp)
@@ -808,7 +811,9 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "strict (each ordered, default), group (with x-tso=acqrel, "
         "barriers only where a run of them begins and ends: not exact), "
         "none (as group, and accesses to and from vector and "
-        "floating-point registers unordered unless atomic: not exact)");
+        "floating-point registers unordered and atomic only in parts: "
+        "not exact), atomic (as none, except the vector moves of 16-byte "
+        "atomic loads and stores)");
 
     object_class_property_add_bool(oc, "x-tso-stack",
                                    tcg_get_tso_stack, tcg_set_tso_stack);

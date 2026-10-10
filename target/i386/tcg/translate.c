@@ -2721,10 +2721,27 @@ static bool gen_st_vec_env(DisasContext *s, TCGv addr, int offset, MemOp mop)
     return true;
 }
 
-static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align)
+/*
+ * The atomicity of a 16-byte vector access: with AVX, x86 makes an aligned
+ * one atomic as a whole.  Under x-tso-vec=none, where vector accesses are
+ * not ordered (tcg_tso_vec_none), only each 8-byte half is, so that the
+ * host needs no 16-byte atomic access for them; with x-tso-vec=atomic,
+ * the aligned integer moves (MOVDQA, VMOVDQA) that 16-byte atomic loads
+ * and stores use stay atomic as a whole, and ordered.
+ */
+static MemOp sse_atom(DisasContext *s, bool atomic_move)
 {
-    MemOp atom = (s->cpuid_ext_features & CPUID_EXT_AVX
-                  ? MO_ATOM_IFALIGN : MO_ATOM_IFALIGN_PAIR);
+    if (!(s->cpuid_ext_features & CPUID_EXT_AVX) ||
+        (tcg_tso_vec_none && !(tcg_tso_vec_atomic && atomic_move))) {
+        return MO_ATOM_IFALIGN_PAIR;
+    }
+    return MO_ATOM_IFALIGN;
+}
+
+static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align,
+                                  bool atomic_move)
+{
+    MemOp atom = sse_atom(s, atomic_move);
     MemOp mop = MO_128 | MO_LE | atom | (align ? MO_ALIGN_16 : 0);
     int mem_index = s->mem_index;
     TCGv_i128 t;
@@ -2737,10 +2754,10 @@ static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align)
     gen_st_i128_env(t, offset);
 }
 
-static inline void gen_sto_env_A0(DisasContext *s, int offset, bool align)
+static inline void gen_sto_env_A0(DisasContext *s, int offset, bool align,
+                                  bool atomic_move)
 {
-    MemOp atom = (s->cpuid_ext_features & CPUID_EXT_AVX
-                  ? MO_ATOM_IFALIGN : MO_ATOM_IFALIGN_PAIR);
+    MemOp atom = sse_atom(s, atomic_move);
     MemOp mop = MO_128 | MO_LE | atom | (align ? MO_ALIGN_16 : 0);
     int mem_index = s->mem_index;
     TCGv_i128 t;

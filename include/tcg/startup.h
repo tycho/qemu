@@ -66,6 +66,14 @@ extern bool tcg_tso_vec_group;
 extern bool tcg_tso_vec_none;
 
 /*
+ * x-tso-vec=atomic: as x-tso-vec=none, but the front end keeps the
+ * whole atomicity, and so the order, of the vector accesses a guest may
+ * use as 16-byte atomic loads and stores.  With x-tso-vec=none it makes
+ * vector accesses atomic only in parts.
+ */
+extern bool tcg_tso_vec_atomic;
+
+/*
  * In qemu-user, guest accesses the front end marks as thread-private
  * (TCGContext.ldst_private: x86 RSP-based and implicit stack accesses)
  * get no memory-order constraint (accel property x-tso-stack).
