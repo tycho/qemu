@@ -523,6 +523,13 @@ typedef enum {
 } TCGFrint;
 void tcg_gen_frint_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGFrint mode);
 /*
+ * Round to an integral value in int32's range, in the current mode
+ * (TCG_FRINT_CURRENT, signaling inexact) or toward zero (TCG_FRINT_ZERO);
+ * a NaN, an infinity or a value outside the range gives -2^31 and signals
+ * invalid.
+ */
+void tcg_gen_frint32_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGFrint mode);
+/*
  * The same on element 0 of 128-bit vectors.  The result's other elements
  * are those of the first input.
  */

@@ -2480,6 +2480,7 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_fcvtzs_vec:
     case INDEX_op_frintx_vec:
     case INDEX_op_frint_vec:
+    case INDEX_op_frint32_vec:
     case INDEX_op_fadds_vec:
     case INDEX_op_fsubs_vec:
     case INDEX_op_fmuls_vec:
