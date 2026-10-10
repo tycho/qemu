@@ -97,6 +97,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-pin", "on" },
         { "x-lazyinc", "on" },
         { "x-flags", "dead" },
+        { "x-repstr", "on" },
         { "x-region", "on" },
         { "x-superblock", "4" },
         { "x-tblookup", "on" },
