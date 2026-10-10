@@ -449,6 +449,24 @@ void translator_region_reset(void)
     region_n_split = 0;
 }
 
+/*
+ * Whether a breakpoint is set on @page.  A breakpoint on a TB's own page
+ * makes the TB one insn (check_for_breakpoints), but a region reaches
+ * the next page too: a block there would run past the breakpoint.
+ * Inserting one invalidates the TBs on its page, regions included.
+ */
+static bool region_page_has_breakpoint(CPUState *cpu, vaddr page)
+{
+    CPUBreakpoint *bp;
+
+    QTAILQ_FOREACH(bp, &cpu->breakpoints, entry) {
+        if ((bp->pc & TARGET_PAGE_MASK) == page) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool region_page_ok(const DisasContextBase *db, vaddr pc)
 {
     vaddr first = db->pc_first & TARGET_PAGE_MASK;
@@ -461,6 +479,9 @@ static bool region_page_ok(const DisasContextBase *db, vaddr pc)
         return true;
     }
     if ((pc & TARGET_PAGE_MASK) != first + TARGET_PAGE_SIZE) {
+        return false;
+    }
+    if (r && region_page_has_breakpoint(r->cpu, first + TARGET_PAGE_SIZE)) {
         return false;
     }
     /*
@@ -1005,13 +1026,16 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             }
             goto next_block;
         }
-        db->pc_next = r->end;
         if (r->unit && r->n == 1) {
-            /* A plain TB: its start is the loop label again. */
+            /*
+             * A plain TB: its start is the loop label again, and its end
+             * the one the front end set, as for any TB.
+             */
             db->loop_label->region = false;
             db->loop_label->loop = true;
         } else if (r->unit) {
             /* A unit gains without a cycle: its jumps stay within it. */
+            db->pc_next = r->end;
         } else if (r->n == 1 || !r->backedges) {
             /* Nothing to gain: translate the head as a plain TB. */
             region_drop(tb_page_addr0(tb));
@@ -1019,6 +1043,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             g_free(region_cur_trial);
             region_cur_trial = NULL;
             siglongjmp(tcg_ctx->jmp_trans, -2);
+        } else {
+            db->pc_next = r->end;
         }
     }
     gen_tb_end(tb, cflags, icount_start_insn, db->num_insns);
