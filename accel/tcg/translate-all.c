@@ -346,6 +346,9 @@ void page_init(void)
  * Isolate the portion of code gen which can setjmp/longjmp.
  * Return the size of the generated code, or negative on error.
  */
+extern bool xtcg_ph_on;
+extern uint64_t xtcg_ph_ns[5];
+
 static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
                            vaddr pc, void *host_pc,
                            int *max_insns, int64_t *ti)
@@ -359,7 +362,14 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
 
     CPUState *cs = env_cpu(env);
     tcg_ctx->cpu = cs;
-    cs->cc->tcg_ops->translate_code(cs, tb, max_insns, pc, host_pc);
+    if (xtcg_ph_on) {
+        int64_t t0 = get_clock();
+
+        cs->cc->tcg_ops->translate_code(cs, tb, max_insns, pc, host_pc);
+        qatomic_add(&xtcg_ph_ns[0], get_clock() - t0);
+    } else {
+        cs->cc->tcg_ops->translate_code(cs, tb, max_insns, pc, host_pc);
+    }
 
     assert(tb->size != 0);
     tcg_ctx->cpu = NULL;
@@ -381,8 +391,10 @@ void xtcg_tbstats_print(void)
         return;
     }
     fprintf(stderr, "xtcg-tbstats tbs %" PRIu64 " insns %" PRIu64
-            " code %" PRIu64 " ns %" PRIu64 "\n",
-            xs_tbs, xs_insns, xs_code, xs_ns);
+            " code %" PRIu64 " ns %" PRIu64 " front %" PRIu64
+            " opt %" PRIu64 " live %" PRIu64 " emit %" PRIu64 "\n",
+            xs_tbs, xs_insns, xs_code, xs_ns, xtcg_ph_ns[0], xtcg_ph_ns[1],
+            xtcg_ph_ns[2], xtcg_ph_ns[3]);
 }
 
 static TranslationBlock *tb_gen_code_1(CPUState *cpu, TCGTBCPUState s);
@@ -396,6 +408,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     if (on < 0) {
         on = getenv("XTCG_TBSTATS") != NULL;
         xs_on = on;
+        xtcg_ph_on = on;
     }
     if (!on) {
         return tb_gen_code_1(cpu, s);

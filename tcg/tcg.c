@@ -9367,10 +9367,23 @@ static void shladd_pass(TCGContext *s)
 }
 #endif
 
+/* Measurement only (XTCG_TBSTATS): ns per translation phase. */
+bool xtcg_ph_on;
+uint64_t xtcg_ph_ns[5];
+
+static int64_t xtcg_ph_mark(int64_t t0, int i)
+{
+    int64_t t = get_clock();
+
+    qatomic_add(&xtcg_ph_ns[i], t - t0);
+    return t;
+}
+
 int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 {
     int i, num_insns;
     TCGOp *op;
+    int64_t xt = xtcg_ph_on ? get_clock() : 0;
 
     if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP)
                  && qemu_log_in_addr_range(pc_start))) {
@@ -9413,6 +9426,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         goto_tb_cold_pass(s);
     }
     reachable_code_pass(s);
+    if (xtcg_ph_on) {
+        xt = xtcg_ph_mark(xt, 1);
+    }
     liveness_pass_0(s);
     s->xblk_region = false;
     s->nb_region_homes = 0;
@@ -9489,6 +9505,10 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             fprintf(logfile, "\n");
             qemu_log_unlock(logfile);
         }
+    }
+
+    if (xtcg_ph_on) {
+        xt = xtcg_ph_mark(xt, 2);
     }
 
     /* Initialize goto_tb jump offsets. */
@@ -9734,6 +9754,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
                         tcg_ptr_byte_diff(s->code_ptr, s->code_buf));
 #endif
 
+    if (xtcg_ph_on) {
+        xtcg_ph_mark(xt, 3);
+    }
     return tcg_current_code_size(s);
 }
 
