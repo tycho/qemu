@@ -4072,6 +4072,21 @@ TCGOp *tcg_op_insert_after(TCGContext *s, TCGOp *old_op,
     return new_op;
 }
 
+bool xtcg_thread_br;
+
+/* Whether every use of @l is a br or brcond. */
+static bool label_uses_only_br(TCGLabel *l)
+{
+    TCGLabelUse *u;
+
+    QSIMPLEQ_FOREACH(u, &l->branches, next) {
+        if (u->op->opc != INDEX_op_br && u->op->opc != INDEX_op_brcond) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void move_label_uses(TCGLabel *to, TCGLabel *from)
 {
     TCGLabelUse *u;
@@ -4417,6 +4432,20 @@ reachable_code_pass(TCGContext *s)
                 tcg_op_remove(s, op_prev);
                 /* Fall through means insns become live again.  */
                 dead = false;
+            }
+
+            /*
+             * Measurement only (units): a label whose code is a lone br to
+             * another label: its branches go there directly.
+             */
+            if (xtcg_thread_br && !label->region && !label->loop) {
+                TCGOp *nx = QTAILQ_NEXT(op, link);
+
+                if (nx && nx->opc == INDEX_op_br
+                    && arg_label(nx->args[0]) != label
+                    && label_uses_only_br(label)) {
+                    move_label_uses(arg_label(nx->args[0]), label);
+                }
             }
 
             if (QSIMPLEQ_EMPTY(&label->branches)) {

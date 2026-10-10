@@ -199,6 +199,7 @@ typedef struct RegionTrial {
  * whether or not they have run.
  */
 static int units_max = -1;
+extern bool xtcg_thread_br;
 
 static int units_blocks(void)
 {
@@ -206,6 +207,7 @@ static int units_blocks(void)
         const char *e = getenv("XTCG_UNITS");
 
         units_max = e ? MIN(MAX(atoi(e), 0), REGION_MAX_BLOCKS) : 0;
+        xtcg_thread_br = units_max > 1 && !getenv("XTCG_NOTHREAD");
     }
     return units_max;
 }
