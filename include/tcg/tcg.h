@@ -303,6 +303,8 @@ typedef struct TCGTemp {
     unsigned int env_alias:1;
     /* A global held in a fixed host register across TBs (tcg_temp_pin). */
     unsigned int pinned:1;
+    /* 1 + its index in TCGContext.chain_dead, or 0 (tcg_chain_dead_add). */
+    unsigned int chain_dead:4;
 
     int64_t val;
     struct TCGTemp *mem_base;

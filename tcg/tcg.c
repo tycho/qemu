@@ -4543,16 +4543,12 @@ void tcg_chain_dead_add(TCGTemp *ts)
 {
     tcg_debug_assert(tcg_ctx->nb_chain_dead < ARRAY_SIZE(tcg_ctx->chain_dead));
     tcg_ctx->chain_dead[tcg_ctx->nb_chain_dead++] = ts;
+    ts->chain_dead = tcg_ctx->nb_chain_dead;
 }
 
 static int temp_chain_dead_index(TCGContext *s, TCGTemp *ts)
 {
-    for (int i = 0; i < s->nb_chain_dead; i++) {
-        if (s->chain_dead[i] == ts) {
-            return i;
-        }
-    }
-    return -1;
+    return (int)ts->chain_dead - 1;
 }
 
 bool tcg_chain_dead_read_since(TCGOp *after)
@@ -6416,7 +6412,8 @@ static void tcg_reg_alloc_chain_store(TCGContext *s, bool dead)
     for (int i = 0; i < s->nb_globals; i++) {
         TCGTemp *ts = &s->temps[i];
 
-        if (ts->kind == TEMP_GLOBAL &&
+        if (ts->kind == TEMP_GLOBAL && !ts->mem_coherent &&
+            !temp_readonly(ts) &&
             (temp_chain_dead_index(s, ts) >= 0) == dead) {
             temp_sync(s, ts, s->reserved_regs, 0, 0);
         }
