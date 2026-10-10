@@ -2049,6 +2049,41 @@ static void tcg_out_exit_tb(TCGContext *s, uintptr_t a0)
     }
 }
 
+/*
+ * A goto_tb slot whose unlinked path is at the TB's end (goto_tb_cold):
+ * one branch, to the reset label until linked.  Right before that label,
+ * tcg_out_goto_tb_tramp() leaves the way to a TB out of branch range.
+ */
+#define TCG_TARGET_HAS_GOTO_TB_COLD
+
+static void tcg_out_goto_tb_cold(TCGContext *s, int which)
+{
+    set_jmp_insn_offset(s, which);
+    s->gen_tb->jmp_cold |= 1u << which;
+    tcg_out_reloc(s, s->code_ptr, R_AARCH64_JUMP26,
+                  s->call_tb_reset[which], 0);
+    tcg_out_insn(s, branch, B, 0);
+}
+
+static void tcg_out_goto_tb_tramp(TCGContext *s, int which)
+{
+    intptr_t i_off = tcg_pcrel_diff(s, (void *)get_jmp_target_addr(s, which));
+
+    tcg_debug_assert(i_off == sextract64(i_off, 0, 21));
+    tcg_out_insn(s, ldlit, LDR, i_off >> 2, TCG_REG_TMP0);
+    tcg_out_insn(s, bcond_reg, BR, TCG_REG_TMP0);
+}
+
+/*
+ * The reset label after the trampoline.  A thread in the trampoline when
+ * the slot is unlinked loads the reset address and branches there
+ * indirectly: like goto_tb's, the label is a BTI landing pad.
+ */
+static void tcg_out_goto_tb_land(TCGContext *s)
+{
+    tcg_out_bti(s, BTI_J);
+}
+
 static void tcg_out_goto_tb(TCGContext *s, int which)
 {
     /*
@@ -2133,6 +2168,19 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
         } else {
             insn = deposit32(Ibranch_B, 0, 26, (reset - jmp_rx) >> 2);
         }
+        qatomic_set((uint32_t *)jmp_rw, insn);
+        flush_idcache_range(jmp_rx, jmp_rw, 4);
+        return;
+    }
+
+    if (tb->jmp_cold & (1u << n)) {
+        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
+
+        /* To the TB, or by way of the trampoline before the reset label. */
+        if (d_offset != sextract64(d_offset, 0, 28)) {
+            d_offset = reset - 8 - jmp_rx;
+        }
+        insn = deposit32(Ibranch_B, 0, 26, d_offset >> 2);
         qatomic_set((uint32_t *)jmp_rw, insn);
         flush_idcache_range(jmp_rx, jmp_rw, 4);
         return;
