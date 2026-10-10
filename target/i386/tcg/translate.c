@@ -469,6 +469,12 @@ static bool unit_cc(DisasContext *s)
     if (!on || !s->base.region) {
         return false;
     }
+    if (getenv("XTCG_CC_PCS")) {
+        char key[32];
+
+        snprintf(key, sizeof(key), ",%llx,", (unsigned long long)s->base.pc_first);
+        return strstr(getenv("XTCG_CC_PCS"), key) != NULL;
+    }
     if (bits) {
         uint64_t h = (uint64_t)s->base.pc_first * 0x9e3779b97f4a7c15ull;
 
