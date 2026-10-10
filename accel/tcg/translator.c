@@ -446,6 +446,31 @@ void translator_region_reset(void)
     region_n_split = 0;
 }
 
+/*
+ * Whether a breakpoint may stop code on @page.  A breakpoint on a TB's own
+ * page makes the TB one insn (check_for_breakpoints), and setting one
+ * invalidates nothing, so nothing stops a region's code on the next page
+ * at a breakpoint set there, before or after the region was translated.
+ * In user mode, the next page is used only without a gdbstub, which could
+ * set one at any time; in system mode, only while none is set there.
+ */
+static bool region_page_has_breakpoint(CPUState *cpu, vaddr page)
+{
+    CPUBreakpoint *bp;
+
+#ifdef CONFIG_USER_ONLY
+    if (gdb_may_set_breakpoints()) {
+        return true;
+    }
+#endif
+    QTAILQ_FOREACH(bp, &cpu->breakpoints, entry) {
+        if ((bp->pc & TARGET_PAGE_MASK) == page) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool region_page_ok(const DisasContextBase *db, vaddr pc)
 {
     vaddr first = db->pc_first & TARGET_PAGE_MASK;
@@ -458,6 +483,9 @@ static bool region_page_ok(const DisasContextBase *db, vaddr pc)
         return true;
     }
     if ((pc & TARGET_PAGE_MASK) != first + TARGET_PAGE_SIZE) {
+        return false;
+    }
+    if (r && region_page_has_breakpoint(r->cpu, first + TARGET_PAGE_SIZE)) {
         return false;
     }
     /*
