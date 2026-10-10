@@ -1048,6 +1048,10 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             /* A plain TB: its start is the loop label again. */
             db->loop_label->region = false;
             db->loop_label->loop = true;
+        } else if (r->unit && r->backedges && getenv("XTCG_UNITS_ACYCLIC")) {
+            /* Measurement only: a unit with a cycle is a plain TB. */
+            region_reject = true;
+            siglongjmp(tcg_ctx->jmp_trans, -2);
         } else if (r->unit) {
             /* A unit gains without a cycle. */
         } else if (r->n == 1 || !r->backedges) {
