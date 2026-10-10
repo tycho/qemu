@@ -258,6 +258,7 @@ bool tcg_fpcheck_runtime;
 bool tcg_iopl_runtime;
 
 TCGTsoMode tcg_tso_mode;
+bool tcg_reserial;
 bool tcg_tso_stack;
 bool tcg_tso_vec_group;
 bool tcg_tso_vec_none;

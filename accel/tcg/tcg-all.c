@@ -449,9 +449,11 @@ static char *tcg_get_tso(Object *obj, Error **errp)
 
 static void tcg_set_tso(Object *obj, const char *value, Error **errp)
 {
+    tcg_reserial = false;
     if (!strcmp(value, "auto")) {
         tcg_tso_mode = tcg_can_ldst_acqrel() ? TCG_TSO_ACQREL
                                              : TCG_TSO_BARRIER;
+        tcg_reserial = true;
         return;
     }
     for (int i = 0; i < ARRAY_SIZE(tcg_tso_names); i++) {
@@ -826,7 +828,8 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-tso",
         "Guest memory ordering: barrier (default), "
         "acqrel (load-acquire/store-release accesses), "
-        "auto (acqrel where the host supports it, else barrier), "
+        "auto (acqrel where the host supports it, else barrier, and in "
+        "user mode serial code again once a single thread is left), "
         "none (no barriers: unsafe, for measurement)");
 
     object_class_property_add_str(oc, "x-tso-vec", tcg_get_tso_vec,

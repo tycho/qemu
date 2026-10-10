@@ -50,6 +50,12 @@ typedef enum TCGTsoMode {
 extern TCGTsoMode tcg_tso_mode;
 
 /*
+ * User mode: when the last thread but one exits, the remaining CPU goes
+ * back to serial code, as before the first thread was created (x-tso=auto).
+ */
+extern bool tcg_reserial;
+
+/*
  * Guest accesses wider than 8 bytes that the guest doesn't make atomic
  * (accel property x-tso-vec): each ordered like any access (false, the
  * default), or, under TCG_TSO_ACQREL, as runs with barriers only where a
