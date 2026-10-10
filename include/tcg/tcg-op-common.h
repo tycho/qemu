@@ -593,6 +593,16 @@ void tcg_gen_mulw_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
  */
 void tcg_gen_addp_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 /*
+ * Dot products of bytes, into 32-bit elements of 128-bit vectors: each
+ * element of r is that element of a plus the sum of the products of the
+ * four bytes of b and c at its position, modulo 2^32; both bytes signed
+ * (sdot4), unsigned (udot4), or those of b unsigned and those of c signed
+ * (usdot4).
+ */
+void tcg_gen_sdot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c);
+void tcg_gen_udot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c);
+void tcg_gen_usdot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c);
+/*
  * How narrow_vec fits a wide element into a narrow one: keep its low bits,
  * or saturate signed to signed, signed to unsigned, or unsigned to
  * unsigned.

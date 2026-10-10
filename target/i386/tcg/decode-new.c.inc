@@ -809,6 +809,11 @@ static const X86OpEntry opcodes_0F38_00toEF[240] = {
     [0x3e] = X86_OP_ENTRY3(PMAXUW,        V,x,  H,x, W,x,  vex4 cpuid(SSE41) avx2_256 p_66),
     [0x3f] = X86_OP_ENTRY3(PMAXUD,        V,x,  H,x, W,x,  vex4 cpuid(SSE41) avx2_256 p_66),
 
+    [0x50] = X86_OP_ENTRY3(VPDPBUSD, V,x, H,x, W,x, vex6 chk(W0) cpuid(AVX_VNNI) p_66),
+    [0x51] = X86_OP_ENTRY3(VPDPBUSDS, V,x, H,x, W,x, vex6 chk(W0) cpuid(AVX_VNNI) p_66),
+    [0x52] = X86_OP_ENTRY3(VPDPWSSD, V,x, H,x, W,x, vex6 chk(W0) cpuid(AVX_VNNI) p_66),
+    [0x53] = X86_OP_ENTRY3(VPDPWSSDS, V,x, H,x, W,x, vex6 chk(W0) cpuid(AVX_VNNI) p_66),
+
     /* VPBROADCASTQ not listed as W0 in table 2-16 */
     [0x58] = X86_OP_ENTRY3(VPBROADCASTD,   V,x,  None,None, W,d,  vex6 chk(W0) cpuid(AVX2) p_66),
     [0x59] = X86_OP_ENTRY3(VPBROADCASTQ,   V,x,  None,None, W,q,  vex6 chk(W0) cpuid(AVX2) p_66),
@@ -2643,6 +2648,9 @@ static bool has_cpuid_feature(DisasContext *s, X86CPUIDFeature cpuid)
 
     case X86_FEAT_CMPCCXADD:
         return (s->cpuid_7_1_eax_features & CPUID_7_1_EAX_CMPCCXADD);
+
+    case X86_FEAT_AVX_VNNI:
+        return s->cpuid_7_1_eax_features & CPUID_7_1_EAX_AVX_VNNI;
 
     case X86_FEAT_XSAVEOPT:
         return (s->cpuid_xsave_features & CPUID_XSAVE_XSAVEOPT);

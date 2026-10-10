@@ -8296,6 +8296,13 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w)
                 r |= CPUID_7_0_EBX_INVPCID;
             }
         }
+        /*
+         * AVX-VNNI comes with the integer vector paths (x-simd), which
+         * give it the host's dot products where it has them.
+         */
+        if (tcg_enabled() && tcg_vint && w == FEAT_7_1_EAX) {
+            r |= CPUID_7_1_EAX_AVX_VNNI;
+        }
     } else {
         return ~0;
     }

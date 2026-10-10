@@ -342,6 +342,64 @@ void glue(helper_pmaddwd, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
     }
 }
 
+#if SHIFT >= 1
+/*
+ * AVX-VNNI: each dword of d accumulates the products of the four unsigned
+ * bytes of v and signed bytes of s at its position (VPDPBUSD), or of the
+ * two signed words (VPDPWSSD); the S forms saturate the sum.
+ */
+#if SHIFT == 1
+static inline int32_t vnni_busd(Reg *v, Reg *s, int i)
+{
+    int32_t sum = 0;
+
+    for (int k = 0; k < 4; k++) {
+        sum += v->B(4 * i + k) * (int8_t)s->B(4 * i + k);
+    }
+    return sum;
+}
+
+static inline int64_t vnni_wssd(Reg *v, Reg *s, int i)
+{
+    return (int64_t)(int16_t)v->W(2 * i) * (int16_t)s->W(2 * i) +
+           (int64_t)(int16_t)v->W(2 * i + 1) * (int16_t)s->W(2 * i + 1);
+}
+
+static inline uint32_t vnni_sat(int64_t x)
+{
+    return x > INT32_MAX ? INT32_MAX : x < INT32_MIN ? INT32_MIN : x;
+}
+#endif
+
+void glue(helper_vpdpbusd, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
+{
+    for (int i = 0; i < (2 << SHIFT); i++) {
+        d->L(i) += vnni_busd(v, s, i);
+    }
+}
+
+void glue(helper_vpdpbusds, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
+{
+    for (int i = 0; i < (2 << SHIFT); i++) {
+        d->L(i) = vnni_sat((int64_t)(int32_t)d->L(i) + vnni_busd(v, s, i));
+    }
+}
+
+void glue(helper_vpdpwssd, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
+{
+    for (int i = 0; i < (2 << SHIFT); i++) {
+        d->L(i) += (uint32_t)vnni_wssd(v, s, i);
+    }
+}
+
+void glue(helper_vpdpwssds, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
+{
+    for (int i = 0; i < (2 << SHIFT); i++) {
+        d->L(i) = vnni_sat((int64_t)(int32_t)d->L(i) + vnni_wssd(v, s, i));
+    }
+}
+#endif
+
 #if SHIFT == 0
 static inline int abs1(int a)
 {
