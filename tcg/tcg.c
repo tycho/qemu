@@ -5657,6 +5657,12 @@ static void la_branch_inherit(TCGContext *s, TCGLabel *l, int nt, bool cond)
             l->ft_state[i] = ft;
         }
         switch (ts->kind) {
+        case TEMP_FIXED:
+            /* A pinned global flows into the label in its register. */
+            if (!ts->pinned) {
+                continue;
+            }
+            break;
         case TEMP_GLOBAL:
         case TEMP_TB:
             break;
@@ -5700,6 +5706,12 @@ static void la_loopback(TCGContext *s, TCGLabel *l, int nt)
         TCGTemp *ts = &s->temps[i];
 
         switch (ts->kind) {
+        case TEMP_FIXED:
+            /* A pinned global is current across the back edge. */
+            if (!ts->pinned) {
+                continue;
+            }
+            /* fall through */
         case TEMP_GLOBAL:
         case TEMP_TB:
             ts->state = TS_DEAD | TS_MEM;
