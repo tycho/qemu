@@ -3847,6 +3847,45 @@ static bool op_falls_through(const TCGOp *op)
 }
 
 /*
+ * Units (tcg_units): a conditional jump between two blocks of a unit is a
+ * brcond to a label holding a br to the taken block's region label, then
+ * a br to the other block's.  Move each such two-op stub, reached only by
+ * branches, to the end of the TB: the br before it then reaches its label
+ * by falling through, so the not-taken side runs no branch, and the taken
+ * side runs the stub as it would in place (the allocator puts the
+ * region's homes in place in the stub, on that side alone).
+ */
+static void region_stub_pass(TCGContext *s)
+{
+    TCGOp *last = QTAILQ_LAST(&s->ops);
+    TCGOp *op, *next;
+
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        TCGOp *prev = QTAILQ_PREV(op, link);
+        TCGLabel *l;
+        TCGOp *br;
+        bool end = op == last;
+
+        if (op->opc == INDEX_op_set_label) {
+            l = arg_label(op->args[0]);
+            br = QTAILQ_NEXT(op, link);
+            if (!l->region && !l->loop && prev && !op_falls_through(prev)
+                && br && br->opc == INDEX_op_br && br != last
+                && arg_label(br->args[0])->region) {
+                next = QTAILQ_NEXT(br, link);
+                QTAILQ_REMOVE(&s->ops, op, link);
+                QTAILQ_REMOVE(&s->ops, br, link);
+                QTAILQ_INSERT_TAIL(&s->ops, op, link);
+                QTAILQ_INSERT_TAIL(&s->ops, br, link);
+            }
+        }
+        if (end) {
+            break;
+        }
+    }
+}
+
+/*
  * Whether the code after @op, followed through fall-through, reaches a
  * back edge to an XLBL_LOOP label before leaving the TB.
  */
@@ -7766,6 +7805,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 
     tcg_optimize(s);
 
+    if (tcg_units) {
+        region_stub_pass(s);
+    }
     reachable_code_pass(s);
     liveness_pass_0(s);
     s->xblk_region = false;
