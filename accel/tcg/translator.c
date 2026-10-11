@@ -533,6 +533,14 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
                       ? dest > r->pc[i] && dest <= db->pc_next
                       : dest > r->pc[i] && dest < r->bend[i];
 
+        if (inside && region_is_split(dest)) {
+            /*
+             * The block ended at this split point and goes on to it: it
+             * would only split there again.  Translate a plain TB.
+             */
+            region_reject = true;
+            siglongjmp(tcg_ctx->jmp_trans, -2);
+        }
         if (inside) {
             /* A jump into a block already translated: split it there. */
             if (region_n_split < REGION_SPLIT_MAX) {
