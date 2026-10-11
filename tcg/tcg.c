@@ -5257,8 +5257,8 @@ bool tcg_chain_dead_read_since(TCGOp *after)
  */
 static void la_chain_dead(TCGContext *s, int ng)
 {
-    for (int i = 0; i < ng; i++) {
-        TCGTemp *ts = &s->temps[i];
+    for (int k = 0; k < s->nb_la_globals; k++) {
+        TCGTemp *ts = &s->temps[s->la_globals[k]];
         int state = ts->state;
 
         if (temp_chain_dead_index(s, ts) >= 0) {
@@ -5632,7 +5632,10 @@ static bool xblk_classify(TCGContext *s)
 static void la_record(TCGContext *s, TCGLabel *l, int nt)
 {
     l->live_in = tcg_malloc(nt);
-    for (int i = 0; i < nt; i++) {
+    memset(l->live_in, TS_DEAD | TS_MEM, nt);
+    for (int k = 0; k < named_temps(s); k++) {
+        int i = named_temp(s, k);
+
         l->live_in[i] = s->temps[i].state;
     }
 }
@@ -5646,8 +5649,10 @@ static void la_branch_inherit(TCGContext *s, TCGLabel *l, int nt, bool cond)
 {
     if (cond) {
         l->ft_state = tcg_malloc(nt);
+        memset(l->ft_state, TS_DEAD | TS_MEM, nt);
     }
-    for (int i = 0; i < nt; i++) {
+    for (int k = 0; k < named_temps(s); k++) {
+        int i = named_temp(s, k);
         TCGTemp *ts = &s->temps[i];
         int tk = l->live_in[i];
         int ft = ts->state;
@@ -5702,8 +5707,8 @@ static void la_loopback(TCGContext *s, TCGLabel *l, int nt)
 {
     XblkLoopReg *lr = l->loopregs;
 
-    for (int i = 0; i < nt; i++) {
-        TCGTemp *ts = &s->temps[i];
+    for (int k = 0; k < named_temps(s); k++) {
+        TCGTemp *ts = &s->temps[named_temp(s, k)];
 
         switch (ts->kind) {
         case TEMP_FIXED:
@@ -5745,7 +5750,8 @@ static void la_loopback(TCGContext *s, TCGLabel *l, int nt)
  */
 static void la_region_state(TCGContext *s, int nt, bool cond)
 {
-    for (int i = 0; i < nt; i++) {
+    for (int k = 0; k < named_temps(s); k++) {
+        int i = named_temp(s, k);
         TCGTemp *ts = &s->temps[i];
         int ft = ts->state, tk, st;
         bool home;
@@ -5834,7 +5840,7 @@ static bool la_xblk_label(TCGContext *s, TCGOp *op, int nt)
         return false;
     }
     /* XLBL_INHERIT: values flow from the branch; temps end here. */
-    for (int i = 0; i < nt; i++) {
+    for (int i = s->nb_globals; i < nt; i++) {
         TCGTemp *ts = &s->temps[i];
 
         if (ts->kind == TEMP_EBB || ts->kind == TEMP_CONST) {
@@ -7856,7 +7862,8 @@ static XblkSnap *xblk_snap(TCGContext *s)
     XblkSnap *sn = tcg_malloc(sizeof(*sn) + s->nb_temps * sizeof(sn->t[0]));
 
     memcpy(sn->reg_to_temp, s->reg_to_temp, sizeof(sn->reg_to_temp));
-    for (int i = 0; i < s->nb_temps; i++) {
+    for (int k = 0; k < named_temps(s); k++) {
+        int i = named_temp(s, k);
         TCGTemp *ts = &s->temps[i];
 
         sn->t[i].val = ts->val;
@@ -7870,7 +7877,8 @@ static XblkSnap *xblk_snap(TCGContext *s)
 static void xblk_restore(TCGContext *s, const XblkSnap *sn)
 {
     memcpy(s->reg_to_temp, sn->reg_to_temp, sizeof(sn->reg_to_temp));
-    for (int i = 0; i < s->nb_temps; i++) {
+    for (int k = 0; k < named_temps(s); k++) {
+        int i = named_temp(s, k);
         TCGTemp *ts = &s->temps[i];
 
         ts->val = sn->t[i].val;
@@ -7886,7 +7894,8 @@ static void xblk_restore(TCGContext *s, const XblkSnap *sn)
  */
 static void xblk_obligations(TCGContext *s, const uint8_t *state)
 {
-    for (int i = 0; i < s->nb_temps; i++) {
+    for (int k = 0; k < named_temps(s); k++) {
+        int i = named_temp(s, k);
         TCGTemp *ts = &s->temps[i];
 
         switch (ts->kind) {
@@ -7920,8 +7929,8 @@ static void xblk_obligations(TCGContext *s, const uint8_t *state)
 /* After an unconditional branch: nothing falls through. */
 static void xblk_forget(TCGContext *s)
 {
-    for (int i = 0; i < s->nb_temps; i++) {
-        TCGTemp *ts = &s->temps[i];
+    for (int k = 0; k < named_temps(s); k++) {
+        TCGTemp *ts = &s->temps[named_temp(s, k)];
 
         switch (ts->kind) {
         case TEMP_GLOBAL:
