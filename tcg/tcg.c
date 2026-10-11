@@ -4088,6 +4088,22 @@ static inline void la_reset_pref(TCGTemp *ts)
         = (ts->state == TS_DEAD ? 0 : tcg_target_available_regs[ts->type]);
 }
 
+/*
+ * The temps that the TB names: the globals some op names (s->la_globals),
+ * then the TB's own temps.  The other globals stay in memory throughout:
+ * at a label, a call or a guest access there is nothing to do for them.
+ */
+static inline int named_temps(TCGContext *s)
+{
+    return s->nb_la_globals + s->nb_temps - s->nb_globals;
+}
+
+static inline int named_temp(TCGContext *s, int k)
+{
+    return k < s->nb_la_globals ? s->la_globals[k]
+                                : s->nb_globals + k - s->nb_la_globals;
+}
+
 /* liveness analysis: end of function: all temps are dead, and globals
    should be in memory. */
 /*
@@ -4394,10 +4410,10 @@ static TCGRegSet op_clobber_regs(TCGOpcode opc)
 static void la_cross_call(TCGContext *s, int nt, TCGRegSet clobber)
 {
     TCGRegSet mask = ~clobber;
-    int i;
 
-    for (i = 0; i < nt; i++) {
-        TCGTemp *ts = &s->temps[i];
+    for (int k = 0; k < named_temps(s); k++) {
+        TCGTemp *ts = &s->temps[named_temp(s, k)];
+
         if (!(ts->state & TS_DEAD)) {
             TCGRegSet *pset = la_temp_pref(ts);
             TCGRegSet set = *pset;
@@ -5495,8 +5511,9 @@ static void ldst_record_writeback(TCGContext *s, TCGRegSet allocated_regs)
     TCGLdstWriteback *wb = NULL;
     unsigned n = 0;
 
-    for (int i = 0; i < s->nb_globals; i++) {
-        TCGTemp *ts = &s->temps[i];
+    /* Only a global some op names can be in a register. */
+    for (int k = 0; k < s->nb_la_globals; k++) {
+        TCGTemp *ts = &s->temps[s->la_globals[k]];
 
         if (ts->kind == TEMP_FIXED || ts->mem_coherent
             || ts->val_type == TEMP_VAL_MEM || ts->val_type == TEMP_VAL_DEAD) {
@@ -5545,11 +5562,13 @@ static void ldst_record_writeback(TCGContext *s, TCGRegSet allocated_regs)
  */
 static void ldst_note_save_regs(TCGContext *s, TCGRegSet clobber)
 {
+    TCGRegSet regs = tcg_target_call_clobber_regs & ~clobber;
+
     s->ldst_save_regs = 0;
-    for (int i = 0; i < TCG_TARGET_NB_REGS; i++) {
-        if (tcg_regset_test_reg(tcg_target_call_clobber_regs, i)
-            && !tcg_regset_test_reg(clobber, i)
-            && s->reg_to_temp[i]) {
+    for (; regs; regs &= regs - 1) {
+        int i = ctz64(regs);
+
+        if (s->reg_to_temp[i]) {
             tcg_regset_set_reg(s->ldst_save_regs, i);
         }
     }
@@ -6178,10 +6197,8 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             TCGRegSet clobber = op_clobber_regs(op->opc);
 
             assert_carry_dead(s);
-            for (i = 0; i < TCG_TARGET_NB_REGS; i++) {
-                if (tcg_regset_test_reg(clobber, i)) {
-                    tcg_reg_free(s, i, i_allocated_regs);
-                }
+            for (; clobber; clobber &= clobber - 1) {
+                tcg_reg_free(s, ctz64(clobber), i_allocated_regs);
             }
         }
         s->ldst_nb_wb = 0;
@@ -6640,10 +6657,9 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
 
     /* tcg_lazysync: the globals only the slow path needed. */
     if (lazy && lazy->dead) {
-        for (i = 0; i < s->nb_globals; i++) {
-            if (test_bit(i, lazy->dead)) {
-                temp_dead(s, &s->temps[i]);
-            }
+        for (i = find_first_bit(lazy->dead, s->nb_globals); i < s->nb_globals;
+             i = find_next_bit(lazy->dead, s->nb_globals, i + 1)) {
+            temp_dead(s, &s->temps[i]);
         }
     }
 }
