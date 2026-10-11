@@ -1974,6 +1974,8 @@ void tcg_func_start(TCGContext *s)
 
     s->nb_ops = 0;
     s->nb_labels = 0;
+    s->call_ret = s->call_land = NULL;
+    s->call_ret_set = false;
     s->current_frame_offset = s->frame_start;
 
 #ifdef CONFIG_DEBUG_TCG
