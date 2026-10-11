@@ -3933,6 +3933,9 @@ static void la_branch_inherit(TCGContext *s, TCGLabel *l, int nt, bool cond)
         int ft = ts->state;
         bool live;
 
+        if (cond) {
+            l->ft_state[i] = ft;
+        }
         switch (ts->kind) {
         case TEMP_GLOBAL:
         case TEMP_TB:
@@ -3948,7 +3951,6 @@ static void la_branch_inherit(TCGContext *s, TCGLabel *l, int nt, bool cond)
             continue;
         }
         if (cond) {
-            l->ft_state[i] = ft;
             live = !(ft & TS_DEAD) || (ft & TS_MEM);
         } else {
             live = false;
