@@ -4881,14 +4881,13 @@ static void region_stub_pass(TCGContext *s)
     TCGOp *op, *next;
 
     QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
-        TCGOp *prev = QTAILQ_PREV(op, link);
-        TCGLabel *l;
-        TCGOp *br;
         bool end = op == last;
 
         if (op->opc == INDEX_op_set_label) {
-            l = arg_label(op->args[0]);
-            br = QTAILQ_NEXT(op, link);
+            TCGOp *prev = QTAILQ_PREV(op, link);
+            TCGLabel *l = arg_label(op->args[0]);
+            TCGOp *br = QTAILQ_NEXT(op, link);
+
             if (!l->region && !l->loop && prev && !op_falls_through(prev)
                 && br && br->opc == INDEX_op_br && br != last
                 && arg_label(br->args[0])->region) {
@@ -5016,6 +5015,9 @@ static void la_branch_inherit(TCGContext *s, TCGLabel *l, int nt, bool cond)
         int ft = ts->state;
         bool live;
 
+        if (cond) {
+            l->ft_state[i] = ft;
+        }
         switch (ts->kind) {
         case TEMP_FIXED:
             /* A pinned global flows into the label in its register. */
@@ -5037,7 +5039,6 @@ static void la_branch_inherit(TCGContext *s, TCGLabel *l, int nt, bool cond)
             continue;
         }
         if (cond) {
-            l->ft_state[i] = ft;
             live = !(ft & TS_DEAD) || (ft & TS_MEM);
         } else {
             live = false;
@@ -5277,7 +5278,7 @@ static void xblk_region_homes(TCGContext *s)
     int npend = 0;
     TCGRegSet vregs, taken = s->reserved_regs;
     int vec_budget = -XBLK_VEC_SPARE, nint = 0, nvec = 0, n = 0;
-    int int_budget = XBLK_REGION_INT, nops = 0, opi = -1;
+    int int_budget = XBLK_REGION_INT, nops = 0, opi = -1, nord = 0;
     int *lstart = NULL, *lend = NULL;
     uint8_t *depth = NULL;
     bool *carried = NULL;
@@ -5294,26 +5295,25 @@ static void xblk_region_homes(TCGContext *s)
          * go round the loop, so they gain most from a register.
          */
         uint8_t *seen = tcg_malloc(s->nb_globals);
+        TCGLabel *l;
 
         carried = tcg_malloc(s->nb_globals * sizeof(*carried));
         memset(carried, 0, s->nb_globals * sizeof(*carried));
-        for (int k = 0; k < s->nb_labels; k++) {
-            int i = 0;
+        QSIMPLEQ_FOREACH(l, &s->labels, next) {
+            int i = lstart[l->id];
 
-            if (lend[k] < 0) {
+            if (lend[l->id] < 0) {
                 continue;
             }
             memset(seen, 0, s->nb_globals);
-            QTAILQ_FOREACH(op, &s->ops, link) {
+            /* From the loop's label to its last back edge. */
+            for (op = l->xset; op && i <= lend[l->id];
+                 op = QTAILQ_NEXT(op, link), i++) {
                 const TCGOpDef *def = &tcg_op_defs[op->opc];
                 int no, ni;
 
-                if (i < lstart[k] || op->opc == INDEX_op_discard) {
-                    i++;
+                if (op->opc == INDEX_op_discard) {
                     continue;
-                }
-                if (i++ > lend[k]) {
-                    break;
                 }
                 if (op->opc == INDEX_op_call) {
                     no = TCGOP_CALLO(op);
@@ -5390,8 +5390,13 @@ static void xblk_region_homes(TCGContext *s)
         }
     }
     for (int i = 0; i < s->nb_globals; i++) {
-        int j = i;
+        int j;
 
+        if (!uses[i]) {
+            /* Never a home: left out of the order. */
+            continue;
+        }
+        j = nord++;
         while (j > 0
                && (carried
                    ? (carried[order[j - 1]] < carried[i]
@@ -5407,11 +5412,11 @@ static void xblk_region_homes(TCGContext *s)
     for (int k = 0; k < ARRAY_SIZE(tcg_target_reg_alloc_order); k++) {
         vec_budget += tcg_regset_test_reg(vregs, tcg_target_reg_alloc_order[k]);
     }
-    for (int o = 0; o < s->nb_globals && n < ARRAY_SIZE(s->region_home); o++) {
+    for (int o = 0; o < nord && n < ARRAY_SIZE(s->region_home); o++) {
         TCGTemp *ts = &s->temps[order[o]];
         TCGRegSet ok;
 
-        if (!uses[order[o]] || ts->kind != TEMP_GLOBAL || ts->indirect_reg) {
+        if (ts->kind != TEMP_GLOBAL || ts->indirect_reg) {
             continue;
         }
         switch (ts->type) {
