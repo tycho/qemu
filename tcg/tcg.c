@@ -6866,6 +6866,11 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             }
 #endif
             tcg_out_label(s, arg_label(op->args[0]));
+#ifdef TCG_TARGET_HAS_GOTO_TB_COLD
+            if (arg_label(op->args[0])->cold_slot) {
+                tcg_out_goto_tb_land(s);
+            }
+#endif
             break;
         case INDEX_op_call:
             assert_carry_dead(s);
