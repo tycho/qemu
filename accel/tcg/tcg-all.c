@@ -100,7 +100,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-flags", "dead" },
         { "x-repstr", "on" },
         { "x-region", "on" },
-        { "x-superblock", "4" },
+        { "x-superblock", "units" },
         { "x-tblookup", "on" },
         { "x-i386-runtime", "on" },
         { "x-addr32", "on" },
