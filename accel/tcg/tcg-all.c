@@ -63,6 +63,7 @@ struct TCGState {
     bool iofast;
     bool hosttime;
     bool pause_hint;
+    bool hyperv;
 };
 typedef struct TCGState TCGState;
 
@@ -253,6 +254,20 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     tcg_pause_hint = s->pause_hint &&
                      (s->mttcg_enabled == ON_OFF_AUTO_ON ||
                       ms->smp.max_cpus == 1);
+#endif
+
+#ifndef CONFIG_USER_ONLY
+    /*
+     * x-hyperv: the reference TSC page and reference time are the TSC
+     * scaled to 100 ns, which needs the TSC at a fixed 1 GHz.
+     */
+    if (s->hyperv) {
+        if (!tcg_tsc_counter) {
+            error_report("x-hyperv needs x-hosttime (and no icount)");
+            return -EINVAL;
+        }
+        tcg_hyperv = true;
+    }
 #endif
 
     tcg_allowed = true;
@@ -796,6 +811,16 @@ static void tcg_set_xtcg_stats(Object *obj, bool value, Error **errp)
     xtcg_stats_enable(value);
 }
 
+static bool tcg_get_hyperv(Object *obj, Error **errp)
+{
+    return TCG_STATE(obj)->hyperv;
+}
+
+static void tcg_set_hyperv(Object *obj, bool value, Error **errp)
+{
+    TCG_STATE(obj)->hyperv = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -995,6 +1020,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                    tcg_set_xtcg_stats);
     object_class_property_set_description(oc, "x-stats",
         "xtcg: count TCG events and print them to stderr at exit");
+
+    object_class_property_add_bool(oc, "x-hyperv",
+                                   tcg_get_hyperv, tcg_set_hyperv);
+    object_class_property_set_description(oc, "x-hyperv",
+        "x86 system mode: implement the Hyper-V interface for hv-relaxed, "
+        "hv-vpindex, hv-time and hv-frequencies (otherwise ignored under "
+        "TCG), and turn them on by default; needs x-hosttime");
 }
 
 static const TypeInfo tcg_accel_type = {

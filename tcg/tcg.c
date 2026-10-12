@@ -341,6 +341,7 @@ bool tcg_pcid;
 
 bool tcg_lean;
 bool tcg_repstr;
+bool tcg_hyperv;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
