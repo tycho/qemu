@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xtcg-stats.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "helper-tcg.h"
@@ -78,6 +79,8 @@ static int cc_op_lazy_plain(int op)
 target_ulong helper_cc_compute_nz(target_ulong dst, target_ulong src1,
                                   int op)
 {
+    xtcg_stat_inc(XS_CC_NZ);
+    xtcg_hist_inc(XH_CC_NZ_OP, op & 0xff);
     if (cc_op_is_lazy(op)) {
         op = cc_op_lazy_plain(op);
     }
@@ -110,6 +113,8 @@ target_ulong helper_cc_compute_all(target_ulong dst, target_ulong src1,
     uint32_t flags = 0;
     int shift = 0;
 
+    xtcg_stat_inc(XS_CC_ALL);
+    xtcg_hist_inc(XH_CC_ALL_OP, op);
     switch (op) {
     default: /* should never happen */
         return 0;
@@ -334,6 +339,7 @@ target_ulong helper_cc_compute_all2(target_ulong dst, target_ulong src1,
 
 uint32_t cpu_cc_compute_all(CPUX86State *env)
 {
+    xtcg_stat_inc(XS_CC_ALL_C);
     return helper_cc_compute_all2(CC_DST, CC_SRC, CC_SRC2, env->cc_dst2,
                                   CC_OP);
 }
@@ -341,6 +347,8 @@ uint32_t cpu_cc_compute_all(CPUX86State *env)
 target_ulong helper_cc_compute_c(target_ulong dst, target_ulong src1,
                                  target_ulong src2, int op)
 {
+    xtcg_stat_inc(XS_CC_C);
+    xtcg_hist_inc(XH_CC_C_OP, op);
     switch (op) {
     default: /* should never happen */
     case CC_OP_LOGICB:
