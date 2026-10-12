@@ -9485,6 +9485,26 @@ static bool narrow32_op(const TCGOp *op)
     }
 }
 
+/*
+ * The constants of an I32 op are sign-extended from 32 bits, as the
+ * backend matches and encodes them: an I64 constant whose high half
+ * isn't the sign of its low half (0x00000000ffffffff) would be encoded
+ * as some other value.
+ */
+static bool narrow32_consts(const TCGOp *x)
+{
+    const TCGOpDef *def = &tcg_op_defs[x->opc];
+
+    for (int i = def->nb_oargs; i < def->nb_oargs + def->nb_iargs; i++) {
+        TCGTemp *ts = arg_temp(x->args[i]);
+
+        if (ts->kind == TEMP_CONST && ts->val != (int32_t)ts->val) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void narrow32_pass(TCGContext *s)
 {
     TCGOp *op, *next;
@@ -9514,7 +9534,7 @@ static void narrow32_pass(TCGContext *s)
             }
         }
         if (TCGOP_TYPE(x) != TCG_TYPE_I64 || !narrow32_op(x) ||
-            arg_temp(x->args[0]) != t ||
+            arg_temp(x->args[0]) != t || !narrow32_consts(x) ||
             !tcg_op_supported(x->opc, TCG_TYPE_I32, 0)) {
             continue;
         }
