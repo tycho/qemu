@@ -1016,11 +1016,11 @@ static void qemu_spice_cleanup(void)
     }
 
     qemu_spice_display_cleanup();
-    qemu_spice_input_cleanup();
     migration_remove_notifier(&migration_state);
     g_clear_pointer(&spice_consoles, g_slist_free);
     g_clear_pointer(&auth_passwd, g_free);
     g_clear_pointer(&spice_server, spice_server_destroy);
+    qemu_spice_input_cleanup();
     g_clear_pointer(&vm_change_entry, qemu_del_vm_change_state_handler);
     using_spice = 0;
 }

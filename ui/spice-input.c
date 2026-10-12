@@ -264,19 +264,20 @@ void qemu_spice_input_init(void)
     mouse_mode_notifier(&spice_pointer->mouse_mode, NULL);
 }
 
+/*
+ * Runs after spice_server_destroy(). spice-server can't remove keyboard
+ * and mouse instances while it runs, and destroying it still uses the
+ * keyboard (it releases the keys a client holds) and detaches the tablet
+ * itself, so only QEMU's side is undone here.
+ */
 void qemu_spice_input_cleanup(void)
 {
     if (spice_pointer) {
         qemu_remove_mouse_mode_change_notifier(&spice_pointer->mouse_mode);
-        if (spice_pointer->absolute) {
-            spice_server_remove_interface(&spice_pointer->tablet.base);
-        }
-        spice_server_remove_interface(&spice_pointer->mouse.base);
         g_clear_pointer(&spice_pointer, g_free);
     }
     if (spice_kbd) {
         qemu_input_led_notifier_remove(&spice_kbd->led_notifier);
-        spice_server_remove_interface(&spice_kbd->sin.base);
         g_clear_pointer(&spice_kbd, g_free);
     }
 }
