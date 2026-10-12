@@ -9222,8 +9222,10 @@ static void tcg_out_st_helper_args(TCGContext *s, const TCGLabelQemuLdst *ldst,
  * output is a temp that dies in a mov to a pinned global right after it,
  * the op writes the pinned global instead and the mov goes.  Nothing runs
  * between the two, so the global changes at the same point as before; an
- * op that faults leaves its output register unwritten.  Runs after
- * liveness, whose results it keeps up to date.  With tcg_lean, also for
+ * op that faults leaves its output register unwritten.  Not when the op
+ * also stores the temp: a TB temp kept in memory across labels is read
+ * from there after it dies in the mov.  Runs after liveness, whose results
+ * it keeps up to date.  With tcg_lean, also for
  * globals that aren't pinned (not a guest load), where it saves the
  * register-to-register move.
  */
@@ -9254,7 +9256,7 @@ static void pinned_fold_pass(TCGContext *s)
             arg_temp(next->args[1]) != t ||
             (t->kind != TEMP_EBB && t->kind != TEMP_TB) ||
             t->type != g->type || TCGOP_TYPE(next) != g->type ||
-            !(next->life & (DEAD_ARG << 1))) {
+            !(next->life & (DEAD_ARG << 1)) || (op->life & SYNC_ARG)) {
             continue;
         }
         op->args[0] = next->args[0];
