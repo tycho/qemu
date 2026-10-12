@@ -2914,6 +2914,16 @@ static void tcg_out_goto_tb_tramp(TCGContext *s, int which)
     tcg_out_insn(s, bcond_reg, BR, TCG_REG_TMP0);
 }
 
+/*
+ * The reset label after the trampoline.  A thread in the trampoline when
+ * the slot is unlinked loads the reset address and branches there
+ * indirectly: like goto_tb's, the label is a BTI landing pad.
+ */
+static void tcg_out_goto_tb_land(TCGContext *s)
+{
+    tcg_out_bti(s, BTI_J);
+}
+
 static void tcg_out_goto_tb(TCGContext *s, int which)
 {
     /*
