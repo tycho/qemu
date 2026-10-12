@@ -6894,6 +6894,10 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         case INDEX_op_call_tb:
             tcg_debug_assert(op->args[0] < ARRAY_SIZE(s->call_tb_reset));
             s->call_tb_reset[op->args[0]] = arg_label(op->args[1]);
+#ifdef TCG_TARGET_HAS_GOTO_TB_COLD
+            /* A trampoline before the reset label, to a TB out of range. */
+            arg_label(op->args[1])->cold_slot = op->args[0] + 1;
+#endif
             tcg_out_call_tb(s, op->args[0]);
             break;
 #endif
