@@ -4752,6 +4752,7 @@ static void i386_tr_block_start(DisasContextBase *dcbase, CPUState *cpu)
 
     dc->cc_op = CC_OP_DYNAMIC;
     dc->cc_op_dirty = false;
+    assert(!dc->ymmh_pending);
     dc->cc_srcT = NULL;
     dc->pc = dc->base.pc_next;
     dc->pc_save = dc->base.pc_next;
