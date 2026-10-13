@@ -340,6 +340,7 @@ TCGCR3Flush tcg_cr3_flush;
 bool tcg_pcid;
 
 bool tcg_lean;
+bool tcg_alignfold;
 bool tcg_repstr;
 bool tcg_vexzero;
 bool tcg_crypto;
@@ -4384,6 +4385,202 @@ static void goto_tb_cold_pass(TCGContext *s)
         next = done ? NULL : after;
     }
 #endif
+}
+
+/*
+ * tcg_alignfold: alignment checks implied by an earlier one.  A guest
+ * access whose address is the sum of the same globals, unchanged, as an
+ * earlier access checked for at least the same alignment, plus a constant
+ * that differs from that access's by a multiple of the alignment, can't be
+ * misaligned if the earlier one wasn't; if it was, the earlier access
+ * faulted.  The later access's check is dropped (MO_AMASK cleared).  The
+ * facts hold from an access to the next label, or to a call that may write
+ * globals: between labels, ops run in order.
+ */
+typedef struct AlignForm {
+    TCGTemp *g[2];          /* globals (fixed ones too) summed, g[0] < g[1] */
+    unsigned ver[2];
+    int64_t c;
+    bool known;
+} AlignForm;
+
+typedef struct AlignFact {
+    TCGTemp *g[2];
+    unsigned ver[2];
+    int64_t c;
+    unsigned bits;
+} AlignFact;
+
+#define ALIGN_FACTS 16
+
+static bool align_form_add(AlignForm *r, const AlignForm *a,
+                           const AlignForm *b)
+{
+    TCGTemp *g[4];
+    unsigned v[4], n = 0;
+
+    if (!a->known || !b->known) {
+        return false;
+    }
+    for (int k = 0; k < 2; k++) {
+        if (a->g[k]) {
+            g[n] = a->g[k];
+            v[n++] = a->ver[k];
+        }
+    }
+    for (int k = 0; k < 2; k++) {
+        if (b->g[k]) {
+            g[n] = b->g[k];
+            v[n++] = b->ver[k];
+        }
+    }
+    if (n > 2) {
+        return false;
+    }
+    memset(r, 0, sizeof(*r));
+    r->known = true;
+    r->c = a->c + b->c;
+    if (n == 2 && g[1] < g[0]) {
+        r->g[0] = g[1];
+        r->ver[0] = v[1];
+        r->g[1] = g[0];
+        r->ver[1] = v[0];
+    } else {
+        for (unsigned k = 0; k < n; k++) {
+            r->g[k] = g[k];
+            r->ver[k] = v[k];
+        }
+    }
+    return true;
+}
+
+static void align_form_of(AlignForm *d, const AlignForm *form,
+                          const unsigned *ver, TCGTemp *src)
+{
+    memset(d, 0, sizeof(*d));
+    if (src->kind == TEMP_GLOBAL || src->kind == TEMP_FIXED) {
+        d->known = true;
+        d->g[0] = src;
+        d->ver[0] = ver[temp_idx(src)];
+    } else if (src->kind == TEMP_CONST) {
+        d->known = true;
+        d->c = src->val;
+    } else {
+        *d = form[temp_idx(src)];
+    }
+}
+
+static void __attribute__((noinline))
+align_fold_pass(TCGContext *s)
+{
+    AlignForm *form = g_new0(AlignForm, s->nb_temps);
+    unsigned *ver = g_new0(unsigned, s->nb_globals);
+    AlignFact fact[ALIGN_FACTS];
+    unsigned nfact = 0, next = 0;
+    TCGOp *op;
+
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        TCGOpcode opc = op->opc;
+        const TCGOpDef *def = &tcg_op_defs[opc];
+        int nb_o = def->nb_oargs, nb_i = def->nb_iargs;
+
+        if (opc == INDEX_op_set_label) {
+            nfact = 0;
+            continue;
+        }
+        if (opc == INDEX_op_call) {
+            nb_o = TCGOP_CALLO(op);
+            nb_i = TCGOP_CALLI(op);
+            if (!(tcg_call_flags(op) & TCG_CALL_NO_WRITE_GLOBALS)) {
+                for (int k = 0; k < s->nb_globals; k++) {
+                    ver[k]++;
+                }
+                nfact = 0;
+            }
+        }
+        switch (opc) {
+        case INDEX_op_qemu_ld:
+        case INDEX_op_qemu_st:
+        case INDEX_op_qemu_ld2:
+        case INDEX_op_qemu_st2: {
+            TCGTemp *at = arg_temp(op->args[nb_o + nb_i - 1]);
+            MemOpIdx oi = op->args[nb_o + nb_i];
+            MemOp mop = get_memop(oi);
+            unsigned bits = memop_alignment_bits(mop);
+            AlignForm f;
+            bool done = false;
+
+            align_form_of(&f, form, ver, at);
+            if (!bits || !f.known) {
+                break;
+            }
+            for (unsigned k = 0; k < nfact; k++) {
+                const AlignFact *a = &fact[k];
+
+                if (a->bits >= bits && a->g[0] == f.g[0] &&
+                    a->g[1] == f.g[1] &&
+                    (!f.g[0] || a->ver[0] == f.ver[0]) &&
+                    (!f.g[1] || a->ver[1] == f.ver[1]) &&
+                    !((f.c - a->c) & ((1ull << bits) - 1))) {
+                    op->args[nb_o + nb_i] =
+                        make_memop_idx(mop & ~MO_AMASK, get_mmuidx(oi));
+                    done = true;
+                    break;
+                }
+            }
+            if (!done) {
+                AlignFact *a;
+
+                if (nfact < ALIGN_FACTS) {
+                    a = &fact[nfact++];
+                } else {
+                    a = &fact[next++ % ALIGN_FACTS];
+                }
+                a->g[0] = f.g[0];
+                a->g[1] = f.g[1];
+                a->ver[0] = f.ver[0];
+                a->ver[1] = f.ver[1];
+                a->c = f.c;
+                a->bits = bits;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+
+        /* The forms of this op's outputs; writes to globals. */
+        for (int k = 0; k < nb_o; k++) {
+            TCGTemp *ts = arg_temp(op->args[k]);
+            AlignForm t = { .known = false };
+
+            if (nb_o == 1 && TCGOP_TYPE(op) == TCG_TYPE_I64) {
+                if (opc == INDEX_op_mov) {
+                    align_form_of(&t, form, ver, arg_temp(op->args[1]));
+                } else if (opc == INDEX_op_add) {
+                    AlignForm a, b;
+
+                    align_form_of(&a, form, ver, arg_temp(op->args[1]));
+                    align_form_of(&b, form, ver, arg_temp(op->args[2]));
+                    align_form_add(&t, &a, &b);
+                }
+            }
+            if (ts->kind == TEMP_GLOBAL || ts->kind == TEMP_FIXED) {
+                ver[temp_idx(ts)]++;
+            } else {
+                form[temp_idx(ts)] = t;
+            }
+        }
+        if (opc == INDEX_op_discard) {
+            TCGTemp *ts = arg_temp(op->args[0]);
+
+            if (ts->kind == TEMP_GLOBAL || ts->kind == TEMP_FIXED) {
+                ver[temp_idx(ts)]++;
+            }
+        }
+    }
+    g_free(form);
+    g_free(ver);
 }
 
 /* Reachable analysis : remove unreachable code.  */
@@ -9680,6 +9877,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     tcg_temp_ebb_reset_freed(s);
 
     tcg_optimize(s);
+    if (tcg_alignfold) {
+        align_fold_pass(s);
+    }
     if (tcg_dse) {
         dead_env_store_pass(s);
     }
