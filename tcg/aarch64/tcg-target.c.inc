@@ -687,6 +687,10 @@ typedef enum {
     Iqrrr_e_SDOT      = 0x0e809400,  /* FEAT_DotProd */
     Iqrrr_e_UDOT      = 0x2e809400,  /* FEAT_DotProd */
     Iqrrr_e_USDOT     = 0x0e809c00,  /* FEAT_I8MM */
+    /* Cryptographic three-register SHA (Q bit and size are fixed). */
+    Iqrrr_e_SHA1C     = 0x5e000000,  /* FEAT_SHA1 */
+    Iqrrr_e_SHA1P     = 0x5e001000,  /* FEAT_SHA1 */
+    Iqrrr_e_SHA1M     = 0x5e002000,  /* FEAT_SHA1 */
     Iqrrr_e_SABD      = 0x0e207400,
     Iqrrr_e_UABD      = 0x2e207400,
     Iqrrr_e_URHADD    = 0x2e201400,
@@ -737,6 +741,12 @@ typedef enum {
     Iqrrr_e_FCMEQ     = 0x0e20e400,
     Iqrrr_e_FCMGE     = 0x2e20e400,
     Iqrrr_e_FCMGT     = 0x2ea0e400,
+
+    /* Cryptographic AES (Q bit and size are fixed). */
+    Iqrr_e_AESE       = 0x4e284800,  /* FEAT_AES */
+    Iqrr_e_AESD       = 0x4e285800,  /* FEAT_AES */
+    Iqrr_e_AESMC      = 0x4e286800,  /* FEAT_AES */
+    Iqrr_e_AESIMC     = 0x4e287800,  /* FEAT_AES */
 
     /* AdvSIMD two-reg misc.  */
     Iqrr_e_REV64      = 0x0e200800,
@@ -4561,6 +4571,29 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_usdot4_vec:
         tcg_out_insn_qrrr_e(s, Iqrrr_e_USDOT, 1, MO_32, a0, a2, args[3]);
         break;
+    case INDEX_op_sha1c_vec:
+        /* The state is both the first input and the output. */
+        tcg_out_insn_qrrr_e(s, Iqrrr_e_SHA1C, 0, 0, a0, a2, args[3]);
+        break;
+    case INDEX_op_sha1p_vec:
+        tcg_out_insn_qrrr_e(s, Iqrrr_e_SHA1P, 0, 0, a0, a2, args[3]);
+        break;
+    case INDEX_op_sha1m_vec:
+        tcg_out_insn_qrrr_e(s, Iqrrr_e_SHA1M, 0, 0, a0, a2, args[3]);
+        break;
+    case INDEX_op_aese_vec:
+        /* The state is both the first input and the output. */
+        tcg_out_insn_qrr_e(s, Iqrr_e_AESE, 0, 0, a0, a2);
+        break;
+    case INDEX_op_aesd_vec:
+        tcg_out_insn_qrr_e(s, Iqrr_e_AESD, 0, 0, a0, a2);
+        break;
+    case INDEX_op_aesmc_vec:
+        tcg_out_insn_qrr_e(s, Iqrr_e_AESMC, 0, 0, a0, a1);
+        break;
+    case INDEX_op_aesimc_vec:
+        tcg_out_insn_qrr_e(s, Iqrr_e_AESIMC, 0, 0, a0, a1);
+        break;
     case INDEX_op_narrow_vec:
         tcg_out_narrow_vec(s, vece, a0, a1, a2, args[3]);
         break;
@@ -5169,6 +5202,15 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_usdot4_vec:
         return type == TCG_TYPE_V128 && vece == MO_32 &&
                (cpuinfo & CPUINFO_I8MM);
+    case INDEX_op_sha1c_vec:
+    case INDEX_op_sha1p_vec:
+    case INDEX_op_sha1m_vec:
+        return type == TCG_TYPE_V128 && (cpuinfo & CPUINFO_SHA1);
+    case INDEX_op_aese_vec:
+    case INDEX_op_aesd_vec:
+    case INDEX_op_aesmc_vec:
+    case INDEX_op_aesimc_vec:
+        return type == TCG_TYPE_V128 && (cpuinfo & CPUINFO_AES);
 
     case INDEX_op_fadd_vec:
     case INDEX_op_fsub_vec:
@@ -5404,7 +5446,16 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_sdot4_vec:
     case INDEX_op_udot4_vec:
     case INDEX_op_usdot4_vec:
+    case INDEX_op_sha1c_vec:
+    case INDEX_op_sha1p_vec:
+    case INDEX_op_sha1m_vec:
         return C_O1_I3(w, 0, w, w);
+    case INDEX_op_aese_vec:
+    case INDEX_op_aesd_vec:
+        return C_O1_I2(w, 0, w);
+    case INDEX_op_aesmc_vec:
+    case INDEX_op_aesimc_vec:
+        return C_O1_I1(w, w);
     case INDEX_op_widen_vec:
     case INDEX_op_addlp_vec:
         return C_O1_I1(w, w);

@@ -100,6 +100,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-flags", "dead" },
         { "x-repstr", "on" },
         { "x-vexzero", "on" },
+        { "x-crypto", "on" },
         { "x-region", "on" },
         { "x-superblock", "units" },
         { "x-tblookup", "on" },
@@ -786,6 +787,16 @@ static void tcg_set_repstr(Object *obj, bool value, Error **errp)
     tcg_repstr = value;
 }
 
+static bool tcg_get_crypto(Object *obj, Error **errp)
+{
+    return tcg_crypto;
+}
+
+static void tcg_set_crypto(Object *obj, bool value, Error **errp)
+{
+    tcg_crypto = value;
+}
+
 static bool tcg_get_vexzero(Object *obj, Error **errp)
 {
     return tcg_vexzero;
@@ -989,6 +1000,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-repstr",
         "x86 REP STOS and REP MOVS a page at a time with the host's widest "
         "stores, as with fast string operations (default off)");
+    object_class_property_add_bool(oc, "x-crypto", tcg_get_crypto,
+                                   tcg_set_crypto);
+    object_class_property_set_description(oc, "x-crypto",
+        "SHA-1 and AES round insns as host cryptographic insns inline, "
+        "where the host has them, instead of helper calls");
+
     object_class_property_add_bool(oc, "x-vexzero", tcg_get_vexzero,
                                    tcg_set_vexzero);
     object_class_property_set_description(oc, "x-vexzero",
