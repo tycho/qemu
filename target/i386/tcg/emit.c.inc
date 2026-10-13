@@ -1775,10 +1775,83 @@ VINT_BINARY(PMULDQ, pmuldq, NULL,
             && vint_can(INDEX_op_perm_vec, MO_32),
             vint_pmul_even, true)
 
-BINARY_INT_SSE(VAESDEC, aesdec)
-BINARY_INT_SSE(VAESDECLAST, aesdeclast)
-BINARY_INT_SSE(VAESENC, aesenc)
-BINARY_INT_SSE(VAESENCLAST, aesenclast)
+BINARY_INT_SSE(VAESDEC_helper, aesdec)
+BINARY_INT_SSE(VAESDECLAST_helper, aesdeclast)
+BINARY_INT_SSE(VAESENC_helper, aesenc)
+BINARY_INT_SSE(VAESENCLAST_helper, aesenclast)
+
+static bool crypto_can(TCGOpcode opc, unsigned vece)
+{
+    return tcg_crypto && tcg_can_emit_vec_op(opc, TCG_TYPE_V128, vece) > 0;
+}
+
+/*
+ * x-crypto: an AES round with TCG's AES ops, per 128-bit lane.  x86 keeps
+ * the state in the AES standard's byte order, as they do: AESENC is
+ * aesmc(aese(state, 0)) ^ key, AESDEC aesimc(aesd(state, 0)) ^ key, and
+ * the last rounds leave out the (inverse) MixColumns.
+ */
+static bool gen_aes_round(DisasContext *s, X86DecodedInsn *decode,
+                          bool dec, bool mix)
+{
+    TCGOpcode sb = dec ? INDEX_op_aesd_vec : INDEX_op_aese_vec;
+    TCGOpcode mc = dec ? INDEX_op_aesimc_vec : INDEX_op_aesmc_vec;
+    TCGv_vec zero;
+
+    if (!crypto_can(sb, MO_8) || (mix && !crypto_can(mc, MO_8))) {
+        return false;
+    }
+    zero = tcg_constant_vec(TCG_TYPE_V128, MO_8, 0);
+    for (int lane = 0; lane <= s->vex_l; lane++) {
+        TCGv_vec st = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec key = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(st, tcg_env, decode->op[1].offset + lane * 16);
+        tcg_gen_ld_vec(key, tcg_env, decode->op[2].offset + lane * 16);
+        if (dec) {
+            tcg_gen_aesd_vec(st, st, zero);
+            if (mix) {
+                tcg_gen_aesimc_vec(st, st);
+            }
+        } else {
+            tcg_gen_aese_vec(st, st, zero);
+            if (mix) {
+                tcg_gen_aesmc_vec(st, st);
+            }
+        }
+        tcg_gen_xor_vec(MO_8, st, st, key);
+        tcg_gen_st_vec(st, tcg_env, decode->op[0].offset + lane * 16);
+    }
+    return true;
+}
+
+static void gen_VAESDEC(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (!gen_aes_round(s, decode, true, true)) {
+        gen_VAESDEC_helper(s, decode);
+    }
+}
+
+static void gen_VAESDECLAST(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (!gen_aes_round(s, decode, true, false)) {
+        gen_VAESDECLAST_helper(s, decode);
+    }
+}
+
+static void gen_VAESENC(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (!gen_aes_round(s, decode, false, true)) {
+        gen_VAESENC_helper(s, decode);
+    }
+}
+
+static void gen_VAESENCLAST(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (!gen_aes_round(s, decode, false, false)) {
+        gen_VAESENCLAST_helper(s, decode);
+    }
+}
 
 /* The OR of the two 64-bit halves of @v, as an integer. */
 static TCGv_i64 vint_or_halves(TCGv_vec v)
@@ -5285,8 +5358,57 @@ static void gen_SHA1MSG2(DisasContext *s, X86DecodedInsn *decode)
     gen_helper_sha1msg2(OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
+/* The four 32-bit elements of @v in the reverse order. */
+static void gen_rev32x4(TCGv_vec v)
+{
+    tcg_gen_rotli_vec(MO_64, v, v, 32);
+    tcg_gen_ext_vec(v, v, v, 8);
+}
+
 static void gen_SHA1RNDS4(DisasContext *s, X86DecodedInsn *decode)
 {
+    static const uint32_t k[4] = {
+        0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xCA62C1D6
+    };
+    static const TCGOpcode f[4] = {
+        INDEX_op_sha1c_vec, INDEX_op_sha1p_vec,
+        INDEX_op_sha1m_vec, INDEX_op_sha1p_vec
+    };
+    unsigned i = decode->immediate & 3;
+
+    /*
+     * x-crypto: four rounds with TCG's SHA-1 ops, which keep a, b, c, d in
+     * elements 0 to 3 (x86: 3 to 0) and take the round constant added to
+     * the message words; e is 0.
+     */
+    if (crypto_can(f[i], MO_32) && vint_can(INDEX_op_ext_vec, MO_8) &&
+        tcg_can_emit_vec_op(INDEX_op_rotli_vec, TCG_TYPE_V128, MO_64)) {
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec w = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec zero = tcg_constant_vec(TCG_TYPE_V128, MO_32, 0);
+
+        tcg_gen_ld_vec(a, tcg_env, decode->op[0].offset);
+        tcg_gen_ld_vec(w, tcg_env, decode->op[1].offset);
+        gen_rev32x4(a);
+        gen_rev32x4(w);
+        tcg_gen_add_vec(MO_32, w, w,
+                        tcg_constant_vec(TCG_TYPE_V128, MO_32, k[i]));
+        switch (i) {
+        case 0:
+            tcg_gen_sha1c_vec(a, a, zero, w);
+            break;
+        case 2:
+            tcg_gen_sha1m_vec(a, a, zero, w);
+            break;
+        default:
+            tcg_gen_sha1p_vec(a, a, zero, w);
+            break;
+        }
+        gen_rev32x4(a);
+        tcg_gen_st_vec(a, tcg_env, decode->op[0].offset);
+        return;
+    }
+
     switch(decode->immediate & 3) {
     case 0:
         gen_helper_sha1rnds4_f0(OP_PTR0, OP_PTR0, OP_PTR1);
@@ -5548,6 +5670,14 @@ static void gen_UD(DisasContext *s, X86DecodedInsn *decode)
 static void gen_VAESIMC(DisasContext *s, X86DecodedInsn *decode)
 {
     assert(!s->vex_l);
+    if (crypto_can(INDEX_op_aesimc_vec, MO_8)) {
+        TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(t, tcg_env, decode->op[2].offset);
+        tcg_gen_aesimc_vec(t, t);
+        tcg_gen_st_vec(t, tcg_env, decode->op[0].offset);
+        return;
+    }
     gen_helper_aesimc_xmm(tcg_env, OP_PTR0, OP_PTR2);
 }
 
