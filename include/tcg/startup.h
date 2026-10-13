@@ -399,6 +399,12 @@ extern bool tcg_pcid;
 extern bool tcg_lean;
 
 /*
+ * tcg_alignfold: a guest access's alignment check is dropped where an
+ * earlier check on the same globals plus a constant implies it.
+ */
+extern bool tcg_alignfold;
+
+/*
  * x86 guests (accel property x-repstr): REP STOS and REP MOVS a page at
  * a time with the host's widest stores where they can, as CPUs with fast
  * string operations do.

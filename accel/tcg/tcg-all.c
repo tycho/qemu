@@ -103,6 +103,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-repstr", "on" },
         { "x-vexzero", "on" },
         { "x-crypto", "on" },
+        { "x-alignfold", "on" },
         { "x-region", "on" },
         { "x-superblock", "units" },
         { "x-tblookup", "on" },
@@ -843,6 +844,16 @@ static void tcg_set_vexzero(Object *obj, bool value, Error **errp)
     tcg_vexzero = value;
 }
 
+static bool tcg_get_alignfold(Object *obj, Error **errp)
+{
+    return tcg_alignfold;
+}
+
+static void tcg_set_alignfold(Object *obj, bool value, Error **errp)
+{
+    tcg_alignfold = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1061,6 +1072,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-vexzero",
         "Zero the upper halves of ymm registers written by VEX.128 insns "
         "once per block, instead of at each write");
+
+    object_class_property_add_bool(oc, "x-alignfold", tcg_get_alignfold,
+                                   tcg_set_alignfold);
+    object_class_property_set_description(oc, "x-alignfold",
+        "Drop guest alignment checks implied by an earlier check on the "
+        "same address registers");
 }
 
 static const TypeInfo tcg_accel_type = {
