@@ -88,4 +88,11 @@ extern bool tcg_vpermvar;
  */
 extern bool tcg_vint;
 
+/*
+ * tcg_vexzero: x86 VEX.128 writes leave the upper half of their ymm
+ * register pending zero until the state is next visible, so that a block
+ * zeroes each register's upper half once.
+ */
+extern bool tcg_vexzero;
+
 #endif
