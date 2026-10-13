@@ -4502,7 +4502,9 @@ align_fold_pass(TCGContext *s)
         case INDEX_op_qemu_ld:
         case INDEX_op_qemu_st:
         case INDEX_op_qemu_ld2:
-        case INDEX_op_qemu_st2: {
+        case INDEX_op_qemu_st2:
+        case INDEX_op_qemu_ld_vec:
+        case INDEX_op_qemu_st_vec: {
             TCGTemp *at = arg_temp(op->args[nb_o + nb_i - 1]);
             MemOpIdx oi = op->args[nb_o + nb_i];
             MemOp mop = get_memop(oi);
