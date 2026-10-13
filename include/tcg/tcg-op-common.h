@@ -603,6 +603,28 @@ void tcg_gen_sdot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c);
 void tcg_gen_udot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c);
 void tcg_gen_usdot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c);
 /*
+ * SHA-1 and AES building blocks on 128-bit vectors, as Arm's cryptographic
+ * extension defines them (SHA1C/SHA1P/SHA1M, AESE/AESD/AESMC/AESIMC).
+ *
+ * sha1c, sha1p, sha1m: four SHA-1 rounds with the choose, parity or
+ * majority function: a holds the state, a, b, c and d in elements 0 to 3;
+ * element 0 of e is the fifth word; w holds the message words plus round
+ * constant for the four rounds, in order.  r is the new a, b, c, d.
+ *
+ * aese: SubBytes(ShiftRows(a ^ k)); aesd: InvSubBytes(InvShiftRows(a ^ k));
+ * aesmc: MixColumns(a); aesimc: InvMixColumns(a); the state in the byte
+ * order of the AES standard's column-major array.
+ *
+ * Only where the backend has them: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_sha1c_vec(TCGv_vec r, TCGv_vec a, TCGv_vec e, TCGv_vec w);
+void tcg_gen_sha1p_vec(TCGv_vec r, TCGv_vec a, TCGv_vec e, TCGv_vec w);
+void tcg_gen_sha1m_vec(TCGv_vec r, TCGv_vec a, TCGv_vec e, TCGv_vec w);
+void tcg_gen_aese_vec(TCGv_vec r, TCGv_vec a, TCGv_vec k);
+void tcg_gen_aesd_vec(TCGv_vec r, TCGv_vec a, TCGv_vec k);
+void tcg_gen_aesmc_vec(TCGv_vec r, TCGv_vec a);
+void tcg_gen_aesimc_vec(TCGv_vec r, TCGv_vec a);
+/*
  * How narrow_vec fits a wide element into a narrow one: keep its low bits,
  * or saturate signed to signed, signed to unsigned, or unsigned to
  * unsigned.

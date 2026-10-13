@@ -342,6 +342,7 @@ bool tcg_pcid;
 bool tcg_lean;
 bool tcg_repstr;
 bool tcg_vexzero;
+bool tcg_crypto;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
@@ -2888,6 +2889,15 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_udot4_vec:
     case INDEX_op_usdot4_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_dot4_vec;
+    case INDEX_op_sha1c_vec:
+    case INDEX_op_sha1p_vec:
+    case INDEX_op_sha1m_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_sha1_vec;
+    case INDEX_op_aese_vec:
+    case INDEX_op_aesd_vec:
+    case INDEX_op_aesmc_vec:
+    case INDEX_op_aesimc_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_aes_vec;
     case INDEX_op_narrow_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_narrow_vec;
     case INDEX_op_abd_vec:
