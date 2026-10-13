@@ -3695,6 +3695,27 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         goto illegal_op;
     }
 
+    /* After all of the insn's bytes are fetched: no restart past here. */
+    if (decode.cr0_check) {
+        /* As in validate_cr0_exceptions: EM first, not for VEX insns. */
+        if (!(s->prefix & PREFIX_VEX)) {
+            gen_check_cr0_fp(s, HF_EM_MASK, false, EXCP06_ILLOP);
+        }
+        gen_check_cr0_fp(s, HF_TS_MASK, false, EXCP07_PREX);
+    }
+
+    /*
+     * A memory destination that is also a source (2op), or an insn that
+     * accepts LOCK, is a read-modify-write: x86 faults on it as a write.
+     * Not an X86_TYPE_nop operand: x87, NOP and the opcodes left to the
+     * old decoder only use it for the address, and may just read.
+     */
+    if (decode.op[0].has_ea && decode.e.op0 != X86_TYPE_nop &&
+        (decode.op[1].has_ea || accept_lock)) {
+        tcg_set_insn_start_param(s->base.insn_start, 2,
+            tcg_get_insn_start_param(s->base.insn_start, 2) | X86_INSN_RMW);
+    }
+
     /* A 256-bit insn uses the upper halves: zero the pending ones first. */
     if (s->vex_l) {
         gen_vexzero_flush(s);
