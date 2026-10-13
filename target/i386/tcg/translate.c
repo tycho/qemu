@@ -4912,6 +4912,7 @@ static void i386_tr_block_start(DisasContextBase *dcbase, CPUState *cpu)
 
     dc->cc_op = entry < 0 ? CC_OP_DYNAMIC : entry;
     dc->cc_op_dirty = false;
+    assert(!dc->ymmh_pending);
     dc->cc_srcT = NULL;
     if (cc_op_live(dc->cc_op) & USES_CC_SRCT) {
         dc->cc_srcT = tcg_temp_new();

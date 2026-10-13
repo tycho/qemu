@@ -7519,6 +7519,24 @@ static void temp_sync(TCGContext *s, TCGTemp *ts, TCGRegSet allocated_regs,
                                ts->mem_base->reg, ts->mem_offset)) {
                 break;
             }
+            /*
+             * A vector constant (x86's pending upper halves, tcg_vexzero):
+             * store it from the register that holds the constant temp of
+             * that value, if one does.  Not loaded there for this: nothing
+             * would release that register before the next label, whose
+             * other predecessors don't hold the constant.
+             */
+            if (tcg_vexzero && free_or_dead && ts->type >= TCG_TYPE_V64
+                && s->const_table[ts->type]) {
+                TCGTemp *c = g_hash_table_lookup(s->const_table[ts->type],
+                                                 &ts->val);
+
+                if (c && c->val_type == TEMP_VAL_REG) {
+                    tcg_out_st(s, ts->type, c->reg,
+                               ts->mem_base->reg, ts->mem_offset);
+                    break;
+                }
+            }
             temp_load(s, ts, tcg_target_available_regs[ts->type],
                       allocated_regs, preferred_regs);
             /* fallthrough */
