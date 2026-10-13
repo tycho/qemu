@@ -103,4 +103,12 @@ extern bool tcg_vexzero;
  */
 extern bool tcg_crypto;
 
+/*
+ * tcg_sse_unaligned: x86 SSE and AVX accesses that require alignment
+ * (MOVAPS, MOVDQA, legacy SSE arithmetic on memory, VMOVAPS) don't check
+ * it, so a misaligned one doesn't raise #GP.  Unlike x86 hardware; for
+ * guests that don't rely on the fault.
+ */
+extern bool tcg_sse_unaligned;
+
 #endif

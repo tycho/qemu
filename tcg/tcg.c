@@ -244,6 +244,7 @@ bool tcg_vpermvar;
 bool tcg_vint;
 bool tcg_vexzero;
 bool tcg_crypto;
+bool tcg_sse_unaligned;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
