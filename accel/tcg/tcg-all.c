@@ -270,6 +270,16 @@ static void tcg_set_simd(Object *obj, bool value, Error **errp)
     tcg_vint = value;
 }
 
+static bool tcg_get_crypto(Object *obj, Error **errp)
+{
+    return tcg_crypto;
+}
+
+static void tcg_set_crypto(Object *obj, bool value, Error **errp)
+{
+    tcg_crypto = value;
+}
+
 static bool tcg_get_vexzero(Object *obj, Error **errp)
 {
     return tcg_vexzero;
@@ -317,6 +327,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "backend can: vector loads and stores as host vector accesses, "
         "permutes and element inserts as host permutes and table lookups, "
         "integer vector operations as host vector operations");
+
+    object_class_property_add_bool(oc, "x-crypto", tcg_get_crypto,
+                                   tcg_set_crypto);
+    object_class_property_set_description(oc, "x-crypto",
+        "SHA-1 and AES round insns as host cryptographic insns inline, "
+        "where the host has them, instead of helper calls");
 
     object_class_property_add_bool(oc, "x-vexzero", tcg_get_vexzero,
                                    tcg_set_vexzero);
