@@ -11469,7 +11469,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             s->gen_tb->jmp_dead[op->args[1]] = op->args[0] + 1;
 #ifdef TCG_TARGET_HAS_GOTO_TB_COLD
             if (s->goto_tb_cold) {
-                /* One branch, to the next insn while unlinked. */
+                /* One insn, a NOP while unlinked. */
                 tcg_out_goto_tb_next(s, op->args[0]);
                 break;
             }

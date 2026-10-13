@@ -3244,15 +3244,17 @@ static void tcg_out_goto_tb_cold(TCGContext *s, int which)
 }
 
 /*
- * A goto_tb slot of one branch that continues with the next insn while
- * unlinked (goto_tb_dead in tcg_goto_tb_cold TBs): no trampoline, so a TB
- * out of branch range is never linked to it.
+ * A goto_tb slot that continues with the next insn while unlinked
+ * (goto_tb_dead in tcg_goto_tb_cold TBs): a NOP, which linking makes a
+ * branch.  Not a branch to the next insn: some cores (Qualcomm Oryon)
+ * mispredict one taken on every pass.  No trampoline, so a TB out of
+ * branch range is never linked to it.
  */
 static void tcg_out_goto_tb_next(TCGContext *s, int which)
 {
     set_jmp_insn_offset(s, which);
     s->gen_tb->jmp_cold |= 1u << which;
-    tcg_out_insn(s, branch, B, 1);
+    tcg_out32(s, NOP);
     set_jmp_reset_offset(s, which);
 }
 
@@ -3447,13 +3449,16 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
 
         /*
          * To the TB, or by way of the trampoline before the reset label,
-         * or for a slot without one (its reset is the next insn) to it.
+         * or for a slot without one (its reset is the next insn) a NOP.
          */
         if (d_offset != sextract64(d_offset, 0, 28)) {
             d_offset = reset - (reset == jmp_rx + 4 ? 0 : tramp_size(tb, n))
                        - jmp_rx;
         }
         insn = deposit32(Ibranch_B, 0, 26, d_offset >> 2);
+        if (reset == jmp_rx + 4 && d_offset == 4) {
+            insn = NOP;
+        }
         qatomic_set((uint32_t *)jmp_rw, insn);
         flush_idcache_range(jmp_rx, jmp_rw, 4);
         if (tb->jmp_cond[n]) {
