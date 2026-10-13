@@ -242,6 +242,7 @@ bool tcg_vecmem;
 bool tcg_vperm;
 bool tcg_vpermvar;
 bool tcg_vint;
+bool tcg_vexzero;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;

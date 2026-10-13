@@ -114,6 +114,12 @@ static void x86_restore_state_to_opc(CPUState *cs,
     if (cc_op != CC_OP_DYNAMIC) {
         env->cc_op = cc_op;
     }
+    for (unsigned i = 0, m = data[2] >> X86_INSN_YMMH_SHIFT; m; ++i, m >>= 1) {
+        if (m & 1) {
+            env->xmm_regs[i].ZMM_Q(2) = 0;
+            env->xmm_regs[i].ZMM_Q(3) = 0;
+        }
+    }
 }
 
 int x86_mmu_index_pl(CPUX86State *env, unsigned pl)

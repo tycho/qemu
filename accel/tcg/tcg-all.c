@@ -270,6 +270,16 @@ static void tcg_set_simd(Object *obj, bool value, Error **errp)
     tcg_vint = value;
 }
 
+static bool tcg_get_vexzero(Object *obj, Error **errp)
+{
+    return tcg_vexzero;
+}
+
+static void tcg_set_vexzero(Object *obj, bool value, Error **errp)
+{
+    tcg_vexzero = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -307,6 +317,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "backend can: vector loads and stores as host vector accesses, "
         "permutes and element inserts as host permutes and table lookups, "
         "integer vector operations as host vector operations");
+
+    object_class_property_add_bool(oc, "x-vexzero", tcg_get_vexzero,
+                                   tcg_set_vexzero);
+    object_class_property_set_description(oc, "x-vexzero",
+        "Zero the upper halves of ymm registers written by VEX.128 insns "
+        "once per block, instead of at each write");
 }
 
 static const TypeInfo tcg_accel_type = {

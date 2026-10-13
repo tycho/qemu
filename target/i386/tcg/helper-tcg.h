@@ -126,4 +126,11 @@ static inline void do_end_instruction(CPUX86State *env)
     env->hflags &= ~HF_INHIBIT_IRQ_MASK;
     env->eflags &= ~HF_RF_MASK;
 }
+/*
+ * Bits 16-31 of the third insn_start word: the ymm registers whose upper
+ * half earlier VEX.128 insns of the block left pending zero (tcg_vexzero);
+ * restoring the state at the insn zeroes them.
+ */
+#define X86_INSN_YMMH_SHIFT 16
+
 #endif /* I386_HELPER_TCG_H */
