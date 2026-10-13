@@ -137,6 +137,11 @@ typedef struct DisasContext {
 
     sigjmp_buf jmpbuf;
     TCGOp *prev_insn_start;
+    /*
+     * tcg_vexzero: the ymm registers whose upper half a VEX.128 write left
+     * to be zeroed (gen_vexzero_flush), one bit per register.
+     */
+    uint16_t ymmh_pending;
     TCGOp *prev_insn_end;
 } DisasContext;
 
@@ -367,8 +372,41 @@ static void assume_cc_op(DisasContext *s, CCOp op)
     set_cc_op_1(s, op, false);
 }
 
+/*
+ * Zero the upper halves that VEX.128 writes left pending, where the state
+ * becomes visible: before helpers and exits (gen_update_cc_op), at the end
+ * of the block, and before an insn that uses the upper halves.
+ */
+static void gen_vexzero_flush(DisasContext *s)
+{
+    TCGv_vec zero = NULL;
+
+    if (!s->ymmh_pending) {
+        return;
+    }
+    /* One zero register for all the stores, where the host has vectors. */
+    if (tcg_op_supported(INDEX_op_mov_vec, TCG_TYPE_V128, 0)) {
+        zero = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_dupi_vec(MO_64, zero, 0);
+    }
+    for (int i = 0; s->ymmh_pending; ++i) {
+        int ofs = offsetof(CPUX86State, xmm_regs[i].ZMM_X(1));
+
+        if (!(s->ymmh_pending & (1u << i))) {
+            continue;
+        }
+        if (zero) {
+            tcg_gen_st_vec(zero, tcg_env, ofs);
+        } else {
+            tcg_gen_gvec_dup_imm(MO_64, ofs, 16, 16, 0);
+        }
+        s->ymmh_pending &= ~(1u << i);
+    }
+}
+
 static void gen_update_cc_op(DisasContext *s)
 {
+    gen_vexzero_flush(s);
     if (s->cc_op_dirty) {
         tcg_gen_movi_i32(cpu_cc_op, s->cc_op);
         s->cc_op_dirty = false;
@@ -3544,6 +3582,7 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
 
     dc->cc_op = CC_OP_DYNAMIC;
     dc->cc_op_dirty = false;
+    dc->ymmh_pending = 0;
     /* select memory access functions */
     dc->mem_index = cpu_mmu_index(cpu, false);
     dc->cpuid_features = env->features[FEAT_1_EDX];
@@ -3578,7 +3617,8 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     if (tb_cflags(dcbase->tb) & CF_PCREL) {
         pc_arg &= ~TARGET_PAGE_MASK;
     }
-    tcg_gen_insn_start(pc_arg, dc->cc_op, 0);
+    tcg_gen_insn_start(pc_arg, dc->cc_op,
+                       (uint64_t)dc->ymmh_pending << X86_INSN_YMMH_SHIFT);
 }
 
 static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
@@ -3587,6 +3627,7 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     bool orig_cc_op_dirty = dc->cc_op_dirty;
     CCOp orig_cc_op = dc->cc_op;
     target_ulong orig_pc_save = dc->pc_save;
+    uint16_t orig_ymmh_pending = dc->ymmh_pending;
 
 #ifdef TARGET_VSYSCALL_PAGE
     /*
@@ -3612,6 +3653,7 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         assert(dc->cc_op_dirty == orig_cc_op_dirty);
         assert(dc->cc_op == orig_cc_op);
         assert(dc->pc_save == orig_pc_save);
+        dc->ymmh_pending = orig_ymmh_pending;
         dc->base.num_insns--;
         tcg_remove_ops_after(dc->prev_insn_end);
         dc->base.insn_start = dc->prev_insn_start;
@@ -3645,6 +3687,11 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
+
+    if (dc->base.is_jmp != DISAS_NORETURN) {
+        gen_vexzero_flush(dc);
+    }
+    assert(!dc->ymmh_pending);
 
     switch (dc->base.is_jmp) {
     case DISAS_NORETURN:

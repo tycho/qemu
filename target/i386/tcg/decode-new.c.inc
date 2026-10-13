@@ -3103,6 +3103,11 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         goto illegal_op;
     }
 
+    /* A 256-bit insn uses the upper halves: zero the pending ones first. */
+    if (s->vex_l) {
+        gen_vexzero_flush(s);
+    }
+
     /*
      * Checks that result in #GP or VMEXIT come second.  Intercepts are
      * generally checked after non-memory exceptions (i.e. after all
