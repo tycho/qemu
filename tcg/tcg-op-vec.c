@@ -372,6 +372,63 @@ void tcg_gen_usdot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c)
     do_dot4(r, a, b, c, INDEX_op_usdot4_vec);
 }
 
+static void do_crypto(TCGOpcode opc, unsigned vece, int nargs, TCGv_vec r,
+                      TCGv_vec a, TCGv_vec b, TCGv_vec c)
+{
+    tcg_debug_assert(tcgv_vec_temp(r)->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(tcgv_vec_temp(a)->base_type == TCG_TYPE_V128);
+    tcg_assert_listed_vecop(opc);
+    tcg_debug_assert(tcg_can_emit_vec_op(opc, TCG_TYPE_V128, vece) > 0);
+    switch (nargs) {
+    case 1:
+        vec_gen_2(opc, TCG_TYPE_V128, vece, tcgv_vec_arg(r), tcgv_vec_arg(a));
+        break;
+    case 2:
+        vec_gen_3(opc, TCG_TYPE_V128, vece, tcgv_vec_arg(r), tcgv_vec_arg(a),
+                  tcgv_vec_arg(b));
+        break;
+    default:
+        vec_gen_4(opc, TCG_TYPE_V128, vece, tcgv_vec_arg(r), tcgv_vec_arg(a),
+                  tcgv_vec_arg(b), tcgv_vec_arg(c));
+        break;
+    }
+}
+
+void tcg_gen_sha1c_vec(TCGv_vec r, TCGv_vec a, TCGv_vec e, TCGv_vec w)
+{
+    do_crypto(INDEX_op_sha1c_vec, MO_32, 3, r, a, e, w);
+}
+
+void tcg_gen_sha1p_vec(TCGv_vec r, TCGv_vec a, TCGv_vec e, TCGv_vec w)
+{
+    do_crypto(INDEX_op_sha1p_vec, MO_32, 3, r, a, e, w);
+}
+
+void tcg_gen_sha1m_vec(TCGv_vec r, TCGv_vec a, TCGv_vec e, TCGv_vec w)
+{
+    do_crypto(INDEX_op_sha1m_vec, MO_32, 3, r, a, e, w);
+}
+
+void tcg_gen_aese_vec(TCGv_vec r, TCGv_vec a, TCGv_vec k)
+{
+    do_crypto(INDEX_op_aese_vec, MO_8, 2, r, a, k, NULL);
+}
+
+void tcg_gen_aesd_vec(TCGv_vec r, TCGv_vec a, TCGv_vec k)
+{
+    do_crypto(INDEX_op_aesd_vec, MO_8, 2, r, a, k, NULL);
+}
+
+void tcg_gen_aesmc_vec(TCGv_vec r, TCGv_vec a)
+{
+    do_crypto(INDEX_op_aesmc_vec, MO_8, 1, r, a, NULL, NULL);
+}
+
+void tcg_gen_aesimc_vec(TCGv_vec r, TCGv_vec a)
+{
+    do_crypto(INDEX_op_aesimc_vec, MO_8, 1, r, a, NULL, NULL);
+}
+
 void tcg_gen_narrow_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
                         TCGNarrow kind, unsigned shift, bool round)
 {

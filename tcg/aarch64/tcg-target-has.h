@@ -81,6 +81,8 @@
 #define TCG_TARGET_HAS_mulw_vec         1
 #define TCG_TARGET_HAS_addp_vec         1
 #define TCG_TARGET_HAS_dot4_vec         1
+#define TCG_TARGET_HAS_sha1_vec         1
+#define TCG_TARGET_HAS_aes_vec          1
 #define TCG_TARGET_HAS_narrow_vec       1
 #define TCG_TARGET_HAS_abd_vec          1
 #define TCG_TARGET_HAS_addlp_vec        1
