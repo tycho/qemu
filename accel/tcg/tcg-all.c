@@ -100,6 +100,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-flags", "dead" },
         { "x-repstr", "on" },
         { "x-vexzero", "on" },
+        { "x-crypto", "on" },
         { "x-region", "on" },
         { "x-superblock", "units" },
         { "x-tblookup", "on" },
