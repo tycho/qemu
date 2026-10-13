@@ -280,6 +280,16 @@ static void tcg_set_crypto(Object *obj, bool value, Error **errp)
     tcg_crypto = value;
 }
 
+static bool tcg_get_sse_unaligned(Object *obj, Error **errp)
+{
+    return tcg_sse_unaligned;
+}
+
+static void tcg_set_sse_unaligned(Object *obj, bool value, Error **errp)
+{
+    tcg_sse_unaligned = value;
+}
+
 static bool tcg_get_vexzero(Object *obj, Error **errp)
 {
     return tcg_vexzero;
@@ -334,6 +344,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "SHA-1, SHA-256, AES round, carry-less multiply and CRC-32C "
         "insns as host insns inline, where the host has them, instead "
         "of helper calls");
+
+    object_class_property_add_bool(oc, "x-sse-unaligned",
+                                   tcg_get_sse_unaligned,
+                                   tcg_set_sse_unaligned);
+    object_class_property_set_description(oc, "x-sse-unaligned",
+        "x86 SSE/AVX accesses that require alignment don't check it: a "
+        "misaligned MOVAPS doesn't raise #GP, unlike x86 hardware");
 
     object_class_property_add_bool(oc, "x-vexzero", tcg_get_vexzero,
                                    tcg_set_vexzero);
