@@ -3151,7 +3151,13 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
      */
     if (decode.op[0].has_ea && decode.e.op0 != X86_TYPE_nop &&
         (decode.op[1].has_ea || accept_lock)) {
-        tcg_set_insn_start_param(s->base.insn_start, 2, X86_INSN_RMW);
+        tcg_set_insn_start_param(s->base.insn_start, 2,
+            tcg_get_insn_start_param(s->base.insn_start, 2) | X86_INSN_RMW);
+    }
+
+    /* A 256-bit insn uses the upper halves: zero the pending ones first. */
+    if (s->vex_l) {
+        gen_vexzero_flush(s);
     }
 
     /*

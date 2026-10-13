@@ -101,6 +101,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-lazyinc", "on" },
         { "x-flags", "dead" },
         { "x-repstr", "on" },
+        { "x-vexzero", "on" },
         { "x-region", "on" },
         { "x-superblock", "units" },
         { "x-tblookup", "on" },
@@ -821,6 +822,16 @@ static void tcg_set_hyperv(Object *obj, bool value, Error **errp)
     TCG_STATE(obj)->hyperv = value;
 }
 
+static bool tcg_get_vexzero(Object *obj, Error **errp)
+{
+    return tcg_vexzero;
+}
+
+static void tcg_set_vexzero(Object *obj, bool value, Error **errp)
+{
+    tcg_vexzero = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1027,6 +1038,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "x86 system mode: implement the Hyper-V interface for hv-relaxed, "
         "hv-vpindex, hv-time and hv-frequencies (otherwise ignored under "
         "TCG), and turn them on by default; needs x-hosttime");
+
+    object_class_property_add_bool(oc, "x-vexzero", tcg_get_vexzero,
+                                   tcg_set_vexzero);
+    object_class_property_set_description(oc, "x-vexzero",
+        "Zero the upper halves of ymm registers written by VEX.128 insns "
+        "once per block, instead of at each write");
 }
 
 static const TypeInfo tcg_accel_type = {

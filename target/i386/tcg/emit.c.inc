@@ -419,9 +419,14 @@ static void gen_writeback(DisasContext *s, X86DecodedInsn *decode, int opn, TCGv
         break;
     case X86_OP_SSE:
         if (!op->has_ea && (s->prefix & PREFIX_VEX) && op->ot <= MO_128) {
-            tcg_gen_gvec_dup_imm(MO_64,
-                                 offsetof(CPUX86State, xmm_regs[op->n].ZMM_X(1)),
-                                 16, 16, 0);
+            if (tcg_vexzero) {
+                s->ymmh_pending |= 1u << op->n;
+            } else {
+                tcg_gen_gvec_dup_imm(MO_64,
+                                     offsetof(CPUX86State,
+                                              xmm_regs[op->n].ZMM_X(1)),
+                                     16, 16, 0);
+            }
         }
         break;
 #ifndef CONFIG_USER_ONLY
@@ -7291,6 +7296,11 @@ static void gen_VZEROUPPER(DisasContext *s, X86DecodedInsn *decode)
 {
     int i;
 
+    if (tcg_vexzero) {
+        s->ymmh_pending = MAKE_64BIT_MASK(0, CPU_NB_REGS);
+        return;
+    }
+
     for (i = 0; i < CPU_NB_REGS; i++) {
         int offset = offsetof(CPUX86State, xmm_regs[i].ZMM_X(1));
         tcg_gen_gvec_dup_imm(MO_64, offset, 16, 16, 0);
@@ -7400,6 +7410,7 @@ static void gen_XOR(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_XRSTOR(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_vexzero_flush(s);
     TCGv_i64 features = tcg_temp_new_i64();
 
     tcg_gen_concat_tl_i64(features, cpu_regs[R_EAX], cpu_regs[R_EDX]);
@@ -7415,6 +7426,7 @@ static void gen_XRSTOR(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_XSAVE(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_vexzero_flush(s);
     TCGv_i64 features = tcg_temp_new_i64();
 
     tcg_gen_concat_tl_i64(features, cpu_regs[R_EAX], cpu_regs[R_EDX]);
@@ -7423,6 +7435,7 @@ static void gen_XSAVE(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_XSAVEOPT(DisasContext *s, X86DecodedInsn *decode)
 {
+    gen_vexzero_flush(s);
     TCGv_i64 features = tcg_temp_new_i64();
 
     tcg_gen_concat_tl_i64(features, cpu_regs[R_EAX], cpu_regs[R_EDX]);
