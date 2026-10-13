@@ -2173,11 +2173,17 @@ static bool gen_st_vec_env(DisasContext *s, TCGv addr, int offset, MemOp mop)
     return true;
 }
 
+/* x-sse-unaligned: an access's alignment requirement isn't checked. */
+static bool sse_align(bool align)
+{
+    return align && !tcg_sse_unaligned;
+}
+
 static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align)
 {
     MemOp atom = (s->cpuid_ext_features & CPUID_EXT_AVX
                   ? MO_ATOM_IFALIGN : MO_ATOM_IFALIGN_PAIR);
-    MemOp mop = MO_128 | MO_LE | atom | (align ? MO_ALIGN_16 : 0);
+    MemOp mop = MO_128 | MO_LE | atom | (sse_align(align) ? MO_ALIGN_16 : 0);
     int mem_index = s->mem_index;
     TCGv_i128 t;
 
@@ -2193,7 +2199,7 @@ static inline void gen_sto_env_A0(DisasContext *s, int offset, bool align)
 {
     MemOp atom = (s->cpuid_ext_features & CPUID_EXT_AVX
                   ? MO_ATOM_IFALIGN : MO_ATOM_IFALIGN_PAIR);
-    MemOp mop = MO_128 | MO_LE | atom | (align ? MO_ALIGN_16 : 0);
+    MemOp mop = MO_128 | MO_LE | atom | (sse_align(align) ? MO_ALIGN_16 : 0);
     int mem_index = s->mem_index;
     TCGv_i128 t;
 
@@ -2212,6 +2218,8 @@ static void gen_ldy_env_A0(DisasContext *s, int offset, bool align)
     TCGv_i128 t0 = tcg_temp_new_i128();
     TCGv_i128 t1 = tcg_temp_new_i128();
     TCGv a0_hi = tcg_temp_new();
+
+    align = sse_align(align);
 
     if (tcg_vecmem && tcg_can_qemu_ldst_vec(mop)) {
         TCGv_vec v0 = tcg_temp_new_vec(TCG_TYPE_V128);
@@ -2243,6 +2251,8 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
     int mem_index = s->mem_index;
     TCGv_i128 t = tcg_temp_new_i128();
     TCGv a0_hi = tcg_temp_new();
+
+    align = sse_align(align);
 
     if (tcg_vecmem && tcg_can_qemu_ldst_vec(mop)) {
         TCGv_vec v0 = tcg_temp_new_vec(TCG_TYPE_V128);
