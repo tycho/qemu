@@ -266,6 +266,16 @@ static void tcg_set_lean(Object *obj, bool value, Error **errp)
     tcg_lean = value;
 }
 
+static bool tcg_get_alignfold(Object *obj, Error **errp)
+{
+    return tcg_alignfold;
+}
+
+static void tcg_set_alignfold(Object *obj, bool value, Error **errp)
+{
+    tcg_alignfold = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -302,6 +312,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Leaner code for common guest patterns where the host allows: "
         "guest accesses use the host's addressing modes (qemu-user), "
         "32-bit operations and shifted-operand adds");
+
+    object_class_property_add_bool(oc, "x-alignfold", tcg_get_alignfold,
+                                   tcg_set_alignfold);
+    object_class_property_set_description(oc, "x-alignfold",
+        "Drop guest alignment checks implied by an earlier check on the "
+        "same address registers");
 }
 
 static const TypeInfo tcg_accel_type = {
