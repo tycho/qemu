@@ -65,4 +65,10 @@ void tcg_prologue_init(void);
  */
 extern bool tcg_lean;
 
+/*
+ * tcg_alignfold: a guest access's alignment check is dropped where an
+ * earlier check on the same globals plus a constant implies it.
+ */
+extern bool tcg_alignfold;
+
 #endif
