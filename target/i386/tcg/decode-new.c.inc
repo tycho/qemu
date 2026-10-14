@@ -3284,6 +3284,9 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
     X86DecodeFunc decode_func = decode_root;
     bool accept_lock = false;
     uint8_t cc_live, b;
+#ifdef TARGET_X86_64
+    int reg32 = -1;     /* a 32-bit result written to this register */
+#endif
 
     s->pc = s->base.pc_next;
     s->override = -1;
@@ -3718,6 +3721,12 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         gen_load(s, &decode, 1, s->T0);
         gen_load(s, &decode, 2, s->T1);
         decode.e.gen(s, &decode);
+#ifdef TARGET_X86_64
+        if (decode.op[0].unit == X86_OP_INT && !decode.op[0].has_ea &&
+            decode.op[0].ot == MO_32) {
+            reg32 = decode.op[0].n;
+        }
+#endif
         gen_writeback(s, &decode, 0, s->T0);
     }
 
@@ -3741,7 +3750,23 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
 
     if (decode.cc_op != -1) {
         if (decode.cc_dst) {
-            tcg_gen_mov_tl(cpu_cc_dst, decode.cc_dst);
+            TCGv dst = decode.cc_dst;
+
+#ifdef TARGET_X86_64
+            /*
+             * The flags of a 32-bit operation read the low 32 bits of
+             * CC_DST: take them from the register the result went to,
+             * zero-extended there, so that the 64-bit result has no other
+             * use and can be computed in 32-bit form.
+             */
+            if (tcg_lean_narrow32() && dst == s->T0 && reg32 >= 0 &&
+                decode.cc_op >= CC_OP_FIRST_BWLQ &&
+                decode.cc_op <= CC_OP_LAST_BWLQ &&
+                (decode.cc_op & 3) == MO_32) {
+                dst = cpu_regs[reg32];
+            }
+#endif
+            tcg_gen_mov_tl(cpu_cc_dst, dst);
         }
         if (decode.cc_src) {
             tcg_gen_mov_tl(cpu_cc_src, decode.cc_src);
