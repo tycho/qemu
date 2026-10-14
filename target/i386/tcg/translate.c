@@ -23,6 +23,7 @@
 #include "accel/tcg/cpu-mmu-index.h"
 #include "exec/translation-block.h"
 #include "tcg/tcg-op.h"
+#include "tcg/startup.h"
 #include "tcg/tcg-op-gvec.h"
 #include "exec/translator.h"
 #include "exec/target_page.h"
