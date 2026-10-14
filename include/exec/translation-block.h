@@ -123,8 +123,8 @@ struct TranslationBlock {
      * setting one of the jump targets (or patching the jump instruction). Only
      * two of such jumps are supported.
      */
-#define TB_JMP_OFFSET_INVALID 0xffff /* indicates no jump generated */
-    uint16_t jmp_reset_offset[2]; /* offset of original jump target */
+#define TB_JMP_OFFSET_INVALID UINT32_MAX /* indicates no jump generated */
+    uint32_t jmp_reset_offset[2]; /* offset of original jump target */
     /*
      * The goto_tb slots that leave by a host call (tcg_gen_call_tb), and
      * TB_JMP_RET_LANDING if host returns may enter the TB
@@ -144,7 +144,7 @@ struct TranslationBlock {
      * (the TB struct out of literal range): one insn longer.
      */
     uint8_t jmp_far;
-    uint16_t jmp_insn_offset[2];  /* offset of direct jump insn */
+    uint32_t jmp_insn_offset[2];  /* offset of direct jump insn */
     uintptr_t jmp_target_addr[2]; /* target address */
 
     /*
