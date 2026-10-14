@@ -7028,6 +7028,15 @@ static void ldst_fold_pass(TCGContext *s)
 
 #endif
 
+bool tcg_lean_narrow32(void)
+{
+#ifdef TCG_TARGET_I32_OPS_ZEXT
+    return tcg_lean;
+#else
+    return false;
+#endif
+}
+
 #ifdef TCG_TARGET_I32_OPS_ZEXT
 /*
  * x-lean: an operation whose only use is the zero-extension of its low 32
@@ -7061,6 +7070,258 @@ static bool narrow32_op(const TCGOp *op)
 }
 
 /*
+ * The 32-bit class of a temp's value where it is read: the class of its
+ * latest definition (a 32-bit sign or zero extension, or neither), from a
+ * forward walk that forgets everything at a label, a call, and an op that
+ * leaves the block and may come back (call_tb: the callee writes globals).
+ * A global's class is unknown until the TB defines it.
+ */
+enum { N32_SEXT = 1, N32_ZEXT = 2 };
+
+static bool narrow32_consts(const TCGOp *x);
+
+static int narrow32_def_class(const TCGOp *op, const uint8_t *cls)
+{
+    TCGTemp *in;
+
+    if (TCGOP_TYPE(op) == TCG_TYPE_I32) {
+        switch (op->opc) {
+        case INDEX_op_extrl_i64_i32:
+        case INDEX_op_extrh_i64_i32:
+        case INDEX_op_ext_i32_i64:
+        case INDEX_op_extu_i32_i64:
+            break;
+        default:
+            /* An I32 op into an I64 temp (narrow32_pass): zero-extended. */
+            return N32_ZEXT;
+        }
+    }
+    switch (op->opc) {
+    case INDEX_op_mov:
+        in = arg_temp(op->args[1]);
+        if (in->kind == TEMP_CONST) {
+            return (in->val == (int32_t)in->val ? N32_SEXT : 0) |
+                   (in->val == (uint32_t)in->val ? N32_ZEXT : 0);
+        }
+        return cls[temp_idx(in)];
+    case INDEX_op_sextract:
+        return op->args[2] == 0 && op->args[3] <= 32 ? N32_SEXT : 0;
+    case INDEX_op_extract:
+        return op->args[2] + op->args[3] <= 32
+               ? N32_ZEXT | (op->args[3] < 32 ? N32_SEXT : 0) : 0;
+    case INDEX_op_ld8u:
+    case INDEX_op_ld16u:
+        return N32_ZEXT | N32_SEXT;
+    case INDEX_op_ld32u:
+    case INDEX_op_extu_i32_i64:
+        return N32_ZEXT;
+    case INDEX_op_ld8s:
+    case INDEX_op_ld16s:
+    case INDEX_op_ld32s:
+    case INDEX_op_ext_i32_i64:
+        return N32_SEXT;
+    default:
+        return 0;
+    }
+}
+
+/* Whether @arg's value is a 32-bit extension of class @c here. */
+static bool narrow32_is(const uint8_t *cls, TCGArg arg, int c)
+{
+    TCGTemp *ts = arg_temp(arg);
+
+    if (ts->kind == TEMP_CONST) {
+        return c == N32_SEXT ? ts->val == (int32_t)ts->val
+                             : ts->val == (uint32_t)ts->val;
+    }
+    return cls[temp_idx(ts)] & c;
+}
+
+/*
+ * A 64-bit brcond of two sign-extended values orders them as their low
+ * 32 bits do, signed or unsigned; of two zero-extended values, for
+ * equality and unsigned order.  The arguments stay: only the compare's
+ * width changes.
+ */
+static void narrow32_brcond(const uint8_t *cls, TCGOp *op)
+{
+    TCGCond cond = op->args[2];
+
+    if (TCGOP_TYPE(op) != TCG_TYPE_I64 || !narrow32_consts(op) ||
+        !tcg_op_supported(op->opc, TCG_TYPE_I32, 0)) {
+        return;
+    }
+    if ((narrow32_is(cls, op->args[0], N32_SEXT) &&
+         narrow32_is(cls, op->args[1], N32_SEXT)) ||
+        (narrow32_is(cls, op->args[0], N32_ZEXT) &&
+         narrow32_is(cls, op->args[1], N32_ZEXT) && !is_signed_cond(cond))) {
+        TCGOP_TYPE(op) = TCG_TYPE_I32;
+    }
+}
+
+/*
+ * The forward walk: narrows brconds, and returns the shifts right by a
+ * constant below 32 of a 32-bit extension (sar of a sign extension, shr of
+ * a zero extension), whose low 32 bits are those of the 32-bit shift of
+ * the low 32 bits.
+ */
+static GHashTable *narrow32_walk(TCGContext *s)
+{
+    uint8_t *cls = tcg_malloc(s->nb_temps);
+    GHashTable *shifts = g_hash_table_new(NULL, NULL);
+    TCGOp *op;
+
+    memset(cls, 0, s->nb_temps);
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        int nb_o;
+
+        if (def->flags & TCG_OPF_BB_EXIT) {
+            memset(cls, 0, s->nb_temps);
+            continue;
+        }
+        switch (op->opc) {
+        case INDEX_op_set_label:
+        case INDEX_op_call:
+            memset(cls, 0, s->nb_temps);
+            continue;
+        case INDEX_op_discard:
+            cls[temp_idx(arg_temp(op->args[0]))] = 0;
+            continue;
+        case INDEX_op_brcond:
+            narrow32_brcond(cls, op);
+            break;
+        case INDEX_op_sar:
+        case INDEX_op_shr:
+            if (TCGOP_TYPE(op) == TCG_TYPE_I64 &&
+                arg_temp(op->args[2])->kind == TEMP_CONST &&
+                arg_temp(op->args[2])->val < 32 &&
+                narrow32_is(cls, op->args[1],
+                            op->opc == INDEX_op_sar ? N32_SEXT : N32_ZEXT)) {
+                g_hash_table_add(shifts, op);
+            }
+            break;
+        default:
+            break;
+        }
+        nb_o = op->opc == INDEX_op_call ? TCGOP_CALLO(op) : def->nb_oargs;
+        for (int i = 0; i < nb_o; i++) {
+            TCGTemp *ts = arg_temp(op->args[i]);
+
+            cls[temp_idx(ts)] = nb_o == 1 && op->opc != INDEX_op_call
+                                ? narrow32_def_class(op, cls) : 0;
+        }
+    }
+    return shifts;
+}
+
+/*
+ * A 32-bit extension t = ext(x) whose value dies at a following I32 op,
+ * which reads only t's low 32 bits: that op reads x instead, if the ops
+ * in between (at most NARROW32_WINDOW; no label, call or branch) touch
+ * neither t nor x.  An op in between that reads x may be where x dies
+ * (x86 imul r, r: two extensions of the register the product replaces):
+ * x read after that would be gone, from a register freed there.
+ */
+#define NARROW32_WINDOW 4
+
+static bool narrow32_writes(const TCGOp *w, TCGTemp *ts)
+{
+    for (int i = 0; i < tcg_op_defs[w->opc].nb_oargs; i++) {
+        if (arg_temp(w->args[i]) == ts) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool narrow32_reads(const TCGOp *w, TCGTemp *ts)
+{
+    const TCGOpDef *d = &tcg_op_defs[w->opc];
+
+    for (int i = d->nb_oargs; i < d->nb_oargs + d->nb_iargs; i++) {
+        if (arg_temp(w->args[i]) == ts) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void narrow32_bypass(TCGContext *s)
+{
+    TCGOp *op, *next;
+
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        TCGOp *u = next;
+        const TCGOpDef *ud;
+        TCGTemp *t, *x;
+        int n, uses = 0;
+        bool ok = true;
+
+        if ((op->opc != INDEX_op_extract && op->opc != INDEX_op_sextract) ||
+            TCGOP_TYPE(op) != TCG_TYPE_I64 || op->args[2] != 0 ||
+            op->args[3] != 32) {
+            continue;
+        }
+        t = arg_temp(op->args[0]);
+        x = arg_temp(op->args[1]);
+        if ((t->kind != TEMP_EBB && t->kind != TEMP_TB) ||
+            (op->life & (SYNC_ARG << 0))) {
+            continue;
+        }
+        for (n = 0; u && n < NARROW32_WINDOW; n++, u = QTAILQ_NEXT(u, link)) {
+            if (u->opc == INDEX_op_set_label || u->opc == INDEX_op_call ||
+                (tcg_op_defs[u->opc].flags &
+                 (TCG_OPF_BB_END | TCG_OPF_BB_EXIT)) ||
+                narrow32_writes(u, t)) {
+                u = NULL;
+                break;
+            }
+            if (narrow32_reads(u, t)) {
+                break;
+            }
+            if (narrow32_writes(u, x) || narrow32_reads(u, x)) {
+                u = NULL;
+                break;
+            }
+        }
+        if (!u || n == NARROW32_WINDOW || TCGOP_TYPE(u) != TCG_TYPE_I32) {
+            continue;
+        }
+        switch (u->opc) {
+        case INDEX_op_extrh_i64_i32:
+        case INDEX_op_ext_i32_i64:
+        case INDEX_op_extu_i32_i64:
+            continue;
+        default:
+            break;
+        }
+        ud = &tcg_op_defs[u->opc];
+        for (int i = ud->nb_oargs; i < ud->nb_oargs + ud->nb_iargs; i++) {
+            if (arg_temp(u->args[i]) == t) {
+                ok &= (u->life & (DEAD_ARG << i)) != 0;
+                uses++;
+            } else if (arg_temp(u->args[i]) == x) {
+                ok = false;     /* keep x's life simple */
+            }
+        }
+        if (!ok || !uses) {
+            continue;
+        }
+        for (int i = ud->nb_oargs; i < ud->nb_oargs + ud->nb_iargs; i++) {
+            if (arg_temp(u->args[i]) == t) {
+                u->args[i] = temp_arg(x);
+                u->life &= ~(DEAD_ARG << i);
+                if (op->life & (DEAD_ARG << 1)) {
+                    u->life |= DEAD_ARG << i;
+                }
+            }
+        }
+        tcg_op_remove(s, op);
+    }
+}
+
+/*
  * The constants of an I32 op are sign-extended from 32 bits, as the
  * backend matches and encodes them: an I64 constant whose high half
  * isn't the sign of its low half (0x00000000ffffffff) would be encoded
@@ -7083,6 +7344,7 @@ static bool narrow32_consts(const TCGOp *x)
 static void narrow32_pass(TCGContext *s)
 {
     TCGOp *op, *next;
+    GHashTable *shifts = narrow32_walk(s);
 
     QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
         TCGOp *x = QTAILQ_PREV(op, link);
@@ -7108,7 +7370,8 @@ static void narrow32_pass(TCGContext *s)
                 continue;
             }
         }
-        if (TCGOP_TYPE(x) != TCG_TYPE_I64 || !narrow32_op(x) ||
+        if (TCGOP_TYPE(x) != TCG_TYPE_I64 ||
+            !(narrow32_op(x) || g_hash_table_contains(shifts, x)) ||
             arg_temp(x->args[0]) != t || !narrow32_consts(x) ||
             !tcg_op_supported(x->opc, TCG_TYPE_I32, 0)) {
             continue;
@@ -7123,6 +7386,8 @@ static void narrow32_pass(TCGContext *s)
         x->output_pref[0] = op->output_pref[0];
         tcg_op_remove(s, op);
     }
+    g_hash_table_destroy(shifts);
+    narrow32_bypass(s);
 }
 #endif
 
