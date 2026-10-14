@@ -105,6 +105,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-region", "on" },
         { "x-superblock", "units" },
         { "x-tblookup", "on" },
+        { "x-tblayout", "split" },
         { "x-i386-runtime", "on" },
         { "x-addr32", "on" },
         { "x-iofast", "on" },
