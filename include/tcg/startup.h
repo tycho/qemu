@@ -62,6 +62,15 @@ void tcg_prologue_init(void);
 extern bool tcg_tbpack;
 
 /*
+ * tcg_tblayout: hot code packed; TB structs and the code of exits not yet
+ * linked out of the code stream, in the cold part of a chunk (tcg_tb_alloc).
+ */
+extern bool tcg_tblayout;
+
+/* Whether the backend can do tcg_tblayout. */
+bool tcg_can_tblayout(void);
+
+/*
  * tcg_retstack: guest calls and returns through a return stack in host
  * code (tcg_gen_push_ret).  The front end sets tcg_retsp_off, the offset
  * in env where the stack's top is kept outside generated code, and
