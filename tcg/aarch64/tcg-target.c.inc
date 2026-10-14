@@ -1430,6 +1430,20 @@ static void tcg_out_movi(TCGContext *s, TCGType type, TCGReg rd,
         return;
     }
 
+    /*
+     * Built in place in cold code (tcg_tblayout), whose pool could be out
+     * of LDR's reach.
+     */
+    if (s->lay_cold_now) {
+        tcg_out_insn(s, movw, MOVZ, type, rd, value & 0xffff, 0);
+        for (int sh = 16; sh < 64; sh += 16) {
+            if ((value >> sh) & 0xffff) {
+                tcg_out_insn(s, movw, MOVK, type, rd, value >> sh, sh);
+            }
+        }
+        return;
+    }
+
     /* For more than 2 insns, dump it into the constant pool.  */
     new_pool_label(s, value, R_AARCH64_CONDBR19, s->code_ptr, 0);
     tcg_out_insn(s, ldlit, LDR, 0, rd);
@@ -2917,13 +2931,37 @@ static void tcg_out_goto_tb_next(TCGContext *s, int which)
     set_jmp_reset_offset(s, which);
 }
 
+/*
+ * TB structs and cold code out of the code stream (tcg_tblayout): the
+ * trampolines reach a struct anywhere in the region, cold code builds its
+ * constants in place.
+ */
+#define TCG_TARGET_HAS_TBLAYOUT
+
 static void tcg_out_goto_tb_tramp(TCGContext *s, int which)
 {
-    intptr_t i_off = tcg_pcrel_diff(s, (void *)get_jmp_target_addr(s, which));
+    intptr_t target = get_jmp_target_addr(s, which);
+    intptr_t i_off = tcg_pcrel_diff(s, (void *)target);
 
-    tcg_debug_assert(i_off == sextract64(i_off, 0, 21));
-    tcg_out_insn(s, ldlit, LDR, i_off >> 2, TCG_REG_TMP0);
+    if (i_off == sextract64(i_off, 0, 21)) {
+        tcg_out_insn(s, ldlit, LDR, i_off >> 2, TCG_REG_TMP0);
+    } else {
+        intptr_t src_rx = (intptr_t)tcg_splitwx_to_rx(s->code_ptr);
+
+        /* The TB struct out of literal range: ADRP and LDR reach it. */
+        s->gen_tb->jmp_far |= 1u << which;
+        tcg_out_insn(s, pcrel, ADRP, TCG_REG_TMP0,
+                     (target >> 12) - (src_rx >> 12));
+        tcg_out_insn_ldst_uimm(s, Ildst_imm_LDRX, TCG_REG_TMP0, TCG_REG_TMP0,
+                               (target & 0xfff) >> 3);
+    }
     tcg_out_insn(s, bcond_reg, BR, TCG_REG_TMP0);
+}
+
+/* The trampoline's distance from the reset label after it. */
+static int tramp_size(const TranslationBlock *tb, int n)
+{
+    return tb->jmp_far & (1u << n) ? 12 : 8;
 }
 
 /*
@@ -2944,7 +2982,21 @@ static void tcg_out_goto_tb(TCGContext *s, int which)
      * in range early, regardless of direct branch distance.
      */
     intptr_t i_off = tcg_pcrel_diff(s, (void *)get_jmp_target_addr(s, which));
-    tcg_debug_assert(i_off == sextract64(i_off, 0, 21));
+
+    /*
+     * The TB struct out of literal range: a slot like goto_tb_cold's, one
+     * branch to the reset label while unlinked, with the trampoline right
+     * before that label.
+     */
+    if (i_off != sextract64(i_off, 0, 21)) {
+        set_jmp_insn_offset(s, which);
+        s->gen_tb->jmp_cold |= 1u << which;
+        tcg_out_insn(s, branch, B, 4);
+        tcg_out_goto_tb_tramp(s, which);
+        set_jmp_reset_offset(s, which);
+        tcg_out_goto_tb_land(s);
+        return;
+    }
 
     set_jmp_insn_offset(s, which);
     tcg_out32(s, Ibranch_B);
@@ -3025,7 +3077,7 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
             insn = deposit32(Ibranch_B, 0, 26, (reset - jmp_rx) >> 2);
         } else {
             if (d_offset != sextract64(d_offset, 0, 28)) {
-                d_offset = reset - 8 - jmp_rx;
+                d_offset = reset - tramp_size(tb, n) - jmp_rx;
             }
             insn = deposit32(Ibranch_BL, 0, 26, d_offset >> 2);
         }
@@ -3042,7 +3094,8 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
          * or for a slot without one (its reset is the next insn) a NOP.
          */
         if (d_offset != sextract64(d_offset, 0, 28)) {
-            d_offset = reset - (reset == jmp_rx + 4 ? 0 : 8) - jmp_rx;
+            d_offset = reset - (reset == jmp_rx + 4 ? 0 : tramp_size(tb, n))
+                       - jmp_rx;
         }
         insn = deposit32(Ibranch_B, 0, 26, d_offset >> 2);
         if (reset == jmp_rx + 4 && d_offset == 4) {

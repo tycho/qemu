@@ -107,6 +107,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-region", "on" },
         { "x-superblock", "units" },
         { "x-tblookup", "on" },
+        { "x-tblayout", "split" },
         { "x-i386-runtime", "on" },
         { "x-addr32", "on" },
         { "x-iofast", "on" },
@@ -854,6 +855,27 @@ static void tcg_set_alignfold(Object *obj, bool value, Error **errp)
     tcg_alignfold = value;
 }
 
+static char *tcg_get_tblayout(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_tblayout ? "split" : "packed");
+}
+
+static void tcg_set_tblayout(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "packed")) {
+        tcg_tblayout = false;
+    } else if (!strcmp(value, "split")) {
+        if (!tcg_can_tblayout()) {
+            error_setg(errp, "x-tblayout=split: not on this host");
+            return;
+        }
+        tcg_tblayout = true;
+    } else {
+        error_setg(errp, "Invalid 'x-tblayout' setting %s (packed, split)",
+                   value);
+    }
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1078,6 +1100,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-alignfold",
         "Drop guest alignment checks implied by an earlier check on the "
         "same address registers");
+
+    object_class_property_add_str(oc, "x-tblayout",
+                                  tcg_get_tblayout, tcg_set_tblayout);
+    object_class_property_set_description(oc, "x-tblayout",
+        "Where TB structs and the code of unlinked exits go: packed, with "
+        "the code (default); split, out of the code stream, which leaves "
+        "the code of TBs translated together side by side");
 }
 
 static const TypeInfo tcg_accel_type = {
