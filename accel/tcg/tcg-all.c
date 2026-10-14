@@ -280,6 +280,27 @@ static void tcg_set_tblookup(Object *obj, bool value, Error **errp)
     tcg_goto_tb_cold = value;
 }
 
+static char *tcg_get_tblayout(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_tblayout ? "split" : "packed");
+}
+
+static void tcg_set_tblayout(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "packed")) {
+        tcg_tblayout = false;
+    } else if (!strcmp(value, "split")) {
+        if (!tcg_can_tblayout()) {
+            error_setg(errp, "x-tblayout=split: not on this host");
+            return;
+        }
+        tcg_tblayout = true;
+    } else {
+        error_setg(errp, "Invalid 'x-tblayout' setting %s (packed, split)",
+                   value);
+    }
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -318,6 +339,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "indirect jumps (in a short helper call at direct jumps to "
         "another page), and pack TB structs next to their code (x86 "
         "guests)");
+
+    object_class_property_add_str(oc, "x-tblayout",
+                                  tcg_get_tblayout, tcg_set_tblayout);
+    object_class_property_set_description(oc, "x-tblayout",
+        "Where TB structs and the code of unlinked exits go: packed, with "
+        "the code (default); split, out of the code stream, which leaves "
+        "the code of TBs translated together side by side");
 }
 
 static const TypeInfo tcg_accel_type = {
