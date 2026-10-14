@@ -288,6 +288,26 @@ static void tcg_set_lazy_incdec(Object *obj, bool value, Error **errp)
     tcg_lazy_incdec = value;
 }
 
+static char *tcg_get_faultflags(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_faultflags ? "adaptive" : "exact");
+}
+
+static void tcg_set_faultflags(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "exact")) {
+        tcg_faultflags = false;
+    } else if (!strcmp(value, "adaptive")) {
+#ifdef CONFIG_USER_ONLY
+        tcg_faultflags = true;
+#else
+        error_setg(errp, "x-faultflags=adaptive is for user mode only");
+#endif
+    } else {
+        error_setg(errp, "Invalid 'x-faultflags' value: %s", value);
+    }
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -333,6 +353,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-lazyinc",
         "x86: INC and DEC after an unknown flags state keep that state "
         "for CF rather than computing it");
+
+    object_class_property_add_str(oc, "x-faultflags", tcg_get_faultflags,
+                                  tcg_set_faultflags);
+    object_class_property_set_description(oc, "x-faultflags",
+        "User mode: condition codes at a guest access: exact (as a "
+        "fault would show them), or adaptive (inputs dead after the "
+        "access aren't kept, except for insns that read them or that "
+        "faulted before: a first fault there may show stale flags)");
 }
 
 static const TypeInfo tcg_accel_type = {
