@@ -139,6 +139,11 @@ struct TranslationBlock {
      * reset address, else to the reset address.
      */
     uint8_t jmp_cold;
+    /*
+     * The slots whose trampoline loads the target address from afar
+     * (the TB struct out of literal range): one insn longer.
+     */
+    uint8_t jmp_far;
     uint16_t jmp_insn_offset[2];  /* offset of direct jump insn */
     uintptr_t jmp_target_addr[2]; /* target address */
 
