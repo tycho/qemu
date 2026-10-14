@@ -32,6 +32,8 @@
 #include "exec/mmap-lock.h"
 #include "exec/translation-block.h"
 #include "tcg/tcg.h"
+#include "exec/tb-flush.h"
+#include "tcg/startup.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
 #include "exec/log.h"
@@ -521,6 +523,15 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
     clear_helper_retaddr();
     if (have_mmap_lock()) {
         mmap_unlock();
+    }
+    if (tcg_exact_pending) {
+        /*
+         * A fault the guest saw: its insn's accesses keep fault-optional
+         * globals from now on, in every translation that covers it.
+         */
+        tcg_exact_pending = false;
+        tcg_exact_site_add(cpu->cc->get_pc(cpu));
+        queue_tb_flush(cpu);
     }
 #else
     /*

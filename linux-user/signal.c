@@ -34,6 +34,7 @@
 #include "signal-common.h"
 #include "host-signal.h"
 #include "user/cpu_loop.h"
+#include "tcg/startup.h"
 #include "user/page-protection.h"
 #include "user/safe-syscall.h"
 #include "user/signal.h"
@@ -757,6 +758,8 @@ void cpu_loop_exit_sigsegv(CPUState *cpu, vaddr addr,
 {
     const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
 
+    /* The guest sees this fault (the callback may longjmp: note it now). */
+    tcg_exact_pending = tcg_faultflags;
     if (tcg_ops->record_sigsegv) {
         tcg_ops->record_sigsegv(cpu, addr, access_type, maperr, ra);
     }
@@ -773,6 +776,8 @@ void cpu_loop_exit_sigbus(CPUState *cpu, vaddr addr,
 {
     const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
 
+    /* The guest sees this fault (the callback may longjmp: note it now). */
+    tcg_exact_pending = tcg_faultflags;
     if (tcg_ops->record_sigbus) {
         tcg_ops->record_sigbus(cpu, addr, access_type, ra);
     }

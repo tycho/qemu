@@ -20,6 +20,7 @@
 #endif
 #include "exec/plugin-gen.h"
 #include "tcg/tcg-op-common.h"
+#include "tcg/startup.h"
 #include "internal-common.h"
 #include "disas/disas.h"
 #include "tb-internal.h"
@@ -156,6 +157,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
                      vaddr pc, void *host_pc, const TranslatorOps *ops,
                      DisasContextBase *db, TCGType addr_type)
 {
+    TCGOp *insn_first;
     uint32_t cflags = tb_cflags(tb);
     TCGOp *icount_start_insn;
     bool plugin_enabled;
@@ -213,7 +215,15 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
          * done next -- either exiting this loop or locate the start of
          * the next instruction.
          */
+        tcg_ctx->ldst_exact = qatomic_read(&tcg_exact_sites_any) &&
+                              tcg_exact_site_has(db->pc_next);
+        tcg_ctx->insn_flags_read = false;
+        insn_first = tcg_last_op();
         ops->translate_insn(db, cpu);
+        if (tcg_faultflags && tcg_ctx->insn_flags_read) {
+            /* A restart of the insn at an access reads its inputs again. */
+            tcg_mark_exact_after(insn_first);
+        }
 
         /*
          * We can't instrument after instructions that change control
