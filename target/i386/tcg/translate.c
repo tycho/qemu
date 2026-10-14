@@ -838,6 +838,8 @@ static void gen_mov_eflags(DisasContext *s, TCGv reg)
     TCGv_i32 cc_op;
     int live, dead;
 
+    tcg_note_flags_read();
+
     if (s->cc_op == CC_OP_EFLAGS) {
         tcg_gen_mov_tl(reg, cpu_cc_src);
         return;
@@ -1025,6 +1027,8 @@ static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
 {
     MemOp size;
 
+    tcg_note_flags_read();
+
     switch (s->cc_op) {
     case CC_OP_SUBB ... CC_OP_SUBQ:
         /* (DATA_TYPE)CC_SRCT < (DATA_TYPE)CC_SRC */
@@ -1102,6 +1106,7 @@ static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
 /* compute eflags.P, trying to store it in reg if not NULL */
 static CCPrepare gen_prepare_eflags_p(DisasContext *s, TCGv reg)
 {
+    tcg_note_flags_read();
     gen_compute_eflags(s);
     return (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = cpu_cc_src,
                          .imm = CC_P };
@@ -1110,6 +1115,7 @@ static CCPrepare gen_prepare_eflags_p(DisasContext *s, TCGv reg)
 /* compute eflags.S, trying to store it in reg if not NULL */
 static CCPrepare gen_prepare_eflags_s(DisasContext *s, TCGv reg)
 {
+    tcg_note_flags_read();
     switch (s->cc_op) {
     case CC_OP_DYNAMIC:
         gen_compute_eflags(s);
@@ -1130,6 +1136,7 @@ static CCPrepare gen_prepare_eflags_s(DisasContext *s, TCGv reg)
 /* compute eflags.O, trying to store it in reg if not NULL */
 static CCPrepare gen_prepare_eflags_o(DisasContext *s, TCGv reg)
 {
+    tcg_note_flags_read();
     switch (s->cc_op) {
     case CC_OP_ADOX:
     case CC_OP_ADCOX:
@@ -1151,6 +1158,7 @@ static CCPrepare gen_prepare_eflags_o(DisasContext *s, TCGv reg)
 /* compute eflags.Z, trying to store it in reg if not NULL */
 static CCPrepare gen_prepare_eflags_z(DisasContext *s, TCGv reg)
 {
+    tcg_note_flags_read();
     switch (s->cc_op) {
     case CC_OP_EFLAGS:
     case CC_OP_ADCX:
@@ -1183,6 +1191,8 @@ static CCPrepare gen_prepare_cc(DisasContext *s, int b, TCGv reg)
     int inv, jcc_op, cond;
     MemOp size;
     CCPrepare cc;
+
+    tcg_note_flags_read();
 
     inv = b & 1;
     jcc_op = (b >> 1) & 7;
@@ -3569,6 +3579,14 @@ void tcg_x86_init(void)
     tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_src));
     tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_src2));
     tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_dst2));
+    /*
+     * The condition codes' inputs that are dead after a guest access
+     * needn't be computed for it (x-faultflags); the CC_OP stays exact.
+     */
+    tcg_global_fault_optional(tcgv_tl_temp(cpu_cc_dst));
+    tcg_global_fault_optional(tcgv_tl_temp(cpu_cc_src));
+    tcg_global_fault_optional(tcgv_tl_temp(cpu_cc_src2));
+    tcg_global_fault_optional(tcgv_tl_temp(cpu_cc_dst2));
 
     for (i = 0; i < CPU_NB_REGS; ++i) {
         cpu_regs[i] = tcg_global_mem_new(tcg_env,
@@ -3737,7 +3755,9 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
 
-    dc->base.tb->chain_dead_in = dc->cc_entry_done && dc->cc_entry_dead;
+    /* An exact access needs the flags stored by the predecessor. */
+    dc->base.tb->chain_dead_in = dc->cc_entry_done && dc->cc_entry_dead &&
+                                 !tcg_ctx->tb_exact;
 
     switch (dc->base.is_jmp) {
     case DISAS_NORETURN:
