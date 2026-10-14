@@ -131,9 +131,9 @@ struct TranslationBlock {
      * Jumps are numbered 0 to TB_JMP_SLOTS - 1, except TB_EXIT_REQUESTED.
      */
 #define TB_JMP_SLOTS 8
-#define TB_JMP_OFFSET_INVALID 0xffff /* indicates no jump generated */
-    uint16_t jmp_reset_offset[TB_JMP_SLOTS]; /* offset of original target */
-    uint16_t jmp_insn_offset[TB_JMP_SLOTS];  /* offset of direct jump insn */
+#define TB_JMP_OFFSET_INVALID UINT32_MAX /* indicates no jump generated */
+    uint32_t jmp_reset_offset[TB_JMP_SLOTS]; /* offset of original target */
+    uint32_t jmp_insn_offset[TB_JMP_SLOTS];  /* offset of direct jump insn */
     uintptr_t jmp_target_addr[TB_JMP_SLOTS]; /* target address */
     /*
      * The goto_tb slots that leave by a host call (tcg_gen_call_tb), and
@@ -156,6 +156,11 @@ struct TranslationBlock {
      * reset address, else to the reset address.
      */
     uint8_t jmp_cold;
+    /*
+     * The slots whose trampoline loads the target address from afar
+     * (the TB struct out of literal range): one insn longer.
+     */
+    uint8_t jmp_far;
 
     /*
      * Each TB has a NULL-terminated list (jmp_list_head) of incoming jumps.

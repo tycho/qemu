@@ -508,6 +508,12 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
                           "Restarting code generation with re-locked pages");
             goto restart_translate;
 
+        case -4:
+            /* tcg_tblayout: code too far from code it branches to. */
+            qemu_log_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT,
+                          "Restarting code generation without cold code\n");
+            goto restart_translate;
+
         default:
             g_assert_not_reached();
         }
@@ -519,6 +525,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     if (unlikely(search_size < 0)) {
         trace_tb_gen_code_buffer_overflow("encode_search");
         tb_unlock_pages(tb);
+        if (tcg_ctx->lay_on) {
+            /* tcg_tblayout: the chunk's hot part is full. */
+            tcg_ctx->lay_hot_end = tcg_ctx->lay_chunk;
+        }
         goto buffer_overflow;
     }
     tb->tc.size = gen_code_size;
@@ -653,8 +663,13 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 
     /* if the TB already exists, discard what we just translated */
     if (unlikely(existing_tb != tb)) {
-        /* Give back the TB and its code: tcg_tb_alloc put the TB first. */
-        qatomic_set(&tcg_ctx->code_gen_ptr, (void *)tb);
+        /*
+         * Give back the TB and its code: tcg_tb_alloc put the TB first,
+         * or with tcg_tblayout elsewhere (its cold part stays used).
+         */
+        qatomic_set(&tcg_ctx->code_gen_ptr,
+                    tcg_ctx->lay_on ? tcg_splitwx_to_rw(tb->tc.ptr)
+                                    : (void *)tb);
         tcg_tb_remove(tb);
         return existing_tb;
     }
