@@ -94,6 +94,7 @@ static void gen_ldst1(TCGOpcode opc, TCGType type, TCGTemp *v,
 {
     TCGOp *op = tcg_gen_op3(opc, type, temp_arg(v), temp_arg(addr), oi);
     TCGOP_FLAGS(op) = get_memop(oi) & MO_SIZE;
+    tcg_ldst_note(op);
 }
 
 static void gen_ldst2(TCGOpcode opc, TCGType type, TCGTemp *vl, TCGTemp *vh,
@@ -102,6 +103,7 @@ static void gen_ldst2(TCGOpcode opc, TCGType type, TCGTemp *vl, TCGTemp *vh,
     TCGOp *op = tcg_gen_op4(opc, type, temp_arg(vl), temp_arg(vh),
                             temp_arg(addr), oi);
     TCGOP_FLAGS(op) = get_memop(oi) & MO_SIZE;
+    tcg_ldst_note(op);
 }
 
 static void gen_ld_i64(TCGv_i64 v, TCGTemp *addr, MemOpIdx oi)

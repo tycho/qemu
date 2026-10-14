@@ -78,4 +78,16 @@ extern bool tcg_flags_dead;
  */
 extern bool tcg_lazy_incdec;
 
+/*
+ * qemu-user: a guest memory access doesn't keep the values of
+ * fault-optional globals (x86: the lazy condition codes) that are dead
+ * after it, unless its insn reads them (a restart of the insn reads them
+ * again) or a guest-visible fault was taken there before (an exact site).
+ * The first such fault at a site may show stale values of those globals.
+ * Set by x-faultflags=adaptive.
+ */
+extern bool tcg_faultflags;
+/* A fault the guest sees was raised: learn its insn after the longjmp. */
+extern __thread bool tcg_exact_pending;
+
 #endif

@@ -1935,6 +1935,8 @@ void tcg_prologue_init(void)
 
 void tcg_func_start(TCGContext *s)
 {
+    s->ldst_exact = false;
+    s->tb_exact = false;
     s->chain_dead_used = false;
     tcg_pool_reset(s);
     s->nb_temps = s->nb_globals;
@@ -2328,6 +2330,78 @@ TCGTemp *tcgv_i32_temp(TCGv_i32 v)
 bool tcg_flags_guess;
 bool tcg_flags_dead;
 bool tcg_lazy_incdec;
+bool tcg_faultflags;
+__thread bool tcg_exact_pending;
+bool tcg_exact_sites_any;
+static GHashTable *exact_sites;
+static GMutex exact_lock;
+
+void tcg_global_fault_optional(TCGTemp *ts)
+{
+#ifdef CONFIG_USER_ONLY
+    ts->fault_optional = tcg_faultflags;
+#endif
+}
+
+bool tcg_exact_site_has(uint64_t pc)
+{
+    bool ret;
+
+    g_mutex_lock(&exact_lock);
+    ret = exact_sites && g_hash_table_contains(exact_sites, &pc);
+    g_mutex_unlock(&exact_lock);
+    return ret;
+}
+
+void tcg_exact_site_add(uint64_t pc)
+{
+    uint64_t *key = g_new(uint64_t, 1);
+
+    *key = pc;
+    g_mutex_lock(&exact_lock);
+    if (!exact_sites) {
+        exact_sites = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                            g_free, NULL);
+    }
+    g_hash_table_add(exact_sites, key);
+    qatomic_set(&tcg_exact_sites_any, true);
+    g_mutex_unlock(&exact_lock);
+}
+
+static bool op_guest_access(TCGOpcode opc)
+{
+    switch (opc) {
+    case INDEX_op_qemu_ld:
+    case INDEX_op_qemu_st:
+    case INDEX_op_qemu_ld2:
+    case INDEX_op_qemu_st2:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* A guest access just generated: exact if its insn is an exact site. */
+void tcg_ldst_note(TCGOp *op)
+{
+    if (tcg_ctx->ldst_exact) {
+        TCGOP_FLAGS(op) |= TCGOP_LDST_EXACT;
+        tcg_ctx->tb_exact = true;
+    }
+}
+
+/* The guest accesses after @op (those of the insn just translated). */
+void tcg_mark_exact_after(TCGOp *op)
+{
+    TCGContext *s = tcg_ctx;
+
+    for (op = op ? QTAILQ_NEXT(op, link) : QTAILQ_FIRST(&s->ops); op;
+         op = QTAILQ_NEXT(op, link)) {
+        if (op_guest_access(op->opc)) {
+            TCGOP_FLAGS(op) |= TCGOP_LDST_EXACT;
+        }
+    }
+}
 
 bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
 {
@@ -3436,7 +3510,8 @@ static const TCGArgConstraint *op_args_ct(TCGOpcode opc, TCGType type,
 
 static const TCGArgConstraint *opcode_args_ct(const TCGOp *op)
 {
-    return op_args_ct(op->opc, TCGOP_TYPE(op), TCGOP_FLAGS(op));
+    return op_args_ct(op->opc, TCGOP_TYPE(op),
+                      TCGOP_FLAGS(op) & ~TCGOP_LDST_EXACT);
 }
 
 bool tcg_op_imm_match(TCGOpcode opc, TCGType type, tcg_target_ulong imm)
@@ -3822,6 +3897,82 @@ static void la_chain_dead(TCGContext *s, int ng)
     }
 }
 
+/*
+ * tcg_faultflags: an insn whose ops read a fault-optional global before
+ * writing it reads it again if QEMU restarts it at one of its accesses:
+ * those accesses are exact.  (The front end reports reads it makes from
+ * other values, tcg_note_flags_read.)
+ */
+static void la_fault_readers(TCGContext *s)
+{
+    uint8_t *written = tcg_malloc(s->nb_globals);
+    TCGOp *op, *start = NULL;
+    bool reads = false;
+
+    memset(written, 0, s->nb_globals);
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        int nb_o, nb_i;
+
+        if (op->opc == INDEX_op_insn_start) {
+            if (reads) {
+                for (TCGOp *a = start; a != op; a = QTAILQ_NEXT(a, link)) {
+                    if (op_guest_access(a->opc)) {
+                        TCGOP_FLAGS(a) |= TCGOP_LDST_EXACT;
+                    }
+                }
+            }
+            start = op;
+            reads = false;
+            memset(written, 0, s->nb_globals);
+            continue;
+        }
+        if (op->opc == INDEX_op_call) {
+            nb_o = TCGOP_CALLO(op);
+            nb_i = TCGOP_CALLI(op);
+        } else {
+            nb_o = def->nb_oargs;
+            nb_i = def->nb_iargs;
+        }
+        for (int i = nb_o; i < nb_o + nb_i; i++) {
+            TCGTemp *ts = arg_temp(op->args[i]);
+
+            if (ts && ts->fault_optional && !written[temp_idx(ts)]) {
+                reads = true;
+            }
+        }
+        for (int i = 0; i < nb_o; i++) {
+            TCGTemp *ts = arg_temp(op->args[i]);
+
+            if (ts->fault_optional) {
+                written[temp_idx(ts)] = 1;
+            }
+        }
+    }
+    if (reads && start) {
+        tcg_mark_exact_after(start);
+    }
+}
+
+/*
+ * liveness analysis: a guest access that isn't exact: globals are synced,
+ * except fault-optional ones.
+ */
+static void la_global_sync_access(TCGContext *s)
+{
+    for (int i = 0; i < s->nb_globals; ++i) {
+        int state = s->temps[i].state;
+
+        if (s->temps[i].fault_optional) {
+            continue;
+        }
+        s->temps[i].state = state | TS_MEM;
+        if (state == TS_DEAD) {
+            la_reset_pref(&s->temps[i]);
+        }
+    }
+}
+
 static void la_global_sync(TCGContext *s, int ng)
 {
     int i;
@@ -3994,6 +4145,9 @@ liveness_pass_1(TCGContext *s)
     prefs = tcg_malloc(sizeof(TCGRegSet) * nb_temps);
     for (int i = 0; i < nb_temps; ++i) {
         s->temps[i].state_ptr = prefs + i;
+    }
+    if (tcg_faultflags) {
+        la_fault_readers(s);
     }
 
     /* ??? Should be redundant with the exit_tb that ends the TB.  */
@@ -4301,7 +4455,12 @@ liveness_pass_1(TCGContext *s)
                 la_bb_end(s, nb_globals, nb_temps);
             } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
                 assert_carry_dead(s);
-                la_global_sync(s, nb_globals);
+                if (op_guest_access(opc) &&
+                    !(TCGOP_FLAGS(op) & TCGOP_LDST_EXACT)) {
+                    la_global_sync_access(s);
+                } else {
+                    la_global_sync(s, nb_globals);
+                }
                 if (def->flags & TCG_OPF_CALL_CLOBBER) {
                     la_cross_call(s, nb_temps);
                 }
@@ -6863,7 +7022,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         do_default:
             /* Sanity check that we've not introduced any unhandled opcodes. */
             tcg_debug_assert(tcg_op_supported(opc, TCGOP_TYPE(op),
-                                              TCGOP_FLAGS(op)));
+                                              TCGOP_FLAGS(op) &
+                                              ~TCGOP_LDST_EXACT));
             /* Note: in order to speed up the code, it would be much
                faster to have specialized register allocator functions for
                some common argument patterns */

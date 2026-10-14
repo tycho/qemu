@@ -281,6 +281,12 @@ typedef struct TCGTemp {
     unsigned int temp_subindex:2;
     /* 1 + its index in TCGContext.chain_dead, or 0 (tcg_chain_dead_add). */
     unsigned int chain_dead:4;
+    /*
+     * A global whose value a guest fault needn't show (tcg_faultflags):
+     * liveness doesn't keep it for a guest access unless the access is
+     * exact (TCGOP_LDST_EXACT).
+     */
+    unsigned int fault_optional:1;
 
     int64_t val;
     struct TCGTemp *mem_base;
@@ -335,6 +341,12 @@ struct TCGOp {
 
 #define TCGOP_TYPE(X)     (X)->param1
 #define TCGOP_FLAGS(X)    (X)->param2
+
+/*
+ * In TCGOP_FLAGS of a guest access, above its size: the fault-optional
+ * globals are live at it (tcg_faultflags).
+ */
+#define TCGOP_LDST_EXACT  0x80
 #define TCGOP_VECE(X)     (X)->param2
 
 /* Make sure operands fit in the bitfields above.  */
@@ -394,6 +406,13 @@ struct TCGContext {
     /* The chain-dead globals (tcg_chain_dead_add); used by this TB. */
     TCGTemp *chain_dead[8];
     int nb_chain_dead;
+
+    /* tcg_faultflags: the insn being translated is an exact site. */
+    bool ldst_exact;
+    /* tcg_faultflags: the TB has a guest access at an exact site. */
+    bool tb_exact;
+    /* tcg_faultflags: the insn read the state of a fault-optional global. */
+    bool insn_flags_read;
     bool chain_dead_used;
 
 #ifdef CONFIG_PLUGIN
@@ -984,5 +1003,21 @@ bool tcg_can_emit_vecop_list(const TCGOpcode *, TCGType, unsigned);
 void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs);
 /* tcg_dump_stats: Append TCG statistics to @buf */
 void tcg_dump_stats(GString *buf);
+
+/*
+ * tcg_faultflags: a front end's globals whose values a guest fault needn't
+ * show; the guest pcs whose accesses still keep them (exact sites); and
+ * the front end's report that the insn being translated reads them.
+ */
+void tcg_global_fault_optional(TCGTemp *ts);
+bool tcg_exact_site_has(uint64_t pc);
+void tcg_exact_site_add(uint64_t pc);
+extern bool tcg_exact_sites_any;
+void tcg_mark_exact_after(TCGOp *op);
+
+static inline void tcg_note_flags_read(void)
+{
+    tcg_ctx->insn_flags_read = true;
+}
 
 #endif /* TCG_H */
