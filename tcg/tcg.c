@@ -6792,6 +6792,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     tb->jmp_insn_offset[1] = TB_JMP_OFFSET_INVALID;
     tb->jmp_call = 0;
     tb->jmp_cold = 0;
+    tb->jmp_far = 0;
     memset(s->call_tb_reset, 0, sizeof(s->call_tb_reset));
 
     tcg_reg_alloc_start(s);
