@@ -1226,6 +1226,20 @@ static void tcg_out_movi(TCGContext *s, TCGType type, TCGReg rd,
         return;
     }
 
+    /*
+     * Built in place in cold code (tcg_tblayout), whose pool could be out
+     * of LDR's reach.
+     */
+    if (s->lay_cold_now) {
+        tcg_out_insn(s, movw, MOVZ, type, rd, value & 0xffff, 0);
+        for (int sh = 16; sh < 64; sh += 16) {
+            if ((value >> sh) & 0xffff) {
+                tcg_out_insn(s, movw, MOVK, type, rd, value >> sh, sh);
+            }
+        }
+        return;
+    }
+
     /* For more than 2 insns, dump it into the constant pool.  */
     new_pool_label(s, value, R_AARCH64_CONDBR19, s->code_ptr, 0);
     tcg_out_insn(s, ldlit, LDR, 0, rd);
@@ -2064,6 +2078,13 @@ static void tcg_out_goto_tb_cold(TCGContext *s, int which)
                   s->call_tb_reset[which], 0);
     tcg_out_insn(s, branch, B, 0);
 }
+
+/*
+ * TB structs and cold code out of the code stream (tcg_tblayout): the
+ * trampolines reach a struct anywhere in the region, cold code builds its
+ * constants in place.
+ */
+#define TCG_TARGET_HAS_TBLAYOUT
 
 static void tcg_out_goto_tb_tramp(TCGContext *s, int which)
 {

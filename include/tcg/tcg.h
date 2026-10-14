@@ -110,6 +110,8 @@ struct TCGLabel {
     QSIMPLEQ_ENTRY(TCGLabel) next;
     /* 1 + the goto_tb_cold slot whose unlinked path starts here, or 0. */
     uint8_t cold_slot;
+    /* Starts code that only a jump reaches, not run in the common case. */
+    bool cold;
 };
 
 typedef struct TCGPool {
@@ -404,6 +406,15 @@ struct TCGContext {
     TCGLabel *exitreq_label;
     /* The reset label of each call_tb slot (tcg_gen_call_tb), or NULL. */
     TCGLabel *call_tb_reset[8];
+    /*
+     * tcg_tblayout: the region's current chunk (hot code from lay_chunk
+     * to lay_hot_end, then TB structs and cold code from lay_cold up to
+     * lay_cold_end); whether this TB uses it (lay_on), must be generated
+     * again without cold code (lay_retry), and whether code is being
+     * emitted in the cold part (lay_cold_now).
+     */
+    void *lay_chunk, *lay_hot_end, *lay_cold, *lay_cold_end;
+    bool lay_on, lay_retry, lay_cold_now;
     /* tcg_gen_push_ret() for a call that leaves through goto_ptr. */
     TCGLabel *call_ret, *call_land;
     bool call_ret_set;
