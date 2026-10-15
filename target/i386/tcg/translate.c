@@ -4308,6 +4308,7 @@ void tcg_x86_init(void)
     /*
      * With tcg_vecglobal, the low 128 bits of each xmm register as a
      * vector global; whole-register loads and stores become moves of it.
+     * With tcg_pin_vec too, they stay in host registers across TBs.
      */
     if (tcg_vecglobal) {
         static const char xmm_names[CPU_NB_REGS][6] = {
@@ -4319,9 +4320,13 @@ void tcg_x86_init(void)
         };
 
         for (i = 0; i < CPU_NB_REGS; ++i) {
-            tcg_global_mem_new_vec(tcg_env,
-                                   offsetof(CPUX86State, xmm_regs[i].ZMM_X(0)),
-                                   TCG_TYPE_V128, xmm_names[i]);
+            TCGv_vec v = tcg_global_mem_new_vec(tcg_env,
+                                    offsetof(CPUX86State, xmm_regs[i].ZMM_X(0)),
+                                    TCG_TYPE_V128, xmm_names[i]);
+
+            if (v && tcg_pin_user && tcg_pin_vec) {
+                tcg_temp_pin(tcgv_vec_temp(v));
+            }
         }
     }
 

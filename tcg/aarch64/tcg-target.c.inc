@@ -1964,6 +1964,19 @@ static const TCGReg tcg_target_pin_regs[TCG_TARGET_NB_PIN_REGS] = {
     TCG_REG_X12, TCG_REG_X13, TCG_REG_X14, TCG_REG_X15,
 };
 
+/*
+ * Vector registers for pinned V128 globals: v8-v23, the ones Arm's vector
+ * PCS preserves whole, leaving v0-v7 and v24-v31 to the allocator.  Only
+ * with tcg_vregs_all, whose prologue keeps the caller's d8-d15.
+ */
+#define TCG_TARGET_NB_PIN_VREGS (tcg_vregs_all ? 16 : 0)
+static const TCGReg tcg_target_pin_vregs[16] = {
+    TCG_REG_V8, TCG_REG_V9, TCG_REG_V10, TCG_REG_V11,
+    TCG_REG_V12, TCG_REG_V13, TCG_REG_V14, TCG_REG_V15,
+    TCG_REG_V16, TCG_REG_V17, TCG_REG_V18, TCG_REG_V19,
+    TCG_REG_V20, TCG_REG_V21, TCG_REG_V22, TCG_REG_V23,
+};
+
 static void tcg_out_ldst_writeback(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     /* The helper may leave generated code: the pinned globals first. */
@@ -2018,13 +2031,13 @@ static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
         tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X4, lb->site);
         tcg_out_call_int(s, (const void *)helper_tso_cross_ld);
-        tcg_out_pinned_clobbered(s, false);
+        tcg_out_pinned_clobbered(s, false, 0);
         tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
     } else {
         tcg_out_st_helper_args(s, lb, &ldst_helper_param);
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X5, lb->site);
         tcg_out_call_int(s, (const void *)helper_tso_cross_st);
-        tcg_out_pinned_clobbered(s, false);
+        tcg_out_pinned_clobbered(s, false, 0);
     }
     tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
     tcg_out_goto(s, lb->raddr);
@@ -2046,7 +2059,7 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     tcg_out_ldst_save(s, lb->save_regs, false, 0);
     tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
-    tcg_out_pinned_clobbered(s, false);
+    tcg_out_pinned_clobbered(s, false, 0);
     if (lb->type == TCG_TYPE_V128) {
         /* The Int128 result in X0:X1 goes to the vector. */
         tcg_out_insn(s, fmov, DX, lb->datalo_reg, TCG_REG_X0);
@@ -2088,7 +2101,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
         tcg_out_st_helper_args(s, lb, &ldst_helper_param);
     }
     tcg_out_call_int(s, qemu_st_helpers[opc & MO_SIZE]);
-    tcg_out_pinned_clobbered(s, false);
+    tcg_out_pinned_clobbered(s, false, 0);
     tcg_out_ldst_save(s, lb->save_regs, true, 0);
     tcg_out_goto(s, lb->raddr);
     return true;

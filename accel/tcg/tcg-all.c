@@ -98,6 +98,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-simd", "on" },
         { "x-regcache", "on" },
         { "x-pin", "on" },
+        { "x-pinvec", "on" },
         { "x-lazyinc", "on" },
         { "x-flags", "dead" },
         { "x-repstr", "on" },
@@ -876,6 +877,16 @@ static void tcg_set_tblayout(Object *obj, const char *value, Error **errp)
     }
 }
 
+static bool tcg_get_pinvec(Object *obj, Error **errp)
+{
+    return tcg_pin_vec;
+}
+
+static void tcg_set_pinvec(Object *obj, bool value, Error **errp)
+{
+    tcg_pin_vec = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1107,6 +1118,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Where TB structs and the code of unlinked exits go: packed, with "
         "the code (default); split, out of the code stream, which leaves "
         "the code of TBs translated together side by side");
+
+    object_class_property_add_bool(oc, "x-pinvec", tcg_get_pinvec,
+                                   tcg_set_pinvec);
+    object_class_property_set_description(oc, "x-pinvec",
+        "With x-pin and x-regcache, keep the guest's vector registers in "
+        "host registers across TBs too");
 }
 
 static const TypeInfo tcg_accel_type = {

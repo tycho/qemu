@@ -241,6 +241,13 @@ typedef TCGv_i64 TCGv_vaddr;
 #define TCG_CALL_NO_SIDE_EFFECTS    0x0004
 /* Helper is G_NORETURN.  */
 #define TCG_CALL_NO_RETURN          0x0008
+/*
+ * Helper uses no vector registers and doesn't access the memory of
+ * vector globals: pinned vector globals stay in their registers across
+ * the call.  Its file must be compiled QEMU_GENERAL_REGS_ONLY from before
+ * any code the helper runs; where the compiler can't, the flag is 0.
+ */
+#define TCG_CALL_NO_VREG (QEMU_HAVE_GENERAL_REGS_ONLY ? 0x0010 : 0)
 
 /* convenience version of most used call flags */
 #define TCG_CALL_NO_RWG         TCG_CALL_NO_READ_GLOBALS
@@ -422,7 +429,8 @@ struct TCGContext {
     TCGRegSet reserved_regs;
     /* Pinned globals (tcg_temp_pin), in the order of their registers. */
     int nb_pinned;
-    TCGTemp *pinned[16];
+    int nb_pinned_vec;          /* of them, vector globals */
+    TCGTemp *pinned[32];
     TCGRegSet ldst_save_regs;   /* for the next guest access label */
     TCGLdstWriteback *ldst_wb;  /* likewise, tcg_lazysync */
     unsigned ldst_nb_wb;
@@ -580,6 +588,10 @@ static inline bool temp_writable(TCGTemp *ts)
  * read globals, and after a host signal in generated code
  * (tcg_pinned_unwind).  User mode only, with tcg_pin_user; returns false
  * if the backend has no register left, and @ts stays an ordinary global.
+ * A V128 global that aliases its env memory (tcg_global_mem_new_vec) takes
+ * a register from the backend's vector bank; its memory is made current
+ * before the ops that access it, and the register after those that write
+ * it.
  */
 bool tcg_temp_pin(TCGTemp *ts);
 

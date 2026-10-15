@@ -18,6 +18,14 @@
  */
 
 #include "qemu/osdep.h"
+
+/*
+ * The flags helpers are called with TCG_CALL_NO_VREG: nothing they run
+ * may use vector registers, the inline functions of the headers below
+ * included.
+ */
+QEMU_GENERAL_REGS_ONLY
+
 #include "qemu/xtcg-stats.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
