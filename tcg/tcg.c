@@ -5679,7 +5679,11 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
     if (ots->pinned) {
         /* Into the pinned global's own register. */
         if (ts->val_type == TEMP_VAL_CONST) {
-            tcg_out_movi(s, otype, ots->reg, ts->val);
+            if (otype >= TCG_TYPE_V64) {
+                tcg_out_dupi_vec(s, otype, MO_64, ots->reg, ts->val);
+            } else {
+                tcg_out_movi(s, otype, ots->reg, ts->val);
+            }
         } else {
             if (ts->val_type == TEMP_VAL_MEM) {
                 temp_load(s, ts, tcg_target_available_regs[itype],
@@ -5799,6 +5803,11 @@ static void tcg_reg_alloc_dup(TCGContext *s, const TCGOp *op)
         tcg_target_ulong val = dup_const(vece, its->val);
         if (IS_DEAD_ARG(1)) {
             temp_dead(s, its);
+        }
+        if (ots->pinned) {
+            /* Into the pinned global's own register. */
+            tcg_out_dupi_vec(s, vtype, MO_64, ots->reg, val);
+            return;
         }
         tcg_reg_alloc_do_movi(s, ots, val, arg_life, output_pref(op, 0));
         return;
