@@ -4459,6 +4459,7 @@ static bool op_is_guest_access(TCGOpcode opc)
 bool tcg_lazysync_user;
 bool tcg_pin;
 bool tcg_pin_user;
+bool tcg_pin_vec;
 
 static bool op_lazysync(TCGOpcode opc)
 {
