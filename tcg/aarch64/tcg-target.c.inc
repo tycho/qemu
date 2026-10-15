@@ -1714,6 +1714,19 @@ static const TCGReg tcg_target_pin_regs[TCG_TARGET_NB_PIN_REGS] = {
     TCG_REG_X12, TCG_REG_X13, TCG_REG_X14, TCG_REG_X15,
 };
 
+/*
+ * Vector registers for pinned V128 globals: v8-v23, the ones Arm's vector
+ * PCS preserves whole, leaving v0-v7 and v24-v31 to the allocator.  Only
+ * with tcg_vregs_all, whose prologue keeps the caller's d8-d15.
+ */
+#define TCG_TARGET_NB_PIN_VREGS (tcg_vregs_all ? 16 : 0)
+static const TCGReg tcg_target_pin_vregs[16] = {
+    TCG_REG_V8, TCG_REG_V9, TCG_REG_V10, TCG_REG_V11,
+    TCG_REG_V12, TCG_REG_V13, TCG_REG_V14, TCG_REG_V15,
+    TCG_REG_V16, TCG_REG_V17, TCG_REG_V18, TCG_REG_V19,
+    TCG_REG_V20, TCG_REG_V21, TCG_REG_V22, TCG_REG_V23,
+};
+
 static void tcg_out_ldst_writeback(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     /* The helper may leave generated code: the pinned globals first. */
