@@ -89,7 +89,13 @@ G_NORETURN void x86_cpu_do_unaligned_access(CPUState *cs, vaddr vaddr,
 /* cc_helper.c */
 static inline unsigned int compute_pf(uint8_t x)
 {
-    return !parity8(x) * CC_P;
+    /*
+     * Even parity of the low nibble of x ^ (x >> 4), from a 16-bit table:
+     * no population count, which needs vector registers on some hosts
+     * (cc_helper.c is built without them).
+     */
+    x ^= x >> 4;
+    return ((0x9669 >> (x & 0xf)) & 1) * CC_P;
 }
 
 /* misc_helper.c */
