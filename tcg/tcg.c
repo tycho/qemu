@@ -7644,8 +7644,9 @@ static void pinned_alias_pass(TCGContext *s)
  * Compute values straight into the pinned globals they are moved to.
  * Front ends compute into a temp and then move it to the guest register;
  * for a pinned global that move is a host instruction.  When an op's only
- * output is a temp that dies in a mov to a pinned global right after it,
- * the op writes the pinned global instead and the mov goes.  Nothing runs
+ * output is a temp that dies in a move (mov, or mov_vec for a vector
+ * global) to a pinned global right after it, the op writes the pinned
+ * global instead and the move goes.  Nothing runs
  * between the two, so the global changes at the same point as before; an
  * op that faults leaves its output register unwritten.  Not when the op
  * also stores the temp: a TB temp kept in memory across labels is read
@@ -7661,15 +7662,19 @@ static void pinned_fold_pass(TCGContext *s)
         TCGTemp *t, *g;
 
         next = QTAILQ_NEXT(op, link);
-        if (!next || next->opc != INDEX_op_mov ||
+        if (!next ||
+            (next->opc != INDEX_op_mov && next->opc != INDEX_op_mov_vec) ||
             op->opc == INDEX_op_call || def->nb_oargs != 1 ||
-            (def->flags & TCG_OPF_VECTOR) ||
             ((def->flags & TCG_OPF_SIDE_EFFECTS) &&
              op->opc != INDEX_op_qemu_ld)) {
             continue;
         }
         t = arg_temp(op->args[0]);
         g = arg_temp(next->args[0]);
+        /* A vector op only into a vector global. */
+        if ((def->flags & TCG_OPF_VECTOR) && g->base_type < TCG_TYPE_V64) {
+            continue;
+        }
         if (!g->pinned || arg_temp(next->args[1]) != t ||
             (t->kind != TEMP_EBB && t->kind != TEMP_TB) ||
             t->type != g->type || TCGOP_TYPE(next) != g->type ||
