@@ -282,6 +282,16 @@ static void tcg_set_pin(Object *obj, bool value, Error **errp)
     tcg_pin = value;
 }
 
+static bool tcg_get_pinvec(Object *obj, Error **errp)
+{
+    return tcg_pin_vec;
+}
+
+static void tcg_set_pinvec(Object *obj, bool value, Error **errp)
+{
+    tcg_pin_vec = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -324,6 +334,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-pin",
         "Keep the guest's most used registers in host registers across "
         "TBs (user mode, where the host supports it)");
+
+    object_class_property_add_bool(oc, "x-pinvec", tcg_get_pinvec,
+                                   tcg_set_pinvec);
+    object_class_property_set_description(oc, "x-pinvec",
+        "With x-pin and x-regcache, keep the guest's vector registers in "
+        "host registers across TBs too");
 }
 
 static const TypeInfo tcg_accel_type = {

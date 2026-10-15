@@ -60,9 +60,12 @@ extern bool tcg_lazysync_user;
  * tcg_pin_user: user mode sets it where the host signal handler can store
  * pinned globals (tcg_pinned_unwind) and no plugin reads guest registers;
  * pinning applies only then.
+ * tcg_pin_vec: with tcg_pin_user, a front end pins its vector registers
+ * too, where the backend has registers for them.
  */
 extern bool tcg_pin;
 extern bool tcg_pin_user;
+extern bool tcg_pin_vec;
 
 /*
  * Front ends keep vector registers in env_alias vector
