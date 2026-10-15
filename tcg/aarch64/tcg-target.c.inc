@@ -1769,7 +1769,7 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     tcg_out_ldst_save(s, lb->save_regs, false, 0);
     tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
-    tcg_out_pinned_clobbered(s, false);
+    tcg_out_pinned_clobbered(s, false, 0);
     tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
     tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
     tcg_out_goto(s, lb->raddr);
@@ -1788,7 +1788,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     tcg_out_ldst_save(s, lb->save_regs, false, 0);
     tcg_out_st_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_st_helpers[opc & MO_SIZE]);
-    tcg_out_pinned_clobbered(s, false);
+    tcg_out_pinned_clobbered(s, false, 0);
     tcg_out_ldst_save(s, lb->save_regs, true, 0);
     tcg_out_goto(s, lb->raddr);
     return true;
