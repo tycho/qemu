@@ -1141,20 +1141,40 @@ static void tcg_out_pinned_clobbered(TCGContext *s, bool store);
 #define TCG_TARGET_NB_PIN_REGS 0
 static const TCGReg tcg_target_pin_regs[1];
 #endif
+#ifndef TCG_TARGET_NB_PIN_VREGS
+#define TCG_TARGET_NB_PIN_VREGS 0
+static const TCGReg tcg_target_pin_vregs[1];
+#endif
 
 bool tcg_temp_pin(TCGTemp *ts)
 {
     TCGContext *s = tcg_ctx;
+    bool vec = ts->base_type >= TCG_TYPE_V64;
+    int nb_int = s->nb_pinned - s->nb_pinned_vec;
+    TCGReg reg;
 
     if (tcg_use_softmmu || !tcg_pin_user ||
-        s->nb_pinned >= MIN(TCG_TARGET_NB_PIN_REGS, ARRAY_SIZE(s->pinned))) {
+        s->nb_pinned >= ARRAY_SIZE(s->pinned)) {
         return false;
     }
     tcg_debug_assert(ts->kind == TEMP_GLOBAL && !ts->indirect_reg &&
                      ts->mem_base->kind == TEMP_FIXED);
+    if (vec) {
+        if (ts->base_type != TCG_TYPE_V128 ||
+            s->nb_pinned_vec >= TCG_TARGET_NB_PIN_VREGS) {
+            return false;
+        }
+        tcg_debug_assert(ts->env_alias);
+        reg = tcg_target_pin_vregs[s->nb_pinned_vec++];
+    } else {
+        if (nb_int >= TCG_TARGET_NB_PIN_REGS) {
+            return false;
+        }
+        reg = tcg_target_pin_regs[nb_int];
+    }
     ts->kind = TEMP_FIXED;
     ts->pinned = 1;
-    ts->reg = tcg_target_pin_regs[s->nb_pinned];
+    ts->reg = reg;
     ts->val_type = TEMP_VAL_REG;
     tcg_regset_set_reg(s->reserved_regs, ts->reg);
     s->pinned[s->nb_pinned++] = ts;
@@ -1184,14 +1204,17 @@ static void tcg_out_pinned_ld(TCGContext *s)
 /*
  * Store (@store) or load the pinned globals in registers that a call
  * clobbers, to or from their env slots: around calls out of generated
- * code that don't otherwise store or load them.
+ * code that don't otherwise store or load them.  Calling conventions
+ * preserve at most part of a vector register (AArch64: the low 64 bits
+ * of v8-v15), so every call clobbers the pinned vector globals.
  */
 static void tcg_out_pinned_clobbered(TCGContext *s, bool store)
 {
     for (int i = 0; i < s->nb_pinned; i++) {
         TCGTemp *ts = s->pinned[i];
 
-        if (!tcg_regset_test_reg(tcg_target_call_clobber_regs, ts->reg)) {
+        if (ts->type != TCG_TYPE_V128 &&
+            !tcg_regset_test_reg(tcg_target_call_clobber_regs, ts->reg)) {
             continue;
         }
         if (store) {
@@ -1217,7 +1240,9 @@ void tcg_pinned_unwind(const uint64_t (*regs)[2], int nregs)
             continue;
         }
         dst = (void *)(uintptr_t)(regs[base][0] + ts->mem_offset);
-        if (ts->type == TCG_TYPE_I32) {
+        if (ts->type == TCG_TYPE_V128) {
+            memcpy(dst, regs[ts->reg], 16);
+        } else if (ts->type == TCG_TYPE_I32) {
             *(uint32_t *)dst = regs[ts->reg][0];
         } else {
             *(uint64_t *)dst = regs[ts->reg][0];
@@ -4268,11 +4293,19 @@ static void la_alias_sync(TCGTemp *ts)
     ts->state |= TS_MEM;
 }
 
-/* liveness analysis: a helper call may read and write any env memory. */
+/*
+ * liveness analysis: a helper call may read and write any env memory.
+ * A pinned global is in a fixed register, synced by pinned_alias_pass and
+ * around calls instead.
+ */
 static void la_alias_call(TCGContext *s)
 {
     for (int i = 0; i < s->nb_alias; i++) {
-        la_alias_kill(&s->temps[s->alias_temp[i]]);
+        TCGTemp *ts = &s->temps[s->alias_temp[i]];
+
+        if (!ts->pinned) {
+            la_alias_kill(ts);
+        }
     }
 }
 
@@ -4296,6 +4329,9 @@ static void la_alias_access(TCGContext *s, TCGOp *op)
     for (int i = 0; i < s->nb_alias; i++) {
         TCGTemp *ts = &s->temps[s->alias_temp[i]];
 
+        if (ts->pinned) {
+            continue;
+        }
         /* Through another pointer, any byte may be the global's. */
         if (base == ts->mem_base
             && (lo >= ts->mem_offset + tcg_type_size(ts->base_type)
@@ -7444,6 +7480,167 @@ static void tcg_out_st_helper_args(TCGContext *s, const TCGLabelQemuLdst *ldst,
 }
 
 /*
+ * Insert a store of the pinned vector global @p before @op (@st), or a
+ * load of it after @op.
+ */
+static void pinned_alias_sync(TCGContext *s, TCGOp *op, TCGTemp *p, bool st)
+{
+    TCGOp *x;
+
+    if (st) {
+        x = tcg_op_insert_before(s, op, INDEX_op_st_vec, TCG_TYPE_V128, 3);
+    } else {
+        x = tcg_op_insert_after(s, op, INDEX_op_ld_vec, TCG_TYPE_V128, 3);
+    }
+    x->args[0] = temp_arg(p);
+    x->args[1] = temp_arg(p->mem_base);
+    x->args[2] = p->mem_offset;
+}
+
+/*
+ * Whether @op computes its outputs from a temp that may point into env
+ * (@from_env): an op other than a load, a call or one with side effects,
+ * with such an input.
+ */
+static bool pinned_alias_derives(TCGOp *op, const bool *from_env)
+{
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+
+    if (op->opc == INDEX_op_call || dse_access_size(op) ||
+        (def->flags & TCG_OPF_SIDE_EFFECTS)) {
+        return false;
+    }
+    for (int i = 0; i < def->nb_iargs; i++) {
+        TCGTemp *a = arg_temp(op->args[def->nb_oargs + i]);
+
+        if (a && from_env[temp_idx(a)]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Pinned vector globals alias their env memory, but liveness can't sync
+ * a fixed register: store the register before an op that reads its
+ * memory or writes only part of it, and load it after an op that writes
+ * that memory.  Accesses through env plus a constant offset, or through
+ * a pointer set to env plus a constant since the last label, are
+ * compared with each global's bytes; through any other pointer computed
+ * from env, they may be any global's.  A pointer loaded from memory or
+ * returned by a helper doesn't point into env (front ends keep no
+ * pointers into env there).  Calls store and reload the pinned vector
+ * globals themselves (tcg_out_pinned_clobbered).  Runs before liveness;
+ * the ops it inserts lie between @op and the next op to visit, so it
+ * skips them.
+ */
+static void pinned_alias_pass(TCGContext *s)
+{
+    TCGTemp *env = tcgv_ptr_temp(tcg_env);
+    intptr_t *env_off = tcg_malloc(sizeof(intptr_t) * s->nb_temps);
+    bool *is_env = tcg_malloc(sizeof(bool) * s->nb_temps);
+    bool *from_env = tcg_malloc(sizeof(bool) * s->nb_temps);
+    bool *tb_from_env = tcg_malloc(sizeof(bool) * s->nb_temps);
+    bool changed = true;
+    TCGOp *op, *next;
+
+    /*
+     * The temps that some op computes from env, in any order: what a TB
+     * temp may hold at a label.  Elsewhere, from_env follows the ops in
+     * order: the front ends reuse EBB temps for unrelated values.
+     */
+    memset(tb_from_env, 0, sizeof(bool) * s->nb_temps);
+    tb_from_env[temp_idx(env)] = true;
+    while (changed) {
+        changed = false;
+        QTAILQ_FOREACH(op, &s->ops, link) {
+            const TCGOpDef *def = &tcg_op_defs[op->opc];
+
+            if (pinned_alias_derives(op, tb_from_env)) {
+                for (int i = 0; i < def->nb_oargs; i++) {
+                    TCGTemp *o = arg_temp(op->args[i]);
+
+                    changed |= !tb_from_env[temp_idx(o)];
+                    tb_from_env[temp_idx(o)] = true;
+                }
+            }
+        }
+    }
+
+    memset(is_env, 0, sizeof(bool) * s->nb_temps);
+    memcpy(from_env, tb_from_env, sizeof(bool) * s->nb_globals);
+    memset(from_env + s->nb_globals, 0,
+           sizeof(bool) * (s->nb_temps - s->nb_globals));
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        int size = dse_access_size(op);
+        bool known = true, store, derived;
+        intptr_t lo = 0;
+
+        if (op->opc == INDEX_op_set_label) {
+            memset(is_env, 0, sizeof(bool) * s->nb_temps);
+            for (int i = s->nb_globals; i < s->nb_temps; i++) {
+                from_env[i] = s->temps[i].kind == TEMP_TB && tb_from_env[i];
+            }
+            continue;
+        }
+        if (op->opc == INDEX_op_call) {
+            for (int i = 0; i < TCGOP_CALLO(op); i++) {
+                is_env[temp_idx(arg_temp(op->args[i]))] = false;
+                from_env[temp_idx(arg_temp(op->args[i]))] = false;
+            }
+            continue;
+        }
+        /* The address, before the op's outputs replace what we know. */
+        if (size) {
+            TCGTemp *base = arg_temp(op->args[1]);
+
+            lo = op->args[2];
+            if (base == env) {
+                /* As is. */
+            } else if (is_env[temp_idx(base)]) {
+                lo += env_off[temp_idx(base)];
+            } else if (from_env[temp_idx(base)]) {
+                known = false;
+            } else {
+                size = 0;
+            }
+        }
+        derived = pinned_alias_derives(op, from_env);
+        for (int i = 0; i < def->nb_oargs; i++) {
+            is_env[temp_idx(arg_temp(op->args[i]))] = false;
+            from_env[temp_idx(arg_temp(op->args[i]))] = derived;
+        }
+        if (op->opc == INDEX_op_add && arg_temp(op->args[1]) == env &&
+            arg_temp(op->args[2])->kind == TEMP_CONST) {
+            TCGTemp *d = arg_temp(op->args[0]);
+
+            is_env[temp_idx(d)] = true;
+            env_off[temp_idx(d)] = arg_temp(op->args[2])->val;
+        }
+        if (!size) {
+            continue;
+        }
+        store = def->nb_oargs == 0;
+        for (int i = 0; i < s->nb_pinned; i++) {
+            TCGTemp *p = s->pinned[i];
+            intptr_t plo = p->mem_offset, phi = plo + 16;
+
+            if (p->type != TCG_TYPE_V128 ||
+                (known && (lo >= phi || lo + size <= plo))) {
+                continue;
+            }
+            if (!store || !known || lo > plo || lo + size < phi) {
+                pinned_alias_sync(s, op, p, true);
+            }
+            if (store) {
+                pinned_alias_sync(s, op, p, false);
+            }
+        }
+    }
+}
+
+/*
  * Compute values straight into the pinned globals they are moved to.
  * Front ends compute into a temp and then move it to the guest register;
  * for a pinned global that move is a host instruction.  When an op's only
@@ -7530,6 +7727,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 
     reachable_code_pass(s);
     liveness_pass_0(s);
+    if (s->nb_pinned_vec) {
+        pinned_alias_pass(s);
+    }
     liveness_pass_1(s);
 
     if (s->nb_indirects > 0) {

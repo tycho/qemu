@@ -392,7 +392,8 @@ struct TCGContext {
     TCGRegSet reserved_regs;
     /* Pinned globals (tcg_temp_pin), in the order of their registers. */
     int nb_pinned;
-    TCGTemp *pinned[16];
+    int nb_pinned_vec;          /* of them, vector globals */
+    TCGTemp *pinned[32];
     TCGRegSet ldst_save_regs;   /* for the next guest access label */
     TCGLdstWriteback *ldst_wb;  /* likewise, tcg_lazysync */
     unsigned ldst_nb_wb;
@@ -503,6 +504,10 @@ static inline bool temp_writable(TCGTemp *ts)
  * read globals, and after a host signal in generated code
  * (tcg_pinned_unwind).  User mode only, with tcg_pin_user; returns false
  * if the backend has no register left, and @ts stays an ordinary global.
+ * A V128 global that aliases its env memory (tcg_global_mem_new_vec) takes
+ * a register from the backend's vector bank; its memory is made current
+ * before the ops that access it, and the register after those that write
+ * it.
  */
 bool tcg_temp_pin(TCGTemp *ts);
 
