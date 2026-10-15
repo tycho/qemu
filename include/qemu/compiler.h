@@ -182,6 +182,21 @@
 #define QEMU_DISABLE_CFI
 #endif
 
+/*
+ * QEMU_GENERAL_REGS_ONLY: compile the rest of the file without vector and
+ * floating-point registers, where the compiler can (CONFIG_GENERAL_REGS_ONLY:
+ * GCC on AArch64); QEMU_HAVE_GENERAL_REGS_ONLY says whether it does.  Code
+ * called from there that was compiled before it (inline functions from
+ * headers included earlier) is not covered.
+ */
+#ifdef CONFIG_GENERAL_REGS_ONLY
+#define QEMU_HAVE_GENERAL_REGS_ONLY 1
+#define QEMU_GENERAL_REGS_ONLY _Pragma("GCC target(\"general-regs-only\")")
+#else
+#define QEMU_HAVE_GENERAL_REGS_ONLY 0
+#define QEMU_GENERAL_REGS_ONLY
+#endif
+
 #if __has_attribute(annotate)
 #define QEMU_ANNOTATE(x) __attribute__((annotate(x)))
 #else
