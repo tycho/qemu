@@ -1,6 +1,9 @@
-DEF_HELPER_FLAGS_4(cc_compute_all, TCG_CALL_NO_RWG_SE, tl, tl, tl, tl, int)
-DEF_HELPER_FLAGS_4(cc_compute_c, TCG_CALL_NO_RWG_SE, tl, tl, tl, tl, int)
-DEF_HELPER_FLAGS_3(cc_compute_nz, TCG_CALL_NO_RWG_SE, tl, tl, tl, int)
+DEF_HELPER_FLAGS_4(cc_compute_all, TCG_CALL_NO_RWG_SE | TCG_CALL_NO_VREG,
+                   tl, tl, tl, tl, int)
+DEF_HELPER_FLAGS_4(cc_compute_c, TCG_CALL_NO_RWG_SE | TCG_CALL_NO_VREG,
+                   tl, tl, tl, tl, int)
+DEF_HELPER_FLAGS_3(cc_compute_nz, TCG_CALL_NO_RWG_SE | TCG_CALL_NO_VREG,
+                   tl, tl, tl, int)
 
 DEF_HELPER_3(write_eflags, void, env, tl, i32)
 DEF_HELPER_1(read_eflags, tl, env)
