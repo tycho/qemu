@@ -3120,6 +3120,12 @@ config_host_data.set('CONFIG_ARM_AES_BUILTIN', cc.compiles('''
     void foo(uint8x16_t *p) { *p = vaesmcq_u8(*p); }
   '''))
 
+# For AArch64, detect if code can be built without vector registers.
+config_host_data.set('CONFIG_GENERAL_REGS_ONLY', host_arch == 'aarch64' and cc.compiles('''
+    #pragma GCC target("general-regs-only")
+    int foo(int x) { return x + 1; }
+  ''', args: ['-Werror', '-Wunknown-pragmas']))
+
 if get_option('membarrier').disabled()
   have_membarrier = false
 elif host_os == 'windows'

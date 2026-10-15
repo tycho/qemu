@@ -235,6 +235,13 @@ typedef TCGv_i64 TCGv_vaddr;
 #define TCG_CALL_NO_SIDE_EFFECTS    0x0004
 /* Helper is G_NORETURN.  */
 #define TCG_CALL_NO_RETURN          0x0008
+/*
+ * Helper uses no vector registers and doesn't access the memory of
+ * vector globals: pinned vector globals stay in their registers across
+ * the call.  Its file must be compiled QEMU_GENERAL_REGS_ONLY from before
+ * any code the helper runs; where the compiler can't, the flag is 0.
+ */
+#define TCG_CALL_NO_VREG (QEMU_HAVE_GENERAL_REGS_ONLY ? 0x0010 : 0)
 
 /* convenience version of most used call flags */
 #define TCG_CALL_NO_RWG         TCG_CALL_NO_READ_GLOBALS

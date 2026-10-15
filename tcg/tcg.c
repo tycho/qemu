@@ -1133,7 +1133,8 @@ typedef struct TCGOutOpSubtract {
 
 static void tcg_out_pinned_st(TCGContext *s);
 static void tcg_out_pinned_ld(TCGContext *s);
-static void tcg_out_pinned_clobbered(TCGContext *s, bool store);
+static void tcg_out_pinned_clobbered(TCGContext *s, bool store,
+                                     unsigned flags);
 
 #include "tcg-target.c.inc"
 
@@ -1218,15 +1219,17 @@ static void tcg_out_pinned_ld(TCGContext *s)
  * clobbers, to or from their env slots: around calls out of generated
  * code that don't otherwise store or load them.  Calling conventions
  * preserve at most part of a vector register (AArch64: the low 64 bits
- * of v8-v15), so every call clobbers the pinned vector globals.
+ * of v8-v15), so every call clobbers the pinned vector globals, unless
+ * its @flags include TCG_CALL_NO_VREG.
  */
-static void tcg_out_pinned_clobbered(TCGContext *s, bool store)
+static void tcg_out_pinned_clobbered(TCGContext *s, bool store,
+                                     unsigned flags)
 {
     for (int i = 0; i < s->nb_pinned; i++) {
         TCGTemp *ts = s->pinned[i];
 
-        if (ts->type != TCG_TYPE_V128 &&
-            !tcg_regset_test_reg(tcg_target_call_clobber_regs, ts->reg)) {
+        if (ts->type == TCG_TYPE_V128 ? flags & TCG_CALL_NO_VREG
+            : !tcg_regset_test_reg(tcg_target_call_clobber_regs, ts->reg)) {
             continue;
         }
         if (store) {
@@ -6854,7 +6857,7 @@ static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
      * sync them if they might be read.
      */
     if (info->flags & TCG_CALL_NO_READ_GLOBALS) {
-        tcg_out_pinned_clobbered(s, true);
+        tcg_out_pinned_clobbered(s, true, info->flags);
     } else {
         tcg_out_pinned_st(s);
     }
@@ -6885,7 +6888,7 @@ static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
         /* The helper may have written them. */
         tcg_out_pinned_ld(s);
     } else {
-        tcg_out_pinned_clobbered(s, false);
+        tcg_out_pinned_clobbered(s, false, info->flags);
     }
 
     /* Assign output registers and emit moves if needed.  */
