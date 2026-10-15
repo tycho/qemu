@@ -7712,6 +7712,79 @@ static TCGTemp *pinned_fold(TCGContext *s, TCGOp *op)
     return g;
 }
 
+/* Whether @op names @t among its arguments. */
+static bool pinned_fold_refs(const TCGOp *op, const TCGTemp *t)
+{
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+
+    for (int i = 0; i < def->nb_oargs + def->nb_iargs; i++) {
+        if (arg_temp(op->args[i]) == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * A vector result moved to a pinned vector global a few ops later: front
+ * ends compute every part of an insn's result before they write any of
+ * it (so that a fault leaves the registers unwritten), e.g. both halves
+ * of a 256-bit AVX operation.  When the ops between, within the same
+ * insn, can't fault, exit or branch and use neither the temp nor the
+ * global, the op writes the global instead and the move goes.
+ */
+static TCGTemp *pinned_fold_far(TCGContext *s, TCGOp *op)
+{
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+    TCGTemp *t, *g;
+    TCGOp *mov, *x;
+    int n = 0;
+
+    if (op->opc == INDEX_op_call || def->nb_oargs != 1 ||
+        (def->flags & TCG_OPF_SIDE_EFFECTS)) {
+        return NULL;
+    }
+    t = arg_temp(op->args[0]);
+    if (t->base_type < TCG_TYPE_V64 ||
+        (t->kind != TEMP_EBB && t->kind != TEMP_TB) || (op->life & SYNC_ARG)) {
+        return NULL;
+    }
+    for (mov = QTAILQ_NEXT(op, link); mov; mov = QTAILQ_NEXT(mov, link)) {
+        const TCGOpDef *md = &tcg_op_defs[mov->opc];
+
+        if (mov->opc == INDEX_op_mov_vec && arg_temp(mov->args[1]) == t) {
+            break;
+        }
+        if (++n > 8 || mov->opc == INDEX_op_call ||
+            mov->opc == INDEX_op_insn_start ||
+            mov->opc == INDEX_op_set_label ||
+            (md->flags & (TCG_OPF_SIDE_EFFECTS | TCG_OPF_BB_END |
+                          TCG_OPF_COND_BRANCH | TCG_OPF_CALL_CLOBBER)) ||
+            pinned_fold_refs(mov, t)) {
+            return NULL;
+        }
+    }
+    if (!mov) {
+        return NULL;
+    }
+    g = arg_temp(mov->args[0]);
+    if (!g->pinned || g->base_type < TCG_TYPE_V64 || t->type != g->type ||
+        TCGOP_TYPE(mov) != g->type || !(mov->life & (DEAD_ARG << 1))) {
+        return NULL;
+    }
+    for (x = QTAILQ_NEXT(op, link); x != mov; x = QTAILQ_NEXT(x, link)) {
+        if (pinned_fold_refs(x, g)) {
+            return NULL;
+        }
+    }
+    op->args[0] = mov->args[0];
+    op->life = (op->life & ~(DEAD_ARG | SYNC_ARG))
+               | (mov->life & (DEAD_ARG | SYNC_ARG));
+    op->output_pref[0] = mov->output_pref[0];
+    tcg_op_remove(s, mov);
+    return g;
+}
+
 static void pinned_fold_pass(TCGContext *s)
 {
     TCGOp *op, *prev;
@@ -7719,6 +7792,9 @@ static void pinned_fold_pass(TCGContext *s)
 
     for (op = QTAILQ_FIRST(&s->ops); op; op = QTAILQ_NEXT(op, link)) {
         g = pinned_fold(s, op);
+        if (!g) {
+            g = pinned_fold_far(s, op);
+        }
         while (g && g->base_type >= TCG_TYPE_V64 &&
                (prev = QTAILQ_PREV(op, link)) &&
                (g = pinned_fold(s, prev))) {
