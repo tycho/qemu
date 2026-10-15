@@ -18,6 +18,14 @@
  */
 
 #include "qemu/osdep.h"
+
+/*
+ * The flags helpers are called with TCG_CALL_NO_VREG: nothing they run
+ * may use vector registers, the inline functions of the headers below
+ * included.
+ */
+QEMU_GENERAL_REGS_ONLY_BEGIN
+
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "helper-tcg.h"
@@ -441,3 +449,5 @@ void HELPER(clts)(CPUX86State *env)
     env->cr[0] &= ~CR0_TS_MASK;
     env->hflags &= ~HF_TS_MASK;
 }
+
+QEMU_GENERAL_REGS_ONLY_END
