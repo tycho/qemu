@@ -7675,41 +7675,55 @@ static void pinned_alias_pass(TCGContext *s)
  * op that faults leaves its output register unwritten.  Not when the op
  * also stores the temp: a TB temp kept in memory across labels is read
  * from there after it dies in the mov.  Runs after liveness, whose results
- * it keeps up to date.
+ * it keeps up to date.  A vector result often reaches the global through
+ * a chain of moves between temps: after a fold into a vector global, the
+ * op before is tried again, back to the op that computes the value.
  */
+static TCGTemp *pinned_fold(TCGContext *s, TCGOp *op)
+{
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+    TCGOp *next = QTAILQ_NEXT(op, link);
+    TCGTemp *t, *g;
+
+    if (!next ||
+        (next->opc != INDEX_op_mov && next->opc != INDEX_op_mov_vec) ||
+        op->opc == INDEX_op_call || def->nb_oargs != 1 ||
+        ((def->flags & TCG_OPF_SIDE_EFFECTS) &&
+         op->opc != INDEX_op_qemu_ld)) {
+        return NULL;
+    }
+    t = arg_temp(op->args[0]);
+    g = arg_temp(next->args[0]);
+    /* A vector op only into a vector global. */
+    if ((def->flags & TCG_OPF_VECTOR) && g->base_type < TCG_TYPE_V64) {
+        return NULL;
+    }
+    if (!g->pinned || arg_temp(next->args[1]) != t ||
+        (t->kind != TEMP_EBB && t->kind != TEMP_TB) ||
+        t->type != g->type || TCGOP_TYPE(next) != g->type ||
+        !(next->life & (DEAD_ARG << 1)) || (op->life & SYNC_ARG)) {
+        return NULL;
+    }
+    op->args[0] = next->args[0];
+    op->life = (op->life & ~(DEAD_ARG | SYNC_ARG))
+               | (next->life & (DEAD_ARG | SYNC_ARG));
+    op->output_pref[0] = next->output_pref[0];
+    tcg_op_remove(s, next);
+    return g;
+}
+
 static void pinned_fold_pass(TCGContext *s)
 {
-    TCGOp *op, *next;
+    TCGOp *op, *prev;
+    TCGTemp *g;
 
     for (op = QTAILQ_FIRST(&s->ops); op; op = QTAILQ_NEXT(op, link)) {
-        const TCGOpDef *def = &tcg_op_defs[op->opc];
-        TCGTemp *t, *g;
-
-        next = QTAILQ_NEXT(op, link);
-        if (!next ||
-            (next->opc != INDEX_op_mov && next->opc != INDEX_op_mov_vec) ||
-            op->opc == INDEX_op_call || def->nb_oargs != 1 ||
-            ((def->flags & TCG_OPF_SIDE_EFFECTS) &&
-             op->opc != INDEX_op_qemu_ld)) {
-            continue;
+        g = pinned_fold(s, op);
+        while (g && g->base_type >= TCG_TYPE_V64 &&
+               (prev = QTAILQ_PREV(op, link)) &&
+               (g = pinned_fold(s, prev))) {
+            op = prev;
         }
-        t = arg_temp(op->args[0]);
-        g = arg_temp(next->args[0]);
-        /* A vector op only into a vector global. */
-        if ((def->flags & TCG_OPF_VECTOR) && g->base_type < TCG_TYPE_V64) {
-            continue;
-        }
-        if (!g->pinned || arg_temp(next->args[1]) != t ||
-            (t->kind != TEMP_EBB && t->kind != TEMP_TB) ||
-            t->type != g->type || TCGOP_TYPE(next) != g->type ||
-            !(next->life & (DEAD_ARG << 1)) || (op->life & SYNC_ARG)) {
-            continue;
-        }
-        op->args[0] = next->args[0];
-        op->life = (op->life & ~(DEAD_ARG | SYNC_ARG))
-                   | (next->life & (DEAD_ARG | SYNC_ARG));
-        op->output_pref[0] = next->output_pref[0];
-        tcg_op_remove(s, next);
     }
 }
 
