@@ -836,6 +836,9 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 #endif
 
     tcg_ctx->addr_type = addr_type;
+    /* Per attempt: a translation that restarts records its exits anew. */
+    memset(tb->jmp_entry, 0, sizeof(tb->jmp_entry));
+    tb->entry_reads = false;
 
     /* Initialize DisasContext */
     db->tb = tb;
