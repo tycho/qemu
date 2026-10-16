@@ -2176,7 +2176,18 @@ gen_eob(DisasContext *s, int mode)
             TCGv_i64 key = tcg_temp_new_i64();
 
             tcg_gen_extu_tl_i64(key, cpu_eip);
-            tcg_gen_ret_tb(key);
+            if (tb_cflags(s->base.tb) & CF_PCREL) {
+                tcg_gen_ret_tb(key);
+            } else {
+                /*
+                 * A hit returns to the code after the CALL, which sets
+                 * EIP from constants wherever it is needed: store it on
+                 * the miss path only.
+                 */
+                tcg_gen_discard_tl(cpu_eip);
+                tcg_gen_ret_tb(key);
+                tcg_gen_trunc_i64_tl(cpu_eip, key);
+            }
         } else if (mode == DISAS_JUMP && s->rs_call && use_retstack(s)) {
             /* The lookup leaves by a host call; land comes after it. */
             land = gen_new_label();
