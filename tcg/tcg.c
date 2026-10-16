@@ -4072,9 +4072,27 @@ liveness_pass_0(TCGContext *s)
     void * const multiple_ebb = (void *)(uintptr_t)-1;
     int nb_temps = s->nb_temps;
     TCGOp *op, *ebb;
+    /*
+     * With x-lean, also the number of the EBB that last wrote each
+     * TEMP_TB (wrote), and whether an EBB read one before writing it
+     * (read_in).  Control enters an EBB only at its start, so a TEMP_TB
+     * that no EBB reads before writing carries no value across a label:
+     * it can be a TEMP_EBB too, which liveness need not keep in memory
+     * at the end of a basic block.  Front ends reuse a few TB-lifetime
+     * scratch temps in every guest instruction this way.
+     */
+    int *wrote = NULL;
+    unsigned long *read_in = NULL;
+    int ebb_no = 1;
 
     for (int i = s->nb_globals; i < nb_temps; ++i) {
         s->temps[i].state_ptr = NULL;
+    }
+    if (tcg_lean) {
+        wrote = tcg_malloc(nb_temps * sizeof(int));
+        read_in = tcg_malloc(BITS_TO_LONGS(nb_temps) * sizeof(unsigned long));
+        memset(wrote, 0, nb_temps * sizeof(int));
+        memset(read_in, 0, BITS_TO_LONGS(nb_temps) * sizeof(unsigned long));
     }
 
     /*
@@ -4091,6 +4109,7 @@ liveness_pass_0(TCGContext *s)
         switch (op->opc) {
         case INDEX_op_set_label:
             ebb = op;
+            ebb_no++;
             continue;
         case INDEX_op_discard:
             continue;
@@ -4116,6 +4135,16 @@ liveness_pass_0(TCGContext *s)
             } else if (ts->state_ptr != ebb) {
                 ts->state_ptr = multiple_ebb;
             }
+            if (read_in && i >= nb_oargs && wrote[temp_idx(ts)] != ebb_no) {
+                set_bit(temp_idx(ts), read_in);
+            }
+        }
+        for (int i = 0; wrote && i < nb_oargs; ++i) {
+            TCGTemp *ts = arg_temp(op->args[i]);
+
+            if (ts->kind == TEMP_TB) {
+                wrote[temp_idx(ts)] = ebb_no;
+            }
         }
     }
 
@@ -4125,7 +4154,9 @@ liveness_pass_0(TCGContext *s)
      */
     for (int i = s->nb_globals; i < nb_temps; ++i) {
         TCGTemp *ts = &s->temps[i];
-        if (ts->kind == TEMP_TB && ts->state_ptr != multiple_ebb) {
+        if (ts->kind == TEMP_TB &&
+            (ts->state_ptr != multiple_ebb ||
+             (read_in && !test_bit(i, read_in)))) {
             ts->kind = TEMP_EBB;
         }
     }
