@@ -25,6 +25,7 @@
 #include "exec/translation-block.h"
 #include "qemu/xxhash.h"
 #include "tb-jmp-cache.h"
+#include "internal-common.h"
 
 #ifdef CONFIG_SOFTMMU
 
@@ -53,9 +54,16 @@ static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
 
 #else
 
-/* In user-mode we can get better hashing because we do not have a TLB */
+/*
+ * In user-mode we can get better hashing because we do not have a TLB.
+ * With the inline lookup, the pc's low bits alone: guest code spreads
+ * over them, and the generated code takes them in one host insn.
+ */
 static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
 {
+    if (tcg_ijmp_inline) {
+        return pc & (TB_JMP_CACHE_SIZE - 1);
+    }
     return (pc ^ (pc >> TB_JMP_CACHE_BITS)) & (TB_JMP_CACHE_SIZE - 1);
 }
 

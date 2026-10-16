@@ -169,11 +169,11 @@ static void gen_jmp_cache_offset(TCGv_i64 off, TCGv_i64 pc)
 {
 #define JC_ENTRY_SIZE sizeof_field(CPUJumpCache, array[0])
     const unsigned e = ctz32(JC_ENTRY_SIZE);
-    TCGv_i64 tmp = tcg_temp_ebb_new_i64();
 
     QEMU_BUILD_BUG_ON(JC_ENTRY_SIZE & (JC_ENTRY_SIZE - 1));
 #undef JC_ENTRY_SIZE
 #ifdef CONFIG_SOFTMMU
+    TCGv_i64 tmp = tcg_temp_ebb_new_i64();
     TCGv_i64 hi = tcg_temp_ebb_new_i64();
     const unsigned sh = TARGET_PAGE_BITS - TB_JMP_PAGE_BITS;
 
@@ -185,12 +185,11 @@ static void gen_jmp_cache_offset(TCGv_i64 off, TCGv_i64 pc)
     tcg_gen_deposit_z_i64(off, tmp, e, TB_JMP_PAGE_BITS);
     tcg_gen_or_i64(off, off, hi);
     tcg_temp_free_i64(hi);
-#else
-    tcg_gen_shri_i64(tmp, pc, TB_JMP_CACHE_BITS);
-    tcg_gen_xor_i64(tmp, tmp, pc);
-    tcg_gen_deposit_z_i64(off, tmp, e, TB_JMP_CACHE_BITS);
-#endif
     tcg_temp_free_i64(tmp);
+#else
+    /* Only the inline lookup uses this: tcg_ijmp_inline's hash. */
+    tcg_gen_deposit_z_i64(off, pc, e, TB_JMP_CACHE_BITS);
+#endif
 }
 
 /*
