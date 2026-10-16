@@ -3521,6 +3521,13 @@ void tcg_x86_init(void)
                 break;
             }
         }
+        /*
+         * With tcg_pin_cc, CC_OP after them, if a register is left: every
+         * exit sets it, most TBs that read the flags read it.
+         */
+        if (tcg_pin_cc && i == ARRAY_SIZE(pin_order)) {
+            tcg_temp_pin(tcgv_i32_temp(cpu_cc_op));
+        }
     }
 
     for (i = 0; i < 6; ++i) {
