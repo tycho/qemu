@@ -1954,14 +1954,23 @@ static void tcg_out_ldst_save(TCGContext *s, TCGRegSet regs, bool restore,
  * otherwise reserved (x28 holds guest_base or the return stack), which
  * helpers keep, then caller-saved ones above the argument registers, which
  * are stored around calls and reloaded after them
- * (tcg_out_pinned_clobbered).
+ * (tcg_out_pinned_clobbered).  On Linux hosts x18 is an ordinary
+ * caller-saved register, unless the host code uses it for a shadow call
+ * stack: a seventeenth.
  */
+#if defined(CONFIG_LINUX) && !__has_feature(shadow_call_stack)
+#define TCG_TARGET_NB_PIN_REGS 17
+#else
 #define TCG_TARGET_NB_PIN_REGS 16
+#endif
 static const TCGReg tcg_target_pin_regs[TCG_TARGET_NB_PIN_REGS] = {
     TCG_REG_X20, TCG_REG_X21, TCG_REG_X22, TCG_REG_X23,
     TCG_REG_X24, TCG_REG_X25, TCG_REG_X26, TCG_REG_X27,
     TCG_REG_X8, TCG_REG_X9, TCG_REG_X10, TCG_REG_X11,
     TCG_REG_X12, TCG_REG_X13, TCG_REG_X14, TCG_REG_X15,
+#if TCG_TARGET_NB_PIN_REGS > 16
+    TCG_REG_X18,
+#endif
 };
 
 /*
