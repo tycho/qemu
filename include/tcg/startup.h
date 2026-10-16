@@ -40,7 +40,8 @@ extern bool tcg_region;
 extern unsigned tcg_superblock;
 
 /*
- * With tcg_superblock, the most blocks of a unit (0: none): in user mode,
+ * The most blocks of a unit (0: none; with or without tcg_superblock's
+ * sampled loops): in user mode,
  * a TB that isn't a sampled loop head is translated with the blocks its
  * direct jumps reach, at or after its start on its page and the next,
  * whether or not they have run.
