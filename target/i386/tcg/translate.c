@@ -1913,8 +1913,23 @@ static void gen_push_v(DisasContext *s, TCGv val)
     MemOp d_ot = mo_pushpop(s, s->dflag);
     MemOp a_ot = mo_stacksize(s);
     int size = 1 << d_ot;
-    TCGv new_esp = tcg_temp_new();
+    TCGv new_esp;
 
+    if (tcg_lean && a_ot == MO_64) {
+        /*
+         * The address apart from the new stack pointer, which is updated
+         * after the store: an access at rsp - size can take the offset in
+         * the host's addressing mode.
+         */
+        TCGv addr = tcg_temp_new();
+
+        gen_lea_ss_ofs(s, addr, cpu_regs[R_ESP], -size);
+        gen_op_st_v(s, d_ot, val, addr);
+        tcg_gen_subi_tl(cpu_regs[R_ESP], cpu_regs[R_ESP], size);
+        return;
+    }
+
+    new_esp = tcg_temp_new();
     tcg_gen_subi_tl(new_esp, cpu_regs[R_ESP], size);
 
     /* Now reduce the value to the address size and apply SS base.  */
