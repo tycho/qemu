@@ -4912,12 +4912,22 @@ bool tcg_chain_dead_read_since(TCGOp *after)
         if (def->flags & (TCG_OPF_BB_END | TCG_OPF_BB_EXIT)) {
             return true;
         }
+        /*
+         * An op that may fault (a guest access) or raise an exception (a
+         * helper with side effects) counts as a read: the state it
+         * leaves for the fault must hold the chain-dead globals.
+         */
         if (op->opc == INDEX_op_call) {
-            if (!(tcg_call_flags(op) & TCG_CALL_NO_READ_GLOBALS)) {
+            unsigned flags = tcg_call_flags(op);
+
+            if (!(flags & TCG_CALL_NO_READ_GLOBALS) ||
+                !(flags & TCG_CALL_NO_SIDE_EFFECTS)) {
                 return true;
             }
             nb_o = TCGOP_CALLO(op);
             nb_i = TCGOP_CALLI(op);
+        } else if (def->flags & TCG_OPF_CALL_CLOBBER) {
+            return true;
         } else {
             nb_o = def->nb_oargs;
             nb_i = def->nb_iargs;
