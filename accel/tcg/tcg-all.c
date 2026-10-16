@@ -97,6 +97,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-regcache", "on" },
         { "x-pin", "on" },
         { "x-pinvec", "on" },
+        { "x-pincc", "on" },
         { "x-lazyinc", "on" },
         { "x-flags", "dead" },
         { "x-repstr", "on" },
