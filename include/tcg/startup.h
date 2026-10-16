@@ -62,10 +62,14 @@ extern bool tcg_lazysync_user;
  * pinning applies only then.
  * tcg_pin_vec: with tcg_pin_user, a front end pins its vector registers
  * too, where the backend has registers for them.
+ * tcg_pin_cc: with tcg_pin_user, a front end pins the global that holds
+ * its lazy condition-code operation, when a register is left after its
+ * guest registers.
  */
 extern bool tcg_pin;
 extern bool tcg_pin_user;
 extern bool tcg_pin_vec;
+extern bool tcg_pin_cc;
 
 /*
  * tcg_pin_system_ok: whether the backend can pin guest registers in system

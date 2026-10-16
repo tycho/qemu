@@ -289,6 +289,16 @@ static void tcg_set_pin(Object *obj, bool value, Error **errp)
     tcg_pin = value;
 }
 
+static bool tcg_get_pincc(Object *obj, Error **errp)
+{
+    return tcg_pin_cc;
+}
+
+static void tcg_set_pincc(Object *obj, bool value, Error **errp)
+{
+    tcg_pin_cc = value;
+}
+
 static bool tcg_get_pinvec(Object *obj, Error **errp)
 {
     return tcg_pin_vec;
@@ -348,6 +358,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-pinvec",
         "With x-pin and x-regcache, keep the guest's vector registers in "
         "host registers across TBs too");
+
+    object_class_property_add_bool(oc, "x-pincc", tcg_get_pincc,
+                                   tcg_set_pincc);
+    object_class_property_set_description(oc, "x-pincc",
+        "With x-pin, keep the guest's condition-code operation in a host "
+        "register across TBs too, where the host has one to spare");
 }
 
 static const TypeInfo tcg_accel_type = {
