@@ -5322,6 +5322,12 @@ static void gen_PUSHF(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_helper_read_eflags(s->T0, tcg_env);
+    /*
+     * The helper left env's flags state as the full flags, consistent: a
+     * fault in the push keeps it rather than restore the CC_OP the insn
+     * started with.
+     */
+    tcg_set_insn_start_param(s->base.insn_start, 1, CC_OP_DYNAMIC);
     gen_push_v(s, s->T0);
     assume_cc_op(s, CC_OP_EFLAGS);
 }

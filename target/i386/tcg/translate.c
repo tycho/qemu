@@ -143,6 +143,12 @@ typedef struct DisasContext {
     bool cc_entry_done;
     bool cc_entry_dead;
     bool cc_op_dirty;
+    /*
+     * The insn stores to memory after its flags consumers run (its
+     * destination is memory): they must leave the flags state as it is,
+     * which a fault in that store restores (insn_start).
+     */
+    bool cc_keep;
 
     CCOp cc_op;  /* current CC operation */
     /*
@@ -962,6 +968,23 @@ static void gen_compute_eflags(DisasContext *s)
     set_cc_op(s, CC_OP_EFLAGS);
 }
 
+/*
+ * All eflags for a consumer: in cc_src, which becomes the flags state, or,
+ * with cc_keep, in a temp, leaving the state as it is.
+ */
+static TCGv gen_eflags(DisasContext *s)
+{
+    TCGv t;
+
+    if (!s->cc_keep || s->cc_op == CC_OP_EFLAGS) {
+        gen_compute_eflags(s);
+        return cpu_cc_src;
+    }
+    t = tcg_temp_new();
+    gen_mov_eflags(s, t);
+    return t;
+}
+
 typedef enum {
     /* imm is valid and reg2 is a constant */
     CC_PREPARE_IMM,
@@ -1180,8 +1203,7 @@ static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
 /* compute eflags.P, trying to store it in reg if not NULL */
 static CCPrepare gen_prepare_eflags_p(DisasContext *s, TCGv reg)
 {
-    gen_compute_eflags(s);
-    return (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = cpu_cc_src,
+    return (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = gen_eflags(s),
                          .imm = CC_P };
 }
 
@@ -1190,8 +1212,8 @@ static CCPrepare gen_prepare_eflags_s(DisasContext *s, TCGv reg)
 {
     switch (s->cc_op) {
     case CC_OP_DYNAMIC:
-        gen_compute_eflags(s);
-        /* FALLTHRU */
+        return (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = gen_eflags(s),
+                             .imm = CC_S };
     case CC_OP_EFLAGS:
     case CC_OP_ADCX:
     case CC_OP_ADOX:
@@ -1220,8 +1242,7 @@ static CCPrepare gen_prepare_eflags_o(DisasContext *s, TCGv reg)
     case CC_OP_MULB ... CC_OP_MULQ:
         return (CCPrepare) { .cond = TCG_COND_NE, .reg = cpu_cc_src };
     default:
-        gen_compute_eflags(s);
-        return (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = cpu_cc_src,
+        return (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = gen_eflags(s),
                              .imm = CC_O };
     }
 }
@@ -1261,6 +1282,7 @@ static CCPrepare gen_prepare_cc(DisasContext *s, int b, TCGv reg)
     int inv, jcc_op, cond;
     MemOp size;
     CCPrepare cc;
+    TCGv flags;
 
     inv = b & 1;
     jcc_op = (b >> 1) & 7;
@@ -1337,8 +1359,7 @@ static CCPrepare gen_prepare_cc(DisasContext *s, int b, TCGv reg)
             cc = gen_prepare_eflags_z(s, reg);
             break;
         case JCC_BE:
-            gen_compute_eflags(s);
-            cc = (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = cpu_cc_src,
+            cc = (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = gen_eflags(s),
                                .imm = CC_Z | CC_C };
             break;
         case JCC_S:
@@ -1348,21 +1369,21 @@ static CCPrepare gen_prepare_cc(DisasContext *s, int b, TCGv reg)
             cc = gen_prepare_eflags_p(s, reg);
             break;
         case JCC_L:
-            gen_compute_eflags(s);
-            if (!reg || reg == cpu_cc_src) {
+            flags = gen_eflags(s);
+            if (!reg || reg == flags) {
                 reg = tcg_temp_new();
             }
-            tcg_gen_addi_tl(reg, cpu_cc_src, CC_O - CC_S);
+            tcg_gen_addi_tl(reg, flags, CC_O - CC_S);
             cc = (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = reg,
                                .imm = CC_O };
             break;
         default:
         case JCC_LE:
-            gen_compute_eflags(s);
-            if (!reg || reg == cpu_cc_src) {
+            flags = gen_eflags(s);
+            if (!reg || reg == flags) {
                 reg = tcg_temp_new();
             }
-            tcg_gen_addi_tl(reg, cpu_cc_src, CC_O - CC_S);
+            tcg_gen_addi_tl(reg, flags, CC_O - CC_S);
             cc = (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = reg,
                                .imm = CC_O | CC_Z };
             break;
