@@ -1296,10 +1296,13 @@ static unsigned long xtcg_es_gen, xtcg_es_run, xtcg_es_busy;
 
 static bool flags_entry_on(void)
 {
-    if (flags_entry < 0) {
-        flags_entry = getenv("XTCG_FLAGSENTRY") != NULL;
+    int on = qatomic_read(&flags_entry);
+
+    if (on < 0) {
+        on = getenv("XTCG_FLAGSENTRY") != NULL;
+        qatomic_set(&flags_entry, on);
     }
-    return flags_entry;
+    return on;
 }
 
 void xtcg_entry_stats_maybe(void);
@@ -1307,7 +1310,8 @@ void xtcg_entry_stats_maybe(void)
 {
     if (getenv("XTCG_ESTAT")) {
         fprintf(stderr, "ESTAT variants %lu runs %lu busy %lu\n",
-                xtcg_es_gen, xtcg_es_run, xtcg_es_busy);
+                qatomic_read(&xtcg_es_gen), qatomic_read(&xtcg_es_run),
+                qatomic_read(&xtcg_es_busy));
     }
 }
 
@@ -1321,10 +1325,16 @@ void xtcg_entry_stats_maybe(void)
 static TranslationBlock *tb_entry_variant(CPUState *cpu, TCGTBCPUState s,
                                           TranslationBlock *tb,
                                           TranslationBlock **last_tb,
-                                          int tb_exit)
+                                          int tb_exit, unsigned flushes)
 {
     TranslationBlock *v;
-    unsigned e, want, flushes;
+    unsigned e, want;
+
+    /* tb's own translation may have flushed the code: last_tb is gone. */
+    if (qatomic_read(&tb_ctx.tb_flush_count) != flushes) {
+        *last_tb = NULL;
+        return tb;
+    }
 
     if (tb_exit < 0 || tb_exit >= TB_JMP_SLOTS || !tb->entry_reads ||
         (tb->cflags & CF_ENTRY_MASK) || s.cflags != curr_cflags(cpu)) {
@@ -1340,23 +1350,22 @@ static TranslationBlock *tb_entry_variant(CPUState *cpu, TCGTBCPUState s,
         want = want ? want : e;
     }
     if (want != e) {
-        xtcg_es_busy++;
+        qatomic_inc(&xtcg_es_busy);
         return tb;
     }
     s.cflags |= e << CF_ENTRY_SHIFT;
-    flushes = qatomic_read(&tb_ctx.tb_flush_count);
     v = tb_htable_lookup(cpu, s);
     if (v == NULL) {
         mmap_lock();
         v = tb_gen_code(cpu, s);
         mmap_unlock();
-        xtcg_es_gen++;
+        qatomic_inc(&xtcg_es_gen);
     }
     if (qatomic_read(&tb_ctx.tb_flush_count) != flushes) {
         /* The translation flushed the code: last_tb is gone. */
         *last_tb = NULL;
     }
-    xtcg_es_run++;
+    qatomic_inc(&xtcg_es_run);
     return v;
 }
 
@@ -1374,6 +1383,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 
         while (!cpu_handle_interrupt(cpu, &last_tb)) {
             TranslationBlock *tb;
+            unsigned flushes;
             TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
             s.cflags = cpu->cflags_next_tb;
 
@@ -1394,6 +1404,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 break;
             }
 
+            flushes = qatomic_read(&tb_ctx.tb_flush_count);
             tb = tb_lookup(cpu, s);
             if (tb == NULL) {
                 CPUJumpCache *jc;
@@ -1417,7 +1428,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             }
 
             if (last_tb && flags_entry_on()) {
-                tb = tb_entry_variant(cpu, s, tb, &last_tb, tb_exit);
+                tb = tb_entry_variant(cpu, s, tb, &last_tb, tb_exit, flushes);
             }
 
 #ifndef CONFIG_USER_ONLY
