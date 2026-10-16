@@ -3218,6 +3218,8 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea)) {
         gen_lea_modrm(s, &decode);
     }
+    /* A store after the emitter: its flags consumers keep the state. */
+    s->cc_keep = decode.op[0].has_ea;
     if (s->prefix & PREFIX_LOCK) {
         assert(decode.op[0].has_ea && !decode.op[2].has_ea);
         gen_load(s, &decode, 2, s->T1);
@@ -3239,6 +3241,7 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
 #endif
         gen_writeback(s, &decode, 0, s->T0);
     }
+    s->cc_keep = false;
 
     /*
      * Write back flags after last memory access.  Some older ALU instructions, as
