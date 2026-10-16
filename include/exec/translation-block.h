@@ -85,6 +85,9 @@ struct TranslationBlock {
 #define CF_PCREL         0x00020000 /* Opcodes in TB are PC-relative */
 #define CF_BP_PAGE       0x00040000 /* Breakpoint present in code page */
 #define CF_STEP_ATOMIC   0x00080000 /* Running in cpu_exec_step_atomic */
+/* The front end's index of the state the TB is entered in; 0: any. */
+#define CF_ENTRY_MASK    0x00f00000
+#define CF_ENTRY_SHIFT   20
 #define CF_CLUSTER_MASK  0xff000000 /* Top 8 bits are cluster ID */
 #define CF_CLUSTER_SHIFT 24
 
@@ -149,6 +152,15 @@ struct TranslationBlock {
      */
     uint8_t jmp_dead[TB_JMP_SLOTS];
     bool chain_dead_in;
+    /*
+     * Entry-specialized TBs (CF_ENTRY_MASK): for a goto_tb slot, the
+     * front end's index of its state at that exit (0: none); whether
+     * this TB, translated for any state, reads the state it is entered
+     * in; and the one index a specialized copy of it is made for.
+     */
+    uint8_t jmp_entry[TB_JMP_SLOTS];
+    bool entry_reads;
+    uint8_t entry_want;
     /*
      * The goto_tb slots whose unlinked path is out of line, at the TB's
      * end (tcg_goto_tb_cold): a slot is one direct branch, to the TB it

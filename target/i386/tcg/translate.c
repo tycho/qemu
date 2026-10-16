@@ -151,6 +151,12 @@ typedef struct DisasContext {
      * else CC_OP_DYNAMIC.
      */
     CCOp cc_op_guess;
+    /*
+     * Entry-specialized TBs: whether cc_op is still the state the TB was
+     * entered in, for a TB translated for any state (it reads that state
+     * when it reads CC_OP at run time: TranslationBlock.entry_reads).
+     */
+    bool cc_entry_open;
     int mem_index; /* select memory access functions */
     uint32_t flags; /* all execution flags */
     int cpuid_features;
@@ -390,10 +396,44 @@ static bool use_flags_dead(DisasContext *s)
 #endif
 }
 
+/*
+ * Entry-specialized TBs (CF_ENTRY_MASK): the static CC_OPs a TB can be
+ * translated to be entered in, by index; 0 is any state (DYNAMIC).
+ */
+static const CCOp x86_entry_cc_op[16] = {
+    CC_OP_DYNAMIC, CC_OP_EFLAGS,
+    CC_OP_ADDL, CC_OP_ADDQ, CC_OP_SUBB, CC_OP_SUBW, CC_OP_SUBL, CC_OP_SUBQ,
+    CC_OP_LOGICB, CC_OP_LOGICW, CC_OP_LOGICL, CC_OP_LOGICQ,
+    CC_OP_INCL, CC_OP_INCQ, CC_OP_DECL, CC_OP_DECQ,
+};
+
+static unsigned x86_entry_index(CCOp op)
+{
+    for (unsigned i = 1; i < ARRAY_SIZE(x86_entry_cc_op); i++) {
+        if (x86_entry_cc_op[i] == op) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+/* CC_OP's run-time value, which may be the state the TB is entered in. */
+static TCGv_i32 cc_op_read(DisasContext *s)
+{
+    if (s->cc_entry_open) {
+        s->base.tb->entry_reads = true;
+    }
+    return cpu_cc_op;
+}
+
 static void set_cc_op_1(DisasContext *s, CCOp op, bool dirty)
 {
     int dead;
 
+    if (op != CC_OP_DYNAMIC && !cc_op_lazy(op)) {
+        /* A known state: no longer the one the TB was entered in. */
+        s->cc_entry_open = false;
+    }
     if (!s->cc_entry_done && s->cc_op == CC_OP_DYNAMIC &&
         op != CC_OP_DYNAMIC) {
         s->cc_entry_done = true;
@@ -944,13 +984,13 @@ static void gen_mov_eflags(DisasContext *s, TCGv reg)
     if (cc_op_lazy(s->cc_op) ||
         (s->cc_op == CC_OP_DYNAMIC && tcg_lazy_incdec)) {
         gen_helper_cc_compute_all2(reg, dst, src1, src2, cpu_cc_dst2,
-                                   cpu_cc_op);
+                                   cc_op_read(s));
         return;
     }
     if (s->cc_op != CC_OP_DYNAMIC) {
         cc_op = tcg_constant_i32(s->cc_op);
     } else {
-        cc_op = cpu_cc_op;
+        cc_op = cc_op_read(s);
     }
     gen_helper_cc_compute_all(reg, dst, src1, src2, cc_op);
 }
@@ -1003,14 +1043,14 @@ static CCPrepare gen_prepare_val_nz(TCGv src, MemOp size, bool eqz)
 
 /* compute eflags.C, trying to store it in reg if not NULL */
 /* CF from the CC_OP in env, through the helper. */
-static void gen_compute_c_helper(TCGv reg)
+static void gen_compute_c_helper(DisasContext *s, TCGv reg)
 {
     if (tcg_lazy_incdec) {
         gen_helper_cc_compute_c2(reg, cpu_cc_dst, cpu_cc_src, cpu_cc_src2,
-                                 cpu_cc_dst2, cpu_cc_op);
+                                 cpu_cc_dst2, cc_op_read(s));
     } else {
         gen_helper_cc_compute_c(reg, cpu_cc_dst, cpu_cc_src, cpu_cc_src2,
-                                cpu_cc_op);
+                                cc_op_read(s));
     }
 }
 
@@ -1048,7 +1088,7 @@ static bool gen_compute_c_guess(DisasContext *s, TCGv reg)
 
     slow = gen_new_label();
     done = gen_new_label();
-    tcg_gen_brcondi_i32(TCG_COND_NE, cpu_cc_op, op, slow);
+    tcg_gen_brcondi_i32(TCG_COND_NE, cc_op_read(s), op, slow);
     switch (op) {
     case CC_OP_LOGICB ... CC_OP_LOGICQ:
     case CC_OP_POPCNT:
@@ -1094,7 +1134,7 @@ static bool gen_compute_c_guess(DisasContext *s, TCGv reg)
     }
     tcg_gen_br(done);
     gen_set_label(slow);
-    gen_compute_c_helper(reg);
+    gen_compute_c_helper(s, reg);
     gen_set_label(done);
     return true;
 }
@@ -1170,7 +1210,7 @@ static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
             reg = tcg_temp_new();
         }
         if (s->cc_op != CC_OP_DYNAMIC || !gen_compute_c_guess(s, reg)) {
-            gen_compute_c_helper(reg);
+            gen_compute_c_helper(s, reg);
         }
         return (CCPrepare) { .cond = TCG_COND_NE, .reg = reg,
                              .rhs_type = CC_PREPARE_DIRECT };
@@ -1241,7 +1281,7 @@ static CCPrepare gen_prepare_eflags_z(DisasContext *s, TCGv reg)
         if (!reg) {
             reg = tcg_temp_new();
         }
-        gen_helper_cc_compute_nz(reg, cpu_cc_dst, cpu_cc_src, cpu_cc_op);
+        gen_helper_cc_compute_nz(reg, cpu_cc_dst, cpu_cc_src, cc_op_read(s));
         return (CCPrepare) { .cond = TCG_COND_EQ, .reg = reg, .imm = 0 };
     case CC_OP_POPCNT:
         return (CCPrepare) { .cond = TCG_COND_EQ, .reg = cpu_cc_dst };
@@ -2668,6 +2708,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
             dead = true;
         }
         tcg_gen_goto_tb(tb_num);
+        s->base.tb->jmp_entry[tb_num] = x86_entry_index(s->cc_op);
         if (req && !dead) {
             gen_set_label(req);
             req = NULL;
@@ -4409,10 +4450,12 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     g_assert(SVME(dc) == ((flags & HF_SVME_MASK) != 0));
     g_assert(GUEST(dc) == ((flags & HF_GUEST_MASK) != 0));
 
-    dc->cc_op = CC_OP_DYNAMIC;
+    dc->cc_op = x86_entry_cc_op[(cflags & CF_ENTRY_MASK) >> CF_ENTRY_SHIFT];
     dc->cc_op_dirty = false;
+    dc->cc_entry_open = dc->cc_op == CC_OP_DYNAMIC;
     /* The block is translated when it is first entered. */
-    dc->cc_op_guess = tcg_flags_guess ? env->cc_op : CC_OP_DYNAMIC;
+    dc->cc_op_guess = tcg_flags_guess && dc->cc_op == CC_OP_DYNAMIC
+                      ? env->cc_op : CC_OP_DYNAMIC;
     dc->ymmh_pending = 0;
     /* select memory access functions */
     dc->mem_index = cpu_mmu_index(cpu, false);
@@ -4456,6 +4499,15 @@ static void i386_tr_tb_start(DisasContextBase *db, CPUState *cpu)
     }
     dc->cc_entry_op = tcg_last_op();
     dc->cc_entry_done = dc->cc_entry_dead = false;
+
+    /*
+     * A TB entered after a SUB: the minuend SUB's consumers compare,
+     * rebuilt from the stored result and subtrahend (dead if unused).
+     */
+    if (dc->cc_op >= CC_OP_SUBB && dc->cc_op <= CC_OP_SUBQ) {
+        dc->cc_srcT = tcg_temp_new();
+        tcg_gen_add_tl(dc->cc_srcT, cpu_cc_dst, cpu_cc_src);
+    }
 }
 
 static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
@@ -4604,6 +4656,7 @@ static void i386_tr_block_start(DisasContextBase *dcbase, CPUState *cpu)
 
     dc->cc_op = CC_OP_DYNAMIC;
     dc->cc_op_dirty = false;
+    dc->cc_entry_open = false;
     assert(!dc->ymmh_pending);
     dc->cc_srcT = NULL;
     dc->pc = dc->base.pc_next;

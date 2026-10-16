@@ -142,7 +142,8 @@ bool translator_loop_back(DisasContextBase *db, vaddr dest)
 {
     TCGLabel *exit;
 
-    if (!db->loop_label || db->region || dest != db->pc_first) {
+    if (!db->loop_label || db->region || dest != db->pc_first ||
+        (tb_cflags(db->tb) & CF_ENTRY_MASK)) {
         return false;
     }
     /*
@@ -510,6 +511,10 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
 
     *backward = false;
     if (!r || r->stubbing) {
+        return NULL;
+    }
+    /* A TB made for one entry state is entered only from outside. */
+    if (dest == db->pc_first && (tb_cflags(db->tb) & CF_ENTRY_MASK)) {
         return NULL;
     }
     for (int i = 0; i < r->n; i++) {

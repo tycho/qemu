@@ -1284,9 +1284,80 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
     if (insns_left > 0 && insns_left < tb->icount)  {
         assert(insns_left <= CF_COUNT_MASK);
         assert(cpu->icount_extra == 0);
-        cpu->cflags_next_tb = (tb->cflags & ~CF_COUNT_MASK) | insns_left;
+        cpu->cflags_next_tb = (tb->cflags & ~(CF_COUNT_MASK | CF_ENTRY_MASK)) |
+                              insns_left;
     }
 #endif
+}
+
+/* EXP: XTCG_FLAGSENTRY=1 enables entry-specialized TBs; counters. */
+static int flags_entry = -1;
+static unsigned long xtcg_es_gen, xtcg_es_run, xtcg_es_busy;
+
+static bool flags_entry_on(void)
+{
+    if (flags_entry < 0) {
+        flags_entry = getenv("XTCG_FLAGSENTRY") != NULL;
+    }
+    return flags_entry;
+}
+
+void xtcg_entry_stats_maybe(void);
+void xtcg_entry_stats_maybe(void)
+{
+    if (getenv("XTCG_ESTAT")) {
+        fprintf(stderr, "ESTAT variants %lu runs %lu busy %lu\n",
+                xtcg_es_gen, xtcg_es_run, xtcg_es_busy);
+    }
+}
+
+/*
+ * Entry-specialized TBs: when last_tb left through a direct exit whose
+ * state the front end knows (jmp_entry) and tb reads the state it is
+ * entered in, run (and link to) tb's copy translated for that state.
+ * It is found in the hash table only, never the jump cache, so only
+ * such exits enter it.  One copy per TB: the first state asked for.
+ */
+static TranslationBlock *tb_entry_variant(CPUState *cpu, TCGTBCPUState s,
+                                          TranslationBlock *tb,
+                                          TranslationBlock **last_tb,
+                                          int tb_exit)
+{
+    TranslationBlock *v;
+    unsigned e, want, flushes;
+
+    if (tb_exit < 0 || tb_exit >= TB_JMP_SLOTS || !tb->entry_reads ||
+        (tb->cflags & CF_ENTRY_MASK) || s.cflags != curr_cflags(cpu)) {
+        return tb;
+    }
+    e = (*last_tb)->jmp_entry[tb_exit];
+    if (!e) {
+        return tb;
+    }
+    want = qatomic_read(&tb->entry_want);
+    if (!want) {
+        want = qatomic_cmpxchg(&tb->entry_want, 0, e);
+        want = want ? want : e;
+    }
+    if (want != e) {
+        xtcg_es_busy++;
+        return tb;
+    }
+    s.cflags |= e << CF_ENTRY_SHIFT;
+    flushes = qatomic_read(&tb_ctx.tb_flush_count);
+    v = tb_htable_lookup(cpu, s);
+    if (v == NULL) {
+        mmap_lock();
+        v = tb_gen_code(cpu, s);
+        mmap_unlock();
+        xtcg_es_gen++;
+    }
+    if (qatomic_read(&tb_ctx.tb_flush_count) != flushes) {
+        /* The translation flushed the code: last_tb is gone. */
+        *last_tb = NULL;
+    }
+    xtcg_es_run++;
+    return v;
 }
 
 /* main execution loop */
@@ -1343,6 +1414,10 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                                         tb_jmp_cache_global(cpu, tb, s.pc));
                     qatomic_set(&jc->array[h].tb, tb);
                 }
+            }
+
+            if (last_tb && flags_entry_on()) {
+                tb = tb_entry_variant(cpu, s, tb, &last_tb, tb_exit);
             }
 
 #ifndef CONFIG_USER_ONLY

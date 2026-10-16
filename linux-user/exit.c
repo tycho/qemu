@@ -29,6 +29,9 @@ extern void __gcov_dump(void);
 
 void preexit_cleanup(CPUArchState *env, int code)
 {
+    extern void xtcg_entry_stats_maybe(void);
+
+    xtcg_entry_stats_maybe();
 #ifdef CONFIG_GCOV
         __gcov_dump();
 #endif

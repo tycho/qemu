@@ -500,7 +500,7 @@ static void prepare_update_cc_incdec_lazy(X86DecodedInsn *decode,
         TCGv low_tl = tcg_temp_new();
 
         /* Whether CC_OP is already a lazy INC/DEC: low byte in range. */
-        tcg_gen_andi_i32(low, cpu_cc_op, 0xff);
+        tcg_gen_andi_i32(low, cc_op_read(s), 0xff);
         tcg_gen_subi_i32(low, low, CC_OP_INCLB);
         tcg_gen_shli_i32(shifted, cpu_cc_op, 8);
         tcg_gen_andi_i32(cc_op, cpu_cc_op, ~0xff);
@@ -513,7 +513,7 @@ static void prepare_update_cc_incdec_lazy(X86DecodedInsn *decode,
                            tcg_constant_tl(CC_OP_DECLQ - CC_OP_INCLB + 1),
                            cpu_cc_dst2, cpu_cc_dst);
     } else {
-        tcg_gen_andi_i32(cc_op, cpu_cc_op, ~0xff);
+        tcg_gen_andi_i32(cc_op, cc_op_read(s), ~0xff);
     }
     tcg_gen_ori_i32(cc_op, cc_op, lazy);
 
@@ -5904,7 +5904,7 @@ static void gen_shift_dynamic_flags(DisasContext *s, X86DecodedInsn *decode, TCG
 
     tcg_gen_trunc_tl_i32(count32, count);
     if (s->cc_op == CC_OP_DYNAMIC || cc_op_lazy(s->cc_op)) {
-        old_cc_op = cpu_cc_op;
+        old_cc_op = cc_op_read(s);
     } else {
         old_cc_op = tcg_constant_i32(s->cc_op);
     }
