@@ -886,14 +886,14 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         db->loop_label->loop = true;
         gen_set_label(db->loop_label);
         loop_op = tcg_last_op();
-        db->region_capable = tcg_superblock && ops->block_start
+        db->region_capable = (tcg_superblock || tcg_units) && ops->block_start
                              && tb_page_addr0(tb) != -1
                              && !(cflags & CF_COUNT_MASK);
-        if (db->region_capable) {
+        if (db->region_capable && tcg_superblock) {
             translator_region_sampler_start();
         }
     }
-    is_head = db->region_capable && region_cap >= 0
+    is_head = db->region_capable && tcg_superblock && region_cap >= 0
               && translator_region_is_head(tb_page_addr0(tb));
 #ifdef CONFIG_USER_ONLY
     unit = db->region_capable && region_cap >= 0 && !is_head

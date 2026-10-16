@@ -106,7 +106,12 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-crypto", "on" },
         { "x-alignfold", "on" },
         { "x-region", "on" },
+#ifdef CONFIG_USER_ONLY
+        /* Sampled loops cost more than they give next to units (user only). */
+        { "x-superblock", "units-only" },
+#else
         { "x-superblock", "units" },
+#endif
         { "x-tblookup", "on" },
         { "x-tblayout", "split" },
         { "x-i386-runtime", "on" },
@@ -731,7 +736,7 @@ static void tcg_set_lazy_incdec(Object *obj, bool value, Error **errp)
 static char *tcg_get_superblock(Object *obj, Error **errp)
 {
     if (tcg_units) {
-        return g_strdup("units");
+        return g_strdup(tcg_superblock ? "units" : "units-only");
     }
     return g_strdup_printf("%u", tcg_superblock);
 }
@@ -745,8 +750,14 @@ static void tcg_set_superblock(Object *obj, const char *value, Error **errp)
         tcg_units = TCG_UNIT_BLOCKS;
         return;
     }
+    if (!strcmp(value, "units-only")) {
+        tcg_superblock = 0;
+        tcg_units = TCG_UNIT_BLOCKS;
+        return;
+    }
     if (qemu_strtou64(value, NULL, 0, &n) < 0 || n > UINT32_MAX) {
-        error_setg(errp, "x-superblock: a number of samples, or 'units'");
+        error_setg(errp, "x-superblock: a number of samples, 'units' or "
+                   "'units-only'");
         return;
     }
     tcg_superblock = n;
@@ -1055,7 +1066,8 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "loop, translate the loop's blocks that have run as one translation "
         "block (0: never, the default); 'units': 4 samples, and in user "
         "mode every other translation block holds the blocks it reaches by "
-        "direct jumps, up to 3");
+        "direct jumps, up to 3; 'units-only': those units, and no sampled "
+        "loops");
 
     object_class_property_add_str(oc, "x-cr3-flush",
                                   tcg_get_cr3_flush, tcg_set_cr3_flush);
