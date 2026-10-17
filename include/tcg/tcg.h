@@ -408,10 +408,13 @@ struct TCGContext {
     TCGBar guest_mo;
 
     TCGRegSet reserved_regs;
-    /* Pinned globals (tcg_temp_pin), in the order of their registers. */
+    /*
+     * Pinned globals (tcg_temp_pin), in the order of their registers:
+     * room for every general and vector register a backend can give.
+     */
     int nb_pinned;
     int nb_pinned_vec;          /* of them, vector globals */
-    TCGTemp *pinned[32];
+    TCGTemp *pinned[64];
     TCGRegSet ldst_save_regs;   /* for the next guest access label */
     TCGLdstWriteback *ldst_wb;  /* likewise, tcg_lazysync */
     unsigned ldst_nb_wb;
