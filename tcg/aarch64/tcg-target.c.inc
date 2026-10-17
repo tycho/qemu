@@ -3113,6 +3113,37 @@ static void tcg_out_goto_ptr(TCGContext *s, TCGReg a0)
     tcg_out_insn(s, bcond_reg, BR, a0);
 }
 
+/*
+ * A conditional branch to a goto_tb slot's insn (TranslationBlock.jmp_cond)
+ * is a B.cond, CBZ or CBNZ: it reaches +-1 MiB.
+ */
+#define TCG_TARGET_HAS_COND_LINK
+
+static bool tcg_cond_link_reloc(int type)
+{
+    return type == R_AARCH64_CONDBR19;
+}
+
+/*
+ * Point slot @n's conditional branch at the TB the slot is now linked to
+ * (@d_addr), when in range; else, and when unlinked, at the slot.
+ */
+static void tb_set_cond_link(const TranslationBlock *tb, int n, bool linked,
+                             uintptr_t d_addr, uintptr_t jmp_rx,
+                             uintptr_t jmp_rw)
+{
+    uintptr_t c_rx = (uintptr_t)tb->tc.ptr + tb->jmp_cond[n] - 1;
+    uintptr_t c_rw = c_rx + (jmp_rw - jmp_rx);
+    ptrdiff_t off = d_addr - c_rx;
+    uint32_t insn = qatomic_read((uint32_t *)c_rw);
+
+    if (!linked || off != sextract64(off, 0, 21)) {
+        off = jmp_rx - c_rx;
+    }
+    qatomic_set((uint32_t *)c_rw, deposit32(insn, 5, 19, off >> 2));
+    flush_idcache_range(c_rx, c_rw, 4);
+}
+
 void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
                               uintptr_t jmp_rx, uintptr_t jmp_rw)
 {
@@ -3158,6 +3189,9 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
         }
         qatomic_set((uint32_t *)jmp_rw, insn);
         flush_idcache_range(jmp_rx, jmp_rw, 4);
+        if (tb->jmp_cond[n]) {
+            tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw);
+        }
         return;
     }
 
@@ -3173,6 +3207,11 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     }
     qatomic_set((uint32_t *)jmp_rw, insn);
     flush_idcache_range(jmp_rx, jmp_rw, 4);
+    if (tb->jmp_cond[n]) {
+        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
+
+        tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw);
+    }
 }
 
 
