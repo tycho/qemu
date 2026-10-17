@@ -2017,6 +2017,30 @@ static TCGRegSet ldst_outputs(TCGLabelQemuLdst *lb)
 }
 
 /*
+ * tcg_tblayout: a branch to the slow path, which goes to the cold part,
+ * where the fast path's conditional branch can reach it.
+ */
+static bool tcg_out_ldst_veneer(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+        return false;
+    }
+    lb->label_ptr[0] = s->code_ptr;
+    lb->veneer = true;
+    tcg_out_insn(s, branch, B, 0);
+    return true;
+}
+
+/* Point the fast path's branch, or its veneer, at the slow path. */
+static bool tcg_out_ldst_slow_entry(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    const tcg_insn_unit *target = tcg_splitwx_to_rx(s->code_ptr);
+
+    return lb->veneer ? reloc_pc26(lb->label_ptr[0], target)
+                      : reloc_pc19(lb->label_ptr[0], target);
+}
+
+/*
  * The out-of-line path of an MO_ACQ_REL access that crosses a 16-byte
  * boundary (see tcg_out_acqrel_check), and in system mode also of its
  * TLB miss (see prepare_host_addr): call helper_tso_cross_ld/st, which
@@ -2031,7 +2055,7 @@ static TCGRegSet ldst_outputs(TCGLabelQemuLdst *lb)
  */
 static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
 {
-    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
         return false;
     }
     tcg_out_ldst_writeback(s, lb);
@@ -2060,7 +2084,7 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     if (lb->fallback) {
         return tcg_out_acqrel_fallback(s, lb);
     }
-    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
         return false;
     }
 
@@ -2088,7 +2112,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     if (lb->fallback) {
         return tcg_out_acqrel_fallback(s, lb);
     }
-    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
         return false;
     }
 

@@ -124,6 +124,8 @@ struct TCGLabelQemuLdst {
     /* tcg_lazysync: dirty globals the slow path stores before its call */
     const TCGLdstWriteback *wb;
     unsigned nb_wb;
+    /* label_ptr[0] is a B to the slow path, in cold code (tcg_tblayout). */
+    bool veneer;
     QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 };
 
@@ -2224,6 +2226,15 @@ static void tb_layout_chunk(TCGContext *s)
     qatomic_set(&s->code_gen_ptr, p);
     s->code_gen_highwater = (uint8_t *)s->lay_hot_end - TCG_HIGHWATER;
     s->lay_on = true;
+}
+
+/*
+ * tcg_tblayout: the high water mark of TB data written at s->lay_cold,
+ * in the current chunk's cold part.
+ */
+void *tcg_tb_data_highwater(TCGContext *s)
+{
+    return (uint8_t *)s->lay_cold_end - TCG_HIGHWATER;
 }
 
 /* tcg_tbpack: the alignment of a packed TB struct and of its code. */
@@ -4731,7 +4742,7 @@ reachable_code_pass(TCGContext *s)
              * and label had not yet been removed.
              */
             if (op_prev && op_prev->opc == INDEX_op_br &&
-                label == arg_label(op_prev->args[0])) {
+                label == arg_label(op_prev->args[0]) && !label->cold) {
                 tcg_op_remove(s, op_prev);
                 /* Fall through means insns become live again.  */
                 dead = false;
@@ -10969,7 +10980,28 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     s->gen_insn_end_off[num_insns] = tcg_current_code_size(s);
 
     /* Generate TB finalization at the end of block */
-    i = tcg_out_ldst_finalize(s);
+#ifdef TCG_TARGET_HAS_TBLAYOUT
+    if (s->lay_on && !s->lay_retry && !QSIMPLEQ_EMPTY(&s->ldst_labels)) {
+        TCGLabelQemuLdst *lb;
+
+        /*
+         * tcg_tblayout: the qemu_ld/st slow paths in the cold part, each
+         * reached through a branch after the TB's last guest insn.
+         */
+        QSIMPLEQ_FOREACH(lb, &s->ldst_labels, next) {
+            if (!tcg_out_ldst_veneer(s, lb)) {
+                i = -2;
+                goto fail;
+            }
+        }
+        tb_layout_switch(s, true, &hot, &cold_cur, &hot_hw);
+        i = tcg_out_ldst_finalize(s);
+        tb_layout_switch(s, false, &hot, &cold_cur, &hot_hw);
+    } else
+#endif
+    {
+        i = tcg_out_ldst_finalize(s);
+    }
     if (i < 0) {
         goto fail;
     }
