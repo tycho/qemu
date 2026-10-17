@@ -20,6 +20,7 @@
 #endif
 #include "exec/plugin-gen.h"
 #include "tcg/tcg-op-common.h"
+#include "tcg/startup.h"
 #include "internal-common.h"
 #include "disas/disas.h"
 #include "tb-internal.h"
@@ -274,6 +275,18 @@ static void gen_inline_lookup(TCGv_i64 pc, uint64_t cs_base, uint32_t flags)
     tcg_gen_goto_ptr(tb);
 
     gen_set_label(miss);
+    if (tcg_tblayout) {
+        /*
+         * The miss path stores and reloads every pinned register around
+         * the helper: with tcg_tblayout it goes to the cold part, and
+         * the checks' branches reach it through one branch here.
+         */
+        TCGLabel *cold = gen_new_label();
+
+        tcg_gen_br(cold);
+        gen_set_label(cold);
+        cold->cold = true;
+    }
     tcg_gen_lookup_and_goto_ptr();
 
     if (key != pc) {
