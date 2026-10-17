@@ -3528,6 +3528,17 @@ void tcg_x86_init(void)
         if (tcg_pin_cc && i == ARRAY_SIZE(pin_order)) {
             tcg_temp_pin(tcgv_i32_temp(cpu_cc_op));
         }
+        /*
+         * With tcg_cc_regs, CC_DST and CC_SRC in host registers between
+         * TBs: a TB that sets the flags leaves them for the next, and one
+         * that reads them first doesn't load them.
+         */
+        if (tcg_cc_regs &&
+            tcg_boundary_global_add(tcgv_tl_temp(cpu_cc_dst))) {
+            bool both = tcg_boundary_global_add(tcgv_tl_temp(cpu_cc_src));
+
+            tcg_debug_assert(both);
+        }
     }
 
     for (i = 0; i < 6; ++i) {
