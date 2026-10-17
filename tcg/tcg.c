@@ -4495,6 +4495,7 @@ bool tcg_pin;
 bool tcg_pin_user;
 bool tcg_pin_vec;
 bool tcg_pin_cc;
+bool tcg_cc_regs;
 
 static bool op_lazysync(TCGOpcode opc)
 {

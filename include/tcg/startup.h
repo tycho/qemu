@@ -72,6 +72,13 @@ extern bool tcg_pin_vec;
 extern bool tcg_pin_cc;
 
 /*
+ * tcg_cc_regs: with tcg_pin_user, a front end keeps the operands of its
+ * lazy condition codes in host registers between TBs (boundary globals,
+ * tcg_boundary_global_add), where the backend has registers for them.
+ */
+extern bool tcg_cc_regs;
+
+/*
  * Front ends keep vector registers in env_alias vector
  * globals (tcg_global_mem_new_vec), so TCG holds them in host registers
  * within a TB.
