@@ -1915,6 +1915,15 @@ static void tb_layout_chunk(TCGContext *s)
     s->lay_on = true;
 }
 
+/*
+ * tcg_tblayout: the high water mark of TB data written at s->lay_cold,
+ * in the current chunk's cold part.
+ */
+void *tcg_tb_data_highwater(TCGContext *s)
+{
+    return (uint8_t *)s->lay_cold_end - TCG_HIGHWATER;
+}
+
 /* tcg_tbpack: the alignment of a packed TB struct and of its code. */
 #define TCG_TBPACK_ALIGN 16
 
