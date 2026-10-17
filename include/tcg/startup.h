@@ -71,6 +71,15 @@ extern bool tcg_tblayout;
 bool tcg_can_tblayout(void);
 
 /*
+ * tcg_bti: where the host has BTI, the code buffer is mapped as guarded
+ * pages and generated code has landing pads at indirect branch targets
+ * (the default).  Without it neither: fewer host insns, no BTI checks on
+ * generated code.  Read when the code buffer is mapped and at code
+ * generation, so it must be set before tcg_init().
+ */
+extern bool tcg_bti;
+
+/*
  * tcg_retstack: guest calls and returns through a return stack in host
  * code (tcg_gen_push_ret).  The front end sets tcg_retsp_off, the offset
  * in env where the stack's top is kept outside generated code, and
