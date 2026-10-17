@@ -184,6 +184,11 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     ops->init_disas_context(db, cpu);
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
 
+    /* Every way into a TB brings the boundary globals in registers. */
+    if (tcg_ctx->nb_boundary) {
+        tcg_gen_boundary_in();
+    }
+
     /* Start translating.  */
     icount_start_insn = gen_tb_start(db, cflags);
     ops->tb_start(db, cpu);

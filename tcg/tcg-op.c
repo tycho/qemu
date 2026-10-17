@@ -2782,6 +2782,16 @@ void tcg_gen_goto_tb(unsigned idx)
     tcg_gen_op1i(INDEX_op_goto_tb, 0, idx);
 }
 
+void tcg_gen_boundary_in(void)
+{
+    TCGContext *s = tcg_ctx;
+
+    tcg_debug_assert(s->nb_boundary == 2);
+    tcg_gen_op2(INDEX_op_boundary_in, s->boundary[0]->base_type,
+                temp_arg(s->boundary[0]), temp_arg(s->boundary[1]));
+    s->boundary_in = true;
+}
+
 void tcg_gen_lookup_and_goto_ptr(void)
 {
     TCGv_ptr ptr;
