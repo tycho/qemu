@@ -1724,6 +1724,15 @@ static const TCGReg tcg_target_pin_regs[TCG_TARGET_NB_PIN_REGS] = {
 };
 
 /*
+ * Registers for boundary globals (tcg_boundary_global_add): two argument
+ * registers, which the allocator uses between TB boundaries as before.
+ */
+#define TCG_TARGET_NB_BOUNDARY_REGS 2
+static const TCGReg tcg_target_boundary_regs[TCG_TARGET_NB_BOUNDARY_REGS] = {
+    TCG_REG_X6, TCG_REG_X7,
+};
+
+/*
  * Vector registers for pinned V128 globals: v8-v23, the ones Arm's vector
  * PCS preserves whole, leaving v0-v7 and v24-v31 to the allocator.  Only
  * with tcg_vregs_all, whose prologue keeps the caller's d8-d15.
