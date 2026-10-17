@@ -6839,6 +6839,29 @@ static void tb_layout_switch(TCGContext *s, bool cold, tcg_insn_unit **hot,
     s->lay_cold_now = cold;
 }
 
+/*
+ * tcg_goto_tb_cold: if goto_tb slot @n, just emitted, is the first insn at
+ * a label that one conditional branch reaches, note that branch: linking
+ * the slot links it too (tb_target_set_jmp_target).
+ */
+static void tcg_note_cond_link(TCGContext *s, int n)
+{
+#ifdef TCG_TARGET_HAS_COND_LINK
+    TCGLabel *l = s->slot_label;
+    TCGRelocation *r;
+
+    if (!tcg_goto_tb_cold || !l || s->lay_cold_now ||
+        s->gen_tb->jmp_insn_offset[n] != s->slot_label_off) {
+        return;
+    }
+    r = QSIMPLEQ_FIRST(&l->relocs);
+    if (!r || QSIMPLEQ_NEXT(r, next) || !tcg_cond_link_reloc(r->type)) {
+        return;
+    }
+    s->gen_tb->jmp_cond[n] = tcg_ptr_byte_diff(r->ptr, s->code_buf) + 1;
+#endif
+}
+
 int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 {
     int i, num_insns;
@@ -6927,6 +6950,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     tb->jmp_call = 0;
     tb->jmp_cold = 0;
     tb->jmp_far = 0;
+    memset(tb->jmp_cond, 0, sizeof(tb->jmp_cond));
+    s->slot_label = NULL;
     memset(s->call_tb_reset, 0, sizeof(s->call_tb_reset));
 
     /*
@@ -7029,6 +7054,10 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             }
 #endif
             tcg_out_label(s, arg_label(op->args[0]));
+            if (!s->lay_cold_now) {
+                s->slot_label = arg_label(op->args[0]);
+                s->slot_label_off = tcg_current_code_size(s);
+            }
 #ifdef TCG_TARGET_HAS_GOTO_TB_COLD
             if (arg_label(op->args[0])->cold_slot) {
                 tcg_out_goto_tb_land(s);
@@ -7044,6 +7073,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             break;
         case INDEX_op_goto_tb:
             tcg_out_goto_tb(s, op->args[0]);
+            tcg_note_cond_link(s, op->args[0]);
             break;
 #ifdef TCG_TARGET_HAS_GOTO_TB_COLD
         case INDEX_op_goto_tb_cold:
@@ -7051,6 +7081,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             s->call_tb_reset[op->args[0]] = arg_label(op->args[1]);
             arg_label(op->args[1])->cold_slot = op->args[0] + 1;
             tcg_out_goto_tb_cold(s, op->args[0]);
+            tcg_note_cond_link(s, op->args[0]);
             break;
 #endif
 #ifdef TCG_TARGET_HAS_RETSTACK

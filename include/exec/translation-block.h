@@ -145,6 +145,13 @@ struct TranslationBlock {
      * (the TB struct out of literal range): one insn longer.
      */
     uint8_t jmp_far;
+    /*
+     * For a goto_tb slot that is the first insn at a label which one
+     * conditional branch reaches: 1 + that branch's offset, else 0.
+     * Linking the slot points the branch at the same TB when it can reach
+     * it, so that the taken path doesn't take a second branch.
+     */
+    uint32_t jmp_cond[2];
     uint32_t jmp_insn_offset[2];  /* offset of direct jump insn */
     uintptr_t jmp_target_addr[2]; /* target address */
 
