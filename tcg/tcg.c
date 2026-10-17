@@ -3827,7 +3827,7 @@ reachable_code_pass(TCGContext *s)
              * and label had not yet been removed.
              */
             if (op_prev->opc == INDEX_op_br &&
-                label == arg_label(op_prev->args[0])) {
+                label == arg_label(op_prev->args[0]) && !label->cold) {
                 tcg_op_remove(s, op_prev);
                 /* Fall through means insns become live again.  */
                 dead = false;
