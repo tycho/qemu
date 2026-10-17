@@ -404,6 +404,12 @@ struct TCGContext {
      */
     void *lay_chunk, *lay_hot_end, *lay_cold, *lay_cold_end;
     bool lay_on, lay_retry, lay_cold_now;
+    /*
+     * tcg_goto_tb_cold: the last label emitted, and its offset in the
+     * code, for a goto_tb slot right at it (TranslationBlock.jmp_cond).
+     */
+    TCGLabel *slot_label;
+    size_t slot_label_off;
     /* tcg_gen_push_ret() for a call that leaves through goto_ptr. */
     TCGLabel *call_ret, *call_land;
     bool call_ret_set;
