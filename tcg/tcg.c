@@ -107,6 +107,8 @@ struct TCGLabelQemuLdst {
     TCGReg datahi_reg;      /* reg index for high word to be loaded or stored */
     const tcg_insn_unit *raddr;   /* addr of the next IR of qemu_ld/st IR */
     tcg_insn_unit *label_ptr[2]; /* label pointers to be updated */
+    /* label_ptr[0] is a B to the slow path, in cold code (tcg_tblayout). */
+    bool veneer;
     QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 };
 
@@ -7103,7 +7105,28 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     s->gen_insn_end_off[num_insns] = tcg_current_code_size(s);
 
     /* Generate TB finalization at the end of block */
-    i = tcg_out_ldst_finalize(s);
+#ifdef TCG_TARGET_HAS_TBLAYOUT
+    if (s->lay_on && !s->lay_retry && !QSIMPLEQ_EMPTY(&s->ldst_labels)) {
+        TCGLabelQemuLdst *lb;
+
+        /*
+         * tcg_tblayout: the qemu_ld/st slow paths in the cold part, each
+         * reached through a branch after the TB's last guest insn.
+         */
+        QSIMPLEQ_FOREACH(lb, &s->ldst_labels, next) {
+            if (!tcg_out_ldst_veneer(s, lb)) {
+                i = -2;
+                goto fail;
+            }
+        }
+        tb_layout_switch(s, true, &hot, &cold_cur, &hot_hw);
+        i = tcg_out_ldst_finalize(s);
+        tb_layout_switch(s, false, &hot, &cold_cur, &hot_hw);
+    } else
+#endif
+    {
+        i = tcg_out_ldst_finalize(s);
+    }
     if (i < 0) {
         goto fail;
     }

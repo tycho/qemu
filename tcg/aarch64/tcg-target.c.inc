@@ -1662,11 +1662,35 @@ static const TCGLdstHelperParam ldst_helper_param = {
     .ntmp = 1, .tmp = { TCG_REG_TMP0 }
 };
 
+/*
+ * tcg_tblayout: a branch to the slow path, which goes to the cold part,
+ * where the fast path's conditional branch can reach it.
+ */
+static bool tcg_out_ldst_veneer(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+        return false;
+    }
+    lb->label_ptr[0] = s->code_ptr;
+    lb->veneer = true;
+    tcg_out_insn(s, branch, B, 0);
+    return true;
+}
+
+/* Point the fast path's branch, or its veneer, at the slow path. */
+static bool tcg_out_ldst_slow_entry(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    const tcg_insn_unit *target = tcg_splitwx_to_rx(s->code_ptr);
+
+    return lb->veneer ? reloc_pc26(lb->label_ptr[0], target)
+                      : reloc_pc19(lb->label_ptr[0], target);
+}
+
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     MemOp opc = get_memop(lb->oi);
 
-    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
         return false;
     }
 
@@ -1681,7 +1705,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     MemOp opc = get_memop(lb->oi);
 
-    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
         return false;
     }
 
