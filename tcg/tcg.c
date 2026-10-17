@@ -240,6 +240,7 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 TCGContext tcg_init_ctx;
 bool tcg_tbpack;
 bool tcg_tblayout;
+bool tcg_bti = true;
 bool tcg_retstack;
 intptr_t tcg_retsp_off;
 int tcg_retstack_reg = -1;
