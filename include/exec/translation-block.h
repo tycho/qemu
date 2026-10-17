@@ -41,6 +41,7 @@ typedef ram_addr_t tb_page_addr_t;
 struct tb_tc {
     const void *ptr;    /* pointer to the translated code */
     size_t size;
+    const uint8_t *search;  /* the unwind data */
 };
 
 struct TranslationBlock {

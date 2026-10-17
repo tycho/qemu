@@ -673,6 +673,7 @@ static inline bool tcg_op_buf_full(void)
 QEMU_RET_ARG_NONNULL void *tcg_malloc_internal(TCGContext *s, int size);
 QEMU_ARG_NONNULL void tcg_pool_reset(TCGContext *s);
 QEMU_ARG_NONNULL TranslationBlock *tcg_tb_alloc(TCGContext *s);
+void *tcg_tb_data_highwater(TCGContext *s);
 
 void tcg_region_reset_all(void);
 
