@@ -2816,6 +2816,10 @@ void tcg_gen_push_ret_done(void)
 {
     if (tcg_ctx->call_land && !tcg_ctx->call_ret_set) {
         gen_set_label(tcg_ctx->call_ret);
+        /* A return lands with the boundary globals in their registers. */
+        if (tcg_ctx->boundary_in) {
+            tcg_gen_boundary_in();
+        }
     }
     tcg_ctx->call_land = NULL;
 }
@@ -2852,6 +2856,16 @@ void tcg_gen_goto_tb_dead(unsigned idx, unsigned exit_idx)
     plugin_gen_disable_mem_helpers();
     tcg_gen_op2(INDEX_op_goto_tb_dead, 0, idx, exit_idx);
     tcg_ctx->chain_dead_used = true;
+}
+
+void tcg_gen_boundary_in(void)
+{
+    TCGContext *s = tcg_ctx;
+
+    tcg_debug_assert(s->nb_boundary == 2);
+    tcg_gen_op2(INDEX_op_boundary_in, s->boundary[0]->base_type,
+                temp_arg(s->boundary[0]), temp_arg(s->boundary[1]));
+    s->boundary_in = true;
 }
 
 void tcg_gen_lookup_and_goto_ptr(void)
@@ -2892,6 +2906,10 @@ void tcg_gen_goto_ptr(TCGv_ptr ptr)
         if (!tcg_ctx->call_ret_set) {
             gen_set_label(tcg_ctx->call_ret);
             tcg_ctx->call_ret_set = true;
+            /* A return lands with the boundary globals in their registers. */
+            if (tcg_ctx->boundary_in) {
+                tcg_gen_boundary_in();
+            }
         }
         tcg_gen_br(tcg_ctx->call_land);
         return;

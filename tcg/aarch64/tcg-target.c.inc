@@ -1974,6 +1974,15 @@ static const TCGReg tcg_target_pin_regs[TCG_TARGET_NB_PIN_REGS] = {
 };
 
 /*
+ * Registers for boundary globals (tcg_boundary_global_add): two argument
+ * registers, which the allocator uses between TB boundaries as before.
+ */
+#define TCG_TARGET_NB_BOUNDARY_REGS 2
+static const TCGReg tcg_target_boundary_regs[TCG_TARGET_NB_BOUNDARY_REGS] = {
+    TCG_REG_X6, TCG_REG_X7,
+};
+
+/*
  * Vector registers for pinned V128 globals: v8-v23, the ones Arm's vector
  * PCS preserves whole, leaving v0-v7 and v24-v31 to the allocator.  Only
  * with tcg_vregs_all, whose prologue keeps the caller's d8-d15.
@@ -5708,6 +5717,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
         tcg_out_ld(s, TCG_TYPE_I64, tcg_retstack_reg, TCG_AREG0,
                    tcg_retsp_off);
     }
+    tcg_out_boundary_ldst(s, true);
     tcg_out_insn(s, bcond_reg, BR, tcg_target_call_iarg_regs[1]);
 
     /*
@@ -5726,6 +5736,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
         tcg_out_st(s, TCG_TYPE_I64, tcg_retstack_reg, TCG_AREG0,
                    tcg_retsp_off);
     }
+    tcg_out_boundary_ldst(s, false);
 
     /* Remove TCG locals stack space.  */
     tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,

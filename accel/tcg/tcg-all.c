@@ -100,6 +100,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-pin", "on" },
         { "x-pinvec", "on" },
         { "x-pincc", "on" },
+        { "x-ccregs", "on" },
         { "x-lazyinc", "on" },
         { "x-flags", "dead" },
         { "x-repstr", "on" },
@@ -899,6 +900,16 @@ static void tcg_set_pincc(Object *obj, bool value, Error **errp)
     tcg_pin_cc = value;
 }
 
+static bool tcg_get_ccregs(Object *obj, Error **errp)
+{
+    return tcg_cc_regs;
+}
+
+static void tcg_set_ccregs(Object *obj, bool value, Error **errp)
+{
+    tcg_cc_regs = value;
+}
+
 static bool tcg_get_pinvec(Object *obj, Error **errp)
 {
     return tcg_pin_vec;
@@ -1168,6 +1179,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-bti",
         "Where the host has BTI, guard generated code with it (default); "
         "off: no landing pads and no guarded pages");
+    object_class_property_add_bool(oc, "x-ccregs", tcg_get_ccregs,
+                                   tcg_set_ccregs);
+    object_class_property_set_description(oc, "x-ccregs",
+        "With x-pin and x-regcache, keep the guest's condition-code "
+        "operands in host registers between TBs, where the host has "
+        "registers for them");
 }
 
 static const TypeInfo tcg_accel_type = {
