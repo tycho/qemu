@@ -301,6 +301,16 @@ static void tcg_set_tblayout(Object *obj, const char *value, Error **errp)
     }
 }
 
+static bool tcg_get_bti(Object *obj, Error **errp)
+{
+    return tcg_bti;
+}
+
+static void tcg_set_bti(Object *obj, bool value, Error **errp)
+{
+    tcg_bti = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -346,6 +356,11 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Where TB structs and the code of unlinked exits go: packed, with "
         "the code (default); split, out of the code stream, which leaves "
         "the code of TBs translated together side by side");
+
+    object_class_property_add_bool(oc, "x-bti", tcg_get_bti, tcg_set_bti);
+    object_class_property_set_description(oc, "x-bti",
+        "Where the host has BTI, guard generated code with it (default); "
+        "off: no landing pads and no guarded pages");
 }
 
 static const TypeInfo tcg_accel_type = {
