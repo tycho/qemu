@@ -295,6 +295,11 @@ typedef struct TCGTemp {
     unsigned int env_alias:1;
     /* A global held in a fixed host register across TBs (tcg_temp_pin). */
     unsigned int pinned:1;
+    /*
+     * 1 + its index in TCGContext.boundary (tcg_boundary_global_add), or
+     * 0: a global in a host register at every TB boundary.
+     */
+    unsigned int boundary:2;
 
     int64_t val;
     struct TCGTemp *mem_base;
@@ -404,6 +409,20 @@ struct TCGContext {
     int nb_pinned;
     int nb_pinned_vec;          /* of them, vector globals */
     TCGTemp *pinned[64];
+    /*
+     * Boundary globals (tcg_boundary_global_add): in their host registers
+     * (tcg_target_boundary_regs), not in memory, wherever control passes
+     * between TBs or into the epilogue, and at labels; ordinary globals
+     * inside a TB.  boundary_in: this TB imports them (INDEX_op_boundary_in).
+     * boundary_undef: those the front end discarded since they were last
+     * written, which may hold anything.  boundary_check: the allocator is
+     * checking a boundary, where they may be dirty in their registers.
+     */
+    TCGTemp *boundary[2];
+    int nb_boundary;
+    bool boundary_in;
+    bool boundary_check;
+    unsigned boundary_undef;
     TCGRegSet ldst_save_regs;   /* for the next guest access label */
     TCGLdstWriteback *ldst_wb;  /* likewise, tcg_lazysync */
     unsigned ldst_nb_wb;
@@ -520,6 +539,7 @@ static inline bool temp_writable(TCGTemp *ts)
  * it.
  */
 bool tcg_temp_pin(TCGTemp *ts);
+bool tcg_boundary_global_add(TCGTemp *ts);
 
 /*
  * tcg_pinned_unwind: after a host signal in generated code, store the

@@ -3835,6 +3835,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
 
     tcg_out_mov(s, TCG_TYPE_PTR, TCG_AREG0, tcg_target_call_iarg_regs[0]);
     tcg_out_pinned_ld(s);
+    tcg_out_boundary_ldst(s, true);
     tcg_out_insn(s, bcond_reg, BR, tcg_target_call_iarg_regs[1]);
 
     /*
@@ -3849,6 +3850,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     tb_ret_addr = tcg_splitwx_to_rx(s->code_ptr);
     tcg_out_bti(s, BTI_J);
     tcg_out_pinned_st(s);
+    tcg_out_boundary_ldst(s, false);
 
     /* Remove TCG locals stack space.  */
     tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,
