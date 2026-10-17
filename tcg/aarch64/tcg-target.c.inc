@@ -1153,7 +1153,7 @@ static void tcg_out_bti(TCGContext *s, AArch64Insn insn)
      * While BTI insns are nops on hosts without FEAT_BTI,
      * there is no point in emitting them in that case either.
      */
-    if (cpuinfo & CPUINFO_BTI) {
+    if ((cpuinfo & CPUINFO_BTI) && tcg_bti) {
         tcg_out32(s, insn);
     }
 }

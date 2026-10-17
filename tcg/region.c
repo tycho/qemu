@@ -31,6 +31,7 @@
 #include "qemu/qtree.h"
 #include "qapi/error.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 #include "exec/translation-block.h"
 #include "tcg-internal.h"
 #include "host/cpuinfo.h"
@@ -98,7 +99,7 @@ bool in_code_gen_buffer(const void *p)
 static int host_prot_read_exec(void)
 {
 #if defined(CONFIG_LINUX) && defined(HOST_AARCH64) && defined(PROT_BTI)
-    if (cpuinfo & CPUINFO_BTI) {
+    if ((cpuinfo & CPUINFO_BTI) && tcg_bti) {
         return PROT_READ | PROT_EXEC | PROT_BTI;
     }
 #endif

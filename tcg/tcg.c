@@ -330,6 +330,7 @@ unsigned tcg_superblock;
 unsigned tcg_units;
 bool tcg_tbpack;
 bool tcg_tblayout;
+bool tcg_bti = true;
 bool tcg_retstack;
 intptr_t tcg_retsp_off;
 int tcg_retstack_reg = -1;

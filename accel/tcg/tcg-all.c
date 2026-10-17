@@ -909,6 +909,16 @@ static void tcg_set_pinvec(Object *obj, bool value, Error **errp)
     tcg_pin_vec = value;
 }
 
+static bool tcg_get_bti(Object *obj, Error **errp)
+{
+    return tcg_bti;
+}
+
+static void tcg_set_bti(Object *obj, bool value, Error **errp)
+{
+    tcg_bti = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1153,6 +1163,11 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-pincc",
         "With x-pin, keep the guest's condition-code operation in a host "
         "register across TBs too, where the host has one to spare");
+
+    object_class_property_add_bool(oc, "x-bti", tcg_get_bti, tcg_set_bti);
+    object_class_property_set_description(oc, "x-bti",
+        "Where the host has BTI, guard generated code with it (default); "
+        "off: no landing pads and no guarded pages");
 }
 
 static const TypeInfo tcg_accel_type = {
