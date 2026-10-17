@@ -121,6 +121,14 @@ bool tcg_chain_dead_read_since(TCGOp *after);
 void tcg_gen_goto_tb_dead(unsigned idx, unsigned exit_idx);
 
 /**
+ * tcg_gen_boundary_in() - the boundary globals arrive in their registers
+ *
+ * At the start of a TB (translator_loop), and where control returns into
+ * a TB from another one.
+ */
+void tcg_gen_boundary_in(void);
+
+/**
  * tcg_gen_lookup_and_goto_ptr() - look up the current TB, jump to it if valid
  * @addr: Guest address of the target TB
  *

@@ -1253,6 +1253,7 @@ static void tcg_out_pinned_st(TCGContext *s);
 static void tcg_out_pinned_ld(TCGContext *s);
 static void tcg_out_pinned_clobbered(TCGContext *s, bool store,
                                      unsigned flags);
+static void tcg_out_boundary_ldst(TCGContext *s, bool load);
 
 #include "tcg-target.c.inc"
 
@@ -1273,6 +1274,58 @@ static const TCGReg tcg_target_pin_regs[1];
 #define TCG_TARGET_NB_PIN_VREGS 0
 static const TCGReg tcg_target_pin_vregs[1];
 #endif
+#ifndef TCG_TARGET_NB_BOUNDARY_REGS
+#define TCG_TARGET_NB_BOUNDARY_REGS 0
+static const TCGReg tcg_target_boundary_regs[1];
+#endif
+
+/*
+ * Make @ts a boundary global: at every TB boundary it is in its host
+ * register, not in memory (TCGContext.boundary).  Only with tcg_pin_user,
+ * whose prologue and epilogue load and store it, and whose fault handling
+ * finds dirty globals in registers (tcg_lazysync).  False if the backend
+ * has no register for it.
+ */
+bool tcg_boundary_global_add(TCGTemp *ts)
+{
+    TCGContext *s = tcg_ctx;
+
+    if (tcg_use_softmmu || !tcg_pin_user || !tcg_lazysync_user ||
+        s->nb_boundary >= MIN(TCG_TARGET_NB_BOUNDARY_REGS,
+                              ARRAY_SIZE(s->boundary))) {
+        return false;
+    }
+    tcg_debug_assert(ts->kind == TEMP_GLOBAL && !ts->indirect_reg &&
+                     !ts->pinned && ts->mem_base->kind == TEMP_FIXED &&
+                     (ts->base_type == TCG_TYPE_I32 ||
+                      ts->base_type == TCG_TYPE_I64));
+    tcg_debug_assert(!tcg_regset_test_reg(s->reserved_regs,
+                     tcg_target_boundary_regs[s->nb_boundary]));
+    s->boundary[s->nb_boundary++] = ts;
+    ts->boundary = s->nb_boundary;
+    return true;
+}
+
+static TCGReg temp_boundary_reg(const TCGTemp *ts)
+{
+    return tcg_target_boundary_regs[ts->boundary - 1];
+}
+
+/* The prologue loads the boundary globals (@load), the epilogue stores. */
+static void tcg_out_boundary_ldst(TCGContext *s, bool load)
+{
+    for (int i = 0; i < s->nb_boundary; i++) {
+        TCGTemp *ts = s->boundary[i];
+
+        if (load) {
+            tcg_out_ld(s, ts->type, temp_boundary_reg(ts), ts->mem_base->reg,
+                       ts->mem_offset);
+        } else {
+            tcg_out_st(s, ts->type, temp_boundary_reg(ts), ts->mem_base->reg,
+                       ts->mem_offset);
+        }
+    }
+}
 
 bool tcg_temp_pin(TCGTemp *ts)
 {
@@ -2363,6 +2416,8 @@ void tcg_func_start(TCGContext *s)
     s->tso_run_emit = false;
     s->chain_dead_used = false;
     tcg_pool_reset(s);
+    s->boundary_in = false;
+    s->boundary_undef = 0;
     s->nb_temps = s->nb_globals;
 
     /* No temps have been previously allocated for size or locality.  */
@@ -4852,6 +4907,20 @@ static void la_func_end(TCGContext *s, int ng, int nt)
     }
 }
 
+/*
+ * liveness analysis: at a TB boundary, or a label with the classic
+ * contract, the boundary globals are live in their registers.
+ */
+static void la_boundary_live(TCGContext *s)
+{
+    for (int i = 0; i < s->nb_boundary; i++) {
+        TCGTemp *ts = s->boundary[i];
+
+        ts->state = 0;
+        *la_temp_pref(ts) = (TCGRegSet)1 << temp_boundary_reg(ts);
+    }
+}
+
 /* liveness analysis: end of basic block: all temps are dead, globals
    and local temps should be in memory. */
 static void la_bb_end(TCGContext *s, int ng, int nt)
@@ -5320,7 +5389,7 @@ static bool xblk_classify(TCGContext *s)
         }
     }
     /* goto_tb_dead: each side of a branch stores what it exits with. */
-    any |= s->chain_dead_used;
+    any |= s->chain_dead_used || s->boundary_in;
     if (!any) {
         return false;
     }
@@ -5329,7 +5398,7 @@ static bool xblk_classify(TCGContext *s)
             continue;
         }
         if (l->xbranch && l->xseen && !l->loop && l->xfwd && !l->xfalls
-            && (s->xblk_region || s->chain_dead_used
+            && (s->xblk_region || s->chain_dead_used || s->boundary_in
                 || xblk_reaches_loop(l->xset)
                 || (op_falls_through(l->xbranch)
                     && xblk_reaches_loop(l->xbranch)))) {
@@ -5528,6 +5597,9 @@ static bool la_xblk_branch(TCGContext *s, TCGOp *op, int nt, bool cond)
     if (!cond && l->xkind == XLBL_LOOP && l->xbranch == op
         && s->xblk_pass == 2 && l->nb_loopregs) {
         la_loopback(s, l, nt);
+        if (s->boundary_in) {
+            la_boundary_live(s);
+        }
         return true;
     }
     return false;
@@ -5767,11 +5839,20 @@ static void xblk_region_homes(TCGContext *s)
     for (int k = 0; k < ARRAY_SIZE(tcg_target_reg_alloc_order); k++) {
         vec_budget += tcg_regset_test_reg(vregs, tcg_target_reg_alloc_order[k]);
     }
+    /* The boundary globals are homes in their own registers. */
+    for (int i = 0; s->boundary_in && i < s->nb_boundary; i++) {
+        TCGTemp *ts = s->boundary[i];
+
+        tcg_regset_set_reg(taken, temp_boundary_reg(ts));
+        s->xblk_home[temp_idx(ts)] = temp_boundary_reg(ts);
+        s->region_home[n++] = ts;
+        nint++;
+    }
     for (int o = 0; o < nord && n < ARRAY_SIZE(s->region_home); o++) {
         TCGTemp *ts = &s->temps[order[o]];
         TCGRegSet ok;
 
-        if (ts->kind != TEMP_GLOBAL || ts->indirect_reg) {
+        if (ts->kind != TEMP_GLOBAL || ts->indirect_reg || ts->boundary) {
             continue;
         }
         switch (ts->type) {
@@ -5914,13 +5995,14 @@ static bool xblk_select_loops(TCGContext *s)
             TCGTemp *ts = &s->temps[i];
 
             if (ts->kind != TEMP_GLOBAL || ts->indirect_reg || !used[i]
-                || (l->live_in[i] & TS_DEAD)) {
+                || (l->live_in[i] & TS_DEAD) || ts->boundary) {
                 continue;
             }
             switch (ts->type) {
             case TCG_TYPE_I32:
             case TCG_TYPE_I64:
-                if (nint++ >= 10) {
+                /* With boundary globals, a register left for the moves. */
+                if (nint++ >= (s->boundary_in ? 5 : 10)) {
                     continue;
                 }
                 break;
@@ -5943,6 +6025,9 @@ static bool xblk_select_loops(TCGContext *s)
          * liveness can steer the loop's new values into it.
          */
         taken = s->reserved_regs;
+        for (int i = 0; s->boundary_in && i < s->nb_boundary; i++) {
+            tcg_regset_set_reg(taken, temp_boundary_reg(s->boundary[i]));
+        }
         nr = 0;
         for (int i = 0; i < l->nb_loopregs; i++) {
             TCGRegSet ok = tcg_target_available_regs[lr[i].ts->type] & ~taken;
@@ -6036,6 +6121,7 @@ bool tcg_pin;
 bool tcg_pin_user;
 bool tcg_pin_vec;
 bool tcg_pin_cc;
+bool tcg_cc_regs;
 
 static bool op_lazysync(TCGOpcode opc)
 {
@@ -6363,6 +6449,20 @@ liveness_pass_1(TCGContext *s)
             assert_carry_dead(s);
             la_chain_dead(s, nb_globals);
             break;
+        case INDEX_op_boundary_in:
+            /* Defines the boundary globals; never removed. */
+            for (int k = 0; k < 2; k++) {
+                ts = arg_temp(op->args[k]);
+                if (ts->state & TS_DEAD) {
+                    arg_life |= DEAD_ARG << k;
+                }
+                if (ts->state & TS_MEM) {
+                    arg_life |= SYNC_ARG << k;
+                }
+                ts->state = TS_DEAD;
+                la_reset_pref(ts);
+            }
+            break;
         case INDEX_op_discard:
             /* mark the temporary as dead */
             ts = arg_temp(op->args[0]);
@@ -6527,10 +6627,16 @@ liveness_pass_1(TCGContext *s)
             if (def->flags & TCG_OPF_BB_EXIT) {
                 assert_carry_dead(s);
                 la_func_end(s, nb_globals, nb_temps);
+                if (s->boundary_in) {
+                    la_boundary_live(s);
+                }
             } else if (def->flags & TCG_OPF_COND_BRANCH) {
                 assert_carry_dead(s);
                 if (!la_xblk_branch(s, op, nb_temps, true)) {
                     la_bb_sync(s, nb_globals, nb_temps);
+                    if (s->boundary_in) {
+                        la_boundary_live(s);
+                    }
                 }
             } else if (def->flags & TCG_OPF_BB_END) {
                 assert_carry_dead(s);
@@ -6538,11 +6644,19 @@ liveness_pass_1(TCGContext *s)
                     ? !la_xblk_label(s, op, nb_temps)
                     : !la_xblk_branch(s, op, nb_temps, false)) {
                     la_bb_end(s, nb_globals, nb_temps);
+                    if (s->boundary_in) {
+                        la_boundary_live(s);
+                    }
                 }
             } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
                 assert_carry_dead(s);
                 if (op_lazysync(opc)) {
                     la_global_live(s, nb_globals, op, nb_oargs);
+                } else if (s->boundary_in && opc == INDEX_op_push_ret) {
+                    /*
+                     * A return-stack push shows no guest state; the call
+                     * after it leaves with the boundary globals in place.
+                     */
                 } else {
                     la_global_sync(s, nb_globals);
                 }
@@ -7273,7 +7387,8 @@ static void temp_save(TCGContext *s, TCGTemp *ts, TCGRegSet allocated_regs)
 {
     /* The liveness analysis already ensures that globals are back
        in memory. Keep an tcg_debug_assert for safety. */
-    tcg_debug_assert(ts->val_type == TEMP_VAL_MEM || temp_readonly(ts));
+    tcg_debug_assert(ts->val_type == TEMP_VAL_MEM || temp_readonly(ts) ||
+                     (s->boundary_check && ts->boundary));
 }
 
 /* save globals to their canonical location and assume they can be
@@ -7299,7 +7414,8 @@ static void sync_globals(TCGContext *s, TCGRegSet allocated_regs)
         TCGTemp *ts = &s->temps[i];
         tcg_debug_assert(ts->val_type != TEMP_VAL_REG
                          || ts->kind == TEMP_FIXED
-                         || ts->mem_coherent);
+                         || ts->mem_coherent
+                         || (s->boundary_check && ts->boundary));
     }
 }
 
@@ -7375,6 +7491,152 @@ static void ldst_note_save_regs(TCGContext *s, TCGRegSet clobber)
     }
 }
 
+/*
+ * The boundary globals arrive in their registers (INDEX_op_boundary_in):
+ * forget where the allocator had them, then install them there.
+ */
+static void tcg_reg_alloc_boundary_in(TCGContext *s, const TCGOp *op)
+{
+    TCGLifeData arg_life = op->life;
+
+    for (int i = 0; i < 2; i++) {
+        TCGTemp *ts = arg_temp(op->args[i]);
+
+        if (ts->val_type == TEMP_VAL_REG) {
+            s->reg_to_temp[ts->reg] = NULL;
+        }
+        ts->val_type = TEMP_VAL_MEM;
+    }
+    for (int i = 0; i < 2; i++) {
+        TCGTemp *ts = arg_temp(op->args[i]);
+        TCGReg reg = temp_boundary_reg(ts);
+
+        if (s->reg_to_temp[reg]) {
+            tcg_reg_free(s, reg, s->reserved_regs);
+        }
+        set_temp_val_reg(s, ts, reg);
+        ts->mem_coherent = 0;
+    }
+    for (int i = 0; i < 2; i++) {
+        TCGTemp *ts = arg_temp(op->args[i]);
+        unsigned bit = 1u << (ts->boundary - 1);
+
+        s->boundary_undef &= ~bit;
+        if (NEED_SYNC_ARG(i)) {
+            temp_sync(s, ts, s->reserved_regs, 0, 0);
+        }
+        if (IS_DEAD_ARG(i)) {
+            temp_dead(s, ts);
+            s->boundary_undef |= bit;
+        }
+    }
+}
+
+/*
+ * Before a TB boundary, or a branch to (or fall-through into) a label with
+ * the classic contract: each boundary global in its register, unless the
+ * front end discarded it (then any value will do).
+ */
+static void tcg_reg_alloc_boundary_place(TCGContext *s)
+{
+    TCGRegSet targets = 0;
+
+    for (int i = 0; i < s->nb_boundary; i++) {
+        tcg_regset_set_reg(targets, temp_boundary_reg(s->boundary[i]));
+    }
+    /* Out of another one's register first. */
+    for (int i = 0; i < s->nb_boundary; i++) {
+        TCGTemp *ts = s->boundary[i];
+
+        if (ts->val_type == TEMP_VAL_REG && ts->reg != temp_boundary_reg(ts)
+            && tcg_regset_test_reg(targets, ts->reg)) {
+            TCGReg r = tcg_reg_alloc(s, tcg_target_available_regs[ts->type],
+                                     s->reserved_regs | targets, 0, false);
+
+            tcg_out_mov(s, ts->type, r, ts->reg);
+            set_temp_val_reg(s, ts, r);
+        }
+    }
+    for (int i = 0; i < s->nb_boundary; i++) {
+        TCGTemp *ts = s->boundary[i];
+        TCGReg reg = temp_boundary_reg(ts);
+
+        if (ts->val_type == TEMP_VAL_REG && ts->reg == reg) {
+            continue;
+        }
+        if (ts->val_type == TEMP_VAL_MEM && (s->boundary_undef & (1u << i))) {
+            continue;
+        }
+        if (s->reg_to_temp[reg]) {
+            tcg_reg_free(s, reg, s->reserved_regs | targets);
+        }
+        if (ts->val_type == TEMP_VAL_REG) {
+            tcg_out_mov(s, ts->type, reg, ts->reg);
+            set_temp_val_reg(s, ts, reg);
+        } else {
+            temp_load(s, ts, (TCGRegSet)1 << reg, s->reserved_regs, 0);
+        }
+    }
+}
+
+/*
+ * A boundary global discarded by the front end is defined again by an
+ * op's output, or by a helper or a host store that may write its memory.
+ */
+static void tcg_boundary_undef_update(TCGContext *s, TCGOp *op)
+{
+    TCGOpcode opc = op->opc;
+    int nb_oargs;
+
+    if (opc == INDEX_op_discard) {
+        return;
+    }
+    if (opc == INDEX_op_call) {
+        if (!(tcg_call_flags(op) & TCG_CALL_NO_WRITE_GLOBALS)) {
+            s->boundary_undef = 0;
+            return;
+        }
+        nb_oargs = TCGOP_CALLO(op);
+    } else {
+        if ((tcg_op_defs[opc].flags & TCG_OPF_SIDE_EFFECTS) &&
+            !op_is_guest_access(opc)) {
+            s->boundary_undef = 0;
+            return;
+        }
+        nb_oargs = tcg_op_defs[opc].nb_oargs;
+    }
+    for (int i = 0; i < nb_oargs; i++) {
+        const TCGTemp *ts = arg_temp(op->args[i]);
+
+        if (ts->boundary) {
+            s->boundary_undef &= ~(1u << (ts->boundary - 1));
+        }
+    }
+}
+
+/* At a label with the classic contract: the boundary globals arrive. */
+static void tcg_reg_alloc_boundary_home(TCGContext *s)
+{
+    for (int i = 0; i < s->nb_boundary; i++) {
+        TCGTemp *ts = s->boundary[i];
+
+        if (ts->val_type == TEMP_VAL_REG) {
+            s->reg_to_temp[ts->reg] = NULL;
+        }
+        ts->val_type = TEMP_VAL_MEM;
+    }
+    for (int i = 0; i < s->nb_boundary; i++) {
+        TCGTemp *ts = s->boundary[i];
+        TCGReg reg = temp_boundary_reg(ts);
+
+        if (s->reg_to_temp[reg]) {
+            tcg_reg_free(s, reg, s->reserved_regs);
+        }
+        set_temp_val_reg(s, ts, reg);
+        ts->mem_coherent = 0;
+    }
+}
+
 /* at the end of a basic block, we assume all temporaries are dead and
    all globals are stored at their canonical location. */
 static void tcg_reg_alloc_bb_end(TCGContext *s, TCGRegSet allocated_regs)
@@ -7401,12 +7663,15 @@ static void tcg_reg_alloc_bb_end(TCGContext *s, TCGRegSet allocated_regs)
         }
     }
 
+    s->boundary_check = s->boundary_in;
     save_globals(s, allocated_regs);
+    s->boundary_check = false;
 }
 
 /* The allocator's state, kept at a branch for its label. */
 typedef struct XblkSnap {
     TCGTemp *reg_to_temp[TCG_TARGET_NB_REGS];
+    unsigned boundary_undef;
     struct {
         int64_t val;
         TCGTempVal val_type;
@@ -7420,6 +7685,7 @@ static XblkSnap *xblk_snap(TCGContext *s)
     XblkSnap *sn = tcg_malloc(sizeof(*sn) + s->nb_temps * sizeof(sn->t[0]));
 
     memcpy(sn->reg_to_temp, s->reg_to_temp, sizeof(sn->reg_to_temp));
+    sn->boundary_undef = s->boundary_undef;
     for (int k = 0; k < named_temps(s); k++) {
         int i = named_temp(s, k);
         TCGTemp *ts = &s->temps[i];
@@ -7435,6 +7701,7 @@ static XblkSnap *xblk_snap(TCGContext *s)
 static void xblk_restore(TCGContext *s, const XblkSnap *sn)
 {
     memcpy(s->reg_to_temp, sn->reg_to_temp, sizeof(sn->reg_to_temp));
+    s->boundary_undef = sn->boundary_undef;
     for (int k = 0; k < named_temps(s); k++) {
         int i = named_temp(s, k);
         TCGTemp *ts = &s->temps[i];
@@ -7728,7 +7995,9 @@ static void tcg_reg_alloc_cbranch(TCGContext *s, const TCGOp *op,
         /* Homes are in place (tcg_reg_alloc_op); the rest is in memory. */
         return;
     }
+    s->boundary_check = s->boundary_in;
     sync_globals(s, allocated_regs);
+    s->boundary_check = false;
 
     for (int i = s->nb_globals; i < s->nb_temps; i++) {
         TCGTemp *ts = &s->temps[i];
@@ -10584,6 +10853,28 @@ static void tb_layout_switch(TCGContext *s, bool cold, tcg_insn_unit **hot,
     s->lay_cold_now = cold;
 }
 
+/*
+ * Whether branch @op goes to a label with the classic contract, where the
+ * boundary globals must be in their registers: not one that inherits the
+ * allocator's state from @op, nor a region's (whose homes include them).
+ * A branch out of the TB (ret_tb) counts as one too.
+ */
+static bool boundary_classic_target(TCGContext *s, const TCGOp *op)
+{
+    TCGLabel *l = op_branch_label(op);
+
+    if (!l || !s->xblk) {
+        return true;
+    }
+    if (l->xkind == XLBL_REGION) {
+        return false;
+    }
+    if (l->xkind == XLBL_INHERIT && l->xbranch == op) {
+        return op->opc == INDEX_op_br ? !l->live_in : !l->ft_state;
+    }
+    return true;
+}
+
 int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 {
     int i, num_insns;
@@ -10593,6 +10884,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     void *hot_hw = NULL;
     TCGOp *cold_first = NULL;
     bool cold_seen = false, ft = true;
+    TCGTemp *ts;
+    /* The last op was a call, whose return lands at the label after it. */
+    bool after_call = false;
 
     if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP)
                  && qemu_log_in_addr_range(pc_start))) {
@@ -10832,19 +11126,37 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             }
             break;
         case INDEX_op_discard:
-            temp_dead(s, arg_temp(op->args[0]));
+            ts = arg_temp(op->args[0]);
+            if (ts->boundary) {
+                /* Not part of the front end's state: any value will do. */
+                s->boundary_undef |= 1u << (ts->boundary - 1);
+            }
+            temp_dead(s, ts);
             break;
         case INDEX_op_set_label:
             {
                 TCGLabel *l = arg_label(op->args[0]);
+                bool inherit = s->xblk && l->xkind == XLBL_INHERIT && l->snap;
+                bool region = s->xblk && l->xkind == XLBL_REGION;
 
-                if (s->xblk && l->xkind == XLBL_INHERIT && l->snap) {
+                /*
+                 * Fallen into, a classic label takes the boundary globals
+                 * in their registers; not after a call, whose return
+                 * lands here with them.  Their discard marks come with the
+                 * allocator's state of an inherited label.
+                 */
+                if (s->boundary_in && s->xblk_ft && !after_call &&
+                    !inherit && !region) {
+                    tcg_reg_alloc_boundary_place(s);
+                }
+                s->boundary_undef = 0;
+                if (inherit) {
                     xblk_restore(s, l->snap);
                     tcg_out_label(s, l);
                     xblk_obligations(s, l->live_in);
                     break;
                 }
-                if (s->xblk && l->xkind == XLBL_REGION) {
+                if (region) {
                     if (s->xblk_ft) {
                         xblk_region_place(s, l);
                     }
@@ -10853,6 +11165,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
                     break;
                 }
                 tcg_reg_alloc_bb_end(s, s->reserved_regs);
+                if (s->boundary_in) {
+                    tcg_reg_alloc_boundary_home(s);
+                }
                 if (s->xblk && l->xkind == XLBL_LOOP && l->nb_loopregs) {
                     xblk_loop_entry(s, l);
                 }
@@ -10873,15 +11188,24 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             assert_carry_dead(s);
             tcg_reg_alloc_call(s, op);
             break;
+        case INDEX_op_boundary_in:
+            tcg_reg_alloc_boundary_in(s, op);
+            break;
         case INDEX_op_exit_tb:
             if (s->chain_dead_used) {
                 tcg_reg_alloc_chain_store(s, true);
+            }
+            if (s->boundary_in) {
+                tcg_reg_alloc_boundary_place(s);
             }
             tcg_out_exit_tb(s, op->args[0]);
             break;
         case INDEX_op_goto_tb:
             if (s->chain_dead_used) {
                 tcg_reg_alloc_chain_store(s, true);
+            }
+            if (s->boundary_in) {
+                tcg_reg_alloc_boundary_place(s);
             }
             tcg_out_goto_tb(s, op->args[0]);
             break;
@@ -10902,6 +11226,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             if (s->chain_dead_used) {
                 tcg_reg_alloc_chain_store(s, true);
             }
+            if (s->boundary_in) {
+                tcg_reg_alloc_boundary_place(s);
+            }
             tcg_debug_assert(op->args[0] < ARRAY_SIZE(s->call_tb_reset));
             s->call_tb_reset[op->args[0]] = arg_label(op->args[1]);
             arg_label(op->args[1])->cold_slot = op->args[0] + 1;
@@ -10910,6 +11237,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 #endif
 #ifdef TCG_TARGET_HAS_RETSTACK
         case INDEX_op_call_tb:
+            if (s->boundary_in) {
+                tcg_reg_alloc_boundary_place(s);
+            }
             tcg_debug_assert(op->args[0] < ARRAY_SIZE(s->call_tb_reset));
             s->call_tb_reset[op->args[0]] = arg_label(op->args[1]);
 #ifdef TCG_TARGET_HAS_GOTO_TB_COLD
@@ -10924,12 +11254,24 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
                 TCGLabel *l = arg_label(op->args[0]);
                 bool x = s->xblk && l->xbranch == op;
 
+                if (s->boundary_in && boundary_classic_target(s, op)) {
+                    tcg_reg_alloc_boundary_place(s);
+                }
                 if (s->xblk && l->xkind == XLBL_REGION) {
                     xblk_region_place(s, l);
                 } else if (x && l->xkind == XLBL_INHERIT && l->live_in) {
                     l->snap = xblk_snap(s);
                 } else if (x && l->xkind == XLBL_LOOP && l->nb_loopregs) {
+                    /* The boundary globals' registers stay out of it. */
+                    TCGRegSet keep = s->reserved_regs;
+
+                    for (int k = 0; s->boundary_in && k < s->nb_boundary;
+                         k++) {
+                        tcg_regset_set_reg(s->reserved_regs,
+                                           temp_boundary_reg(s->boundary[k]));
+                    }
                     xblk_loop_back(s, l);
+                    s->reserved_regs = keep;
                 }
                 tcg_out_br(s, l);
                 if (s->xblk) {
@@ -10951,10 +11293,30 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             /* Note: in order to speed up the code, it would be much
                faster to have specialized register allocator functions for
                some common argument patterns */
+            if (s->boundary_in &&
+                ((tcg_op_defs[opc].flags & TCG_OPF_BB_EXIT) ||
+                 ((tcg_op_defs[opc].flags & TCG_OPF_COND_BRANCH) &&
+                  boundary_classic_target(s, op)))) {
+                /* In their registers, which the op mustn't take. */
+                TCGRegSet keep = s->reserved_regs;
+
+                tcg_reg_alloc_boundary_place(s);
+                for (int k = 0; k < s->nb_boundary; k++) {
+                    tcg_regset_set_reg(s->reserved_regs,
+                                       temp_boundary_reg(s->boundary[k]));
+                }
+                tcg_reg_alloc_op(s, op);
+                s->reserved_regs = keep;
+                break;
+            }
             tcg_reg_alloc_op(s, op);
             break;
         }
         s->xblk_ft = op_falls_through(op);
+        after_call = opc == INDEX_op_call_tb || opc == INDEX_op_call_ptr;
+        if (s->boundary_undef) {
+            tcg_boundary_undef_update(s, op);
+        }
         /* Test for (pending) buffer overflow.  The assumption is that any
            one operation beginning below the high water mark cannot overrun
            the buffer completely.  Thus we can test for overflow after
