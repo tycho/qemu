@@ -10584,8 +10584,10 @@ static GHashTable *narrow32_walk(TCGContext *s)
 /*
  * A 32-bit extension t = ext(x) whose value dies at a following I32 op,
  * which reads only t's low 32 bits: that op reads x instead, if the ops
- * in between (at most NARROW32_WINDOW; no label, call or branch) neither
- * touch t nor write x.
+ * in between (at most NARROW32_WINDOW; no label, call or branch) touch
+ * neither t nor x.  An op in between that reads x may be where x dies
+ * (x86 imul r, r: two extensions of the register the product replaces):
+ * x read after that would be gone, from a register freed there.
  */
 #define NARROW32_WINDOW 4
 
@@ -10644,7 +10646,7 @@ static void narrow32_bypass(TCGContext *s)
             if (narrow32_reads(u, t)) {
                 break;
             }
-            if (narrow32_writes(u, x)) {
+            if (narrow32_writes(u, x) || narrow32_reads(u, x)) {
                 u = NULL;
                 break;
             }
