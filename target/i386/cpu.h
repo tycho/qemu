@@ -2350,6 +2350,14 @@ typedef struct CPUArchState {
 
     /* Bitmap of available CPU topology levels for this CPU. */
     DECLARE_BITMAP(avail_cpu_topo, CPU_TOPOLOGY_LEVEL__MAX);
+
+    /*
+     * TCG's synthetic timers: next expiry, queued expiration messages
+     * (reset by x86_tcg_hyperv_reset)
+     */
+    uint64_t hv_stimer_expiry[HV_STIMER_COUNT];
+    uint64_t hv_stimer_msg_exp[HV_STIMER_COUNT];
+    uint8_t hv_stimer_msg_sint[HV_STIMER_COUNT]; /* the SINT + 1, or 0 */
 } CPUX86State;
 
 /**
@@ -2547,6 +2555,7 @@ struct ArchCPU {
     int32_t hv_max_vps;
 
     bool xen_vapic;
+    bool hv_stimer_attached; /* TCG's synthetic timers use the APIC's */
 };
 
 typedef struct X86CPUModel X86CPUModel;
@@ -3078,9 +3087,15 @@ static inline bool hyperv_feat_enabled(X86CPU *cpu, int feat)
 #define TCG_HYPERV_FEATURES (BIT(HYPERV_FEAT_RELAXED) | \
                              BIT(HYPERV_FEAT_VPINDEX) | \
                              BIT(HYPERV_FEAT_TIME) | \
-                             BIT(HYPERV_FEAT_FREQUENCIES))
+                             BIT(HYPERV_FEAT_FREQUENCIES) | \
+                             TCG_HYPERV_TIMER_FEATURES)
+/* ... with x-hvtimers */
+#define TCG_HYPERV_TIMER_FEATURES (BIT(HYPERV_FEAT_SYNIC) | \
+                                   BIT(HYPERV_FEAT_STIMER) | \
+                                   BIT(HYPERV_FEAT_STIMER_DIRECT))
 
 bool x86_tcg_hyperv(X86CPU *cpu);
+void x86_tcg_hyperv_reset(X86CPU *cpu);
 
 static inline uint64_t cr4_reserved_bits(CPUX86State *env)
 {

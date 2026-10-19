@@ -8685,11 +8685,24 @@ static void x86_tcg_hyperv_cpuid(X86CPU *cpu, uint32_t index,
             *eax |= HV_ACCESS_FREQUENCY_MSRS;
             *edx |= HV_FREQUENCY_MSRS_AVAILABLE;
         }
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_SYNIC)) {
+            *eax |= HV_SYNIC_AVAILABLE;
+        }
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_STIMER)) {
+            *eax |= HV_SYNTIMERS_AVAILABLE;
+        }
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_STIMER_DIRECT)) {
+            *edx |= HV_STIMER_DIRECT_MODE_AVAILABLE;
+        }
         *edx |= HV_CPU_DYNAMIC_PARTITIONING_AVAILABLE;
         break;
     case HV_CPUID_ENLIGHTMENT_INFO:
         if (hyperv_feat_enabled(cpu, HYPERV_FEAT_RELAXED)) {
             *eax |= HV_RELAXED_TIMING_RECOMMENDED;
+        }
+        if (hyperv_feat_enabled(cpu, HYPERV_FEAT_SYNIC)) {
+            /* SINTs are EOIed as usual: TCG has no AutoEOI */
+            *eax |= HV_DEPRECATING_AEOI_RECOMMENDED;
         }
         *ebx = cpu->hyperv_spinlock_attempts;
         break;
@@ -9697,6 +9710,12 @@ static void x86_cpu_reset_hold(Object *obj, ResetType type)
     if (kvm_enabled()) {
         kvm_arch_reset_vcpu(cpu);
     }
+
+#ifdef CONFIG_TCG
+    if (tcg_enabled()) {
+        x86_tcg_hyperv_reset(cpu);
+    }
+#endif
 
     x86_cpu_set_sgxlepubkeyhash(env);
 
