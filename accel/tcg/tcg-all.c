@@ -130,8 +130,12 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-tlb-grow", "1" },
         { "x-pause", "hint" },
         { "x-cr3-flush", "nonglobal" },
+        { "x-haltpoll", "50" },
+        { "x-apictimer", "auto" },
+        { "x-apicpost", "auto" },
 #ifdef CONFIG_DARWIN
         { "x-jitwx", "lazy" },
+        { "x-hostpoll", "kqueue" },
 #endif
     };
 
