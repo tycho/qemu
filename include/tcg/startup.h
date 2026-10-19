@@ -453,6 +453,16 @@ extern bool tcg_alignfold;
 extern bool tcg_repstr;
 
 /*
+ * x86 guests: TCG implements the Hyper-V interface for the enlightenments
+ * it supports (hv-* CPU properties), and turns them on by default.  Needs
+ * tcg_tsc_counter.
+ */
+extern bool tcg_hyperv;
+
+/* tcg_hyperv: also the SynIC and synthetic timers (hv-synic, hv-stimer). */
+extern bool tcg_hvtimers;
+
+/*
  * tcg_vexzero: x86 VEX.128 writes leave the upper half of their ymm
  * register pending zero until the state is next visible, so that a block
  * zeroes each register's upper half once.

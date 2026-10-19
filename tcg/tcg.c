@@ -347,6 +347,8 @@ bool tcg_pcid;
 bool tcg_lean;
 bool tcg_alignfold;
 bool tcg_repstr;
+bool tcg_hyperv;
+bool tcg_hvtimers;
 bool tcg_vexzero;
 bool tcg_crypto;
 __thread TCGContext *tcg_ctx;

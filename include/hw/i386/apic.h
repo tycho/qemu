@@ -18,6 +18,10 @@ uint8_t cpu_get_apic_tpr(APICCommonState *s);
 void apic_init_reset(APICCommonState *s);
 void apic_sipi(APICCommonState *s);
 void apic_poll_irq(APICCommonState *s);
+void apic_set_local_irq(APICCommonState *s, int vector);
+void apic_xtimer_init(APICCommonState *s, void (*cb)(void *),
+                      void (*eoi)(void *), void *opaque);
+void apic_xtimer_mod(APICCommonState *s, int64_t deadline);
 void apic_designate_bsp(APICCommonState *s, bool bsp);
 int apic_get_highest_priority_irr(APICCommonState *s);
 int apic_msr_read(APICCommonState *s, int index, uint64_t *val);
