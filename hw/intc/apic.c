@@ -44,6 +44,12 @@
 #define SYNC_ISR_IRR_TO_VAPIC           0x4
 
 static APICCommonState **local_apics;
+/*
+ * An xAPIC ID differs from its initial one: x-posted resolves physical
+ * destinations under the BQL from then on (the IDs it reads without the
+ * BQL are fixed until then).
+ */
+static bool apic_ids_moved;
 static uint32_t max_apics;
 static uint32_t max_apic_words;
 
@@ -470,8 +476,152 @@ static void apic_update_irq(APICCommonState *s)
 
 static void apic_timer(void *opaque);
 
+/*
+ * x-posted: fixed, edge-triggered IPIs written to the x2APIC ICR or
+ * SELF_IPI register, for a physical unicast destination or a shorthand,
+ * are posted without the BQL.  The sender sets the vector in the target's
+ * pir with a sequentially consistent RMW (ordering the sender's earlier
+ * guest stores before it), raises CPU_INTERRUPT_POLL and asks the target
+ * to leave generated code; the target's POLL pass, under the BQL, moves
+ * pir into IRR (apic_pir_drain), from where it is delivered as any other
+ * edge interrupt.  The target clears POLL before it drains, so a post
+ * that lands after the drain raises it again.
+ *
+ * A halted target is woken under the BQL (apic_kick_locked): the sender
+ * raises POLL, then, after a full barrier, reads halted and halt_polling;
+ * the target stores them, then, after a full barrier, checks for work.
+ * One of the two sees the other's store.
+ *
+ * Logical and broadcast destinations, other delivery modes and level
+ * interrupts take the BQL path, as do all destinations once the guest
+ * changes an xAPIC ID (apic_ids_moved).  An unplugged APIC is freed after
+ * an RCU grace period (apic_unrealize): senders hold no lock.
+ */
+static bool apic_match_dest(APICCommonState *apic, uint32_t dest);
+
+static void apic_pir_drain(APICCommonState *s)
+{
+    for (int w = 0; w < ARRAY_SIZE(s->pir); w++) {
+        uint64_t bits;
+
+        if (!qatomic_read(&s->pir[w])) {
+            continue;
+        }
+        bits = qatomic_xchg(&s->pir[w], 0);
+        while (bits) {
+            int vec = w * 64 + ctz64(bits);
+
+            bits &= bits - 1;
+            /* as apic_set_irq's edge delivery */
+            apic_set_bit(s->irr, vec);
+            apic_reset_bit(s->tmr, vec);
+        }
+    }
+}
+
+static void apic_kick_locked(APICCommonState *s);
+
+/* Post @vec to @t; @self: the sender is @t's own vCPU. */
+static void apic_post(APICCommonState *t, int vec, bool self)
+{
+    CPUState *cs = CPU(t->cpu);
+
+    qatomic_fetch_or(&t->pir[vec >> 6], 1ULL << (vec & 63));
+    cpu_set_interrupt(cs, CPU_INTERRUPT_POLL);
+    qatomic_store_release(&cs->neg.icount_decr.u16.high, -1);
+    if (self) {
+        return;
+    }
+    smp_mb(); /* the request before halted: the vCPU orders the reverse */
+    if (qatomic_read(&cs->halted) && !qatomic_read(&cs->halt_polling)) {
+        apic_kick_locked(t);
+    }
+}
+
+/* An ICR write by @s's own vCPU, without the BQL: true if posted. */
+static bool apic_icr_post(APICCommonState *s, uint32_t lo, uint32_t dest)
+{
+    int vec = lo & 0xff, mode = (lo >> 8) & 7, shorthand = (lo >> 18) & 3;
+    APICCommonState *apic_iter;
+
+    if (!s->posted || s->vapic_paddr || mode != APIC_DM_FIXED ||
+        (lo & (1 << 15)) || vec < 16) {
+        return false;
+    }
+    switch (shorthand) {
+    case 1:
+        apic_post(s, vec, true);
+        return true;
+    case 2:
+    case 3:
+        for (int i = 0; i < max_apic_words * 32; i++) {
+            apic_iter = qatomic_read(&local_apics[i]);
+            if (apic_iter && !(shorthand == 3 && apic_iter == s)) {
+                apic_post(apic_iter, vec, apic_iter == s);
+            }
+        }
+        return true;
+    default:
+        if (lo & (1 << 11)) {
+            return false;   /* logical destination */
+        }
+        if (dest == (is_x2apic_mode(s) ? 0xffffffff : 0xff)) {
+            return false;   /* physical broadcast */
+        }
+        if (qatomic_read(&apic_ids_moved)) {
+            return false;   /* an xAPIC ID changed: resolve under the BQL */
+        }
+        {
+            /* every matching APIC, as apic_get_delivery_bitmask */
+            APICCommonState *match[64];
+            int n = 0;
+
+            for (int i = 0; i < max_apic_words * 32; i++) {
+                apic_iter = qatomic_read(&local_apics[i]);
+                if (apic_iter && apic_match_dest(apic_iter, dest)) {
+                    if (n == ARRAY_SIZE(match)) {
+                        return false;
+                    }
+                    match[n++] = apic_iter;
+                }
+            }
+            for (int i = 0; i < n; i++) {
+                apic_post(match[i], vec, match[i] == s);
+            }
+            return n > 0;
+        }
+    }
+}
+
+bool apic_msr_write_lockless(APICCommonState *s, int index, uint64_t val)
+{
+    if (!s || !s->posted || !is_x2apic_mode(s)) {
+        return false;
+    }
+    switch (index) {
+    case 0x30:
+        if (apic_icr_post(s, (uint32_t)val, val >> 32)) {
+            s->icr[0] = val;
+            s->icr[1] = val >> 32;
+            return true;
+        }
+        return false;
+    case 0x3f:
+        if ((val & 0xff) < 16) {
+            return false;
+        }
+        apic_post(s, val & 0xff, true);
+        return true;
+    default:
+        return false;
+    }
+}
+
 void apic_poll_irq(APICCommonState *s)
 {
+    if (s->posted) {
+        apic_pir_drain(s);
+    }
     /*
      * x-vcpu-timer: the deadline thread found an expiry; only a hint:
      * the timer may have been reprogrammed, cancelled or reset since it
@@ -901,6 +1051,11 @@ static int apic_register_read(APICCommonState *s, int index, uint64_t *value)
     uint32_t val;
     int ret = 0;
 
+    /* x-posted: posted vectors become visible in IRR, ISR and PPR here */
+    if (s->posted && (index == 0x0a || (index >= 0x10 && index <= 0x27))) {
+        apic_pir_drain(s);
+    }
+
     switch(index) {
     case 0x02: /* id */
         if (is_x2apic_mode(s)) {
@@ -1065,6 +1220,9 @@ static int apic_register_write(APICCommonState *s, int index, uint64_t val)
         }
 
         s->id = (val >> 24);
+        if (s->id != s->initial_apic_id) {
+            qatomic_set(&apic_ids_moved, true);
+        }
         break;
     case 0x03:
         break;
@@ -1224,6 +1382,9 @@ int apic_msr_write(APICCommonState *s, int index, uint64_t val)
 
 static void apic_pre_save(APICCommonState *s)
 {
+    if (s->posted) {
+        apic_pir_drain(s);
+    }
     apic_sync_vapic(s, SYNC_FROM_VAPIC);
 }
 
@@ -1280,11 +1441,11 @@ static void apic_realize(DeviceState *dev, Error **errp)
                            apic_vcpu_timer_thread, NULL,
                            QEMU_THREAD_DETACHED);
     }
-    if (s->vcpu_timer) {
+    if (s->vcpu_timer || s->posted) {
         /*
-         * The deadline thread reads this APIC and its CPU without the
-         * BQL, under RCU: keep both until apic_unrealize's grace period
-         * has passed.
+         * The deadline thread and posting vCPUs read this APIC and its CPU
+         * without the BQL, under RCU: keep both until apic_unrealize's
+         * grace period has passed.
          */
         object_ref(OBJECT(s));
         object_ref(OBJECT(s->cpu));
@@ -1321,7 +1482,7 @@ static void apic_unrealize(DeviceState *dev)
 
     timer_free(s->timer);
     qatomic_set(&local_apics[s->initial_apic_id], NULL);
-    if (s->vcpu_timer) {
+    if (s->vcpu_timer || s->posted) {
         APICPut *p = g_new(APICPut, 1);
 
         p->s = s;
@@ -1331,6 +1492,7 @@ static void apic_unrealize(DeviceState *dev)
 
 static const Property apic_properties[] = {
     DEFINE_PROP_BOOL("x-vcpu-timer", APICCommonState, vcpu_timer, false),
+    DEFINE_PROP_BOOL("x-posted", APICCommonState, posted, false),
 };
 
 static void apic_class_init(ObjectClass *klass, const void *data)
