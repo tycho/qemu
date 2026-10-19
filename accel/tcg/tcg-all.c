@@ -38,6 +38,7 @@
 #include "qemu/atomic.h"
 #include "qapi/qapi-types-common.h"
 #include "qapi/qapi-builtin-visit.h"
+#include "qapi/qapi-visit-common.h"
 #include "qemu/units.h"
 #include "qemu/target-info.h"
 #ifndef CONFIG_USER_ONLY
@@ -49,6 +50,8 @@
 #include "accel/accel-cpu-ops.h"
 #include "accel/tcg/cpu-ops.h"
 #include "internal-common.h"
+#include "qapi/visitor.h"
+#include "tcg-accel-ops-mttcg.h"
 
 
 struct TCGState {
@@ -62,6 +65,10 @@ struct TCGState {
     bool iofast;
     bool hosttime;
     bool pause_hint;
+    int hostpoll;
+    uint32_t haltpoll_us;
+    OnOffAuto apictimer;
+    OnOffAuto apicpost;
 };
 typedef struct TCGState TCGState;
 
@@ -143,6 +150,8 @@ static void tcg_accel_instance_init(Object *obj)
 #else
     s->splitwx_enabled = 0;
 #endif
+    s->apictimer = ON_OFF_AUTO_OFF;
+    s->apicpost = ON_OFF_AUTO_OFF;
     xtcg_fork_defaults(obj);
 }
 
@@ -209,6 +218,50 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     }
 
     qemu_add_vm_change_state_handler(tcg_vm_change_state, NULL);
+
+    /*
+     * x-apictimer: the x86 local APIC timer fires on its vCPU (from a
+     * deadline thread), not on the main loop.  x-apicpost: fixed edge
+     * IPIs are posted to their targets without the BQL.  Both need
+     * multi-threaded TCG without icount or record/replay; auto means on
+     * where they can be.  Compat properties, so an explicit -global
+     * still wins.
+     */
+    {
+        static GlobalProperty apictimer_props[] = {
+            { "apic", "x-vcpu-timer", "on" },
+        };
+        static GlobalProperty apicpost_props[] = {
+            { "apic", "x-posted", "on" },
+        };
+        AccelClass *ac = ACCEL_GET_CLASS(as);
+        bool can = s->mttcg_enabled == ON_OFF_AUTO_ON && !icount_enabled() &&
+                   replay_mode == REPLAY_MODE_NONE;
+
+        if (!can && (s->apictimer == ON_OFF_AUTO_ON ||
+                     s->apicpost == ON_OFF_AUTO_ON)) {
+            error_report("x-apictimer and x-apicpost need multi-threaded TCG "
+                         "without icount or record/replay");
+            return -EINVAL;
+        }
+        if (can && !ac->compat_props) {
+            ac->compat_props = g_ptr_array_new();
+        }
+        if (can && s->apictimer != ON_OFF_AUTO_OFF) {
+            compat_props_add(ac->compat_props, apictimer_props,
+                             G_N_ELEMENTS(apictimer_props));
+        }
+        if (can && s->apicpost != ON_OFF_AUTO_OFF) {
+            compat_props_add(ac->compat_props, apicpost_props,
+                             G_N_ELEMENTS(apicpost_props));
+        }
+    }
+
+    /* x-haltpoll: how long a halted vCPU spins before it sleeps */
+    mttcg_haltpoll_ns = (int64_t)s->haltpoll_us * 1000;
+
+    /* x-hostpoll: how the main loop waits for a timeout (no ppoll) */
+    qemu_host_poll = s->hostpoll;
 
     /*
      * x-iofast: TBs end after instructions known to do I/O; a TB ends to
@@ -309,6 +362,85 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #endif
 
     return 0;
+}
+
+static const char * const tcg_hostpoll_names[] = {
+    [QEMU_HOST_POLL_POLL] = "poll",
+    [QEMU_HOST_POLL_KQUEUE] = "kqueue",
+    [QEMU_HOST_POLL_SPIN] = "spin",
+};
+
+static char *tcg_get_hostpoll(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_hostpoll_names[TCG_STATE(obj)->hostpoll]);
+}
+
+static void tcg_set_hostpoll(Object *obj, const char *value, Error **errp)
+{
+    for (int i = 0; i < ARRAY_SIZE(tcg_hostpoll_names); i++) {
+        if (!strcmp(value, tcg_hostpoll_names[i])) {
+            if (i != QEMU_HOST_POLL_POLL && !QEMU_HOST_POLL_KQUEUE_SUPPORTED) {
+                error_setg(errp, "x-hostpoll: '%s' needs kqueue timers in "
+                           "nanoseconds, which this host lacks", value);
+                return;
+            }
+            TCG_STATE(obj)->hostpoll = i;
+            return;
+        }
+    }
+    error_setg(errp, "Invalid 'x-hostpoll' value: %s (poll, kqueue, spin)",
+               value);
+}
+
+static void tcg_get_haltpoll(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    uint32_t value = TCG_STATE(obj)->haltpoll_us;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void tcg_set_haltpoll(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value > 10000) {
+        error_setg(errp, "x-haltpoll: at most 10000 microseconds");
+        return;
+    }
+    TCG_STATE(obj)->haltpoll_us = value;
+}
+
+static void tcg_get_apicpost(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    OnOffAuto value = TCG_STATE(obj)->apicpost;
+
+    visit_type_OnOffAuto(v, name, &value, errp);
+}
+
+static void tcg_set_apicpost(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    visit_type_OnOffAuto(v, name, &TCG_STATE(obj)->apicpost, errp);
+}
+
+static void tcg_get_apictimer(Object *obj, Visitor *v, const char *name,
+                              void *opaque, Error **errp)
+{
+    OnOffAuto value = TCG_STATE(obj)->apictimer;
+
+    visit_type_OnOffAuto(v, name, &value, errp);
+}
+
+static void tcg_set_apictimer(Object *obj, Visitor *v, const char *name,
+                              void *opaque, Error **errp)
+{
+    visit_type_OnOffAuto(v, name, &TCG_STATE(obj)->apictimer, errp);
 }
 
 static char *tcg_get_thread(Object *obj, Error **errp)
@@ -1135,6 +1267,34 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "With x-pin and x-regcache, keep the guest's condition-code "
         "operands in host registers between TBs, where the host has "
         "registers for them");
+
+    object_class_property_add_str(oc, "x-hostpoll",
+                                  tcg_get_hostpoll, tcg_set_hostpoll);
+    object_class_property_set_description(oc, "x-hostpoll",
+        "how the main loop waits for its next timer on hosts without "
+        "ppoll: poll (milliseconds, rounded up), kqueue (a nanosecond "
+        "kqueue timer), spin (kqueue, waking early and polling until the "
+        "deadline)");
+
+    object_class_property_add(oc, "x-haltpoll", "uint32",
+                              tcg_get_haltpoll, tcg_set_haltpoll, NULL, NULL);
+    object_class_property_set_description(oc, "x-haltpoll",
+        "multi-threaded TCG: the longest a halted vCPU spins, watching for "
+        "an interrupt, before it sleeps (microseconds; 0, the default, "
+        "never spins); the spin adapts below it");
+
+    object_class_property_add(oc, "x-apicpost", "OnOffAuto",
+                              tcg_get_apicpost, tcg_set_apicpost, NULL, NULL);
+    object_class_property_set_description(oc, "x-apicpost",
+        "x86: fixed edge IPIs written to the ICR are posted to their "
+        "targets without the BQL (off, on, auto: on with multi-threaded "
+        "TCG, without icount or record/replay)");
+
+    object_class_property_add(oc, "x-apictimer", "OnOffAuto",
+                              tcg_get_apictimer, tcg_set_apictimer, NULL, NULL);
+    object_class_property_set_description(oc, "x-apictimer",
+        "x86: the local APIC timer fires on its vCPU, woken by a deadline "
+        "thread, instead of on the main loop (off, on, auto: as x-apicpost)");
 }
 
 static const TypeInfo tcg_accel_type = {
