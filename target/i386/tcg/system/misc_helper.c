@@ -324,8 +324,13 @@ void helper_wrmsr(CPUX86State *env)
             x86_tcg_hyperv_tsc_changed(env);
         }
         break;
-    default:
-        if (x86_tcg_hyperv_wrmsr(env, (uint32_t)env->regs[R_ECX], val)) {
+    default: {
+        int hv = x86_tcg_hyperv_wrmsr(env, (uint32_t)env->regs[R_ECX], val);
+
+        if (hv < 0) {
+            goto error;
+        }
+        if (hv) {
             break;
         }
         if ((uint32_t)env->regs[R_ECX] >= MSR_MC0_CTL
@@ -340,6 +345,7 @@ void helper_wrmsr(CPUX86State *env)
         }
         /* XXX: exception? */
         break;
+    }
     }
     return;
 error:
