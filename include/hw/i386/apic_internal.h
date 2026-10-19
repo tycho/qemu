@@ -201,7 +201,8 @@ struct APICCommonState {
     void (*xtimer_cb)(void *opaque);  /* ... in its POLL pass */
     void (*xtimer_eoi)(void *opaque); /* ... and after every EOI */
     void *xtimer_opaque;
-    QEMUTimer *xtimer;  /* its deadline */
+    QEMUTimer *xtimer;  /* its deadline, without x-vcpu-timer */
+    int64_t xdeadline;  /* ... with x-vcpu-timer, or INT64_MAX */
     int xdue;           /* ... has passed, for the vCPU to run xtimer_cb */
 };
 

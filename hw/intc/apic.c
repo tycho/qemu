@@ -678,11 +678,11 @@ static void apic_kick_locked(APICCommonState *s)
     bql_unlock();
 }
 
-static void apic_vcpu_timer_fire(APICCommonState *s)
+static void apic_vcpu_timer_fire(APICCommonState *s, int *due)
 {
     CPUState *cs = CPU(s->cpu);
 
-    qatomic_set(&s->timer_due, 1);
+    qatomic_set(due, 1);
     cpu_set_interrupt(cs, CPU_INTERRUPT_POLL);
     qatomic_store_release(&cs->neg.icount_decr.u16.high, -1);
     smp_mb(); /* the request before halted: the vCPU orders the reverse */
@@ -714,7 +714,16 @@ static void *apic_vcpu_timer_thread(void *opaque)
             d = qatomic_read(&s->vdeadline);
             if (d <= now) {
                 if (qatomic_cmpxchg(&s->vdeadline, d, INT64_MAX) == d) {
-                    apic_vcpu_timer_fire(s);
+                    apic_vcpu_timer_fire(s, &s->timer_due);
+                }
+            } else if (d < first) {
+                first = d;
+            }
+            /* and another timer device's deadline (apic_xtimer_mod) */
+            d = qatomic_read(&s->xdeadline);
+            if (d <= now) {
+                if (qatomic_cmpxchg(&s->xdeadline, d, INT64_MAX) == d) {
+                    apic_vcpu_timer_fire(s, &s->xdue);
                 }
             } else if (d < first) {
                 first = d;
@@ -768,15 +777,24 @@ void apic_xtimer_init(APICCommonState *s, void (*cb)(void *),
     s->xtimer_cb = cb;
     s->xtimer_eoi = eoi;
     s->xtimer_opaque = opaque;
-    if (!s->xtimer) {
+    if (!s->vcpu_timer && !s->xtimer) {
         s->xtimer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apic_xtimer_expired, s);
     }
 }
 
-/* @deadline on QEMU_CLOCK_VIRTUAL, or INT64_MAX for none.  BQL held. */
+/*
+ * @deadline on QEMU_CLOCK_VIRTUAL, or INT64_MAX for none.  BQL held.
+ * With x-vcpu-timer, the deadline thread wakes the vCPU, as for the APIC
+ * timer.
+ */
 void apic_xtimer_mod(APICCommonState *s, int64_t deadline)
 {
-    if (deadline == INT64_MAX) {
+    if (s->vcpu_timer) {
+        qatomic_set(&s->xdeadline, deadline);
+        if (deadline != INT64_MAX) {
+            event_notifier_set(&vcpu_timer_notifier);
+        }
+    } else if (deadline == INT64_MAX) {
         timer_del(s->xtimer);
     } else {
         timer_mod(s->xtimer, deadline);
@@ -1274,6 +1292,18 @@ static uint64_t apic_mem_read_locked(void *opaque, hwaddr addr,
     return val;
 }
 
+/*
+ * x-posted with x-lockless-tpr: the vCPU's own xAPIC ICR, as its x2APIC
+ * ICR MSRs: ICR reads and ICR2 writes take no lock (only the owner writes
+ * them), and ICR writes are posted where they can be.
+ */
+static bool apic_posted_mmio(APICCommonState *s, hwaddr addr, unsigned size)
+{
+    return s && s->posted && s->lockless_tpr && size >= 4 && addr <= 0xfff &&
+           !s->vapic_paddr && (s->apicbase & MSR_IA32_APICBASE_ENABLE) &&
+           !is_x2apic_mode(s);
+}
+
 static uint64_t apic_mem_read(void *opaque, hwaddr addr, unsigned size)
 {
     APICCommonState *s = cpu_get_current_apic();
@@ -1281,6 +1311,13 @@ static uint64_t apic_mem_read(void *opaque, hwaddr addr, unsigned size)
 
     if (apic_tpr_lockless(s, addr, size)) {
         return qatomic_read(&s->tpr);
+    }
+    if (apic_posted_mmio(s, addr, size)) {
+        int index = (addr >> 4) & 0xff;
+
+        if (index == 0x30 || index == 0x31) {
+            return s->icr[index & 1];
+        }
     }
     if (self->lockless_tpr) {
         BQL_LOCK_GUARD();
@@ -1495,6 +1532,18 @@ static void apic_mem_write(void *opaque, hwaddr addr, uint64_t val,
         apic_tpr_write_lockless(s, val);
         return;
     }
+    if (apic_posted_mmio(s, addr, size)) {
+        int index = (addr >> 4) & 0xff;
+
+        if (index == 0x31) {
+            s->icr[1] = val;
+            return;
+        }
+        if (index == 0x30 && apic_icr_post(s, val, (s->icr[1] >> 24) & 0xff)) {
+            s->icr[0] = val;
+            return;
+        }
+    }
     /* MSI writes come from any thread, with no APIC of their own. */
     if (self->lockless_tpr) {
         BQL_LOCK_GUARD();
@@ -1573,6 +1622,7 @@ static void apic_realize(DeviceState *dev, Error **errp)
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apic_timer, s);
     s->vdeadline = INT64_MAX;
+    s->xdeadline = INT64_MAX;
     if (s->vcpu_timer && !vcpu_timer_started) {
         vcpu_timer_started = true;
         event_notifier_init(&vcpu_timer_notifier, false);
