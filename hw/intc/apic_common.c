@@ -209,6 +209,8 @@ void apic_init_reset(APICCommonState *s)
         timer_del(s->timer);
     }
     s->timer_expiry = -1;
+    qatomic_set(&s->vdeadline, INT64_MAX);
+    qatomic_set(&s->timer_due, 0);
 
     info = APIC_COMMON_GET_CLASS(s);
     if (info->reset) {

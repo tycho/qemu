@@ -34,6 +34,10 @@
 #include "exec/cpu-common.h"
 #include "qapi/error.h"
 #include "qom/object.h"
+#include "hw/core/qdev-properties.h"
+#include "qemu/event_notifier.h"
+#include "qemu/timer.h"
+#include "system/runstate.h"
 
 #define SYNC_FROM_VAPIC                 0x1
 #define SYNC_TO_VAPIC                   0x2
@@ -464,10 +468,127 @@ static void apic_update_irq(APICCommonState *s)
     }
 }
 
+static void apic_timer(void *opaque);
+
 void apic_poll_irq(APICCommonState *s)
 {
+    /*
+     * x-vcpu-timer: the deadline thread found an expiry; only a hint:
+     * the timer may have been reprogrammed, cancelled or reset since it
+     * claimed it, so fire only a timer that is armed and due now.
+     */
+    if (s->vcpu_timer && qatomic_xchg(&s->timer_due, 0) &&
+        s->timer_expiry != -1 &&
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->next_time) {
+        apic_timer(s);
+    }
     apic_sync_vapic(s, SYNC_FROM_VAPIC);
     apic_update_irq(s);
+}
+
+/*
+ * x-vcpu-timer: the timer fires on the vCPU that owns it, not on the
+ * main loop.  Arming it records its expiry in vdeadline and pokes one
+ * deadline thread, which sleeps (qemu_poll_ns) until the earliest expiry
+ * of all vCPUs.  At an expiry it sets timer_due, raises
+ * CPU_INTERRUPT_POLL and asks the vCPU to leave generated code (without
+ * exit_request: no return to the vCPU's outer loop); the vCPU's POLL
+ * pass, under the BQL it takes itself, fires the timer (apic_timer):
+ * LVT delivery and rearming.  The main loop, and its BQL hand-off to the
+ * vCPU, are out of the path.
+ *
+ * A halted vCPU is woken under the BQL, as cpu_interrupt does: it checks
+ * for work and waits on halt_cond with the BQL held.  The thread sets
+ * POLL with a sequentially consistent RMW, then reads halted after a
+ * full barrier; the vCPU stores halted, and has a full barrier before it
+ * checks for work (mttcg_cpu_thread_fn): one of the two sees the other's
+ * store, so a vCPU that halts as its timer expires is woken either way.
+ */
+static EventNotifier vcpu_timer_notifier;
+static QemuThread vcpu_timer_thread;
+static bool vcpu_timer_started;
+
+/*
+ * Wake @s's halted vCPU, as cpu_interrupt does, under the BQL; not if the
+ * CPU was unplugged meanwhile (apic_unrealize, under the BQL, removes it
+ * from local_apics first).
+ */
+static void apic_kick_locked(APICCommonState *s)
+{
+    bql_lock();
+    if (qatomic_read(&local_apics[s->initial_apic_id]) == s) {
+        qemu_cpu_kick(CPU(s->cpu));
+    }
+    bql_unlock();
+}
+
+static void apic_vcpu_timer_fire(APICCommonState *s)
+{
+    CPUState *cs = CPU(s->cpu);
+
+    qatomic_set(&s->timer_due, 1);
+    cpu_set_interrupt(cs, CPU_INTERRUPT_POLL);
+    qatomic_store_release(&cs->neg.icount_decr.u16.high, -1);
+    smp_mb(); /* the request before halted: the vCPU orders the reverse */
+    if (qatomic_read(&cs->halted) && !qatomic_read(&cs->halt_polling)) {
+        apic_kick_locked(s);
+    }
+}
+
+static void *apic_vcpu_timer_thread(void *opaque)
+{
+    rcu_register_thread();
+    for (;;) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int64_t first = INT64_MAX, timeout;
+        GPollFD pfd = {
+            .fd = event_notifier_get_fd(&vcpu_timer_notifier),
+            .events = G_IO_IN,
+        };
+
+        /* the APICs stay allocated while we look (apic_unrealize) */
+        WITH_RCU_READ_LOCK_GUARD()
+        for (int i = 0; i < max_apic_words * 32; i++) {
+            APICCommonState *s = qatomic_read(&local_apics[i]);
+            int64_t d;
+
+            if (!s || !s->vcpu_timer) {
+                continue;
+            }
+            d = qatomic_read(&s->vdeadline);
+            if (d <= now) {
+                if (qatomic_cmpxchg(&s->vdeadline, d, INT64_MAX) == d) {
+                    apic_vcpu_timer_fire(s);
+                }
+            } else if (d < first) {
+                first = d;
+            }
+        }
+        timeout = first == INT64_MAX ? -1 : first - now;
+        if (!runstate_is_running()) {
+            /* the clock is stopped: wait for the VM to run (apic_vm_state) */
+            timeout = -1;
+        }
+        if (qemu_poll_ns(&pfd, 1, timeout) > 0) {
+            event_notifier_test_and_clear(&vcpu_timer_notifier);
+        }
+    }
+    return NULL;
+}
+
+static void apic_vm_state(void *opaque, bool running, RunState state)
+{
+    if (running) {
+        event_notifier_set(&vcpu_timer_notifier);
+    }
+}
+
+static void apic_vcpu_timer_arm(APICCommonState *s, int64_t deadline)
+{
+    qatomic_set(&s->vdeadline, deadline);
+    if (deadline != INT64_MAX) {
+        event_notifier_set(&vcpu_timer_notifier);
+    }
 }
 
 static void apic_set_irq(APICCommonState *s, int vector_num, int trigger_mode)
@@ -755,6 +876,11 @@ int apic_accept_pic_intr(APICCommonState *s)
 
 static void apic_timer_update(APICCommonState *s, int64_t current_time)
 {
+    if (s->vcpu_timer) {
+        apic_vcpu_timer_arm(s, apic_next_timer(s, current_time) ?
+                               s->next_time : INT64_MAX);
+        return;
+    }
     if (apic_next_timer(s, current_time)) {
         timer_mod(s->timer, s->next_time);
     } else {
@@ -1103,6 +1229,11 @@ static void apic_pre_save(APICCommonState *s)
 
 static void apic_post_load(APICCommonState *s)
 {
+    if (s->vcpu_timer) {
+        apic_vcpu_timer_arm(s, s->timer_expiry != -1 ? s->timer_expiry
+                                                    : INT64_MAX);
+        return;
+    }
     if (s->timer_expiry != -1) {
         timer_mod(s->timer, s->timer_expiry);
     } else {
@@ -1140,6 +1271,24 @@ static void apic_realize(DeviceState *dev, Error **errp)
     s->io_memory.disable_reentrancy_guard = true;
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apic_timer, s);
+    s->vdeadline = INT64_MAX;
+    if (s->vcpu_timer && !vcpu_timer_started) {
+        vcpu_timer_started = true;
+        event_notifier_init(&vcpu_timer_notifier, false);
+        qemu_add_vm_change_state_handler(apic_vm_state, NULL);
+        qemu_thread_create(&vcpu_timer_thread, "apic-timer",
+                           apic_vcpu_timer_thread, NULL,
+                           QEMU_THREAD_DETACHED);
+    }
+    if (s->vcpu_timer) {
+        /*
+         * The deadline thread reads this APIC and its CPU without the
+         * BQL, under RCU: keep both until apic_unrealize's grace period
+         * has passed.
+         */
+        object_ref(OBJECT(s));
+        object_ref(OBJECT(s->cpu));
+    }
 
     /*
      * The --machine none does not call apic_set_max_apic_id before creating
@@ -1154,18 +1303,42 @@ static void apic_realize(DeviceState *dev, Error **errp)
     msi_nonbroken = true;
 }
 
+typedef struct APICPut {
+    struct rcu_head rcu;
+    APICCommonState *s;
+} APICPut;
+
+static void apic_lockless_put(APICPut *p)
+{
+    object_unref(OBJECT(p->s->cpu));
+    object_unref(OBJECT(p->s));
+    g_free(p);
+}
+
 static void apic_unrealize(DeviceState *dev)
 {
     APICCommonState *s = APIC(dev);
 
     timer_free(s->timer);
-    local_apics[s->initial_apic_id] = NULL;
+    qatomic_set(&local_apics[s->initial_apic_id], NULL);
+    if (s->vcpu_timer) {
+        APICPut *p = g_new(APICPut, 1);
+
+        p->s = s;
+        call_rcu(p, apic_lockless_put, rcu);
+    }
 }
+
+static const Property apic_properties[] = {
+    DEFINE_PROP_BOOL("x-vcpu-timer", APICCommonState, vcpu_timer, false),
+};
 
 static void apic_class_init(ObjectClass *klass, const void *data)
 {
     APICCommonClass *k = APIC_COMMON_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
+    device_class_set_props(dc, apic_properties);
     k->realize = apic_realize;
     k->unrealize = apic_unrealize;
     k->set_base = apic_set_base;
