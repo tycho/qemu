@@ -466,8 +466,54 @@ static void apic_update_irq(APICCommonState *s)
 
 void apic_poll_irq(APICCommonState *s)
 {
+    /* only a hint: the timer device checks its own expiries */
+    if (qatomic_xchg(&s->xdue, 0) && s->xtimer_cb) {
+        s->xtimer_cb(s->xtimer_opaque);
+    }
     apic_sync_vapic(s, SYNC_FROM_VAPIC);
     apic_update_irq(s);
+}
+
+static void apic_xtimer_expired(void *opaque)
+{
+    APICCommonState *s = opaque;
+
+    qatomic_set(&s->xdue, 1);
+    cpu_interrupt(CPU(s->cpu), CPU_INTERRUPT_POLL);
+}
+
+/*
+ * A per-vCPU timer device outside the APIC (Hyper-V's synthetic timers)
+ * runs @cb on the vCPU, in its POLL pass with the BQL held, once a
+ * deadline set with apic_xtimer_mod has passed, and @eoi after every EOI
+ * (an interrupt it raised may have been handled).  So the device's state
+ * is only ever touched by its own vCPU.
+ */
+void apic_xtimer_init(APICCommonState *s, void (*cb)(void *),
+                      void (*eoi)(void *), void *opaque)
+{
+    s->xtimer_cb = cb;
+    s->xtimer_eoi = eoi;
+    s->xtimer_opaque = opaque;
+    if (!s->xtimer) {
+        s->xtimer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apic_xtimer_expired, s);
+    }
+}
+
+/* @deadline on QEMU_CLOCK_VIRTUAL, or INT64_MAX for none.  BQL held. */
+void apic_xtimer_mod(APICCommonState *s, int64_t deadline)
+{
+    if (deadline == INT64_MAX) {
+        timer_del(s->xtimer);
+    } else {
+        timer_mod(s->xtimer, deadline);
+    }
+}
+
+/* A fixed, edge-triggered vector from this vCPU's own devices.  BQL held. */
+void apic_set_local_irq(APICCommonState *s, int vector)
+{
+    apic_set_irq(s, vector, APIC_TRIGGER_EDGE);
 }
 
 static void apic_set_irq(APICCommonState *s, int vector_num, int trigger_mode)
@@ -501,6 +547,9 @@ static void apic_eoi(APICCommonState *s)
     apic_reset_bit(s->isr, isrv);
     if (!(s->spurious_vec & APIC_SV_DIRECTED_IO) && apic_get_bit(s->tmr, isrv)) {
         ioapic_eoi_broadcast(isrv);
+    }
+    if (s->xtimer_eoi) {
+        s->xtimer_eoi(s->xtimer_opaque);
     }
     apic_sync_vapic(s, SYNC_FROM_VAPIC | SYNC_TO_VAPIC);
     apic_update_irq(s);
@@ -1159,6 +1208,9 @@ static void apic_unrealize(DeviceState *dev)
     APICCommonState *s = APIC(dev);
 
     timer_free(s->timer);
+    if (s->xtimer) {
+        timer_free(s->xtimer);
+    }
     local_apics[s->initial_apic_id] = NULL;
 }
 
