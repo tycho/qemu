@@ -188,6 +188,9 @@ struct APICCommonState {
     DeviceState *vapic;
     hwaddr vapic_paddr; /* note: persistence via kvmvapic */
     uint32_t extended_log_dest;
+    bool vcpu_timer;   /* x-vcpu-timer: the timer fires on its vCPU */
+    int64_t vdeadline; /* ... its expiry (QEMU_CLOCK_VIRTUAL), or INT64_MAX */
+    int timer_due;     /* ... expired, for the vCPU to fire */
 };
 
 typedef struct VAPICState {
