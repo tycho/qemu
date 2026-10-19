@@ -36,6 +36,9 @@
 #include "tcg/startup.h"
 #include "tcg-accel-ops.h"
 #include "tcg-accel-ops-mttcg.h"
+#include "system/cpus.h"
+#include "qemu/processor.h"
+#include "qemu/timer.h"
 
 typedef struct MttcgForceRcuNotifier {
     Notifier notifier;
@@ -55,6 +58,79 @@ static void mttcg_force_rcu(Notifier *notify, void *data)
      * that there are no deadlocks.
      */
     async_run_on_cpu(cpu, do_nothing, RUN_ON_CPU_NULL);
+}
+
+/*
+ * x-haltpoll: before a halted vCPU's thread sleeps on its halt condition,
+ * it drops the BQL and spins for a while, watching for anything that
+ * would wake it: a new interrupt request, a kick (exit_request), a stop
+ * or queued work.  A wakeup that comes within the spin costs no thread
+ * wakeup, which on some hosts takes several microseconds.  The spin
+ * window adapts per vCPU as KVM's halt_poll_ns does: a halt that ended
+ * after the window but within mttcg_haltpoll_ns doubles it (from
+ * HALTPOLL_START_NS), a longer one halves it, so vCPUs that stay idle
+ * don't keep burning host CPU.
+ */
+int64_t mttcg_haltpoll_ns;
+
+#define HALTPOLL_START_NS 10000
+/* after a wakeup, how long to spin for the BQL before sleeping on it */
+#define HALTPOLL_BQL_SPIN_NS 20000
+
+static __thread int64_t haltpoll_window;
+
+/* Spin for the window; true if something arrived (no sleep needed). */
+static bool mttcg_halt_poll(CPUState *cpu)
+{
+    uint32_t ir;
+    int64_t deadline;
+    bool woken = false;
+
+    if (!haltpoll_window) {
+        return false;
+    }
+    /*
+     * While halt_polling is set, a thread that raises an interrupt
+     * request without the BQL may skip kicking us: we see the request
+     * here.  It raises the request, then (full barrier) reads
+     * halt_polling; we clear halt_polling, then (full barrier) check for
+     * work under the BQL in qemu_process_cpu_events: one of the two sees
+     * the other's store.
+     */
+    qatomic_set(&cpu->halt_polling, true);
+    smp_mb(); /* halt_polling before we sample the requests */
+    ir = qatomic_read(&cpu->interrupt_request);
+    /* as qemu_process_cpu_events does before it waits */
+    qatomic_set_mb(&cpu->exit_request, false);
+    deadline = get_clock() + haltpoll_window;
+    bql_unlock();
+    do {
+        if (qatomic_read(&cpu->interrupt_request) != ir ||
+            qatomic_read(&cpu->exit_request) || qatomic_read(&cpu->stop) ||
+            !cpu_work_list_empty(cpu)) {
+            woken = true;
+            break;
+        }
+        cpu_relax();
+    } while (get_clock() < deadline);
+    qatomic_set(&cpu->halt_polling, false);
+    smp_mb(); /* halt_polling cleared before the check for work */
+    if (woken) {
+        /*
+         * Whoever woke us may still hold the BQL (an IPI's sender does);
+         * a blocked waiter sleeps in the kernel, the wakeup we just
+         * avoided, so spin for it a little first.
+         */
+        deadline = get_clock() + HALTPOLL_BQL_SPIN_NS;
+        do {
+            if (bql_trylock()) {
+                return true;
+            }
+            cpu_relax();
+        } while (get_clock() < deadline);
+    }
+    bql_lock();
+    return woken;
 }
 
 /*
@@ -87,7 +163,30 @@ static void *mttcg_cpu_thread_fn(void *arg)
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
 
     do {
+        int64_t halt_start = 0;
+        bool polled = false;
+
+        /*
+         * Order our halted store before the checks for work below (and
+         * in qemu_process_cpu_events), for threads that raise an
+         * interrupt request without the BQL and then read halted.
+         */
+        smp_mb();
+        if (mttcg_haltpoll_ns && cpu_thread_is_idle(cpu)) {
+            halt_start = get_clock();
+            polled = mttcg_halt_poll(cpu);
+        }
         qemu_process_cpu_events(cpu);
+        if (halt_start && !polled) {
+            int64_t halted = get_clock() - halt_start;
+            if (halted <= mttcg_haltpoll_ns) {
+                haltpoll_window = MIN(MAX(haltpoll_window * 2,
+                                          HALTPOLL_START_NS),
+                                      mttcg_haltpoll_ns);
+            } else {
+                haltpoll_window /= 2;
+            }
+        }
 
         if (cpu_can_run(cpu)) {
             int excp;
