@@ -70,4 +70,7 @@ extern bool tcg_tsc_counter;
  */
 extern bool tcg_hyperv;
 
+/* tcg_hyperv: also the SynIC and synthetic timers (hv-synic, hv-stimer). */
+extern bool tcg_hvtimers;
+
 #endif
