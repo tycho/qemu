@@ -68,6 +68,15 @@ extern bool tcg_lazysync_user;
  */
 extern bool tcg_pin;
 extern bool tcg_pin_user;
+
+/*
+ * tcg_pin_system_ok: whether the backend can pin guest registers in system
+ * mode (TCG_TARGET_NB_PIN_REGS_SYSTEM: callee-saved registers only, which
+ * calls keep); system mode then sets tcg_pin_user from tcg_pin when the
+ * first vCPU is created, before the front end creates its globals and
+ * before the prologue, which loads and stores them.
+ */
+bool tcg_pin_system_ok(void);
 extern bool tcg_pin_vec;
 extern bool tcg_pin_cc;
 

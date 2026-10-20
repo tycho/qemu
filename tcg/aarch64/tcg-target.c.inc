@@ -1708,6 +1708,11 @@ static void tcg_out_ldst_save(TCGContext *s, TCGRegSet regs, bool restore,
 #else
 #define TCG_TARGET_NB_PIN_REGS 16
 #endif
+/*
+ * System mode pins only the first seven, x20-x26: callee-saved, so calls
+ * need no saves, and clear of x-tlbpin's x27 and x28.
+ */
+#define TCG_TARGET_NB_PIN_REGS_SYSTEM 7
 static const TCGReg tcg_target_pin_regs[TCG_TARGET_NB_PIN_REGS] = {
     TCG_REG_X20, TCG_REG_X21, TCG_REG_X22, TCG_REG_X23,
     TCG_REG_X24, TCG_REG_X25, TCG_REG_X26, TCG_REG_X27,

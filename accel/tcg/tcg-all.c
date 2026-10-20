@@ -170,9 +170,14 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #if defined(CONFIG_SOFTMMU)
     /*
      * There's no guest base to take into account, so go ahead and
-     * initialize the prologue now.
+     * initialize the prologue now; or, where guest registers may be
+     * pinned, once the front end has pinned them (tcg_exec_realizefn).
      */
-    tcg_prologue_init();
+    if (tcg_pin && tcg_pin_system_ok()) {
+        tcg_prologue_deferred = true;
+    } else {
+        tcg_prologue_init();
+    }
 #endif
 
 #ifdef CONFIG_USER_ONLY
@@ -181,6 +186,8 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 
     return 0;
 }
+
+bool tcg_prologue_deferred;
 
 static char *tcg_get_thread(Object *obj, Error **errp)
 {
