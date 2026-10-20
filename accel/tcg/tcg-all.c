@@ -1008,6 +1008,20 @@ static void tcg_set_tlbpin(Object *obj, bool value, Error **errp)
     tcg_tlbpin = value;
 }
 
+static bool tcg_get_tlbreuse(Object *obj, Error **errp)
+{
+    return tcg_tlbreuse;
+}
+
+static void tcg_set_tlbreuse(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_tlbreuse_supported()) {
+        error_setg(errp, "x-tlbreuse: not supported by this TCG backend");
+        return;
+    }
+    tcg_tlbreuse = value;
+}
+
 static char *tcg_get_tblayout(Object *obj, Error **errp)
 {
     return g_strdup(tcg_tblayout ? "split" : "packed");
@@ -1306,6 +1320,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-tlbpin",
         "Keep the TLB mask and table of a block's main mmu index in host "
         "registers (system mode)");
+
+    object_class_property_add_bool(oc, "x-tlbreuse", tcg_get_tlbreuse,
+                                   tcg_set_tlbreuse);
+    object_class_property_set_description(oc, "x-tlbreuse",
+        "Let a guest load near an earlier load's address reuse its TLB "
+        "translation (system mode)");
 
     object_class_property_add_str(oc, "x-tblayout",
                                   tcg_get_tblayout, tcg_set_tblayout);

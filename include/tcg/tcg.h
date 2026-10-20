@@ -554,6 +554,12 @@ struct TCGContext {
     int tlb_pin_ofs;
     int tlb_pin_idx;
 
+    /*
+     * tcg_tlbreuse: the marks of the qemu_ld being emitted (bits 32-63 of
+     * its MemOpIdx argument, tcg_xlat_arg), or 0.
+     */
+    uint32_t ldst_xlat;
+
     GHashTable *const_table[TCG_TYPE_COUNT];
     TCGTempSet free_temps[TCG_TYPE_COUNT];
     TCGTemp temps[TCG_MAX_TEMPS]; /* globals first, temps after */

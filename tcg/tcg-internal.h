@@ -94,6 +94,39 @@ TCGTemp *tcg_constant_internal(TCGType type, int64_t val);
  */
 #define TCG_LDST_X_SCALED 4
 
+/*
+ * tcg_tlbreuse: marks in bits 32-63 of a qemu_ld's MemOpIdx argument.  A
+ * head keeps its translation (the TLB addend) in translation slot @slot;
+ * a reuser at distance @d bytes from its head's address loads through
+ * that slot after a page check.  Only the backend reads them.
+ */
+#define TCG_XLAT_HEAD   1
+#define TCG_XLAT_REUSE  2
+#define TCG_XLAT_SLOTS  2
+
+static inline TCGArg tcg_xlat_arg(MemOpIdx oi, unsigned role, unsigned slot,
+                                  int d)
+{
+    uint32_t x = role | slot << 2 | (uint32_t)(uint16_t)d << 16;
+
+    return (TCGArg)oi | (TCGArg)x << 32;
+}
+
+static inline unsigned tcg_xlat_role(uint32_t x)
+{
+    return x & 3;
+}
+
+static inline unsigned tcg_xlat_slot(uint32_t x)
+{
+    return (x >> 2) & 1;
+}
+
+static inline int tcg_xlat_dist(uint32_t x)
+{
+    return (int16_t)(x >> 16);
+}
+
 static inline TCGArg tcg_ldst_x_arg(MemOpIdx oi, unsigned shift, int ofs)
 {
     return (TCGArg)oi | (TCGArg)shift << 32 | (TCGArg)(ofs & 0x1fff) << 40;

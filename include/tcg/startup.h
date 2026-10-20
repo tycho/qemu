@@ -455,6 +455,15 @@ extern bool tcg_tlbpin;
 bool tcg_tlbpin_supported(void);
 
 /*
+ * tcg_tlbreuse: in system mode, a guest load at a constant distance from
+ * an earlier load's address, with no call or label between them, reuses
+ * that load's TLB translation after a page check, on backends that
+ * support it (tcg_tlbreuse_supported).
+ */
+extern bool tcg_tlbreuse;
+bool tcg_tlbreuse_supported(void);
+
+/*
  * x86 guests (accel property x-repstr): REP STOS and REP MOVS a page at
  * a time with the host's widest stores where they can, as CPUs with fast
  * string operations do.

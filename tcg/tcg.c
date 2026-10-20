@@ -347,6 +347,7 @@ bool tcg_pcid;
 bool tcg_lean;
 bool tcg_alignfold;
 bool tcg_tlbpin;
+bool tcg_tlbreuse;
 bool tcg_repstr;
 bool tcg_hyperv;
 bool tcg_hvtimers;
@@ -4800,6 +4801,178 @@ static void tlb_pin_pass(TCGContext *s)
 }
 #endif
 
+#ifdef TCG_TARGET_HAS_TLB_REUSE
+/*
+ * tcg_tlbreuse (system mode), on the final ops: value-number guest load
+ * addresses (a base value plus a constant, through moves and additions of
+ * constants) within each straight line of ops, which a call, a label or a
+ * TB exit ends; a load whose address is within a page of an earlier
+ * load's, with the same base and mmu index, reuses that load's
+ * translation (TCG_XLAT_REUSE) if the earlier load still holds one of the
+ * TCG_XLAT_SLOTS translation slots (TCG_XLAT_HEAD), assigned least
+ * recently used first.  Only plain loads of up to 8 bytes without an
+ * alignment requirement take part.  The backend's guest access slow
+ * paths clear the slots, since their helpers may change the TLB.
+ */
+typedef struct XlatSlot {
+    TCGOp *head;
+    uint32_t vid;
+    int64_t off;
+    unsigned mmu_idx;
+    unsigned size;
+    unsigned last_use;
+} XlatSlot;
+
+static bool xlat_eligible(TCGOp *op)
+{
+    MemOp mop = get_memop(op->args[2]);
+
+    return op->opc == INDEX_op_qemu_ld && TCGOP_TYPE(op) <= TCG_TYPE_I64 &&
+           (mop & MO_SIZE) <= MO_64 && !(mop & (MO_AMASK | MO_BSWAP));
+}
+
+/* Whether a load of @size at @d bytes from its head can be checked. */
+static bool xlat_dist_ok(int64_t d, unsigned size)
+{
+    int64_t lo = MAX(d, 0);
+    int64_t hi = MIN((int64_t)TARGET_PAGE_SIZE - size,
+                     (int64_t)TARGET_PAGE_SIZE - 1 + d);
+
+    return d > -(int64_t)TARGET_PAGE_SIZE && d < (int64_t)TARGET_PAGE_SIZE &&
+           lo <= hi && hi - lo < 4096 && lo < 4096;
+}
+
+static void tlb_reuse_pass(TCGContext *s)
+{
+    int nb = s->nb_temps;
+    uint32_t *vid = tcg_malloc(sizeof(uint32_t) * nb);
+    int64_t *off = tcg_malloc(sizeof(int64_t) * nb);
+    uint32_t next = nb + 1;
+    XlatSlot slot[TCG_XLAT_SLOTS];
+    unsigned clock = 0;
+    TCGOp *op;
+
+    for (int i = 0; i < nb; i++) {
+        TCGTemp *ts = &s->temps[i];
+
+        if (ts->kind == TEMP_CONST) {
+            vid[i] = 0;
+            off[i] = ts->val;
+        } else {
+            vid[i] = i + 1;
+            off[i] = 0;
+        }
+    }
+    memset(slot, 0, sizeof(slot));
+
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        int no = def->nb_oargs;
+
+        if (op->opc == INDEX_op_call) {
+            no = TCGOP_CALLO(op);
+            for (int i = 0; i < s->nb_globals; i++) {
+                vid[i] = next++;
+                off[i] = 0;
+            }
+        }
+        if (op->opc == INDEX_op_call || op->opc == INDEX_op_set_label ||
+            (def->flags & TCG_OPF_BB_EXIT)) {
+            memset(slot, 0, sizeof(slot));
+        } else if (op->opc == INDEX_op_qemu_ld && xlat_eligible(op)) {
+            TCGTemp *at = arg_temp(op->args[1]);
+            MemOpIdx oi = op->args[2];
+            int ai = temp_idx(at);
+            unsigned size = 1 << (get_memop(oi) & MO_SIZE);
+            int k, victim = 0;
+
+            for (k = 0; k < TCG_XLAT_SLOTS; k++) {
+                XlatSlot *x = &slot[k];
+
+                if (x->head && ai < nb && x->vid == vid[ai] &&
+                    x->mmu_idx == get_mmuidx(oi) &&
+                    xlat_dist_ok(off[ai] - x->off, size)) {
+                    break;
+                }
+            }
+            if (k < TCG_XLAT_SLOTS) {
+                XlatSlot *x = &slot[k];
+
+                x->head->args[2] = tcg_xlat_arg(x->head->args[2],
+                                                TCG_XLAT_HEAD, k, 0);
+                op->args[2] = tcg_xlat_arg(oi, TCG_XLAT_REUSE, k,
+                                           off[ai] - x->off);
+                x->last_use = ++clock;
+            } else if (ai < nb) {
+                for (k = 1; k < TCG_XLAT_SLOTS; k++) {
+                    if (!slot[k].head ||
+                        (slot[victim].head &&
+                         slot[k].last_use < slot[victim].last_use)) {
+                        victim = k;
+                    }
+                }
+                slot[victim] = (XlatSlot) {
+                    .head = op, .vid = vid[ai], .off = off[ai],
+                    .mmu_idx = get_mmuidx(oi), .size = size,
+                    .last_use = ++clock,
+                };
+            }
+        }
+
+        /* Outputs: copies and constant offsets keep their base. */
+        for (int i = 0; i < no; i++) {
+            int t = temp_idx(arg_temp(op->args[i]));
+            TCGTemp *a, *b;
+
+            if (t >= nb) {
+                continue;
+            }
+            if (op->opc == INDEX_op_mov && i == 0) {
+                int u = temp_idx(arg_temp(op->args[1]));
+
+                if (u < nb) {
+                    vid[t] = vid[u];
+                    off[t] = off[u];
+                    continue;
+                }
+            }
+            if ((op->opc == INDEX_op_add || op->opc == INDEX_op_sub) &&
+                i == 0) {
+                a = arg_temp(op->args[1]);
+                b = arg_temp(op->args[2]);
+                if (b->kind == TEMP_CONST && temp_idx(a) < nb) {
+                    int u = temp_idx(a);
+
+                    vid[t] = vid[u];
+                    off[t] = off[u] +
+                             (op->opc == INDEX_op_add ? b->val : -b->val);
+                    continue;
+                }
+                if (op->opc == INDEX_op_add && a->kind == TEMP_CONST &&
+                    temp_idx(b) < nb) {
+                    int u = temp_idx(b);
+
+                    vid[t] = vid[u];
+                    off[t] = off[u] + a->val;
+                    continue;
+                }
+            }
+            vid[t] = next++;
+            off[t] = 0;
+        }
+    }
+}
+#endif
+
+bool tcg_tlbreuse_supported(void)
+{
+#ifdef TCG_TARGET_HAS_TLB_REUSE
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool tcg_tlbpin_supported(void)
 {
 #ifdef TCG_TARGET_HAS_TLB_PIN
@@ -9018,7 +9191,11 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             const TCGOutOpQemuLdSt *out =
                 container_of(all_outop[op->opc], TCGOutOpQemuLdSt, base);
 
-            out->out(s, type, new_args[0], new_args[1], new_args[2]);
+            /* tcg_tlbreuse: the marks above the MemOpIdx. */
+            s->ldst_xlat = (uint64_t)new_args[2] >> 32;
+            out->out(s, type, new_args[0], new_args[1],
+                     (MemOpIdx)new_args[2]);
+            s->ldst_xlat = 0;
         }
         break;
 
@@ -11099,6 +11276,11 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 #ifdef TCG_TARGET_HAS_TLB_PIN
     if (tcg_use_softmmu && tcg_tlbpin) {
         tlb_pin_pass(s);
+    }
+#endif
+#ifdef TCG_TARGET_HAS_TLB_REUSE
+    if (tcg_use_softmmu && tcg_tlbreuse) {
+        tlb_reuse_pass(s);
     }
 #endif
 

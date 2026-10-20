@@ -103,6 +103,15 @@ static TCGReg tcg_target_call_oarg_reg(TCGCallReturnKind kind, int slot)
 #define TCG_REG_TLB_MASK   TCG_REG_X28
 #define TCG_REG_TLB_TABLE  TCG_REG_X27
 
+/*
+ * tcg_tlbreuse: the translation slots (a head load's TLB addend, or 0).
+ * System mode only, out of the allocator when the setting is on.
+ */
+#define TCG_TARGET_HAS_TLB_REUSE
+static const TCGReg tcg_xlat_reg[TCG_XLAT_SLOTS] = {
+    TCG_REG_X26, TCG_REG_X25
+};
+
 static bool reloc_pc26(tcg_insn_unit *src_rw, const tcg_insn_unit *target)
 {
     const tcg_insn_unit *src_rx = tcg_splitwx_to_rx(src_rw);
@@ -2085,6 +2094,19 @@ static bool tcg_out_ldst_slow_entry(TCGContext *s, TCGLabelQemuLdst *lb)
  * helper's return address (in the insn's code) but not from a host pc
  * out here.
  */
+/*
+ * tcg_tlbreuse: after a guest access's slow-path helper, which may have
+ * changed the TLB, no translation slot holds a translation.
+ */
+static void tcg_out_xlat_clear(TCGContext *s)
+{
+    if (tcg_use_softmmu && tcg_tlbreuse) {
+        for (int i = 0; i < TCG_XLAT_SLOTS; i++) {
+            tcg_out_movi(s, TCG_TYPE_I64, tcg_xlat_reg[i], 0);
+        }
+    }
+}
+
 static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     if (!tcg_out_ldst_slow_entry(s, lb)) {
@@ -2097,12 +2119,14 @@ static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X4, lb->site);
         tcg_out_call_int(s, (const void *)helper_tso_cross_ld);
         tcg_out_pinned_clobbered(s, false, 0);
+        tcg_out_xlat_clear(s);
         tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
     } else {
         tcg_out_st_helper_args(s, lb, &ldst_helper_param);
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X5, lb->site);
         tcg_out_call_int(s, (const void *)helper_tso_cross_st);
         tcg_out_pinned_clobbered(s, false, 0);
+        tcg_out_xlat_clear(s);
     }
     tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
     tcg_out_goto(s, lb->raddr);
@@ -2125,6 +2149,7 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
     tcg_out_pinned_clobbered(s, false, 0);
+    tcg_out_xlat_clear(s);
     if (lb->type == TCG_TYPE_V128) {
         /* The Int128 result in X0:X1 goes to the vector. */
         tcg_out_insn(s, fmov, DX, lb->datalo_reg, TCG_REG_X0);
@@ -2167,6 +2192,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     }
     tcg_out_call_int(s, qemu_st_helpers[opc & MO_SIZE]);
     tcg_out_pinned_clobbered(s, false, 0);
+    tcg_out_xlat_clear(s);
     tcg_out_ldst_save(s, lb->save_regs, true, 0);
     tcg_out_goto(s, lb->raddr);
     return true;
@@ -2199,9 +2225,10 @@ static bool acqrel_onepath(MemOp memop)
  * In both cases, return a TCGLabelQemuLdst structure if the slow path
  * is required and fill in @h with the host address for the fast path.
  */
-static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
-                                           TCGReg addr_reg, MemOpIdx oi,
-                                           bool is_ld, bool onepath)
+static TCGLabelQemuLdst *prepare_host_addr_to(TCGContext *s, HostAddress *h,
+                                              TCGReg addr_reg, MemOpIdx oi,
+                                              bool is_ld, bool onepath,
+                                              TCGReg addend)
 {
     TCGType addr_type = s->addr_type;
     TCGLabelQemuLdst *ldst = NULL;
@@ -2257,7 +2284,7 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         tcg_out_ld(s, addr_type, TCG_REG_TMP0, TCG_REG_TMP1,
                    is_ld ? offsetof(CPUTLBEntry, addr_read)
                          : offsetof(CPUTLBEntry, addr_write));
-        tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_TMP1, TCG_REG_TMP1,
+        tcg_out_ld(s, TCG_TYPE_PTR, addend, TCG_REG_TMP1,
                    offsetof(CPUTLBEntry, addend));
 
         /*
@@ -2306,7 +2333,7 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
             tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
         }
 
-        h->base = TCG_REG_TMP1;
+        h->base = addend;
         h->index = addr_reg;
         h->index_ext = addr_type;
     } else {
@@ -2337,6 +2364,80 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         }
     }
 
+    return ldst;
+}
+
+static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
+                                           TCGReg addr_reg, MemOpIdx oi,
+                                           bool is_ld, bool onepath)
+{
+    return prepare_host_addr_to(s, h, addr_reg, oi, is_ld, onepath,
+                                TCG_REG_TMP1);
+}
+
+/*
+ * tcg_tlbreuse: a load @d bytes from its head's address, through the
+ * head's translation in @slot: the slot holds one (not 0), and the
+ * load's page offset puts it on the head's page without crossing it,
+ * else the slow path (or, with @onepath, the x-tso fallback, which also
+ * takes a 16-byte crossing).
+ */
+static TCGLabelQemuLdst *prepare_host_addr_reuse(TCGContext *s, HostAddress *h,
+                                                 TCGReg addr_reg, MemOpIdx oi,
+                                                 unsigned slot, int d,
+                                                 bool onepath)
+{
+    TCGLabelQemuLdst *ldst = new_ldst_label(s);
+    MemOp opc = get_memop(oi);
+    unsigned s_bits = opc & MO_SIZE;
+    int lo = MAX(d, 0);
+    int hi = MIN((int)TARGET_PAGE_SIZE - (1 << s_bits),
+                 (int)TARGET_PAGE_SIZE - 1 + d);
+    TCGReg xr = tcg_xlat_reg[slot];
+
+    h->aa = atom_and_align_for_opc(s, opc,
+                                   have_lse2 ? MO_ATOM_WITHIN16
+                                             : MO_ATOM_IFALIGN,
+                                   false);
+    ldst->is_ld = true;
+    ldst->oi = oi;
+    ldst->addr_reg = addr_reg;
+    if (onepath) {
+        ldst->fallback = true;
+        ldst->site = s->gen_insn_pc[s->gen_cur_insn];
+    }
+
+    /*
+     * The page offset, less @lo, at most @hi - @lo (LEU); then, if so, the
+     * slot not 0 (NE), else Z set: EQ is the slow path.
+     */
+    tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I32, TCG_REG_TMP0,
+                     addr_reg, TARGET_PAGE_SIZE - 1);
+    if (lo) {
+        tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I32, TCG_REG_TMP0,
+                     TCG_REG_TMP0, lo);
+    }
+    tcg_out_cmp(s, TCG_TYPE_I32, TCG_COND_GTU, TCG_REG_TMP0, hi - lo, true);
+    tcg_out_insn(s, ccmp_imm, CCMP, TCG_TYPE_I64, xr, 0, 4, TCG_COND_LEU);
+    if (onepath) {
+        /*
+         * As prepare_host_addr's: then, if still NE, a 16-byte crossing
+         * (GTU), else C set and Z clear (GTU): GTU is the x-tso fallback.
+         */
+        tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I32, TCG_REG_TMP2,
+                         addr_reg, 15);
+        tcg_out_insn(s, ccmp_imm, CCMP, TCG_TYPE_I32, TCG_REG_TMP2,
+                     16 - (1 << s_bits), 2, TCG_COND_NE);
+        ldst->label_ptr[0] = s->code_ptr;
+        tcg_out_insn(s, bcond_imm, B_C, TCG_COND_GTU, 0);
+    } else {
+        ldst->label_ptr[0] = s->code_ptr;
+        tcg_out_insn(s, bcond_imm, B_C, TCG_COND_EQ, 0);
+    }
+
+    h->base = xr;
+    h->index = addr_reg;
+    h->index_ext = s->addr_type;
     return ldst;
 }
 
@@ -2547,8 +2648,19 @@ static void tgen_qemu_ld(TCGContext *s, TCGType data_type, TCGReg data_reg,
     TCGLabelQemuLdst *ldst;
     HostAddress h;
 
-    ldst = prepare_host_addr(s, &h, addr_reg, oi, true,
-                             acqrel_onepath(get_memop(oi)));
+    uint32_t x = tcg_use_softmmu && tcg_tlbreuse ? s->ldst_xlat : 0;
+
+    if (tcg_xlat_role(x) == TCG_XLAT_REUSE) {
+        ldst = prepare_host_addr_reuse(s, &h, addr_reg, oi, tcg_xlat_slot(x),
+                                       tcg_xlat_dist(x),
+                                       acqrel_onepath(get_memop(oi)));
+    } else {
+        ldst = prepare_host_addr_to(s, &h, addr_reg, oi, true,
+                                    acqrel_onepath(get_memop(oi)),
+                                    tcg_xlat_role(x) == TCG_XLAT_HEAD
+                                    ? tcg_xlat_reg[tcg_xlat_slot(x)]
+                                    : TCG_REG_TMP1);
+    }
     if (acqrel_cross(get_memop(oi))) {
         tcg_out_qemu_ld_direct(s, get_memop(oi) &
                                ~(MO_ACQ_REL | MO_ACQ_REL_CROSS),
@@ -5700,6 +5812,11 @@ static void tcg_target_init(TCGContext *s)
     if (tcg_use_softmmu && tcg_tlbpin) {
         tcg_regset_set_reg(s->reserved_regs, TCG_REG_TLB_MASK);
         tcg_regset_set_reg(s->reserved_regs, TCG_REG_TLB_TABLE);
+    }
+    if (tcg_use_softmmu && tcg_tlbreuse) {
+        for (int i = 0; i < TCG_XLAT_SLOTS; i++) {
+            tcg_regset_set_reg(s->reserved_regs, tcg_xlat_reg[i]);
+        }
     }
     if (!tcg_vregs_all) {
         for (TCGReg r = TCG_REG_V8; r <= TCG_REG_V15; r++) {
