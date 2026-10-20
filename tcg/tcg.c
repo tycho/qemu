@@ -237,6 +237,7 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
     __attribute__((unused));
 
 TCGContext tcg_init_ctx;
+bool tcg_tlbpin;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
@@ -3573,6 +3574,52 @@ static void move_label_uses(TCGLabel *to, TCGLabel *from)
     QSIMPLEQ_CONCAT(&to->branches, &from->branches);
 }
 
+#ifdef TCG_TARGET_HAS_TLB_PIN
+/*
+ * tcg_tlbpin (system mode): the mmu index most of the TB's guest accesses
+ * use, whose CPUTLBDescFast the backend keeps in registers.
+ */
+static void tlb_pin_pass(TCGContext *s)
+{
+    unsigned counts[NB_MMU_MODES] = { };
+    TCGOp *op;
+    int best = -1;
+
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+
+        switch (op->opc) {
+        case INDEX_op_qemu_ld:
+        case INDEX_op_qemu_st:
+        case INDEX_op_qemu_ld2:
+        case INDEX_op_qemu_st2:
+            counts[get_mmuidx(op->args[def->nb_oargs + def->nb_iargs])]++;
+            break;
+        default:
+            break;
+        }
+    }
+    for (int i = 0; i < NB_MMU_MODES; i++) {
+        if (counts[i] && (best < 0 || counts[i] > counts[best])) {
+            best = i;
+        }
+    }
+    if (best >= 0) {
+        s->tlb_pin_idx = best;
+        s->tlb_pin_ofs = tlb_mask_table_ofs(s, best);
+    }
+}
+#endif
+
+bool tcg_tlbpin_supported(void)
+{
+#ifdef TCG_TARGET_HAS_TLB_PIN
+    return true;
+#else
+    return false;
+#endif
+}
+
 /* Reachable analysis : remove unreachable code.  */
 static void __attribute__((noinline))
 reachable_code_pass(TCGContext *s)
@@ -6644,6 +6691,14 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             qemu_log_unlock(logfile);
         }
     }
+
+    s->tlb_pin_ofs = 0;
+    s->tlb_pin_idx = -1;
+#ifdef TCG_TARGET_HAS_TLB_PIN
+    if (tcg_use_softmmu && tcg_tlbpin) {
+        tlb_pin_pass(s);
+    }
+#endif
 
     /* Initialize goto_tb jump offsets. */
     tb->jmp_reset_offset[0] = TB_JMP_OFFSET_INVALID;

@@ -416,6 +416,13 @@ struct TCGContext {
      */
     bool carry_live;
 
+    /*
+     * tcg_tlbpin: the offset from env of the pinned mmu index's
+     * CPUTLBDescFast, or 0 (none) for this TB.
+     */
+    int tlb_pin_ofs;
+    int tlb_pin_idx;
+
     GHashTable *const_table[TCG_TYPE_COUNT];
     TCGTempSet free_temps[TCG_TYPE_COUNT];
     TCGTemp temps[TCG_MAX_TEMPS]; /* globals first, temps after */
