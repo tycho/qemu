@@ -2095,6 +2095,37 @@ static bool tcg_out_ldst_slow_entry(TCGContext *s, TCGLabelQemuLdst *lb)
  * out here.
  */
 /*
+ * [DEV] XTCG_XLAT_COUNT=1: count tcg_tlbreuse reusers' fast paths and
+ * slow paths, printed at exit.
+ */
+static int xlat_count = -1;
+static uint64_t xlat_counts[2];
+
+static void xlat_count_dump(void)
+{
+    fprintf(stderr, "XTCG-XLAT reuse-fast %" PRIu64 " reuse-slow %" PRIu64
+            "\n", xlat_counts[0], xlat_counts[1]);
+}
+
+static void tcg_out_xlat_count(TCGContext *s, int which)
+{
+    if (xlat_count < 0) {
+        xlat_count = getenv("XTCG_XLAT_COUNT") != NULL;
+        if (xlat_count) {
+            atexit(xlat_count_dump);
+        }
+    }
+    if (xlat_count) {
+        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP0,
+                     (intptr_t)&xlat_counts[which]);
+        tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_TMP1, TCG_REG_TMP0, 0);
+        tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_TMP1,
+                     TCG_REG_TMP1, 1);
+        tcg_out_st(s, TCG_TYPE_I64, TCG_REG_TMP1, TCG_REG_TMP0, 0);
+    }
+}
+
+/*
  * tcg_tlbreuse: after a guest access's slow-path helper, which may have
  * changed the TLB, no translation slot holds a translation.
  */
@@ -2111,6 +2142,9 @@ static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     if (!tcg_out_ldst_slow_entry(s, lb)) {
         return false;
+    }
+    if (lb->xlat_reuse) {
+        tcg_out_xlat_count(s, 1);
     }
     tcg_out_ldst_writeback(s, lb);
     tcg_out_ldst_save(s, lb->save_regs, false, 0);
@@ -2142,6 +2176,9 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     }
     if (!tcg_out_ldst_slow_entry(s, lb)) {
         return false;
+    }
+    if (lb->xlat_reuse) {
+        tcg_out_xlat_count(s, 1);
     }
 
     tcg_out_ldst_writeback(s, lb);
@@ -2402,6 +2439,7 @@ static TCGLabelQemuLdst *prepare_host_addr_reuse(TCGContext *s, HostAddress *h,
     ldst->is_ld = true;
     ldst->oi = oi;
     ldst->addr_reg = addr_reg;
+    ldst->xlat_reuse = true;
     if (onepath) {
         ldst->fallback = true;
         ldst->site = s->gen_insn_pc[s->gen_cur_insn];
@@ -2434,6 +2472,7 @@ static TCGLabelQemuLdst *prepare_host_addr_reuse(TCGContext *s, HostAddress *h,
         ldst->label_ptr[0] = s->code_ptr;
         tcg_out_insn(s, bcond_imm, B_C, TCG_COND_EQ, 0);
     }
+    tcg_out_xlat_count(s, 0);
 
     h->base = xr;
     h->index = addr_reg;

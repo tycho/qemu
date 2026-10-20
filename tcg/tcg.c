@@ -126,6 +126,8 @@ struct TCGLabelQemuLdst {
     unsigned nb_wb;
     /* label_ptr[0] is a B to the slow path, in cold code (tcg_tblayout). */
     bool veneer;
+    /* [DEV] XTCG_XLAT_COUNT: a tcg_tlbreuse reuser's slow path */
+    bool xlat_reuse;
     QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 };
 
