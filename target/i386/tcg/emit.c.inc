@@ -3672,6 +3672,18 @@ static void gen_CMP(DisasContext *s, X86DecodedInsn *decode)
  */
 static bool gen_cmpxchg_retry(DisasContext *s)
 {
+    /*
+     * Only with barriers before guest accesses (x-tso=barrier).  With
+     * x-tso=acqrel the failed compare's acquire load is ordered after an
+     * earlier store-release and before every later access, and a
+     * load-acquire before it orders it: nothing to repair.  That doesn't
+     * cover the unordered accesses x-tso-vec=group/none and x-tso-stack
+     * make (a plain store, then the acquire load), which those settings
+     * give up ordering for anyway, as they do for other accesses.
+     */
+    if (tcg_tso_mode != TCG_TSO_BARRIER) {
+        return false;
+    }
     return (tb_cflags(s->base.tb) & CF_PARALLEL) && tcg_mo_needed(TCG_MO_ALL);
 }
 
