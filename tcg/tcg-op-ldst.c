@@ -667,6 +667,11 @@ typedef void (*gen_atomic_op_i128)(TCGv_i128, TCGv_env, TCGv_i64,
 # define WITH_ATOMIC128(X)
 #endif
 
+TCGBar tcg_mo_needed(TCGBar type)
+{
+    return type & tcg_ctx->guest_mo & ~TCG_TARGET_DEFAULT_MO;
+}
+
 static void tcg_gen_nonatomic_cmpxchg_int(TCGType type, TCGTemp *retv,
                                           TCGTemp *addr, TCGTemp *cmpv,
                                           TCGTemp *newv, unsigned idx,

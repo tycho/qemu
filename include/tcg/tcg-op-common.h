@@ -229,6 +229,17 @@ void tcg_gen_qemu_ld_chk_i128(TCGv_i128, TCGTemp *, TCGArg, MemOp, TCGType);
 QEMU_ARG_NONNULL
 void tcg_gen_qemu_st_chk_i128(TCGv_i128, TCGTemp *, TCGArg, MemOp, TCGType);
 
+/**
+ * tcg_mo_needed:
+ * @type: TCGBar
+ *
+ * Return the orders of @type that the guest's memory order requires and
+ * the host's ordinary accesses don't provide: those for which guest loads
+ * and stores get a barrier.  It says nothing about the host's atomic
+ * operations.
+ */
+TCGBar tcg_mo_needed(TCGBar type);
+
 QEMU_ARG_NONNULL
 void tcg_gen_atomic_cmpxchg_chk_i128(TCGv_i128, TCGTemp *, TCGv_i128,
                                      TCGv_i128, TCGArg, MemOp, TCGType);
