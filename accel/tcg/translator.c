@@ -304,7 +304,7 @@ void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
                                     bool direct)
 {
     assert(translator_use_inline_lookup(db));
-    if (direct) {
+    if (direct && !tcg_xpage_inline) {
         tcg_gen_lookup_jc_and_goto_ptr(pc, cs_base, flags);
     } else {
         gen_inline_lookup(pc, cs_base, flags);

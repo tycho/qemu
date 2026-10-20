@@ -235,6 +235,7 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 }
 
 bool tcg_ijmp_inline;
+bool tcg_xpage_inline;
 bool tcg_jcgen;
 bool tcg_jc_ctx;
 bool tcg_jc_keep_pcrel;
@@ -263,6 +264,22 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
     s->one_insn_per_tb = value;
     /* Set the global also: this changes the behaviour */
     qatomic_set(&one_insn_per_tb, value);
+}
+
+static char *tcg_get_xpage(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_xpage_inline ? "inline" : "call");
+}
+
+static void tcg_set_xpage(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "call")) {
+        tcg_xpage_inline = false;
+    } else if (!strcmp(value, "inline")) {
+        tcg_xpage_inline = true;
+    } else {
+        error_setg(errp, "x-xpage: 'call' or 'inline'");
+    }
 }
 
 static bool tcg_get_tblookup(Object *obj, Error **errp)
@@ -349,6 +366,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "indirect jumps (in a short helper call at direct jumps to "
         "another page), and pack TB structs next to their code (x86 "
         "guests)");
+
+    object_class_property_add_str(oc, "x-xpage", tcg_get_xpage,
+                                  tcg_set_xpage);
+    object_class_property_set_description(oc, "x-xpage",
+        "With x-tblookup, probe the jump cache at direct jumps to another "
+        "page in a short helper call ('call') or in generated code "
+        "('inline')");
 
     object_class_property_add_str(oc, "x-tblayout",
                                   tcg_get_tblayout, tcg_set_tblayout);
