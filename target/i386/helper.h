@@ -98,7 +98,7 @@ DEF_HELPER_FLAGS_2(mwait, TCG_CALL_NO_WG, noreturn, env, int)
 DEF_HELPER_1(rdmsr, void, env)
 DEF_HELPER_1(wrmsr, void, env)
 DEF_HELPER_FLAGS_1(read_cr8, TCG_CALL_NO_RWG, tl, env)
-DEF_HELPER_FLAGS_3(write_crN, TCG_CALL_NO_RWG, void, env, int, tl)
+DEF_HELPER_FLAGS_3(write_crN, TCG_CALL_NO_WG, void, env, int, tl)
 #endif /* !CONFIG_USER_ONLY */
 
 /* x86 FPU */
