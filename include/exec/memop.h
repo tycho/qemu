@@ -138,6 +138,15 @@ typedef enum MemOp {
      * that handles any alignment without a data-dependent branch.
      */
     MO_ACQ_REL_CROSS = 1 << 13,
+    /*
+     * MO_TLB_PAIR_LD, MO_TLB_PAIR_ST: in system mode, a load and the store
+     * to the same address that follows it with no call, label or other
+     * guest access between (tcg_tlbpair).  The load checks both sides of
+     * the TLB entry; the store reuses its translation.  Only the backend
+     * sees them: they never reach a helper.
+     */
+    MO_TLB_PAIR_LD = 1 << 14,
+    MO_TLB_PAIR_ST = 1 << 15,
 
     /* Combinations of the above, for ease of use.  */
     MO_UB    = MO_8,

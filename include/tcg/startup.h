@@ -446,6 +446,21 @@ bool tcg_lean_narrow32(void);
 extern bool tcg_alignfold;
 
 /*
+ * tcg_tlbpin: in system mode, the TLB mask and table of the mmu index most
+ * of a TB's guest accesses use stay in two host registers, loaded at the
+ * TB's start and after every call, on backends that support it
+ * (TCG_TARGET_HAS_TLB_PIN).
+ */
+extern bool tcg_tlbpin;
+
+/*
+ * tcg_tlbpair: in system mode, a store right after a load of the same
+ * address (a read-modify-write) reuses the load's TLB translation, on
+ * backends that support it (TCG_TARGET_HAS_TLB_PIN).
+ */
+extern bool tcg_tlbpair;
+
+/*
  * x86 guests (accel property x-repstr): REP STOS and REP MOVS a page at
  * a time with the host's widest stores where they can, as CPUs with fast
  * string operations do.

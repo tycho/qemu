@@ -95,6 +95,16 @@ static TCGReg tcg_target_call_oarg_reg(TCGCallReturnKind kind, int slot)
 
 #define TCG_REG_GUEST_BASE TCG_REG_X28
 
+/*
+ * tcg_tlbpin: the pinned mmu index's CPUTLBDescFast.{mask, table}.
+ * tcg_tlbpair: the addend of a pair's load, or 0 after its slow path.
+ * System mode only, out of the allocator when the setting is on.
+ */
+#define TCG_TARGET_HAS_TLB_PIN
+#define TCG_REG_TLB_MASK   TCG_REG_X28
+#define TCG_REG_TLB_TABLE  TCG_REG_X27
+#define TCG_REG_TLB_PAIR   TCG_REG_X26
+
 static bool reloc_pc26(tcg_insn_unit *src_rw, const tcg_insn_unit *target)
 {
     const tcg_insn_unit *src_rx = tcg_splitwx_to_rx(src_rw);
@@ -566,8 +576,9 @@ typedef enum {
     Icsel_CSINV        = 0x5a800000,
     Icsel_CSNEG        = 0x5a800400,
 
-    /* Conditional compare (immediate).  */
+    /* Conditional compare (immediate, register).  */
     Iccmp_imm_CCMP     = 0x7a400800,
+    Iccmp_reg_CCMP     = 0x7a400000,
 
     /* Data-processing (1 source) instructions.  */
     Irr_sf_CLZ         = 0x5ac01000,
@@ -1005,6 +1016,15 @@ static void tcg_out_insn_ccmp_imm(TCGContext *s, AArch64Insn insn,
 {
     tcg_debug_assert(imm5 < 32 && nzcv < 16);
     tcg_out32(s, insn | ext << 31 | imm5 << 16 | rn << 5 | nzcv
+              | tcg_cond_to_aarch64[c] << 12);
+}
+
+static void tcg_out_insn_ccmp_reg(TCGContext *s, AArch64Insn insn,
+                                  TCGType ext, TCGReg rn, TCGReg rm,
+                                  unsigned nzcv, TCGCond c)
+{
+    tcg_debug_assert(nzcv < 16);
+    tcg_out32(s, insn | ext << 31 | rm << 16 | rn << 5 | nzcv
               | tcg_cond_to_aarch64[c] << 12);
 }
 
@@ -1653,6 +1673,20 @@ static void tcg_out_goto(TCGContext *s, const tcg_insn_unit *target)
     tcg_out_insn(s, branch, B, offset);
 }
 
+/*
+ * tcg_tlbpin: load the TB's pinned TLB mask and table, at the TB's start
+ * and after every call (a helper may flush or resize the TLB).
+ */
+static void tcg_out_tlb_pin_load(TCGContext *s)
+{
+    if (s->tlb_pin_ofs) {
+        QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, mask) != 0);
+        QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, table) != 8);
+        tcg_out_insn(s, ldstpair, LDP, TCG_REG_TLB_MASK, TCG_REG_TLB_TABLE,
+                     TCG_AREG0, s->tlb_pin_ofs, 1, 0);
+    }
+}
+
 static void tcg_out_call_int(TCGContext *s, const tcg_insn_unit *target)
 {
     ptrdiff_t offset = tcg_pcrel_diff(s, target) >> 2;
@@ -1662,6 +1696,7 @@ static void tcg_out_call_int(TCGContext *s, const tcg_insn_unit *target)
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP0, (intptr_t)target);
         tcg_out_insn(s, bcond_reg, BLR, TCG_REG_TMP0);
     }
+    tcg_out_tlb_pin_load(s);
 }
 
 static void tcg_out_call(TCGContext *s, const tcg_insn_unit *target,
@@ -2074,6 +2109,9 @@ static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X4, lb->site);
         tcg_out_call_int(s, (const void *)helper_tso_cross_ld);
         tcg_out_pinned_clobbered(s, false, 0);
+        if (lb->tlb_pair) {
+            tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TLB_PAIR, 0);
+        }
         tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
     } else {
         tcg_out_st_helper_args(s, lb, &ldst_helper_param);
@@ -2102,6 +2140,9 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
     tcg_out_pinned_clobbered(s, false, 0);
+    if (lb->tlb_pair) {
+        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TLB_PAIR, 0);
+    }
     if (lb->type == TCG_TYPE_V128) {
         /* The Int128 result in X0:X1 goes to the vector. */
         tcg_out_insn(s, fmov, DX, lb->datalo_reg, TCG_REG_X0);
@@ -2176,9 +2217,11 @@ static bool acqrel_onepath(MemOp memop)
  * In both cases, return a TCGLabelQemuLdst structure if the slow path
  * is required and fill in @h with the host address for the fast path.
  */
-static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
-                                           TCGReg addr_reg, MemOpIdx oi,
-                                           bool is_ld, bool onepath)
+static TCGLabelQemuLdst *prepare_host_addr_pair(TCGContext *s,
+                                                HostAddress *h,
+                                                TCGReg addr_reg, MemOpIdx oi,
+                                                bool is_ld, bool onepath,
+                                                bool pair)
 {
     TCGType addr_type = s->addr_type;
     TCGLabelQemuLdst *ldst = NULL;
@@ -2198,16 +2241,26 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         TCGReg addr_adj;
         uint64_t compare_mask;
 
+        TCGReg mask = TCG_REG_TMP0, table = TCG_REG_TMP1;
+        TCGReg cmp_addr = TCG_REG_TMP2;
+
         ldst = new_ldst_label(s);
         ldst->is_ld = is_ld;
         ldst->oi = oi;
         ldst->addr_reg = addr_reg;
+        ldst->tlb_pair = pair;
 
-        /* Load CPUTLBDescFast.{mask,table} into {tmp0,tmp1}. */
-        QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, mask) != 0);
-        QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, table) != 8);
-        tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP1, TCG_AREG0,
-                     tlb_mask_table_ofs(s, mem_index), 1, 0);
+        if (s->tlb_pin_ofs && mem_index == s->tlb_pin_idx) {
+            /* tcg_tlbpin: CPUTLBDescFast.{mask,table} are in registers. */
+            mask = TCG_REG_TLB_MASK;
+            table = TCG_REG_TLB_TABLE;
+        } else {
+            /* Load CPUTLBDescFast.{mask,table} into {tmp0,tmp1}. */
+            QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, mask) != 0);
+            QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, table) != 8);
+            tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP1,
+                         TCG_AREG0, tlb_mask_table_ofs(s, mem_index), 1, 0);
+        }
 
         /*
          * Extract the TLB index from the address into X0.  The bits of a
@@ -2215,20 +2268,35 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
          * out of the index.
          */
         tcg_out_insn(s, addsub_realshift, AND_LSR, addr_type,
-                     TCG_REG_TMP0, TCG_REG_TMP0, addr_reg,
+                     TCG_REG_TMP0, mask, addr_reg,
                      TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
 
         /* Add the tlb_table pointer, forming the CPUTLBEntry address. */
-        tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP1, TCG_REG_TMP1,
+        tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP1, table,
                      TCG_REG_TMP0);
 
-        /* Load the tlb comparator into TMP0, and the fast path addend. */
         QEMU_BUILD_BUG_ON(HOST_BIG_ENDIAN);
-        tcg_out_ld(s, addr_type, TCG_REG_TMP0, TCG_REG_TMP1,
-                   is_ld ? offsetof(CPUTLBEntry, addr_read)
-                         : offsetof(CPUTLBEntry, addr_write));
-        tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_TMP1, TCG_REG_TMP1,
-                   offsetof(CPUTLBEntry, addend));
+        if (pair) {
+            /*
+             * tcg_tlbpair: both comparators into TMP0 and TMP2, the addend
+             * into the pair register, for the store that follows.
+             */
+            QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addr_write) !=
+                              offsetof(CPUTLBEntry, addr_read) + 8);
+            tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP2,
+                         TCG_REG_TMP1, offsetof(CPUTLBEntry, addr_read),
+                         0, 0);
+            tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_TLB_PAIR, TCG_REG_TMP1,
+                       offsetof(CPUTLBEntry, addend));
+            cmp_addr = TCG_REG_TMP1;
+        } else {
+            /* Load the tlb comparator into TMP0, and the fast path addend. */
+            tcg_out_ld(s, addr_type, TCG_REG_TMP0, TCG_REG_TMP1,
+                       is_ld ? offsetof(CPUTLBEntry, addr_read)
+                             : offsetof(CPUTLBEntry, addr_write));
+            tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_TMP1, TCG_REG_TMP1,
+                       offsetof(CPUTLBEntry, addend));
+        }
 
         /*
          * For aligned accesses, we check the first byte and include
@@ -2243,18 +2311,23 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
              */
             addr_adj = addr_reg;
         } else {
-            addr_adj = TCG_REG_TMP2;
+            addr_adj = cmp_addr;
             tcg_out_insn(s, addsub_imm, ADDI, addr_type,
                          addr_adj, addr_reg, s_mask - a_mask);
         }
         compare_mask = (uint64_t)TARGET_PAGE_MASK | a_mask;
 
         /* Store the page mask part of the address into TMP2.  */
-        tcg_out_logicali(s, Ilogic_imm_ANDI, addr_type, TCG_REG_TMP2,
+        tcg_out_logicali(s, Ilogic_imm_ANDI, addr_type, cmp_addr,
                          addr_adj, compare_mask);
 
         /* Perform the address comparison. */
-        tcg_out_cmp(s, addr_type, TCG_COND_NE, TCG_REG_TMP0, TCG_REG_TMP2, 0);
+        tcg_out_cmp(s, addr_type, TCG_COND_NE, TCG_REG_TMP0, cmp_addr, 0);
+        if (pair) {
+            /* And the write side's: NE unless both match. */
+            tcg_out_insn(s, ccmp_reg, CCMP, addr_type, TCG_REG_TMP2,
+                         cmp_addr, 0, TCG_COND_EQ);
+        }
 
         if (onepath) {
             /*
@@ -2276,7 +2349,7 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
             tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
         }
 
-        h->base = TCG_REG_TMP1;
+        h->base = pair ? TCG_REG_TLB_PAIR : TCG_REG_TMP1;
         h->index = addr_reg;
         h->index_ext = addr_type;
     } else {
@@ -2308,6 +2381,58 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
     }
 
     return ldst;
+}
+
+static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
+                                           TCGReg addr_reg, MemOpIdx oi,
+                                           bool is_ld, bool onepath)
+{
+    return prepare_host_addr_pair(s, h, addr_reg, oi, is_ld, onepath, false);
+}
+
+/*
+ * tcg_tlbpair: the store of a pair, through the translation its load left
+ * in the pair register; 0 there (the load took its slow path) sends it to
+ * its own slow path, or with @onepath to the x-tso fallback.
+ */
+static TCGLabelQemuLdst *prepare_pair_store(TCGContext *s, HostAddress *h,
+                                            TCGReg addr_reg, MemOpIdx oi,
+                                            bool onepath)
+{
+    TCGLabelQemuLdst *ldst = new_ldst_label(s);
+    MemOp opc = get_memop(oi);
+
+    h->aa = atom_and_align_for_opc(s, opc,
+                                   have_lse2 ? MO_ATOM_WITHIN16
+                                             : MO_ATOM_IFALIGN,
+                                   (opc & MO_SIZE) == MO_128);
+    ldst->is_ld = false;
+    ldst->oi = oi;
+    ldst->addr_reg = addr_reg;
+    if (onepath) {
+        ldst->fallback = true;
+        ldst->site = s->gen_insn_pc[s->gen_cur_insn];
+    }
+    ldst->label_ptr[0] = s->code_ptr;
+    tcg_out_insn(s, cbz, CBZ, 1, TCG_REG_TLB_PAIR, 0);
+
+    h->base = TCG_REG_TLB_PAIR;
+    h->index = addr_reg;
+    h->index_ext = s->addr_type;
+    return ldst;
+}
+
+/*
+ * The MemOpIdx without the tcg_tlbpair marks, which only the backend
+ * reads; @pair gets them.
+ */
+static MemOpIdx tlb_pair_strip(MemOpIdx oi, MemOp *pair)
+{
+    MemOp opc = get_memop(oi);
+
+    *pair = opc & (MO_TLB_PAIR_LD | MO_TLB_PAIR_ST);
+    return make_memop_idx(opc & ~(MO_TLB_PAIR_LD | MO_TLB_PAIR_ST),
+                          get_mmuidx(oi));
 }
 
 /*
@@ -2516,9 +2641,12 @@ static void tgen_qemu_ld(TCGContext *s, TCGType data_type, TCGReg data_reg,
 {
     TCGLabelQemuLdst *ldst;
     HostAddress h;
+    MemOp pair;
 
-    ldst = prepare_host_addr(s, &h, addr_reg, oi, true,
-                             acqrel_onepath(get_memop(oi)));
+    oi = tlb_pair_strip(oi, &pair);
+    ldst = prepare_host_addr_pair(s, &h, addr_reg, oi, true,
+                                  acqrel_onepath(get_memop(oi)),
+                                  pair & MO_TLB_PAIR_LD);
     if (acqrel_cross(get_memop(oi))) {
         tcg_out_qemu_ld_direct(s, get_memop(oi) &
                                ~(MO_ACQ_REL | MO_ACQ_REL_CROSS),
@@ -2555,9 +2683,16 @@ static void tgen_qemu_st(TCGContext *s, TCGType data_type, TCGReg data_reg,
 {
     TCGLabelQemuLdst *ldst;
     HostAddress h;
+    MemOp pair;
 
-    ldst = prepare_host_addr(s, &h, addr_reg, oi, false,
-                             acqrel_onepath(get_memop(oi)));
+    oi = tlb_pair_strip(oi, &pair);
+    if (pair & MO_TLB_PAIR_ST) {
+        ldst = prepare_pair_store(s, &h, addr_reg, oi,
+                                  acqrel_onepath(get_memop(oi)));
+    } else {
+        ldst = prepare_host_addr(s, &h, addr_reg, oi, false,
+                                 acqrel_onepath(get_memop(oi)));
+    }
     if (acqrel_cross(get_memop(oi))) {
         tcg_out_mb(s, TCG_MO_LD_ST | TCG_MO_ST_ST);
         tcg_out_qemu_st_direct(s, get_memop(oi), data_reg, h);
@@ -5667,6 +5802,13 @@ static void tcg_target_init(TCGContext *s)
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_TMP1);
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_TMP2);
     tcg_regset_set_reg(s->reserved_regs, TCG_VEC_TMP0);
+    if (tcg_use_softmmu && tcg_tlbpin) {
+        tcg_regset_set_reg(s->reserved_regs, TCG_REG_TLB_MASK);
+        tcg_regset_set_reg(s->reserved_regs, TCG_REG_TLB_TABLE);
+    }
+    if (tcg_use_softmmu && tcg_tlbpair) {
+        tcg_regset_set_reg(s->reserved_regs, TCG_REG_TLB_PAIR);
+    }
     if (!tcg_vregs_all) {
         for (TCGReg r = TCG_REG_V8; r <= TCG_REG_V15; r++) {
             tcg_regset_set_reg(s->reserved_regs, r);
@@ -5799,6 +5941,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
 static void tcg_out_tb_start(TCGContext *s)
 {
     tcg_out_bti(s, BTI_J);
+    tcg_out_tlb_pin_load(s);
 }
 
 static void tcg_out_nop_fill(tcg_insn_unit *p, int count)

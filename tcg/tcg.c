@@ -126,6 +126,8 @@ struct TCGLabelQemuLdst {
     unsigned nb_wb;
     /* label_ptr[0] is a B to the slow path, in cold code (tcg_tblayout). */
     bool veneer;
+    /* tcg_tlbpair: a pair's load, whose slow path clears the pair register */
+    bool tlb_pair;
     QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 };
 
@@ -346,6 +348,8 @@ bool tcg_pcid;
 
 bool tcg_lean;
 bool tcg_alignfold;
+bool tcg_tlbpin;
+bool tcg_tlbpair;
 bool tcg_repstr;
 bool tcg_hyperv;
 bool tcg_hvtimers;
@@ -4759,6 +4763,101 @@ align_fold_pass(TCGContext *s)
     g_free(form);
     g_free(ver);
 }
+
+/*
+ * tcg_tlbpin, tcg_tlbpair (system mode), on the final ops: pick the mmu
+ * index most of the TB's guest accesses use, whose TLB mask and table the
+ * backend keeps in registers; and mark each load followed by a store to
+ * the same address with nothing that can change the TLB or leave the
+ * straight line between them (no call, label or other guest access), with
+ * the same mmu index and MemOp but for the sign.  The backend checks
+ * both sides of the TLB entry at the load and reuses its translation for
+ * the store.
+ */
+#ifdef TCG_TARGET_HAS_TLB_PIN
+static void tlb_pair_pass(TCGContext *s)
+{
+    unsigned counts[NB_MMU_MODES] = { };
+    TCGOp *op, *head = NULL;
+    TCGTemp *head_addr = NULL;
+    int best = -1;
+
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        int no = def->nb_oargs, ni = def->nb_iargs;
+        TCGTemp *addr;
+        MemOpIdx oi;
+
+        switch (op->opc) {
+        case INDEX_op_qemu_ld:
+        case INDEX_op_qemu_st:
+        case INDEX_op_qemu_ld2:
+        case INDEX_op_qemu_st2:
+        case INDEX_op_qemu_ld_vec:
+        case INDEX_op_qemu_st_vec:
+            addr = arg_temp(op->args[no + ni - 1]);
+            oi = op->args[no + ni];
+            counts[get_mmuidx(oi)]++;
+            if (!tcg_tlbpair) {
+                continue;
+            }
+            if (head && op->opc == INDEX_op_qemu_st && addr == head_addr) {
+                MemOpIdx hoi = head->args[2];
+
+                if (get_mmuidx(hoi) == get_mmuidx(oi) &&
+                    (get_memop(hoi) & ~MO_SIGN) == get_memop(oi)) {
+                    head->args[2] = make_memop_idx(get_memop(hoi) |
+                                                   MO_TLB_PAIR_LD,
+                                                   get_mmuidx(hoi));
+                    op->args[2] = make_memop_idx(get_memop(oi) |
+                                                 MO_TLB_PAIR_ST,
+                                                 get_mmuidx(oi));
+                    head = NULL;
+                    continue;
+                }
+            }
+            if (op->opc == INDEX_op_qemu_ld) {
+                head = op;
+                head_addr = addr;
+            } else {
+                head = NULL;
+            }
+            continue;
+        default:
+            break;
+        }
+        if (!head) {
+            continue;
+        }
+        if (op->opc == INDEX_op_set_label ||
+            (def->flags & (TCG_OPF_CALL_CLOBBER | TCG_OPF_BB_END))) {
+            head = NULL;
+            continue;
+        }
+        for (int i = 0; i < no; i++) {
+            if (arg_temp(op->args[i]) == head_addr) {
+                head = NULL;
+                break;
+            }
+        }
+    }
+
+    s->tlb_pin_ofs = 0;
+    s->tlb_pin_idx = -1;
+    if (!tcg_tlbpin) {
+        return;
+    }
+    for (int i = 0; i < NB_MMU_MODES; i++) {
+        if (counts[i] && (best < 0 || counts[i] > counts[best])) {
+            best = i;
+        }
+    }
+    if (best >= 0) {
+        s->tlb_pin_idx = best;
+        s->tlb_pin_ofs = tlb_mask_table_ofs(s, best);
+    }
+}
+#endif
 
 /* Reachable analysis : remove unreachable code.  */
 static void __attribute__((noinline))
@@ -11043,6 +11142,14 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             qemu_log_unlock(logfile);
         }
     }
+
+    s->tlb_pin_ofs = 0;
+    s->tlb_pin_idx = -1;
+#ifdef TCG_TARGET_HAS_TLB_PIN
+    if (tcg_use_softmmu && (tcg_tlbpin || tcg_tlbpair)) {
+        tlb_pair_pass(s);
+    }
+#endif
 
     /* Initialize goto_tb jump offsets. */
     for (int n = 0; n < TB_JMP_SLOTS; n++) {
