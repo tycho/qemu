@@ -133,6 +133,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-haltpoll", "50" },
         { "x-apictimer", "auto" },
         { "x-apicpost", "auto" },
+        { "x-tlbpin", "on" },
 #ifdef CONFIG_DARWIN
         { "x-jitwx", "lazy" },
         { "x-hostpoll", "kqueue" },
