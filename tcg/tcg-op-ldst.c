@@ -105,6 +105,38 @@ static void gen_ldst2(TCGOpcode opc, TCGType type, TCGTemp *vl, TCGTemp *vh,
     TCGOP_FLAGS(op) = get_memop(oi) & MO_SIZE;
 }
 
+/*
+ * tcg_atomic: a guest atomic read-modify-write (parallel mode) as one
+ * qemu_atomic op, where the backend has it: up to 64 bits, in the host's
+ * byte order, and no plugin instrumenting the insn (the helper reports
+ * its accesses to plugins).
+ */
+static bool use_qemu_atomic(MemOp memop)
+{
+    if (!tcg_atomic || (memop & MO_SIZE) > MO_64 || (memop & MO_BSWAP)) {
+        return false;
+    }
+#ifdef CONFIG_PLUGIN
+    if (tcg_ctx->plugin_insn != NULL) {
+        return false;
+    }
+#endif
+    return true;
+}
+
+/* @ret = the old value, zero-extended from the access size. */
+static void gen_qemu_atomic(TCGType type, TCGTemp *ret, TCGTemp *val,
+                            TCGTemp *cmp, TCGTemp *addr, MemOp memop,
+                            TCGArg idx, TCGAtomicOp aop)
+{
+    MemOpIdx oi = make_memop_idx(memop & ~MO_SIGN, idx);
+    TCGOp *op = tcg_gen_op6(INDEX_op_qemu_atomic, type, temp_arg(ret),
+                            temp_arg(val), temp_arg(cmp), temp_arg(addr),
+                            oi, aop);
+
+    TCGOP_FLAGS(op) = memop & MO_SIZE;
+}
+
 static void gen_ld_i64(TCGv_i64 v, TCGTemp *addr, MemOpIdx oi)
 {
     gen_ldst1(INDEX_op_qemu_ld, TCG_TYPE_I64, tcgv_i64_temp(v), addr, oi);
@@ -1164,6 +1196,15 @@ static void tcg_gen_atomic_cmpxchg_i32_int(TCGv_i32 retv, TCGTemp *addr,
     }
 
     memop = tcg_canonicalize_memop(memop, 0, 0);
+    if (use_qemu_atomic(memop)) {
+        gen_qemu_atomic(TCG_TYPE_I32, tcgv_i32_temp(retv),
+                        tcgv_i32_temp(newv), tcgv_i32_temp(cmpv), addr,
+                        memop, idx, TCG_ATOMIC_CMPXCHG);
+        if (memop & MO_SIGN) {
+            tcg_gen_ext_i32(retv, retv, memop);
+        }
+        return;
+    }
     gen = table_cmpxchg[memop & (MO_SIZE | MO_BSWAP)];
     tcg_debug_assert(gen != NULL);
 
@@ -1234,6 +1275,12 @@ static void tcg_gen_atomic_cmpxchg_i64_int(TCGv_i64 retv, TCGTemp *addr,
         gen_atomic_cx_i64 gen;
 
         memop = tcg_canonicalize_memop(memop, 1, 0);
+        if (use_qemu_atomic(memop)) {
+            gen_qemu_atomic(TCG_TYPE_I64, tcgv_i64_temp(retv),
+                            tcgv_i64_temp(newv), tcgv_i64_temp(cmpv), addr,
+                            memop, idx, TCG_ATOMIC_CMPXCHG);
+            return;
+        }
         gen = table_cmpxchg[memop & (MO_SIZE | MO_BSWAP)];
         if (gen) {
             MemOpIdx oi = make_memop_idx(memop, idx);
@@ -1384,14 +1431,33 @@ static void do_nonatomic_op_i32(TCGv_i32 ret, TCGTemp *addr, TCGv_i32 val,
     tcg_temp_free_i32(t2);
 }
 
+/*
+ * With tcg_atomic, @aop (a TCGAtomicOp, or -1 for none) returns the old
+ * value; @new_val applies @op to it as well, for the new value.
+ */
 static void do_atomic_op_i32(TCGv_i32 ret, TCGTemp *addr, TCGv_i32 val,
-                             TCGArg idx, MemOp memop, void * const table[])
+                             TCGArg idx, MemOp memop, void * const table[],
+                             int aop, bool new_val,
+                             void (*op)(TCGv_i32, TCGv_i32, TCGv_i32))
 {
     gen_atomic_op_i32 gen;
     TCGv_i64 a64;
     MemOpIdx oi;
 
     memop = tcg_canonicalize_memop(memop, 0, 0);
+
+    if (aop >= 0 && use_qemu_atomic(memop)) {
+        TCGv_i32 old = new_val ? tcg_temp_ebb_new_i32() : ret;
+
+        gen_qemu_atomic(TCG_TYPE_I32, tcgv_i32_temp(old), tcgv_i32_temp(val),
+                        tcgv_i32_temp(val), addr, memop, idx, aop);
+        if (new_val) {
+            op(ret, old, val);
+            tcg_temp_free_i32(old);
+        }
+        tcg_gen_ext_i32(ret, ret, memop);
+        return;
+    }
 
     gen = table[memop & (MO_SIZE | MO_BSWAP)];
     tcg_debug_assert(gen != NULL);
@@ -1426,12 +1492,28 @@ static void do_nonatomic_op_i64(TCGv_i64 ret, TCGTemp *addr, TCGv_i64 val,
 }
 
 static void do_atomic_op_i64(TCGv_i64 ret, TCGTemp *addr, TCGv_i64 val,
-                             TCGArg idx, MemOp memop, void * const table[])
+                             TCGArg idx, MemOp memop, void * const table[],
+                             int aop, bool new_val,
+                             void (*op)(TCGv_i64, TCGv_i64, TCGv_i64),
+                             void (*op32)(TCGv_i32, TCGv_i32, TCGv_i32))
 {
     memop = tcg_canonicalize_memop(memop, 1, 0);
 
     if ((memop & MO_SIZE) == MO_64) {
         gen_atomic_op_i64 gen = table[memop & (MO_SIZE | MO_BSWAP)];
+
+        if (aop >= 0 && use_qemu_atomic(memop)) {
+            TCGv_i64 old = new_val ? tcg_temp_ebb_new_i64() : ret;
+
+            gen_qemu_atomic(TCG_TYPE_I64, tcgv_i64_temp(old),
+                            tcgv_i64_temp(val), tcgv_i64_temp(val), addr,
+                            memop, idx, aop);
+            if (new_val) {
+                op(ret, old, val);
+                tcg_temp_free_i64(old);
+            }
+            return;
+        }
 
         if (gen) {
             MemOpIdx oi = make_memop_idx(memop & ~MO_SIGN, idx);
@@ -1450,7 +1532,8 @@ static void do_atomic_op_i64(TCGv_i64 ret, TCGTemp *addr, TCGv_i64 val,
         TCGv_i32 r32 = tcg_temp_ebb_new_i32();
 
         tcg_gen_extrl_i64_i32(v32, val);
-        do_atomic_op_i32(r32, addr, v32, idx, memop & ~MO_SIGN, table);
+        do_atomic_op_i32(r32, addr, v32, idx, memop & ~MO_SIGN, table,
+                         aop, new_val, op32);
         tcg_temp_free_i32(v32);
 
         tcg_gen_extu_i32_i64(ret, r32);
@@ -1498,7 +1581,7 @@ static void do_atomic_op_i128(TCGv_i128 ret, TCGTemp *addr, TCGv_i128 val,
     tcg_gen_movi_i64(TCGV128_HIGH(ret), 0);
 }
 
-#define GEN_ATOMIC_HELPER128(NAME, OP, NEW)                             \
+#define GEN_ATOMIC_HELPER128(NAME, OP, NEW, AOP)                        \
 static void * const table_##NAME[(MO_SIZE | MO_BSWAP) + 1] = {          \
     [MO_8] = gen_helper_atomic_##NAME##b,                               \
     [MO_16 | MO_LE] = gen_helper_atomic_##NAME##w_le,                   \
@@ -1517,7 +1600,8 @@ void tcg_gen_atomic_##NAME##_i32_chk(TCGv_i32 ret, TCGTemp *addr,       \
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);                  \
     tcg_debug_assert((memop & MO_SIZE) <= MO_32);                       \
     if (tcg_ctx->gen_tb->cflags & CF_PARALLEL) {                        \
-        do_atomic_op_i32(ret, addr, val, idx, memop, table_##NAME);     \
+        do_atomic_op_i32(ret, addr, val, idx, memop, table_##NAME,      \
+                         AOP, NEW, tcg_gen_##OP##_i32);                \
     } else {                                                            \
         do_nonatomic_op_i32(ret, addr, val, idx, memop, NEW,            \
                             tcg_gen_##OP##_i32);                        \
@@ -1530,7 +1614,9 @@ void tcg_gen_atomic_##NAME##_i64_chk(TCGv_i64 ret, TCGTemp *addr,       \
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);                  \
     tcg_debug_assert((memop & MO_SIZE) <= MO_64);                       \
     if (tcg_ctx->gen_tb->cflags & CF_PARALLEL) {                        \
-        do_atomic_op_i64(ret, addr, val, idx, memop, table_##NAME);     \
+        do_atomic_op_i64(ret, addr, val, idx, memop, table_##NAME,      \
+                         AOP, NEW, tcg_gen_##OP##_i64,                 \
+                         tcg_gen_##OP##_i32);                          \
     } else {                                                            \
         do_nonatomic_op_i64(ret, addr, val, idx, memop, NEW,            \
                             tcg_gen_##OP##_i64);                        \
@@ -1550,7 +1636,7 @@ void tcg_gen_atomic_##NAME##_i128_chk(TCGv_i128 ret, TCGTemp *addr,     \
     }                                                                   \
 }
 
-#define GEN_ATOMIC_HELPER(NAME, OP, NEW)                                \
+#define GEN_ATOMIC_HELPER(NAME, OP, NEW, AOP)                           \
 static void * const table_##NAME[(MO_SIZE | MO_BSWAP) + 1] = {          \
     [MO_8] = gen_helper_atomic_##NAME##b,                               \
     [MO_16 | MO_LE] = gen_helper_atomic_##NAME##w_le,                   \
@@ -1567,7 +1653,8 @@ void tcg_gen_atomic_##NAME##_i32_chk(TCGv_i32 ret, TCGTemp *addr,       \
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);                  \
     tcg_debug_assert((memop & MO_SIZE) <= MO_32);                       \
     if (tcg_ctx->gen_tb->cflags & CF_PARALLEL) {                        \
-        do_atomic_op_i32(ret, addr, val, idx, memop, table_##NAME);     \
+        do_atomic_op_i32(ret, addr, val, idx, memop, table_##NAME,      \
+                         AOP, NEW, tcg_gen_##OP##_i32);                \
     } else {                                                            \
         do_nonatomic_op_i32(ret, addr, val, idx, memop, NEW,            \
                             tcg_gen_##OP##_i32);                        \
@@ -1580,30 +1667,32 @@ void tcg_gen_atomic_##NAME##_i64_chk(TCGv_i64 ret, TCGTemp *addr,       \
     tcg_debug_assert(addr_type == tcg_ctx->addr_type);                  \
     tcg_debug_assert((memop & MO_SIZE) <= MO_64);                       \
     if (tcg_ctx->gen_tb->cflags & CF_PARALLEL) {                        \
-        do_atomic_op_i64(ret, addr, val, idx, memop, table_##NAME);     \
+        do_atomic_op_i64(ret, addr, val, idx, memop, table_##NAME,      \
+                         AOP, NEW, tcg_gen_##OP##_i64,                 \
+                         tcg_gen_##OP##_i32);                          \
     } else {                                                            \
         do_nonatomic_op_i64(ret, addr, val, idx, memop, NEW,            \
                             tcg_gen_##OP##_i64);                        \
     }                                                                   \
 }
 
-GEN_ATOMIC_HELPER(fetch_add, add, 0)
-GEN_ATOMIC_HELPER128(fetch_and, and, 0)
-GEN_ATOMIC_HELPER128(fetch_or, or, 0)
-GEN_ATOMIC_HELPER(fetch_xor, xor, 0)
-GEN_ATOMIC_HELPER(fetch_smin, smin, 0)
-GEN_ATOMIC_HELPER(fetch_umin, umin, 0)
-GEN_ATOMIC_HELPER(fetch_smax, smax, 0)
-GEN_ATOMIC_HELPER(fetch_umax, umax, 0)
+GEN_ATOMIC_HELPER(fetch_add, add, 0, TCG_ATOMIC_ADD)
+GEN_ATOMIC_HELPER128(fetch_and, and, 0, TCG_ATOMIC_AND)
+GEN_ATOMIC_HELPER128(fetch_or, or, 0, TCG_ATOMIC_OR)
+GEN_ATOMIC_HELPER(fetch_xor, xor, 0, TCG_ATOMIC_XOR)
+GEN_ATOMIC_HELPER(fetch_smin, smin, 0, -1)
+GEN_ATOMIC_HELPER(fetch_umin, umin, 0, -1)
+GEN_ATOMIC_HELPER(fetch_smax, smax, 0, -1)
+GEN_ATOMIC_HELPER(fetch_umax, umax, 0, -1)
 
-GEN_ATOMIC_HELPER(add_fetch, add, 1)
-GEN_ATOMIC_HELPER(and_fetch, and, 1)
-GEN_ATOMIC_HELPER(or_fetch, or, 1)
-GEN_ATOMIC_HELPER(xor_fetch, xor, 1)
-GEN_ATOMIC_HELPER(smin_fetch, smin, 1)
-GEN_ATOMIC_HELPER(umin_fetch, umin, 1)
-GEN_ATOMIC_HELPER(smax_fetch, smax, 1)
-GEN_ATOMIC_HELPER(umax_fetch, umax, 1)
+GEN_ATOMIC_HELPER(add_fetch, add, 1, TCG_ATOMIC_ADD)
+GEN_ATOMIC_HELPER(and_fetch, and, 1, TCG_ATOMIC_AND)
+GEN_ATOMIC_HELPER(or_fetch, or, 1, TCG_ATOMIC_OR)
+GEN_ATOMIC_HELPER(xor_fetch, xor, 1, TCG_ATOMIC_XOR)
+GEN_ATOMIC_HELPER(smin_fetch, smin, 1, -1)
+GEN_ATOMIC_HELPER(umin_fetch, umin, 1, -1)
+GEN_ATOMIC_HELPER(smax_fetch, smax, 1, -1)
+GEN_ATOMIC_HELPER(umax_fetch, umax, 1, -1)
 
 static void tcg_gen_mov2_i32(TCGv_i32 r, TCGv_i32 a, TCGv_i32 b)
 {
@@ -1615,7 +1704,7 @@ static void tcg_gen_mov2_i64(TCGv_i64 r, TCGv_i64 a, TCGv_i64 b)
     tcg_gen_mov_i64(r, b);
 }
 
-GEN_ATOMIC_HELPER128(xchg, mov2, 0)
+GEN_ATOMIC_HELPER128(xchg, mov2, 0, TCG_ATOMIC_XCHG)
 
 #undef GEN_ATOMIC_HELPER
 #undef GEN_ATOMIC_HELPER128

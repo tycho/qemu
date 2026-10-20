@@ -324,6 +324,21 @@ static void tcg_set_tso_vec(Object *obj, const char *value, Error **errp)
     tcg_tso_vec_atomic = !strcmp(value, "atomic");
 }
 
+static bool tcg_get_atomic(Object *obj, Error **errp)
+{
+    return tcg_atomic;
+}
+
+static void tcg_set_atomic(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_atomic_supported()) {
+        error_setg(errp, "x-atomic: not supported by this TCG backend "
+                   "or host");
+        return;
+    }
+    tcg_atomic = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -362,6 +377,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "auto (acqrel where the host supports it, else barrier, and in "
         "user mode serial code again once a single thread is left), "
         "none (no barriers: unsafe, for measurement)");
+
+    object_class_property_add_bool(oc, "x-atomic", tcg_get_atomic,
+                                   tcg_set_atomic);
+    object_class_property_set_description(oc, "x-atomic",
+        "Guest atomic read-modify-write accesses as host atomic insns "
+        "inline, with the helper only as the slow path");
 
     object_class_property_add_str(oc, "x-tso-vec", tcg_get_tso_vec,
                                   tcg_set_tso_vec);
