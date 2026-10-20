@@ -332,6 +332,11 @@ void helper_wrmsr(CPUX86State *env)
         int ret;
         int index = (uint32_t)env->regs[R_ECX] - MSR_APIC_START;
 
+        /* x-posted: IPIs without the BQL */
+        if (apic_msr_write_lockless(env_archcpu(env)->apic_state, index,
+                                    val)) {
+            break;
+        }
         bql_lock();
         ret = apic_msr_write(env_archcpu(env)->apic_state, index, val);
         bql_unlock();
@@ -356,8 +361,13 @@ void helper_wrmsr(CPUX86State *env)
             x86_tcg_hyperv_tsc_changed(env);
         }
         break;
-    default:
-        if (x86_tcg_hyperv_wrmsr(env, (uint32_t)env->regs[R_ECX], val)) {
+    default: {
+        int hv = x86_tcg_hyperv_wrmsr(env, (uint32_t)env->regs[R_ECX], val);
+
+        if (hv < 0) {
+            goto error;
+        }
+        if (hv) {
             break;
         }
         if ((uint32_t)env->regs[R_ECX] >= MSR_MC0_CTL
@@ -372,6 +382,7 @@ void helper_wrmsr(CPUX86State *env)
         }
         /* XXX: exception? */
         break;
+    }
     }
     return;
 error:

@@ -36,12 +36,22 @@
 #include "exec/cpu-common.h"
 #include "qapi/error.h"
 #include "qom/object.h"
+#include "hw/core/qdev-properties.h"
+#include "qemu/event_notifier.h"
+#include "qemu/timer.h"
+#include "system/runstate.h"
 
 #define SYNC_FROM_VAPIC                 0x1
 #define SYNC_TO_VAPIC                   0x2
 #define SYNC_ISR_IRR_TO_VAPIC           0x4
 
 static APICCommonState **local_apics;
+/*
+ * An xAPIC ID differs from its initial one: x-posted resolves physical
+ * destinations under the BQL from then on (the IDs it reads without the
+ * BQL are fixed until then).
+ */
+static bool apic_ids_moved;
 static uint32_t max_apics;
 static uint32_t max_apic_words;
 
@@ -466,10 +476,335 @@ static void apic_update_irq(APICCommonState *s)
     }
 }
 
+static void apic_timer(void *opaque);
+
+/*
+ * x-posted: fixed, edge-triggered IPIs written to the x2APIC ICR or
+ * SELF_IPI register, for a physical unicast destination or a shorthand,
+ * are posted without the BQL.  The sender sets the vector in the target's
+ * pir with a sequentially consistent RMW (ordering the sender's earlier
+ * guest stores before it), raises CPU_INTERRUPT_POLL and asks the target
+ * to leave generated code; the target's POLL pass, under the BQL, moves
+ * pir into IRR (apic_pir_drain), from where it is delivered as any other
+ * edge interrupt.  The target clears POLL before it drains, so a post
+ * that lands after the drain raises it again.
+ *
+ * A halted target is woken under the BQL (apic_kick_locked): the sender
+ * raises POLL, then, after a full barrier, reads halted and halt_polling;
+ * the target stores them, then, after a full barrier, checks for work.
+ * One of the two sees the other's store.
+ *
+ * Logical and broadcast destinations, other delivery modes and level
+ * interrupts take the BQL path, as do all destinations once the guest
+ * changes an xAPIC ID (apic_ids_moved).  An unplugged APIC is freed after
+ * an RCU grace period (apic_unrealize): senders hold no lock.
+ */
+static bool apic_match_dest(APICCommonState *apic, uint32_t dest);
+
+static void apic_pir_drain(APICCommonState *s)
+{
+    for (int w = 0; w < ARRAY_SIZE(s->pir); w++) {
+        uint64_t bits;
+
+        if (!qatomic_read(&s->pir[w])) {
+            continue;
+        }
+        bits = qatomic_xchg(&s->pir[w], 0);
+        while (bits) {
+            int vec = w * 64 + ctz64(bits);
+
+            bits &= bits - 1;
+            /* as apic_set_irq's edge delivery */
+            apic_set_bit(s->irr, vec);
+            apic_reset_bit(s->tmr, vec);
+        }
+    }
+}
+
+static void apic_kick_locked(APICCommonState *s);
+
+/* Post @vec to @t; @self: the sender is @t's own vCPU. */
+static void apic_post(APICCommonState *t, int vec, bool self)
+{
+    CPUState *cs = CPU(t->cpu);
+
+    qatomic_fetch_or(&t->pir[vec >> 6], 1ULL << (vec & 63));
+    cpu_set_interrupt(cs, CPU_INTERRUPT_POLL);
+    qatomic_store_release(&cs->neg.icount_decr.u16.high, -1);
+    if (self) {
+        return;
+    }
+    smp_mb(); /* the request before halted: the vCPU orders the reverse */
+    if (qatomic_read(&cs->halted) && !qatomic_read(&cs->halt_polling)) {
+        apic_kick_locked(t);
+    }
+}
+
+/* An ICR write by @s's own vCPU, without the BQL: true if posted. */
+static bool apic_icr_post(APICCommonState *s, uint32_t lo, uint32_t dest)
+{
+    int vec = lo & 0xff, mode = (lo >> 8) & 7, shorthand = (lo >> 18) & 3;
+    APICCommonState *apic_iter;
+
+    if (!s->posted || s->vapic_paddr || mode != APIC_DM_FIXED ||
+        (lo & (1 << 15)) || vec < 16) {
+        return false;
+    }
+    switch (shorthand) {
+    case 1:
+        apic_post(s, vec, true);
+        return true;
+    case 2:
+    case 3:
+        for (int i = 0; i < max_apic_words * 32; i++) {
+            apic_iter = qatomic_read(&local_apics[i]);
+            if (apic_iter && !(shorthand == 3 && apic_iter == s)) {
+                apic_post(apic_iter, vec, apic_iter == s);
+            }
+        }
+        return true;
+    default:
+        if (lo & (1 << 11)) {
+            return false;   /* logical destination */
+        }
+        if (dest == (is_x2apic_mode(s) ? 0xffffffff : 0xff)) {
+            return false;   /* physical broadcast */
+        }
+        if (qatomic_read(&apic_ids_moved)) {
+            return false;   /* an xAPIC ID changed: resolve under the BQL */
+        }
+        {
+            /* every matching APIC, as apic_get_delivery_bitmask */
+            APICCommonState *match[64];
+            int n = 0;
+
+            for (int i = 0; i < max_apic_words * 32; i++) {
+                apic_iter = qatomic_read(&local_apics[i]);
+                if (apic_iter && apic_match_dest(apic_iter, dest)) {
+                    if (n == ARRAY_SIZE(match)) {
+                        return false;
+                    }
+                    match[n++] = apic_iter;
+                }
+            }
+            for (int i = 0; i < n; i++) {
+                apic_post(match[i], vec, match[i] == s);
+            }
+            return n > 0;
+        }
+    }
+}
+
+bool apic_msr_write_lockless(APICCommonState *s, int index, uint64_t val)
+{
+    if (!s || !s->posted || !is_x2apic_mode(s)) {
+        return false;
+    }
+    switch (index) {
+    case 0x30:
+        if (apic_icr_post(s, (uint32_t)val, val >> 32)) {
+            s->icr[0] = val;
+            s->icr[1] = val >> 32;
+            return true;
+        }
+        return false;
+    case 0x3f:
+        if ((val & 0xff) < 16) {
+            return false;
+        }
+        apic_post(s, val & 0xff, true);
+        return true;
+    default:
+        return false;
+    }
+}
+
 void apic_poll_irq(APICCommonState *s)
 {
+    if (s->posted) {
+        apic_pir_drain(s);
+    }
+    /*
+     * x-vcpu-timer: the deadline thread found an expiry; only a hint:
+     * the timer may have been reprogrammed, cancelled or reset since it
+     * claimed it, so fire only a timer that is armed and due now.
+     */
+    if (s->vcpu_timer && qatomic_xchg(&s->timer_due, 0) &&
+        s->timer_expiry != -1 &&
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->next_time) {
+        apic_timer(s);
+    }
+    /* only a hint: the timer device checks its own expiries */
+    if (qatomic_xchg(&s->xdue, 0) && s->xtimer_cb) {
+        s->xtimer_cb(s->xtimer_opaque);
+    }
     apic_sync_vapic(s, SYNC_FROM_VAPIC);
     apic_update_irq(s);
+}
+
+/*
+ * x-vcpu-timer: the timer fires on the vCPU that owns it, not on the
+ * main loop.  Arming it records its expiry in vdeadline and pokes one
+ * deadline thread, which sleeps (qemu_poll_ns) until the earliest expiry
+ * of all vCPUs.  At an expiry it sets timer_due, raises
+ * CPU_INTERRUPT_POLL and asks the vCPU to leave generated code (without
+ * exit_request: no return to the vCPU's outer loop); the vCPU's POLL
+ * pass, under the BQL it takes itself, fires the timer (apic_timer):
+ * LVT delivery and rearming.  The main loop, and its BQL hand-off to the
+ * vCPU, are out of the path.
+ *
+ * A halted vCPU is woken under the BQL, as cpu_interrupt does: it checks
+ * for work and waits on halt_cond with the BQL held.  The thread sets
+ * POLL with a sequentially consistent RMW, then reads halted after a
+ * full barrier; the vCPU stores halted, and has a full barrier before it
+ * checks for work (mttcg_cpu_thread_fn): one of the two sees the other's
+ * store, so a vCPU that halts as its timer expires is woken either way.
+ */
+static EventNotifier vcpu_timer_notifier;
+static QemuThread vcpu_timer_thread;
+static bool vcpu_timer_started;
+
+/*
+ * Wake @s's halted vCPU, as cpu_interrupt does, under the BQL; not if the
+ * CPU was unplugged meanwhile (apic_unrealize, under the BQL, removes it
+ * from local_apics first).
+ */
+static void apic_kick_locked(APICCommonState *s)
+{
+    bql_lock();
+    if (qatomic_read(&local_apics[s->initial_apic_id]) == s) {
+        qemu_cpu_kick(CPU(s->cpu));
+    }
+    bql_unlock();
+}
+
+static void apic_vcpu_timer_fire(APICCommonState *s, int *due)
+{
+    CPUState *cs = CPU(s->cpu);
+
+    qatomic_set(due, 1);
+    cpu_set_interrupt(cs, CPU_INTERRUPT_POLL);
+    qatomic_store_release(&cs->neg.icount_decr.u16.high, -1);
+    smp_mb(); /* the request before halted: the vCPU orders the reverse */
+    if (qatomic_read(&cs->halted) && !qatomic_read(&cs->halt_polling)) {
+        apic_kick_locked(s);
+    }
+}
+
+static void *apic_vcpu_timer_thread(void *opaque)
+{
+    rcu_register_thread();
+    for (;;) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int64_t first = INT64_MAX, timeout;
+        GPollFD pfd = {
+            .fd = event_notifier_get_fd(&vcpu_timer_notifier),
+            .events = G_IO_IN,
+        };
+
+        /* the APICs stay allocated while we look (apic_unrealize) */
+        WITH_RCU_READ_LOCK_GUARD()
+        for (int i = 0; i < max_apic_words * 32; i++) {
+            APICCommonState *s = qatomic_read(&local_apics[i]);
+            int64_t d;
+
+            if (!s || !s->vcpu_timer) {
+                continue;
+            }
+            d = qatomic_read(&s->vdeadline);
+            if (d <= now) {
+                if (qatomic_cmpxchg(&s->vdeadline, d, INT64_MAX) == d) {
+                    apic_vcpu_timer_fire(s, &s->timer_due);
+                }
+            } else if (d < first) {
+                first = d;
+            }
+            /* and another timer device's deadline (apic_xtimer_mod) */
+            d = qatomic_read(&s->xdeadline);
+            if (d <= now) {
+                if (qatomic_cmpxchg(&s->xdeadline, d, INT64_MAX) == d) {
+                    apic_vcpu_timer_fire(s, &s->xdue);
+                }
+            } else if (d < first) {
+                first = d;
+            }
+        }
+        timeout = first == INT64_MAX ? -1 : first - now;
+        if (!runstate_is_running()) {
+            /* the clock is stopped: wait for the VM to run (apic_vm_state) */
+            timeout = -1;
+        }
+        if (qemu_poll_ns(&pfd, 1, timeout) > 0) {
+            event_notifier_test_and_clear(&vcpu_timer_notifier);
+        }
+    }
+    return NULL;
+}
+
+static void apic_vm_state(void *opaque, bool running, RunState state)
+{
+    if (running) {
+        event_notifier_set(&vcpu_timer_notifier);
+    }
+}
+
+static void apic_vcpu_timer_arm(APICCommonState *s, int64_t deadline)
+{
+    qatomic_set(&s->vdeadline, deadline);
+    if (deadline != INT64_MAX) {
+        event_notifier_set(&vcpu_timer_notifier);
+    }
+}
+
+static void apic_xtimer_expired(void *opaque)
+{
+    APICCommonState *s = opaque;
+
+    qatomic_set(&s->xdue, 1);
+    cpu_interrupt(CPU(s->cpu), CPU_INTERRUPT_POLL);
+}
+
+/*
+ * A per-vCPU timer device outside the APIC (Hyper-V's synthetic timers)
+ * runs @cb on the vCPU, in its POLL pass with the BQL held, once a
+ * deadline set with apic_xtimer_mod has passed, and @eoi after every EOI
+ * (an interrupt it raised may have been handled).  So the device's state
+ * is only ever touched by its own vCPU.
+ */
+void apic_xtimer_init(APICCommonState *s, void (*cb)(void *),
+                      void (*eoi)(void *), void *opaque)
+{
+    s->xtimer_cb = cb;
+    s->xtimer_eoi = eoi;
+    s->xtimer_opaque = opaque;
+    if (!s->vcpu_timer && !s->xtimer) {
+        s->xtimer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apic_xtimer_expired, s);
+    }
+}
+
+/*
+ * @deadline on QEMU_CLOCK_VIRTUAL, or INT64_MAX for none.  BQL held.
+ * With x-vcpu-timer, the deadline thread wakes the vCPU, as for the APIC
+ * timer.
+ */
+void apic_xtimer_mod(APICCommonState *s, int64_t deadline)
+{
+    if (s->vcpu_timer) {
+        qatomic_set(&s->xdeadline, deadline);
+        if (deadline != INT64_MAX) {
+            event_notifier_set(&vcpu_timer_notifier);
+        }
+    } else if (deadline == INT64_MAX) {
+        timer_del(s->xtimer);
+    } else {
+        timer_mod(s->xtimer, deadline);
+    }
+}
+
+/* A fixed, edge-triggered vector from this vCPU's own devices.  BQL held. */
+void apic_set_local_irq(APICCommonState *s, int vector)
+{
+    apic_set_irq(s, vector, APIC_TRIGGER_EDGE);
 }
 
 static void apic_set_irq(APICCommonState *s, int vector_num, int trigger_mode)
@@ -503,6 +838,9 @@ static void apic_eoi(APICCommonState *s)
     apic_reset_bit(s->isr, isrv);
     if (!(s->spurious_vec & APIC_SV_DIRECTED_IO) && apic_get_bit(s->tmr, isrv)) {
         ioapic_eoi_broadcast(isrv);
+    }
+    if (s->xtimer_eoi) {
+        s->xtimer_eoi(s->xtimer_opaque);
     }
     apic_sync_vapic(s, SYNC_FROM_VAPIC | SYNC_TO_VAPIC);
     apic_update_irq(s);
@@ -757,6 +1095,11 @@ int apic_accept_pic_intr(APICCommonState *s)
 
 static void apic_timer_update(APICCommonState *s, int64_t current_time)
 {
+    if (s->vcpu_timer) {
+        apic_vcpu_timer_arm(s, apic_next_timer(s, current_time) ?
+                               s->next_time : INT64_MAX);
+        return;
+    }
     if (apic_next_timer(s, current_time)) {
         timer_mod(s->timer, s->next_time);
     } else {
@@ -776,6 +1119,11 @@ static int apic_register_read(APICCommonState *s, int index, uint64_t *value)
 {
     uint32_t val;
     int ret = 0;
+
+    /* x-posted: posted vectors become visible in IRR, ISR and PPR here */
+    if (s->posted && (index == 0x0a || (index >= 0x10 && index <= 0x27))) {
+        apic_pir_drain(s);
+    }
 
     switch(index) {
     case 0x02: /* id */
@@ -944,6 +1292,18 @@ static uint64_t apic_mem_read_locked(void *opaque, hwaddr addr,
     return val;
 }
 
+/*
+ * x-posted with x-lockless-tpr: the vCPU's own xAPIC ICR, as its x2APIC
+ * ICR MSRs: ICR reads and ICR2 writes take no lock (only the owner writes
+ * them), and ICR writes are posted where they can be.
+ */
+static bool apic_posted_mmio(APICCommonState *s, hwaddr addr, unsigned size)
+{
+    return s && s->posted && s->lockless_tpr && size >= 4 && addr <= 0xfff &&
+           !s->vapic_paddr && (s->apicbase & MSR_IA32_APICBASE_ENABLE) &&
+           !is_x2apic_mode(s);
+}
+
 static uint64_t apic_mem_read(void *opaque, hwaddr addr, unsigned size)
 {
     APICCommonState *s = cpu_get_current_apic();
@@ -951,6 +1311,13 @@ static uint64_t apic_mem_read(void *opaque, hwaddr addr, unsigned size)
 
     if (apic_tpr_lockless(s, addr, size)) {
         return qatomic_read(&s->tpr);
+    }
+    if (apic_posted_mmio(s, addr, size)) {
+        int index = (addr >> 4) & 0xff;
+
+        if (index == 0x30 || index == 0x31) {
+            return s->icr[index & 1];
+        }
     }
     if (self->lockless_tpr) {
         BQL_LOCK_GUARD();
@@ -1008,6 +1375,9 @@ static int apic_register_write(APICCommonState *s, int index, uint64_t val)
         }
 
         s->id = (val >> 24);
+        if (s->id != s->initial_apic_id) {
+            qatomic_set(&apic_ids_moved, true);
+        }
         break;
     case 0x03:
         break;
@@ -1162,6 +1532,18 @@ static void apic_mem_write(void *opaque, hwaddr addr, uint64_t val,
         apic_tpr_write_lockless(s, val);
         return;
     }
+    if (apic_posted_mmio(s, addr, size)) {
+        int index = (addr >> 4) & 0xff;
+
+        if (index == 0x31) {
+            s->icr[1] = val;
+            return;
+        }
+        if (index == 0x30 && apic_icr_post(s, val, (s->icr[1] >> 24) & 0xff)) {
+            s->icr[0] = val;
+            return;
+        }
+    }
     /* MSI writes come from any thread, with no APIC of their own. */
     if (self->lockless_tpr) {
         BQL_LOCK_GUARD();
@@ -1186,11 +1568,19 @@ int apic_msr_write(APICCommonState *s, int index, uint64_t val)
 
 static void apic_pre_save(APICCommonState *s)
 {
+    if (s->posted) {
+        apic_pir_drain(s);
+    }
     apic_sync_vapic(s, SYNC_FROM_VAPIC);
 }
 
 static void apic_post_load(APICCommonState *s)
 {
+    if (s->vcpu_timer) {
+        apic_vcpu_timer_arm(s, s->timer_expiry != -1 ? s->timer_expiry
+                                                    : INT64_MAX);
+        return;
+    }
     if (s->timer_expiry != -1) {
         timer_mod(s->timer, s->timer_expiry);
     } else {
@@ -1231,6 +1621,25 @@ static void apic_realize(DeviceState *dev, Error **errp)
     }
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apic_timer, s);
+    s->vdeadline = INT64_MAX;
+    s->xdeadline = INT64_MAX;
+    if (s->vcpu_timer && !vcpu_timer_started) {
+        vcpu_timer_started = true;
+        event_notifier_init(&vcpu_timer_notifier, false);
+        qemu_add_vm_change_state_handler(apic_vm_state, NULL);
+        qemu_thread_create(&vcpu_timer_thread, "apic-timer",
+                           apic_vcpu_timer_thread, NULL,
+                           QEMU_THREAD_DETACHED);
+    }
+    if (s->vcpu_timer || s->posted) {
+        /*
+         * The deadline thread and posting vCPUs read this APIC and its CPU
+         * without the BQL, under RCU: keep both until apic_unrealize's
+         * grace period has passed.
+         */
+        object_ref(OBJECT(s));
+        object_ref(OBJECT(s->cpu));
+    }
 
     /*
      * The --machine none does not call apic_set_max_apic_id before creating
@@ -1245,16 +1654,39 @@ static void apic_realize(DeviceState *dev, Error **errp)
     msi_nonbroken = true;
 }
 
+typedef struct APICPut {
+    struct rcu_head rcu;
+    APICCommonState *s;
+} APICPut;
+
+static void apic_lockless_put(APICPut *p)
+{
+    object_unref(OBJECT(p->s->cpu));
+    object_unref(OBJECT(p->s));
+    g_free(p);
+}
+
 static void apic_unrealize(DeviceState *dev)
 {
     APICCommonState *s = APIC(dev);
 
     timer_free(s->timer);
-    local_apics[s->initial_apic_id] = NULL;
+    if (s->xtimer) {
+        timer_free(s->xtimer);
+    }
+    qatomic_set(&local_apics[s->initial_apic_id], NULL);
+    if (s->vcpu_timer || s->posted) {
+        APICPut *p = g_new(APICPut, 1);
+
+        p->s = s;
+        call_rcu(p, apic_lockless_put, rcu);
+    }
 }
 
 static const Property apic_properties[] = {
     DEFINE_PROP_BOOL("x-lockless-tpr", APICCommonState, lockless_tpr, false),
+    DEFINE_PROP_BOOL("x-vcpu-timer", APICCommonState, vcpu_timer, false),
+    DEFINE_PROP_BOOL("x-posted", APICCommonState, posted, false),
 };
 
 static void apic_class_init(ObjectClass *klass, const void *data)

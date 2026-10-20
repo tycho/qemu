@@ -189,6 +189,21 @@ struct APICCommonState {
     hwaddr vapic_paddr; /* note: persistence via kvmvapic */
     uint32_t extended_log_dest;
     bool lockless_tpr; /* x-lockless-tpr: TPR accesses without the BQL */
+    bool vcpu_timer;   /* x-vcpu-timer: the timer fires on its vCPU */
+    int64_t vdeadline; /* ... its expiry (QEMU_CLOCK_VIRTUAL), or INT64_MAX */
+    int timer_due;     /* ... expired, for the vCPU to fire */
+    bool posted;       /* x-posted: fixed edge IPIs posted without the BQL */
+    uint64_t pir[4] QEMU_ALIGNED(64); /* ... posted vectors, not yet in IRR */
+    /*
+     * Another per-vCPU timer device (Hyper-V's synthetic timers, see
+     * apic_xtimer_init), run on this vCPU:
+     */
+    void (*xtimer_cb)(void *opaque);  /* ... in its POLL pass */
+    void (*xtimer_eoi)(void *opaque); /* ... and after every EOI */
+    void *xtimer_opaque;
+    QEMUTimer *xtimer;  /* its deadline, without x-vcpu-timer */
+    int64_t xdeadline;  /* ... with x-vcpu-timer, or INT64_MAX */
+    int xdue;           /* ... has passed, for the vCPU to run xtimer_cb */
 };
 
 typedef struct VAPICState {

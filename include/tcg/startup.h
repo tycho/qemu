@@ -459,6 +459,9 @@ extern bool tcg_repstr;
  */
 extern bool tcg_hyperv;
 
+/* tcg_hyperv: also the SynIC and synthetic timers (hv-synic, hv-stimer). */
+extern bool tcg_hvtimers;
+
 /*
  * tcg_vexzero: x86 VEX.128 writes leave the upper half of their ymm
  * register pending zero until the state is next visible, so that a block
