@@ -1734,7 +1734,6 @@ static void gen_cmpxchg_locked_i128(DisasContext *s, TCGv_i128 oldv,
 static void gen_CMPccXADD(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGLabel *label_top = gen_new_label();
-    TCGLabel *label_bottom = gen_new_label();
     TCGv oldv = tcg_temp_new();
     TCGv newv = tcg_temp_new();
     TCGv cmpv = tcg_temp_new();
@@ -1816,12 +1815,14 @@ static void gen_CMPccXADD(DisasContext *s, X86DecodedInsn *decode)
     tcg_gen_movcond_tl(cond, newv, cmp_lhs, cmp_rhs, newv, s->cc_srcT);
     tcg_gen_atomic_cmpxchg_tl(oldv, s->A0, s->cc_srcT, newv, s->mem_index, ot_full);
 
-    /* Exit unconditionally if cmpxchg succeeded.  */
-    tcg_gen_brcond_tl(TCG_COND_EQ, oldv, s->cc_srcT, label_bottom);
-
-    /* Try again if there was actually a store to make.  */
-    tcg_gen_brcond_tl(cond, cmp_lhs, cmp_rhs, label_top);
-    gen_set_label(label_bottom);
+    /*
+     * Try again until the cmpxchg succeeds, also when the condition is
+     * false and the store writes back the value loaded: x86 always writes
+     * the destination, and that locked write orders the insn as a full
+     * barrier.  The load at label_top is not ordered after earlier
+     * stores, and a failed cmpxchg makes no write (gen_cmpxchg_retry).
+     */
+    tcg_gen_brcond_tl(TCG_COND_NE, oldv, s->cc_srcT, label_top);
 
     /* Store old value to registers only after a successful store.  */
     gen_writeback(s, decode, 1, s->cc_srcT);
