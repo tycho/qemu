@@ -311,8 +311,18 @@ static void gen_probe_lookup(TCGv_i64 pc, uint64_t cs_base, uint32_t flags)
     TCGv_ptr ptr = tcg_temp_ebb_new_ptr();
 
     plugin_gen_disable_mem_helpers();
-    gen_helper_lookup_tb_ptr_jcp(ptr, tcg_env, pc, tcg_constant_i64(cs_base),
-                                 tcg_constant_i32(flags));
+    if (tcg_xpage == TCG_XPAGE_STUB && tcg_xpage_stub) {
+        /* The backend's probe, with the C probe's signature and flags. */
+        tcg_gen_call4((void *)tcg_xpage_stub, &helper_info_lookup_tb_ptr_jcp,
+                      tcgv_ptr_temp(ptr), tcgv_ptr_temp(tcg_env),
+                      tcgv_i64_temp(pc),
+                      tcgv_i64_temp(tcg_constant_i64(cs_base)),
+                      tcgv_i32_temp(tcg_constant_i32(flags)));
+    } else {
+        gen_helper_lookup_tb_ptr_jcp(ptr, tcg_env, pc,
+                                     tcg_constant_i64(cs_base),
+                                     tcg_constant_i32(flags));
+    }
     tcg_gen_brcondi_ptr(TCG_COND_EQ, ptr, 0, miss);
     tcg_gen_goto_ptr(ptr);
     tcg_temp_free_ptr(ptr);
@@ -334,7 +344,8 @@ void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
                                     bool direct)
 {
     assert(translator_use_inline_lookup(db));
-    if (direct && tcg_xpage == TCG_XPAGE_PROBE) {
+    if (direct &&
+        (tcg_xpage == TCG_XPAGE_PROBE || tcg_xpage == TCG_XPAGE_STUB)) {
         gen_probe_lookup(pc, cs_base, flags);
     } else if (direct && tcg_xpage == TCG_XPAGE_CALL) {
         tcg_gen_lookup_jc_and_goto_ptr(pc, cs_base, flags);

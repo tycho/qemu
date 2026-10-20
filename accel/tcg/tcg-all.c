@@ -176,6 +176,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
      * There's no guest base to take into account, so go ahead and
      * initialize the prologue now.
      */
+    tcg_jc_layout_init();
     tcg_prologue_init();
 #endif
 
@@ -270,6 +271,7 @@ static const char *const tcg_xpage_names[] = {
     [TCG_XPAGE_CALL] = "call",
     [TCG_XPAGE_INLINE] = "inline",
     [TCG_XPAGE_PROBE] = "probe",
+    [TCG_XPAGE_STUB] = "stub",
 };
 
 static char *tcg_get_xpage(Object *obj, Error **errp)
@@ -285,7 +287,7 @@ static void tcg_set_xpage(Object *obj, const char *value, Error **errp)
             return;
         }
     }
-    error_setg(errp, "x-xpage: 'call', 'inline' or 'probe'");
+    error_setg(errp, "x-xpage: 'call', 'inline', 'probe' or 'stub'");
 }
 
 static bool tcg_get_tblookup(Object *obj, Error **errp)
@@ -379,7 +381,8 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "With x-tblookup, probe the jump cache at direct jumps to another "
         "page in a short helper call ('call'), in generated code "
         "('inline'), or in a call that only probes, the full lookup "
-        "following on a miss ('probe')");
+        "following on a miss: to C ('probe') or to a shared generated "
+        "probe ('stub')");
 
     object_class_property_add_str(oc, "x-tblayout",
                                   tcg_get_tblayout, tcg_set_tblayout);
