@@ -98,6 +98,16 @@ bool tcg_insn_is_acqrel_ldst(uintptr_t pc);
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);
 
+/*
+ * tcg_atomic: guest atomic read-modify-write accesses (xchg, add, and, or,
+ * xor, cmpxchg, up to 64 bits) in parallel mode are host atomic insns
+ * after the guest access's own checks, with the out-of-line helper only
+ * for what those checks don't pass, on backends that support it
+ * (tcg_atomic_supported).
+ */
+extern bool tcg_atomic;
+bool tcg_atomic_supported(void);
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size
