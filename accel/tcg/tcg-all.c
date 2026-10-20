@@ -134,6 +134,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-haltpoll", "50" },
         { "x-apictimer", "auto" },
         { "x-apicpost", "auto" },
+        { "x-tlbpin", "on" },
 #ifdef CONFIG_DARWIN
         { "x-jitwx", "lazy" },
         { "x-hostpoll", "kqueue" },
@@ -1004,6 +1005,20 @@ static void tcg_set_alignfold(Object *obj, bool value, Error **errp)
     tcg_alignfold = value;
 }
 
+static bool tcg_get_tlbpin(Object *obj, Error **errp)
+{
+    return tcg_tlbpin;
+}
+
+static void tcg_set_tlbpin(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_tlbpin_supported()) {
+        error_setg(errp, "x-tlbpin: not supported by this TCG backend");
+        return;
+    }
+    tcg_tlbpin = value;
+}
+
 static char *tcg_get_tblayout(Object *obj, Error **errp)
 {
     return g_strdup(tcg_tblayout ? "split" : "packed");
@@ -1303,6 +1318,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-alignfold",
         "Drop guest alignment checks implied by an earlier check on the "
         "same address registers");
+
+    object_class_property_add_bool(oc, "x-tlbpin", tcg_get_tlbpin,
+                                   tcg_set_tlbpin);
+    object_class_property_set_description(oc, "x-tlbpin",
+        "Keep the TLB mask and table of a block's main mmu index in host "
+        "registers (system mode)");
 
     object_class_property_add_str(oc, "x-tblayout",
                                   tcg_get_tblayout, tcg_set_tblayout);
