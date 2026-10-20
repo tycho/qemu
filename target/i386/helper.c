@@ -122,14 +122,12 @@ int cpu_x86_support_mca_broadcast(CPUX86State *env)
 /* XXX: add PGE support */
 
 #ifndef CONFIG_USER_ONLY
-void x86_cpu_set_a20(X86CPU *cpu, int a20_state)
+static void do_x86_cpu_set_a20(CPUState *cs, run_on_cpu_data data)
 {
-    CPUX86State *env = &cpu->env;
+    CPUX86State *env = cpu_env(cs);
+    int a20_state = data.host_int;
 
-    a20_state = (a20_state != 0);
     if (a20_state != ((env->a20_mask >> 20) & 1)) {
-        CPUState *cs = CPU(cpu);
-
         qemu_log_mask(CPU_LOG_MMU, "A20 update: a20=%d\n", a20_state);
         /* if the cpu is currently executing code, we must unlink it and
            all the potentially executing TB */
@@ -139,6 +137,24 @@ void x86_cpu_set_a20(X86CPU *cpu, int a20_state)
            we must flush everything */
         tlb_flush(cs);
         env->a20_mask = ~(1 << 20) | (a20_state << 20);
+    }
+}
+
+/*
+ * The A20 line is wired to the first CPU, but any CPU's I/O (port 92, the
+ * keyboard controller) can change it: run the change on the CPU it
+ * belongs to, which owns its TLB and may be running generated code.  Its
+ * queued work runs in order, so successive changes keep theirs.
+ */
+void x86_cpu_set_a20(X86CPU *cpu, int a20_state)
+{
+    CPUState *cs = CPU(cpu);
+    run_on_cpu_data data = RUN_ON_CPU_HOST_INT(a20_state != 0);
+
+    if (!cs->created || qemu_cpu_is_self(cs)) {
+        do_x86_cpu_set_a20(cs, data);
+    } else {
+        async_run_on_cpu(cs, do_x86_cpu_set_a20, data);
     }
 }
 #endif
