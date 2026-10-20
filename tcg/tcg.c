@@ -4828,9 +4828,12 @@ typedef struct XlatSlot {
 static bool xlat_eligible(TCGOp *op)
 {
     MemOp mop = get_memop(op->args[2]);
+    MemOp atom = mop & MO_ATOM_MASK;
 
+    /* No alignment the full lookup would check, explicit or for atomicity. */
     return op->opc == INDEX_op_qemu_ld && TCGOP_TYPE(op) <= TCG_TYPE_I64 &&
-           (mop & MO_SIZE) <= MO_64 && !(mop & (MO_AMASK | MO_BSWAP));
+           (mop & MO_SIZE) <= MO_64 && !(mop & (MO_AMASK | MO_BSWAP)) &&
+           (atom == MO_ATOM_IFALIGN || atom == MO_ATOM_NONE);
 }
 
 /* Whether a load of @size at @d bytes from its head can be checked. */
@@ -4854,6 +4857,11 @@ static void tlb_reuse_pass(TCGContext *s)
     unsigned clock = 0;
     TCGOp *op;
 
+    /*
+     * Every temp gets a fresh value at the start of each straight line:
+     * relations proved on one path into a label, or on a loop's earlier
+     * iteration, don't hold after it.
+     */
     for (int i = 0; i < nb; i++) {
         TCGTemp *ts = &s->temps[i];
 
@@ -4861,7 +4869,7 @@ static void tlb_reuse_pass(TCGContext *s)
             vid[i] = 0;
             off[i] = ts->val;
         } else {
-            vid[i] = i + 1;
+            vid[i] = next++;
             off[i] = 0;
         }
     }
@@ -4878,8 +4886,16 @@ static void tlb_reuse_pass(TCGContext *s)
                 off[i] = 0;
             }
         }
-        if (op->opc == INDEX_op_call || op->opc == INDEX_op_set_label ||
+        if (op->opc == INDEX_op_set_label ||
             (def->flags & TCG_OPF_BB_EXIT)) {
+            memset(slot, 0, sizeof(slot));
+            for (int i = 0; i < nb; i++) {
+                if (s->temps[i].kind != TEMP_CONST) {
+                    vid[i] = next++;
+                    off[i] = 0;
+                }
+            }
+        } else if (op->opc == INDEX_op_call) {
             memset(slot, 0, sizeof(slot));
         } else if (op->opc == INDEX_op_qemu_ld && xlat_eligible(op)) {
             TCGTemp *at = arg_temp(op->args[1]);
@@ -4921,12 +4937,20 @@ static void tlb_reuse_pass(TCGContext *s)
             }
         }
 
-        /* Outputs: copies and constant offsets keep their base. */
+        /*
+         * Outputs: copies and constant offsets keep their base, computed
+         * at the address width only (a narrower result is another value).
+         */
         for (int i = 0; i < no; i++) {
             int t = temp_idx(arg_temp(op->args[i]));
             TCGTemp *a, *b;
 
             if (t >= nb) {
+                continue;
+            }
+            if (TCGOP_TYPE(op) != s->addr_type) {
+                vid[t] = next++;
+                off[t] = 0;
                 continue;
             }
             if (op->opc == INDEX_op_mov && i == 0) {
