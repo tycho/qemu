@@ -845,6 +845,11 @@ static void * const table_cmpxchg[(MO_SIZE | MO_BSWAP) + 1] = {
     WITH_ATOMIC128([MO_128 | MO_BE] = gen_helper_atomic_cmpxchgo_be)
 };
 
+TCGBar tcg_mo_needed(TCGBar type)
+{
+    return type & tcg_ctx->guest_mo & ~TCG_TARGET_DEFAULT_MO;
+}
+
 static void tcg_gen_nonatomic_cmpxchg_i32_int(TCGv_i32 retv, TCGTemp *addr,
                                               TCGv_i32 cmpv, TCGv_i32 newv,
                                               TCGArg idx, MemOp memop)
