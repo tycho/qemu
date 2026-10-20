@@ -235,7 +235,7 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 }
 
 bool tcg_ijmp_inline;
-bool tcg_xpage_inline;
+TCGXPage tcg_xpage;
 bool tcg_jcgen;
 bool tcg_jc_ctx;
 bool tcg_jc_keep_pcrel;
@@ -266,20 +266,26 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
     qatomic_set(&one_insn_per_tb, value);
 }
 
+static const char *const tcg_xpage_names[] = {
+    [TCG_XPAGE_CALL] = "call",
+    [TCG_XPAGE_INLINE] = "inline",
+    [TCG_XPAGE_PROBE] = "probe",
+};
+
 static char *tcg_get_xpage(Object *obj, Error **errp)
 {
-    return g_strdup(tcg_xpage_inline ? "inline" : "call");
+    return g_strdup(tcg_xpage_names[tcg_xpage]);
 }
 
 static void tcg_set_xpage(Object *obj, const char *value, Error **errp)
 {
-    if (!strcmp(value, "call")) {
-        tcg_xpage_inline = false;
-    } else if (!strcmp(value, "inline")) {
-        tcg_xpage_inline = true;
-    } else {
-        error_setg(errp, "x-xpage: 'call' or 'inline'");
+    for (int i = 0; i < ARRAY_SIZE(tcg_xpage_names); i++) {
+        if (!strcmp(value, tcg_xpage_names[i])) {
+            tcg_xpage = i;
+            return;
+        }
     }
+    error_setg(errp, "x-xpage: 'call', 'inline' or 'probe'");
 }
 
 static bool tcg_get_tblookup(Object *obj, Error **errp)
@@ -371,8 +377,9 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                   tcg_set_xpage);
     object_class_property_set_description(oc, "x-xpage",
         "With x-tblookup, probe the jump cache at direct jumps to another "
-        "page in a short helper call ('call') or in generated code "
-        "('inline')");
+        "page in a short helper call ('call'), in generated code "
+        "('inline'), or in a call that only probes, the full lookup "
+        "following on a miss ('probe')");
 
     object_class_property_add_str(oc, "x-tblayout",
                                   tcg_get_tblayout, tcg_set_tblayout);

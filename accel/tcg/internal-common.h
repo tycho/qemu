@@ -27,12 +27,18 @@ extern bool one_insn_per_tb;
 extern bool tcg_ijmp_inline;
 
 /*
- * tcg_xpage_inline: with tcg_ijmp_inline, a direct jump to another page
- * probes the jump cache in generated code too, as an indirect jump does,
- * instead of in a short helper call; the probe's miss path still calls
- * the full lookup helper.
+ * tcg_xpage: with tcg_ijmp_inline, how a direct jump to another page
+ * probes the jump cache: in a short helper call that also looks up a miss
+ * (TCG_XPAGE_CALL), in generated code as an indirect jump does
+ * (TCG_XPAGE_INLINE), or in a call that only probes, reading no guest
+ * state, followed on a miss by the full lookup (TCG_XPAGE_PROBE).
  */
-extern bool tcg_xpage_inline;
+typedef enum {
+    TCG_XPAGE_CALL,
+    TCG_XPAGE_INLINE,
+    TCG_XPAGE_PROBE,
+} TCGXPage;
+extern TCGXPage tcg_xpage;
 
 /*
  * tcg_jcgen: flushing a vCPU's jump cache moves its salt on (O(1))
