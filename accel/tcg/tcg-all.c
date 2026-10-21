@@ -122,6 +122,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-superblock", "units" },
 #endif
         { "x-tblookup", "on" },
+        { "x-xpage", "stub" },
         { "x-tblayout", "split" },
         { "x-i386-runtime", "on" },
         { "x-addr32", "on" },
@@ -143,6 +144,10 @@ static void xtcg_fork_defaults(Object *obj)
     for (int i = 0; i < ARRAY_SIZE(defaults); i++) {
         object_property_parse(obj, defaults[i][0], defaults[i][1],
                               &error_abort);
+    }
+    /* Inline atomics need FEAT_LSE: on where the backend has them. */
+    if (tcg_atomic_supported()) {
+        object_property_parse(obj, "x-atomic", "on", &error_abort);
     }
 #endif
 }
