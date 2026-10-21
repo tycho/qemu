@@ -132,10 +132,8 @@ struct TranslationBlock {
      * Jumps are numbered 0 to TB_JMP_SLOTS - 1, except TB_EXIT_REQUESTED.
      */
 #define TB_JMP_SLOTS 8
+#define TB_JMP_SLOTS_SMALL 2
 #define TB_JMP_OFFSET_INVALID UINT32_MAX /* indicates no jump generated */
-    uint32_t jmp_reset_offset[TB_JMP_SLOTS]; /* offset of original target */
-    uint32_t jmp_insn_offset[TB_JMP_SLOTS];  /* offset of direct jump insn */
-    uintptr_t jmp_target_addr[TB_JMP_SLOTS]; /* target address */
     /*
      * The goto_tb slots that leave by a host call (tcg_gen_call_tb), and
      * TB_JMP_RET_LANDING if host returns may enter the TB
@@ -144,11 +142,9 @@ struct TranslationBlock {
     uint16_t jmp_call;
 #define TB_JMP_RET_LANDING (1u << TB_JMP_SLOTS)
     /*
-     * For a goto_tb slot, 1 + the slot of its tcg_gen_goto_tb_dead(), or 0;
-     * and whether this TB writes the chain-dead globals before it reads
-     * them, so that jumps to it may skip storing them.
+     * Whether this TB writes the chain-dead globals before it reads
+     * them, so that jumps to it may skip storing them (TBJmpSlot.dead).
      */
-    uint8_t jmp_dead[TB_JMP_SLOTS];
     bool chain_dead_in;
     /*
      * The goto_tb slots whose unlinked path is out of line, at the TB's
@@ -163,34 +159,56 @@ struct TranslationBlock {
      */
     uint8_t jmp_far;
     /*
-     * For a goto_tb slot that is the first insn at a label which one
-     * conditional branch reaches: 1 + that branch's offset, else 0.
-     * Linking the slot points the branch at the same TB when it can reach
-     * it, so that the taken path doesn't take a second branch.
+     * The number of slots in jmp[]: TB_JMP_SLOTS_SMALL, or TB_JMP_SLOTS for
+     * a TB whose translation asked for more (translator_goto_tb_slot).
      */
-    uint32_t jmp_cond[TB_JMP_SLOTS];
+    uint8_t nb_slots;
 
     /*
      * Each TB has a NULL-terminated list (jmp_list_head) of incoming jumps.
      * Each TB can have several outgoing jumps, and therefore can participate
-     * in several lists. The list entries are kept in jmp_list_next[]. The
+     * in several lists. The list entries are kept in jmp[].list_next. The
      * low bits of the pointers in these lists (TB_JMP_TAG_MASK) encode
      * which of the list entries is to be used in the pointed TB.
      *
      * List traversals are protected by jmp_lock. The destination TB of each
-     * outgoing jump is kept in jmp_dest[] so that the appropriate jmp_lock
+     * outgoing jump is kept in jmp[].dest so that the appropriate jmp_lock
      * can be acquired from any origin TB.
      *
-     * jmp_dest[] are tagged pointers as well. The LSB is set when the TB is
-     * being invalidated, so that no further outgoing jumps from it can be set.
+     * jmp[].dest are tagged pointers as well. The LSB is set when the TB is
+     * being invalidated, so that no further outgoing jumps from it can be
+     * set.
      *
      * jmp_lock also protects the CF_INVALID cflag; a jump must not be chained
      * to a destination TB that has CF_INVALID set.
      */
     uintptr_t jmp_list_head;
-    uintptr_t jmp_list_next[TB_JMP_SLOTS];
-    uintptr_t jmp_dest[TB_JMP_SLOTS];
+
+    /* The goto_tb slots, nb_slots of them (tb_struct_size). */
+    struct TBJmpSlot {
+        uint32_t reset_offset;  /* offset of original target */
+        uint32_t insn_offset;   /* offset of direct jump insn */
+        /*
+         * For a slot that is the first insn at a label which one
+         * conditional branch reaches: 1 + that branch's offset, else 0.
+         * Linking the slot points the branch at the same TB when it can
+         * reach it, so that the taken path doesn't take a second branch.
+         */
+        uint32_t cond;
+        /* 1 + the slot of its tcg_gen_goto_tb_dead(), or 0. */
+        uint8_t dead;
+        uintptr_t target_addr;  /* target address */
+        uintptr_t list_next;
+        uintptr_t dest;
+    } jmp[];
 };
+
+/* The bytes a TB struct with @nb_slots goto_tb slots takes. */
+static inline size_t tb_struct_size(unsigned nb_slots)
+{
+    return offsetof(TranslationBlock, jmp) +
+           nb_slots * sizeof(struct TBJmpSlot);
+}
 
 #define TB_JMP_TAG_MASK ((uintptr_t)TB_JMP_SLOTS - 1)
 

@@ -143,6 +143,21 @@ typedef struct TCGPool {
    this value, they are statically allocated in the TB stack frame */
 #define TCG_STATIC_CALL_ARGS_SIZE 128
 
+/*
+ * The operation of a qemu_atomic op: it returns the old value of the
+ * memory; CMPXCHG stores the value only if the old value equals the
+ * compare operand (unused by the others).
+ */
+typedef enum TCGAtomicOp {
+    TCG_ATOMIC_XCHG,
+    TCG_ATOMIC_ADD,
+    TCG_ATOMIC_AND,
+    TCG_ATOMIC_OR,
+    TCG_ATOMIC_XOR,
+    TCG_ATOMIC_CMPXCHG,
+    TCG_ATOMIC_NB_OPS,
+} TCGAtomicOp;
+
 typedef enum TCGType {
     TCG_TYPE_I32,
     TCG_TYPE_I64,
@@ -404,6 +419,11 @@ typedef struct TCGLazyMap {
 } TCGLazyMap;
 
 struct TCGContext {
+    /*
+     * System mode: the shared store of the pinned globals that this TB's
+     * slow paths call (tcg_out_ldst_finalize), or NULL.
+     */
+    const tcg_insn_unit *pin_st_tail;
     /* The open run of grouped guest accesses (tcg_tso_vec_group). */
     bool tso_run_ld;            /* loads not yet ordered before later ops */
     bool tso_run_st;            /* the run's stores have had their barrier */
@@ -469,6 +489,8 @@ struct TCGContext {
     tcg_insn_unit *code_buf;      /* pointer for start of tb */
     tcg_insn_unit *code_ptr;      /* pointer for running end of tb */
 
+    /* The goto_tb slots the TB uses so far (tcg_tb_trim_slots). */
+    unsigned goto_tb_slots;
 #ifdef CONFIG_DEBUG_TCG
     int goto_tb_issue_mask;
     const TCGOpcode *vecop_list;
@@ -801,7 +823,7 @@ static inline bool tcg_op_buf_full(void)
      * we have produced "enough" opcodes.  We want to limit TB size
      * such that a RISC host can reasonably use a 16-bit signed
      * branch within the TB.  We also need to be mindful of the
-     * 16-bit unsigned offsets, TranslationBlock.jmp_reset_offset[]
+     * 16-bit unsigned offsets, TranslationBlock.jmp[].reset_offset
      * and TCGContext.gen_insn_end_off[].
      */
     return tcg_ctx->nb_ops >= 4000;
@@ -813,6 +835,8 @@ static inline bool tcg_op_buf_full(void)
 void *tcg_malloc_internal(TCGContext *s, int size);
 void tcg_pool_reset(TCGContext *s);
 TranslationBlock *tcg_tb_alloc(TCGContext *s);
+void tcg_tb_trim_slots(TCGContext *s, TranslationBlock *tb);
+void tcg_tb_reserve_slots(TCGContext *s, TranslationBlock *tb);
 void *tcg_tb_data_highwater(TCGContext *s);
 
 void tcg_region_reset_all(void);

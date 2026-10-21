@@ -27,6 +27,31 @@ extern bool one_insn_per_tb;
 extern bool tcg_ijmp_inline;
 
 /*
+ * tcg_prologue_deferred: system mode generates the prologue when the
+ * first vCPU is created, after the front end has pinned its guest
+ * registers (tcg_pin_system_ok), instead of at accelerator init.
+ */
+extern bool tcg_prologue_deferred;
+
+/*
+ * tcg_xpage: with tcg_ijmp_inline, how a direct jump to another page
+ * probes the jump cache: in a short helper call that also looks up a miss
+ * (TCG_XPAGE_CALL), in generated code as an indirect jump does
+ * (TCG_XPAGE_INLINE), or in a call that only probes, reading no guest
+ * state, followed on a miss by the full lookup: to a C function
+ * (TCG_XPAGE_PROBE) or to the backend's shared generated probe
+ * (TCG_XPAGE_STUB, tcg_xpage_stub).
+ */
+typedef enum {
+    TCG_XPAGE_CALL,
+    TCG_XPAGE_INLINE,
+    TCG_XPAGE_PROBE,
+    TCG_XPAGE_STUB,
+} TCGXPage;
+extern TCGXPage tcg_xpage;
+void tcg_jc_layout_init(void);
+
+/*
  * tcg_jcgen: flushing a vCPU's jump cache moves its salt on (O(1))
  * instead of clearing every entry (see CPUJumpCache); set from the
  * target's TCGCPUOps.jmp_cache_salt.

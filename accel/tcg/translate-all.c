@@ -365,6 +365,8 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
     tcg_ctx->cpu = NULL;
     *max_insns = tb->icount;
 
+    /* Before any host code: the struct keeps only the slots issued. */
+    tcg_tb_trim_slots(tcg_ctx, tb);
     return tcg_gen_code(tcg_ctx, tb, pc);
 }
 
@@ -435,6 +437,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     tcg_ctx->guest_mo = cpu->cc->tcg_ops->guest_default_memory_order;
 
  restart_translate:
+    /* A retry translates again with all the slots (tcg_tb_trim_slots). */
+    tcg_tb_reserve_slots(tcg_ctx, tb);
     trace_translate_block(tb, s.pc, tb->tc.ptr);
 
     gen_code_size = setjmp_gen_code(env, tb, s.pc, host_pc, &max_insns, &ti);
@@ -521,6 +525,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
             g_assert_not_reached();
         }
     }
+    /* tcg_tb_trim_slots may have moved the code start (packed layout). */
+    gen_code_buf = (void *)tcg_splitwx_to_rw(tb->tc.ptr);
     translator_region_reset();
     tcg_ctx->gen_tb = NULL;
 
@@ -640,11 +646,11 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     /* init jump list */
     qemu_spin_init(&tb->jmp_lock);
     tb->jmp_list_head = (uintptr_t)NULL;
-    for (int n = 0; n < TB_JMP_SLOTS; n++) {
-        tb->jmp_list_next[n] = (uintptr_t)NULL;
-        tb->jmp_dest[n] = (uintptr_t)NULL;
+    for (int n = 0; n < tb->nb_slots; n++) {
+        tb->jmp[n].list_next = (uintptr_t)NULL;
+        tb->jmp[n].dest = (uintptr_t)NULL;
         /* original jump addresses, set during tcg_gen_code() */
-        if (tb->jmp_reset_offset[n] != TB_JMP_OFFSET_INVALID) {
+        if (tb->jmp[n].reset_offset != TB_JMP_OFFSET_INVALID) {
             tb_reset_jump(tb, n);
         }
     }

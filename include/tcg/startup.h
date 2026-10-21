@@ -168,6 +168,15 @@ extern bool tcg_lazysync_user;
  */
 extern bool tcg_pin;
 extern bool tcg_pin_user;
+
+/*
+ * tcg_pin_system_ok: whether the backend can pin guest registers in system
+ * mode (TCG_TARGET_NB_PIN_REGS_SYSTEM: callee-saved registers only, which
+ * calls keep); system mode then sets tcg_pin_user from tcg_pin when the
+ * first vCPU is created, before the front end creates its globals and
+ * before the prologue, which loads and stores them.
+ */
+bool tcg_pin_system_ok(void);
 extern bool tcg_pin_vec;
 extern bool tcg_pin_cc;
 
@@ -453,6 +462,42 @@ extern bool tcg_alignfold;
  */
 extern bool tcg_tlbpin;
 bool tcg_tlbpin_supported(void);
+
+/*
+ * tcg_atomic: guest atomic read-modify-write accesses (xchg, add, and, or,
+ * xor, cmpxchg, up to 64 bits) in parallel mode are host atomic insns
+ * after the guest access's own checks, with the out-of-line helper only
+ * for what those checks don't pass, on backends that support it
+ * (tcg_atomic_supported).
+ */
+extern bool tcg_atomic;
+bool tcg_atomic_supported(void);
+
+/*
+ * x-xpage=stub: the layout of the vCPU's jump cache, which the backend's
+ * shared jump-cache probe (tcg_xpage_stub) reads; filled in by the
+ * accelerator before the prologue is generated.  Offsets marked env are
+ * relative to the env pointer.
+ */
+typedef struct TCGJumpCacheLayout {
+    bool valid;
+    bool global;            /* tcg_jc_global: also match gsalt */
+    int jc_ofs;             /* env: CPUState.tb_jmp_cache */
+    int bp_ofs;             /* env: CPUState.breakpoints.tqh_first */
+    int cflags_ofs;         /* env: CPUState.tcg_cflags */
+    int salt_ofs, gsalt_ofs;
+    int entry_tb_ofs, entry_pc_ofs, entry_shift;
+    int hash_shift, page_bits, cache_bits;
+    int tb_cs_base_ofs, tb_flags_ofs, tb_cflags_ofs, tb_ptr_ofs;
+} TCGJumpCacheLayout;
+
+extern TCGJumpCacheLayout tcg_jc_layout;
+
+/*
+ * The backend's shared jump-cache probe, called as
+ * helper_lookup_tb_ptr_jcp (env, pc, cs_base, flags) is, or NULL.
+ */
+extern const void *tcg_xpage_stub;
 
 /*
  * x86 guests (accel property x-repstr): REP STOS and REP MOVS a page at

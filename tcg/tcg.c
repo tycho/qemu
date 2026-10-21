@@ -55,6 +55,7 @@
 #include "elf.h"
 #include "exec/log.h"
 #include "tcg/tcg-ldst.h"
+#include "accel/tcg/cpu-ldst-common.h"
 #include "tcg/tcg-temp-internal.h"
 #include "tcg-internal.h"
 #include "tcg/perf.h"
@@ -74,6 +75,14 @@ static void tcg_out_nop_fill(tcg_insn_unit *p, int count);
 typedef struct TCGLabelQemuLdst TCGLabelQemuLdst;
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *l);
 static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *l);
+#ifdef TCG_TARGET_HAS_QEMU_ATOMIC
+static bool tcg_out_qemu_atomic_slow_path(TCGContext *s,
+                                          TCGLabelQemuLdst *l);
+#endif
+#ifdef TCG_TARGET_HAS_PINNED_ST_PAIRS
+static void tcg_out_pinned_st_pairs(TCGContext *s);
+static void tcg_out_pinned_st_tail(TCGContext *s);
+#endif
 
 /* The CIE and FDE header definitions will be common to all hosts.  */
 typedef struct {
@@ -126,6 +135,9 @@ struct TCGLabelQemuLdst {
     unsigned nb_wb;
     /* label_ptr[0] is a B to the slow path, in cold code (tcg_tblayout). */
     bool veneer;
+    /* qemu_atomic: its TCGAtomicOp + 1 (else 0), and its compare operand */
+    int atomic;
+    TCGReg cmp_reg;
     QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 };
 
@@ -223,6 +235,10 @@ static void tcg_out_ld_helper_args(TCGContext *s, const TCGLabelQemuLdst *l,
     __attribute__((unused));
 static void tcg_out_ld_helper_ret(TCGContext *s, const TCGLabelQemuLdst *l,
                                   bool load_sign, const TCGLdstHelperParam *p)
+    __attribute__((unused));
+static const void *tcg_out_atomic_helper_args(TCGContext *s,
+                                              const TCGLabelQemuLdst *l,
+                                              const TCGLdstHelperParam *p)
     __attribute__((unused));
 static void tcg_out_st_helper_args(TCGContext *s, const TCGLabelQemuLdst *l,
                                    const TCGLdstHelperParam *p)
@@ -347,6 +363,9 @@ bool tcg_pcid;
 bool tcg_lean;
 bool tcg_alignfold;
 bool tcg_tlbpin;
+bool tcg_atomic;
+TCGJumpCacheLayout tcg_jc_layout;
+const void *tcg_xpage_stub;
 bool tcg_repstr;
 bool tcg_hyperv;
 bool tcg_hvtimers;
@@ -520,7 +539,7 @@ static void set_jmp_reset_offset(TCGContext *s, int which)
      * We will check for overflow at the end of the opcode loop in
      * tcg_gen_code, where we bound tcg_current_code_size to UINT16_MAX.
      */
-    s->gen_tb->jmp_reset_offset[which] = tcg_current_code_size(s);
+    s->gen_tb->jmp[which].reset_offset = tcg_current_code_size(s);
 }
 
 static void G_GNUC_UNUSED set_jmp_insn_offset(TCGContext *s, int which)
@@ -529,7 +548,7 @@ static void G_GNUC_UNUSED set_jmp_insn_offset(TCGContext *s, int which)
      * We will check for overflow at the end of the opcode loop in
      * tcg_gen_code, where we bound tcg_current_code_size to UINT16_MAX.
      */
-    s->gen_tb->jmp_insn_offset[which] = tcg_current_code_size(s);
+    s->gen_tb->jmp[which].insn_offset = tcg_current_code_size(s);
 }
 
 static uintptr_t G_GNUC_UNUSED get_jmp_target_addr(TCGContext *s, int which)
@@ -538,7 +557,7 @@ static uintptr_t G_GNUC_UNUSED get_jmp_target_addr(TCGContext *s, int which)
      * Return the read-execute version of the pointer, for the benefit
      * of any pc-relative addressing mode.
      */
-    return (uintptr_t)tcg_splitwx_to_rx(&s->gen_tb->jmp_target_addr[which]);
+    return (uintptr_t)tcg_splitwx_to_rx(&s->gen_tb->jmp[which].target_addr);
 }
 
 static int __attribute__((unused))
@@ -893,8 +912,29 @@ static int tcg_out_ldst_finalize(TCGContext *s)
 {
     TCGLabelQemuLdst *lb;
 
+#ifdef TCG_TARGET_HAS_PINNED_ST_PAIRS
+    /*
+     * System mode: with two slow paths or more, they store the pinned
+     * globals by calling one copy of the stores, here at the start of the
+     * TB's slow-path code (the code before it ends in a branch).
+     */
+    s->pin_st_tail = NULL;
+    if (tcg_use_softmmu && s->nb_pinned &&
+        !QSIMPLEQ_EMPTY(&s->ldst_labels) &&
+        QSIMPLEQ_NEXT(QSIMPLEQ_FIRST(&s->ldst_labels), next)) {
+        s->pin_st_tail = tcg_splitwx_to_rx(s->code_ptr);
+        tcg_out_pinned_st_tail(s);
+    }
+#endif
     /* qemu_ld/st slow paths */
     QSIMPLEQ_FOREACH(lb, &s->ldst_labels, next) {
+#ifdef TCG_TARGET_HAS_QEMU_ATOMIC
+        if (lb->atomic) {
+            if (!tcg_out_qemu_atomic_slow_path(s, lb)) {
+                return -2;
+            }
+        } else
+#endif
         if (lb->is_ld
             ? !tcg_out_qemu_ld_slow_path(s, lb)
             : !tcg_out_qemu_st_slow_path(s, lb)) {
@@ -977,6 +1017,7 @@ static int tcg_out_pool_finalize(TCGContext *s)
 #define C_O1_I4(O1, I1, I2, I3, I4)     C_PFX5(c_o1_i4_, O1, I1, I2, I3, I4),
 
 #define C_N1_I2(O1, I1, I2)             C_PFX3(c_n1_i2_, O1, I1, I2),
+#define C_N1_I3(O1, I1, I2, I3)         C_PFX4(c_n1_i3_, O1, I1, I2, I3),
 #define C_N1O1_I1(O1, O2, I1)           C_PFX3(c_n1o1_i1_, O1, O2, I1),
 #define C_N2_I1(O1, O2, I1)             C_PFX3(c_n2_i1_, O1, O2, I1),
 
@@ -1004,6 +1045,7 @@ static TCGConstraintSetIndex tcg_target_op_def(TCGOpcode, TCGType, unsigned);
 #undef C_O1_I3
 #undef C_O1_I4
 #undef C_N1_I2
+#undef C_N1_I3
 #undef C_N1O1_I1
 #undef C_N2_I1
 #undef C_O2_I1
@@ -1031,6 +1073,7 @@ typedef struct TCGConstraintSet {
 #define C_O1_I4(O1, I1, I2, I3, I4)     { 1, 4, { #O1, #I1, #I2, #I3, #I4 } },
 
 #define C_N1_I2(O1, I1, I2)             { 1, 2, { "&" #O1, #I1, #I2 } },
+#define C_N1_I3(O1, I1, I2, I3)         { 1, 3, { "&" #O1, #I1, #I2, #I3 } },
 #define C_N1O1_I1(O1, O2, I1)           { 2, 1, { "&" #O1, #O2, #I1 } },
 #define C_N2_I1(O1, O2, I1)             { 2, 1, { "&" #O1, "&" #O2, #I1 } },
 
@@ -1054,6 +1097,7 @@ static const TCGConstraintSet constraint_sets[] = {
 #undef C_O1_I3
 #undef C_O1_I4
 #undef C_N1_I2
+#undef C_N1_I3
 #undef C_N1O1_I1
 #undef C_N2_I1
 #undef C_O2_I1
@@ -1076,6 +1120,7 @@ static const TCGConstraintSet constraint_sets[] = {
 #define C_O1_I4(O1, I1, I2, I3, I4)     C_PFX5(c_o1_i4_, O1, I1, I2, I3, I4)
 
 #define C_N1_I2(O1, I1, I2)             C_PFX3(c_n1_i2_, O1, I1, I2)
+#define C_N1_I3(O1, I1, I2, I3)         C_PFX4(c_n1_i3_, O1, I1, I2, I3)
 #define C_N1O1_I1(O1, O2, I1)           C_PFX3(c_n1o1_i1_, O1, O2, I1)
 #define C_N2_I1(O1, O2, I1)             C_PFX3(c_n2_i1_, O1, O2, I1)
 
@@ -1212,6 +1257,16 @@ typedef struct TCGOutOpQemuLdStX {
                 TCGReg index, bool index_zero, TCGArg arg);
 } TCGOutOpQemuLdStX;
 
+/*
+ * qemu_atomic: @ret = the old value at @addr, updated with @val by @aop
+ * (TCGAtomicOp); for TCG_ATOMIC_CMPXCHG, only if it equals @cmp.
+ */
+typedef struct TCGOutOpQemuAtomic {
+    TCGOutOp base;
+    void (*out)(TCGContext *s, TCGType type, TCGReg ret, TCGReg val,
+                TCGReg cmp, TCGReg addr, MemOpIdx oi, TCGAtomicOp aop);
+} TCGOutOpQemuAtomic;
+
 typedef struct TCGOutOpQemuLdSt2 {
     TCGOutOp base;
     void (*out)(TCGContext *s, TCGType type, TCGReg dlo, TCGReg dhi,
@@ -1277,6 +1332,10 @@ static const TCGReg tcg_target_pin_regs[1];
 #define TCG_TARGET_NB_PIN_VREGS 0
 static const TCGReg tcg_target_pin_vregs[1];
 #endif
+#ifndef TCG_TARGET_NB_PIN_REGS_SYSTEM
+#define TCG_TARGET_NB_PIN_REGS_SYSTEM 0
+#endif
+
 #ifndef TCG_TARGET_NB_BOUNDARY_REGS
 #define TCG_TARGET_NB_BOUNDARY_REGS 0
 static const TCGReg tcg_target_boundary_regs[1];
@@ -1330,6 +1389,11 @@ static void tcg_out_boundary_ldst(TCGContext *s, bool load)
     }
 }
 
+bool tcg_pin_system_ok(void)
+{
+    return TCG_TARGET_NB_PIN_REGS_SYSTEM > 0;
+}
+
 bool tcg_temp_pin(TCGTemp *ts)
 {
     TCGContext *s = tcg_ctx;
@@ -1337,8 +1401,12 @@ bool tcg_temp_pin(TCGTemp *ts)
     int nb_int = s->nb_pinned - s->nb_pinned_vec;
     TCGReg reg;
 
-    if (tcg_use_softmmu || !tcg_pin_user ||
-        s->nb_pinned >= ARRAY_SIZE(s->pinned)) {
+    if (!tcg_pin_user || s->nb_pinned >= ARRAY_SIZE(s->pinned)) {
+        return false;
+    }
+    /* System mode: callee-saved registers only (calls keep them), no vectors. */
+    if (tcg_use_softmmu &&
+        (vec || nb_int >= TCG_TARGET_NB_PIN_REGS_SYSTEM)) {
         return false;
     }
     tcg_debug_assert(ts->kind == TEMP_GLOBAL && !ts->indirect_reg &&
@@ -1368,6 +1436,12 @@ bool tcg_temp_pin(TCGTemp *ts)
 /* Store every pinned global to its env slot. */
 static void tcg_out_pinned_st(TCGContext *s)
 {
+#ifdef TCG_TARGET_HAS_PINNED_ST_PAIRS
+    if (tcg_use_softmmu) {
+        tcg_out_pinned_st_pairs(s);
+        return;
+    }
+#endif
     for (int i = 0; i < s->nb_pinned; i++) {
         TCGTemp *ts = s->pinned[i];
 
@@ -1452,6 +1526,12 @@ static const TCGOutOpShlAdd outop_shladd = {
 static void tcg_out_spin_hint(TCGContext *s)
 {
 }
+#endif
+
+#ifndef TCG_TARGET_HAS_QEMU_ATOMIC
+static const TCGOutOpQemuAtomic outop_qemu_atomic = {
+    .base.static_constraint = C_NotImplemented,
+};
 #endif
 
 #ifndef TCG_TARGET_HAS_LDST_X
@@ -1586,6 +1666,7 @@ static const TCGOutOp * const all_outop[NB_OPS] = {
     OUTOP(INDEX_op_qemu_st, TCGOutOpQemuLdSt, outop_qemu_st),
     OUTOP(INDEX_op_qemu_ld_x, TCGOutOpQemuLdStX, outop_qemu_ld_x),
     OUTOP(INDEX_op_qemu_st_x, TCGOutOpQemuLdStX, outop_qemu_st_x),
+    OUTOP(INDEX_op_qemu_atomic, TCGOutOpQemuAtomic, outop_qemu_atomic),
     OUTOP(INDEX_op_shladd, TCGOutOpShlAdd, outop_shladd),
     OUTOP(INDEX_op_qemu_st2, TCGOutOpQemuLdSt2, outop_qemu_st2),
     OUTOP(INDEX_op_rems, TCGOutOpBinary, outop_rems),
@@ -1660,6 +1741,14 @@ void tcg_register_thread(void)
             tcg_debug_assert(b >= 0 && b < n);
             s->temps[i].mem_base = &s->temps[b];
         }
+    }
+
+    /* The pinned globals are this context's own temps. */
+    for (i = 0; i < s->nb_pinned; ++i) {
+        ptrdiff_t t = tcg_init_ctx.pinned[i] - tcg_init_ctx.temps;
+
+        tcg_debug_assert(t >= 0 && t < tcg_init_ctx.nb_globals);
+        s->pinned[i] = &s->temps[t];
     }
 
     /* Claim an entry in tcg_ctxs */
@@ -1785,6 +1874,77 @@ static TCGHelperInfo info_helper_st64_mmu = {
               | dh_typemask(i64, 3)  /* uint64_t data */
               | dh_typemask(i32, 4)  /* unsigned oi */
               | dh_typemask(ptr, 5)  /* uintptr_t ra */
+};
+
+/* The C functions an atomic access's slow path calls (cpu_atomic_*_mmu). */
+static TCGHelperInfo info_atomic_op32 = {
+    .flags = TCG_CALL_NO_WG,
+    .typemask = dh_typemask(i32, 0)
+              | dh_typemask(env, 1)
+              | dh_typemask(i64, 2)  /* vaddr addr */
+              | dh_typemask(i32, 3)  /* uint32_t val */
+              | dh_typemask(i32, 4)  /* MemOpIdx oi */
+              | dh_typemask(ptr, 5)  /* uintptr_t ra */
+};
+
+static TCGHelperInfo info_atomic_op64 = {
+    .flags = TCG_CALL_NO_WG,
+    .typemask = dh_typemask(i64, 0)
+              | dh_typemask(env, 1)
+              | dh_typemask(i64, 2)  /* vaddr addr */
+              | dh_typemask(i64, 3)  /* uint64_t val */
+              | dh_typemask(i32, 4)  /* MemOpIdx oi */
+              | dh_typemask(ptr, 5)  /* uintptr_t ra */
+};
+
+static TCGHelperInfo info_atomic_cx32 = {
+    .flags = TCG_CALL_NO_WG,
+    .typemask = dh_typemask(i32, 0)
+              | dh_typemask(env, 1)
+              | dh_typemask(i64, 2)  /* vaddr addr */
+              | dh_typemask(i32, 3)  /* uint32_t cmpv */
+              | dh_typemask(i32, 4)  /* uint32_t newv */
+              | dh_typemask(i32, 5)  /* MemOpIdx oi */
+              | dh_typemask(ptr, 6)  /* uintptr_t ra */
+};
+
+static TCGHelperInfo info_atomic_cx64 = {
+    .flags = TCG_CALL_NO_WG,
+    .typemask = dh_typemask(i64, 0)
+              | dh_typemask(env, 1)
+              | dh_typemask(i64, 2)  /* vaddr addr */
+              | dh_typemask(i64, 3)  /* uint64_t cmpv */
+              | dh_typemask(i64, 4)  /* uint64_t newv */
+              | dh_typemask(i32, 5)  /* MemOpIdx oi */
+              | dh_typemask(ptr, 6)  /* uintptr_t ra */
+};
+
+/* Indexed by TCGAtomicOp and MO_SIZE; little-endian guest data. */
+static const void * const atomic_helpers[TCG_ATOMIC_NB_OPS][4] = {
+    [TCG_ATOMIC_XCHG] = {
+        cpu_atomic_xchgb_mmu, cpu_atomic_xchgw_le_mmu,
+        cpu_atomic_xchgl_le_mmu, cpu_atomic_xchgq_le_mmu,
+    },
+    [TCG_ATOMIC_ADD] = {
+        cpu_atomic_fetch_addb_mmu, cpu_atomic_fetch_addw_le_mmu,
+        cpu_atomic_fetch_addl_le_mmu, cpu_atomic_fetch_addq_le_mmu,
+    },
+    [TCG_ATOMIC_AND] = {
+        cpu_atomic_fetch_andb_mmu, cpu_atomic_fetch_andw_le_mmu,
+        cpu_atomic_fetch_andl_le_mmu, cpu_atomic_fetch_andq_le_mmu,
+    },
+    [TCG_ATOMIC_OR] = {
+        cpu_atomic_fetch_orb_mmu, cpu_atomic_fetch_orw_le_mmu,
+        cpu_atomic_fetch_orl_le_mmu, cpu_atomic_fetch_orq_le_mmu,
+    },
+    [TCG_ATOMIC_XOR] = {
+        cpu_atomic_fetch_xorb_mmu, cpu_atomic_fetch_xorw_le_mmu,
+        cpu_atomic_fetch_xorl_le_mmu, cpu_atomic_fetch_xorq_le_mmu,
+    },
+    [TCG_ATOMIC_CMPXCHG] = {
+        cpu_atomic_cmpxchgb_mmu, cpu_atomic_cmpxchgw_le_mmu,
+        cpu_atomic_cmpxchgl_le_mmu, cpu_atomic_cmpxchgq_le_mmu,
+    },
 };
 
 static TCGHelperInfo info_helper_st128_mmu = {
@@ -2167,6 +2327,10 @@ static void tcg_context_init(unsigned max_threads)
     init_call_layout(&info_helper_st32_mmu);
     init_call_layout(&info_helper_st64_mmu);
     init_call_layout(&info_helper_st128_mmu);
+    init_call_layout(&info_atomic_op32);
+    init_call_layout(&info_atomic_op64);
+    init_call_layout(&info_atomic_cx32);
+    init_call_layout(&info_atomic_cx64);
 
     tcg_target_init(s);
     if (!tcg_target_ldst_clobber_regs) {
@@ -2303,6 +2467,8 @@ void *tcg_tb_data_highwater(TCGContext *s)
 TranslationBlock *tcg_tb_alloc(TCGContext *s)
 {
     uintptr_t align = tcg_tbpack ? TCG_TBPACK_ALIGN : qemu_icache_linesize;
+    unsigned nb_slots = TB_JMP_SLOTS;
+    size_t size = tb_struct_size(nb_slots);
     TranslationBlock *tb;
     void *next;
 
@@ -2312,8 +2478,9 @@ TranslationBlock *tcg_tb_alloc(TCGContext *s)
         if (s->lay_on) {
             /* The struct in the chunk's cold part; the code where it was. */
             tb = (void *)ROUND_UP((uintptr_t)s->lay_cold, TCG_TBPACK_ALIGN);
-            s->lay_cold = (void *)ROUND_UP((uintptr_t)(tb + 1),
+            s->lay_cold = (void *)ROUND_UP((uintptr_t)tb + size,
                                            TCG_TBPACK_ALIGN);
+            tb->nb_slots = nb_slots;
             return tb;
         }
         tb = (void *)ROUND_UP((uintptr_t)s->code_gen_ptr, align);
@@ -2323,9 +2490,10 @@ TranslationBlock *tcg_tb_alloc(TCGContext *s)
          * See tcg_region_thread_initial_alloc.
          */
         if (tb) {
-            next = (void *)ROUND_UP((uintptr_t)(tb + 1), align);
+            next = (void *)ROUND_UP((uintptr_t)tb + size, align);
             if (next <= s->code_gen_highwater) {
                 qatomic_set(&s->code_gen_ptr, next);
+                tb->nb_slots = nb_slots;
                 return tb;
             }
         }
@@ -2439,6 +2607,7 @@ void tcg_func_start(TCGContext *s)
     s->call_ret_set = false;
     s->current_frame_offset = s->frame_start;
 
+    s->goto_tb_slots = 0;
 #ifdef CONFIG_DEBUG_TCG
     s->goto_tb_issue_mask = 0;
 #endif
@@ -2949,6 +3118,7 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
 
     case INDEX_op_qemu_ld_x:
     case INDEX_op_qemu_st_x:
+    case INDEX_op_qemu_atomic:
     case INDEX_op_shladd:
         tcg_debug_assert(type <= TCG_TYPE_REG);
         goto do_lookup;
@@ -3605,6 +3775,7 @@ void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs)
             case INDEX_op_qemu_st_vec:
             case INDEX_op_qemu_ld_x:
             case INDEX_op_qemu_st_x:
+            case INDEX_op_qemu_atomic:
                 {
                     const char *s_al, *s_tlb, *s_op, *s_at;
                     TCGArg xarg = op->args[k];
@@ -4462,6 +4633,7 @@ dead_env_store_pass(TCGContext *s)
         case INDEX_op_qemu_st_vec:
         case INDEX_op_qemu_ld_x:
         case INDEX_op_qemu_st_x:
+        case INDEX_op_qemu_atomic:
             dse_keep_only(&dead, dse_scratch_lo, dse_scratch_hi);
             break;
         case INDEX_op_exit_tb:
@@ -4782,6 +4954,7 @@ static void tlb_pin_pass(TCGContext *s)
         case INDEX_op_qemu_st2:
         case INDEX_op_qemu_ld_vec:
         case INDEX_op_qemu_st_vec:
+        case INDEX_op_qemu_atomic:
             counts[get_mmuidx(op->args[def->nb_oargs + def->nb_iargs])]++;
             break;
         default:
@@ -4799,6 +4972,62 @@ static void tlb_pin_pass(TCGContext *s)
     }
 }
 #endif
+
+/*
+ * A TB struct is allocated with all TB_JMP_SLOTS goto_tb slots
+ * (tcg_tb_alloc); once the front end has translated the block, before any
+ * host code, it keeps only TB_JMP_SLOTS_SMALL if no higher slot was issued
+ * (goto_tb, goto_tb_dead, call_tb: goto_tb_issue_mask).  The struct lies
+ * at the cold cursor with tcg_tblayout, else right before the code: the
+ * cursor or the code start moves.  A translation retried for the backend
+ * gets all the slots back first.
+ */
+static uintptr_t tb_struct_end(TCGContext *s, TranslationBlock *tb,
+                               unsigned nb_slots)
+{
+    uintptr_t align = s->lay_on || tcg_tbpack ? TCG_TBPACK_ALIGN
+                                              : qemu_icache_linesize;
+
+    return ROUND_UP((uintptr_t)tb + tb_struct_size(nb_slots), align);
+}
+
+static void tb_struct_resize(TCGContext *s, TranslationBlock *tb,
+                             unsigned nb_slots)
+{
+    uintptr_t from = tb_struct_end(s, tb, tb->nb_slots);
+    uintptr_t to = tb_struct_end(s, tb, nb_slots);
+
+    if (s->lay_on) {
+        tcg_debug_assert((uintptr_t)s->lay_cold == from);
+        s->lay_cold = (void *)to;
+    } else {
+        tcg_debug_assert((uintptr_t)s->code_gen_ptr == from);
+        tcg_debug_assert((uintptr_t)tcg_splitwx_to_rw(tb->tc.ptr) == from);
+        qatomic_set(&s->code_gen_ptr, (void *)to);
+        tb->tc.ptr = tcg_splitwx_to_rx((void *)to);
+    }
+    tb->nb_slots = nb_slots;
+}
+
+void tcg_tb_trim_slots(TCGContext *s, TranslationBlock *tb)
+{
+    if (tb->nb_slots > TB_JMP_SLOTS_SMALL &&
+        !(s->goto_tb_slots >> TB_JMP_SLOTS_SMALL)) {
+        tb_struct_resize(s, tb, TB_JMP_SLOTS_SMALL);
+    }
+}
+
+void tcg_tb_reserve_slots(TCGContext *s, TranslationBlock *tb)
+{
+    if (tb->nb_slots < TB_JMP_SLOTS) {
+        tb_struct_resize(s, tb, TB_JMP_SLOTS);
+    }
+}
+
+bool tcg_atomic_supported(void)
+{
+    return tcg_op_supported(INDEX_op_qemu_atomic, TCG_TYPE_I64, 0);
+}
 
 bool tcg_tlbpin_supported(void)
 {
@@ -6155,6 +6384,7 @@ static bool op_is_guest_access(TCGOpcode opc)
     case INDEX_op_qemu_st_vec:
     case INDEX_op_qemu_ld_x:
     case INDEX_op_qemu_st_x:
+    case INDEX_op_qemu_atomic:
         return true;
     default:
         return false;
@@ -9042,6 +9272,15 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         }
         break;
 
+    case INDEX_op_qemu_atomic:
+        {
+            const TCGOutOpQemuAtomic *out = &outop_qemu_atomic;
+
+            out->out(s, type, new_args[0], new_args[1], new_args[2],
+                     new_args[3], new_args[4], new_args[5]);
+        }
+        break;
+
     case INDEX_op_qemu_ld2:
     case INDEX_op_qemu_st2:
         {
@@ -9946,6 +10185,46 @@ static void tcg_out_st_helper_args(TCGContext *s, const TCGLabelQemuLdst *ldst,
     }
 
     tcg_out_helper_load_common_args(s, ldst, parm, info, next_arg);
+}
+
+/*
+ * The arguments of a qemu_atomic slow path's call of cpu_atomic_*_mmu: env,
+ * addr, the compare value for cmpxchg, the value (datahi_reg), oi, ra.
+ * Returns the function; its result is the old value, zero-extended from
+ * the access size to 32 bits (64 for a 64-bit access).
+ */
+static const void *tcg_out_atomic_helper_args(TCGContext *s,
+                                              const TCGLabelQemuLdst *ldst,
+                                              const TCGLdstHelperParam *parm)
+{
+    MemOp size = get_memop(ldst->oi) & MO_SIZE;
+    TCGAtomicOp aop = ldst->atomic - 1;
+    bool cx = aop == TCG_ATOMIC_CMPXCHG;
+    TCGType dtype = size == MO_64 ? TCG_TYPE_I64 : TCG_TYPE_I32;
+    const TCGHelperInfo *info;
+    TCGMovExtend mov[3];
+    unsigned next_arg = 1, nmov = 0;
+
+    tcg_debug_assert(size <= MO_64);
+    if (cx) {
+        info = size == MO_64 ? &info_atomic_cx64 : &info_atomic_cx32;
+    } else {
+        info = size == MO_64 ? &info_atomic_op64 : &info_atomic_op32;
+    }
+
+    tcg_debug_assert(s->addr_type <= TCG_TYPE_REG);
+    nmov += tcg_out_helper_add_mov(mov + nmov, &info->in[next_arg++],
+                                   TCG_TYPE_I64, s->addr_type,
+                                   ldst->addr_reg, -1);
+    if (cx) {
+        nmov += tcg_out_helper_add_mov(mov + nmov, &info->in[next_arg++],
+                                       dtype, ldst->type, ldst->cmp_reg, -1);
+    }
+    nmov += tcg_out_helper_add_mov(mov + nmov, &info->in[next_arg++],
+                                   dtype, ldst->type, ldst->datahi_reg, -1);
+    tcg_out_helper_load_slots(s, nmov, mov, parm);
+    tcg_out_helper_load_common_args(s, ldst, parm, info, next_arg);
+    return atomic_helpers[aop][size];
 }
 
 /*
@@ -10941,14 +11220,14 @@ static void tcg_note_cond_link(TCGContext *s, int n)
     TCGRelocation *r;
 
     if (!tcg_goto_tb_cold || !l || s->lay_cold_now ||
-        s->gen_tb->jmp_insn_offset[n] != s->slot_label_off) {
+        s->gen_tb->jmp[n].insn_offset != s->slot_label_off) {
         return;
     }
     r = QSIMPLEQ_FIRST(&l->relocs);
     if (!r || QSIMPLEQ_NEXT(r, next) || !tcg_cond_link_reloc(r->type)) {
         return;
     }
-    s->gen_tb->jmp_cond[n] = tcg_ptr_byte_diff(r->ptr, s->code_buf) + 1;
+    s->gen_tb->jmp[n].cond = tcg_ptr_byte_diff(r->ptr, s->code_buf) + 1;
 #endif
 }
 
@@ -11103,17 +11382,17 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 #endif
 
     /* Initialize goto_tb jump offsets. */
-    for (int n = 0; n < TB_JMP_SLOTS; n++) {
-        tb->jmp_reset_offset[n] = TB_JMP_OFFSET_INVALID;
-        tb->jmp_insn_offset[n] = TB_JMP_OFFSET_INVALID;
+    for (int n = 0; n < tb->nb_slots; n++) {
+        tb->jmp[n].reset_offset = TB_JMP_OFFSET_INVALID;
+        tb->jmp[n].insn_offset = TB_JMP_OFFSET_INVALID;
+        tb->jmp[n].cond = 0;
+        tb->jmp[n].dead = 0;
     }
     tb->jmp_call = 0;
     tb->jmp_cold = 0;
     tb->jmp_far = 0;
-    memset(tb->jmp_cond, 0, sizeof(tb->jmp_cond));
     s->slot_label = NULL;
     memset(s->call_tb_reset, 0, sizeof(s->call_tb_reset));
-    memset(tb->jmp_dead, 0, sizeof(tb->jmp_dead));
 
     /*
      * tcg_tblayout: code from the first cold label after the TB's last
@@ -11298,7 +11577,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             break;
         case INDEX_op_goto_tb_dead:
             tcg_reg_alloc_chain_store(s, false);
-            s->gen_tb->jmp_dead[op->args[1]] = op->args[0] + 1;
+            s->gen_tb->jmp[op->args[1]].dead = op->args[0] + 1;
 #ifdef TCG_TARGET_HAS_GOTO_TB_COLD
             if (s->goto_tb_cold) {
                 /* One insn, a NOP while unlinked. */
@@ -11482,12 +11761,12 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     }
 
     /* A call_tb or goto_tb_cold slot, while unlinked, leads to its label. */
-    for (int n = 0; n < ARRAY_SIZE(tb->jmp_reset_offset); n++) {
+    for (int n = 0; n < tb->nb_slots; n++) {
         TCGLabel *l = s->call_tb_reset[n];
 
         if (l) {
             tcg_debug_assert(l->has_value);
-            tb->jmp_reset_offset[n] =
+            tb->jmp[n].reset_offset =
                 tcg_ptr_byte_diff(l->u.value_ptr,
                                   tcg_splitwx_to_rx(s->code_buf));
         }

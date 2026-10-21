@@ -15,6 +15,12 @@
 #define have_lrcpc2 (cpuinfo & CPUINFO_LRCPC2)
 #define have_lrcpc3 (cpuinfo & CPUINFO_LRCPC3)
 
+/* qemu_atomic, with FEAT_LSE (its constraint set says) */
+#define TCG_TARGET_HAS_QEMU_ATOMIC
+
+/* tcg_out_pinned_st_pairs, and the slow paths' shared copy of it */
+#define TCG_TARGET_HAS_PINNED_ST_PAIRS
+
 /*
  * MO_ACQ_REL guest accesses: LDAPR/STLR.  Unaligned ones rely on FEAT_LSE2
  * (they must not cross 16 bytes; the backend checks).

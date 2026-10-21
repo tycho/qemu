@@ -123,6 +123,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-superblock", "units" },
 #endif
         { "x-tblookup", "on" },
+        { "x-xpage", "stub" },
         { "x-tblayout", "split" },
         { "x-i386-runtime", "on" },
         { "x-addr32", "on" },
@@ -144,6 +145,10 @@ static void xtcg_fork_defaults(Object *obj)
     for (int i = 0; i < ARRAY_SIZE(defaults); i++) {
         object_property_parse(obj, defaults[i][0], defaults[i][1],
                               &error_abort);
+    }
+    /* Inline atomics need FEAT_LSE: on where the backend has them. */
+    if (tcg_atomic_supported()) {
+        object_property_parse(obj, "x-atomic", "on", &error_abort);
     }
 #endif
 }
@@ -382,9 +387,15 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #if defined(CONFIG_SOFTMMU)
     /*
      * There's no guest base to take into account, so go ahead and
-     * initialize the prologue now.
+     * initialize the prologue now; or, where guest registers may be
+     * pinned, once the front end has pinned them (tcg_exec_realizefn).
      */
-    tcg_prologue_init();
+    tcg_jc_layout_init();
+    if (tcg_pin && tcg_pin_system_ok()) {
+        tcg_prologue_deferred = true;
+    } else {
+        tcg_prologue_init();
+    }
 #endif
 
 #ifdef CONFIG_USER_ONLY
@@ -522,6 +533,8 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 }
 
 bool tcg_ijmp_inline;
+bool tcg_prologue_deferred;
+TCGXPage tcg_xpage;
 bool tcg_jcgen;
 bool tcg_jc_keep_pcrel;
 bool tcg_jc_global;
@@ -774,6 +787,29 @@ static bool tcg_get_region(Object *obj, Error **errp)
 static void tcg_set_region(Object *obj, bool value, Error **errp)
 {
     tcg_region = value;
+}
+
+static const char *const tcg_xpage_names[] = {
+    [TCG_XPAGE_CALL] = "call",
+    [TCG_XPAGE_INLINE] = "inline",
+    [TCG_XPAGE_PROBE] = "probe",
+    [TCG_XPAGE_STUB] = "stub",
+};
+
+static char *tcg_get_xpage(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_xpage_names[tcg_xpage]);
+}
+
+static void tcg_set_xpage(Object *obj, const char *value, Error **errp)
+{
+    for (int i = 0; i < ARRAY_SIZE(tcg_xpage_names); i++) {
+        if (!strcmp(value, tcg_xpage_names[i])) {
+            tcg_xpage = i;
+            return;
+        }
+    }
+    error_setg(errp, "x-xpage: 'call', 'inline', 'probe' or 'stub'");
 }
 
 static bool tcg_get_tblookup(Object *obj, Error **errp)
@@ -1100,6 +1136,21 @@ static void tcg_set_hvtimers(Object *obj, bool value, Error **errp)
     TCG_STATE(obj)->hvtimers = value;
 }
 
+static bool tcg_get_atomic(Object *obj, Error **errp)
+{
+    return tcg_atomic;
+}
+
+static void tcg_set_atomic(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_atomic_supported()) {
+        error_setg(errp, "x-atomic: not supported by this TCG backend "
+                   "or host");
+        return;
+    }
+    tcg_atomic = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1205,6 +1256,15 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "indirect jumps (in a short helper call at direct jumps to "
         "another page), and pack TB structs next to their code (x86 "
         "guests)");
+
+    object_class_property_add_str(oc, "x-xpage", tcg_get_xpage,
+                                  tcg_set_xpage);
+    object_class_property_set_description(oc, "x-xpage",
+        "With x-tblookup, probe the jump cache at direct jumps to another "
+        "page in a short helper call ('call'), in generated code "
+        "('inline'), or in a call that only probes, the full lookup "
+        "following on a miss: to C ('probe') or to a shared generated "
+        "probe ('stub')");
 
     object_class_property_add_bool(oc, "x-addr32",
                                    tcg_get_addr32, tcg_set_addr32);
@@ -1318,6 +1378,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-alignfold",
         "Drop guest alignment checks implied by an earlier check on the "
         "same address registers");
+
+    object_class_property_add_bool(oc, "x-atomic", tcg_get_atomic,
+                                   tcg_set_atomic);
+    object_class_property_set_description(oc, "x-atomic",
+        "Guest atomic read-modify-write accesses as host atomic insns "
+        "inline, with the helper only as the slow path");
 
     object_class_property_add_bool(oc, "x-tlbpin", tcg_get_tlbpin,
                                    tcg_set_tlbpin);

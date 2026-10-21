@@ -36,6 +36,7 @@
 #include "exec/cputlb.h"
 #include "tcg/tcg.h"
 #include "tcg/startup.h"
+#include "qemu/plugin.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
 #include "exec/log.h"
@@ -577,16 +578,16 @@ static TranslationBlock *region_sample_head(TranslationBlock *tb,
                 head = tb;
                 break;
             }
-            p = src->jmp_list_next[p & TB_JMP_TAG_MASK];
+            p = src->jmp[p & TB_JMP_TAG_MASK].list_next;
         }
         qemu_spin_unlock(&tb->jmp_lock);
         if (head) {
             return head;
         }
     }
-    for (int n = 0; n < TB_JMP_SLOTS; n++) {
+    for (int n = 0; n < tb->nb_slots; n++) {
         TranslationBlock *dst = (TranslationBlock *)
-            (qatomic_read(&tb->jmp_dest[n]) & ~(uintptr_t)1);
+            (qatomic_read(&tb->jmp[n].dest) & ~(uintptr_t)1);
 
         if (dst && dst != tb && tb_page_addr0(dst) != -1 &&
             tb_page_addr0(dst) < at &&
@@ -730,6 +731,50 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
 const void *HELPER(lookup_tb_ptr_jc)(CPUArchState *env, uint64_t pc,
                                      uint64_t cs_base, uint32_t flags)
 {
+    const void *ptr = HELPER(lookup_tb_ptr_jcp)(env, pc, cs_base, flags);
+
+    return ptr ? ptr : HELPER(lookup_tb_ptr)(env);
+}
+
+/* x-xpage=stub: the jump cache's layout for the backend's probe. */
+void tcg_jc_layout_init(void)
+{
+#ifndef CONFIG_USER_ONLY
+    TCGJumpCacheLayout *l = &tcg_jc_layout;
+
+    QEMU_BUILD_BUG_ON(sizeof(((CPUJumpCache *)0)->array[0]) != 16);
+    l->global = tcg_jc_global;
+    l->jc_ofs = (int)offsetof(CPUState, tb_jmp_cache) -
+                  (int)sizeof(CPUState);
+    l->bp_ofs = (int)offsetof(CPUState, breakpoints.tqh_first) -
+                  (int)sizeof(CPUState);
+    l->cflags_ofs = (int)offsetof(CPUState, tcg_cflags) -
+                  (int)sizeof(CPUState);
+    l->salt_ofs = offsetof(CPUJumpCache, salt);
+    l->gsalt_ofs = offsetof(CPUJumpCache, gsalt);
+    l->entry_tb_ofs = offsetof(CPUJumpCache, array[0].tb);
+    l->entry_pc_ofs = offsetof(CPUJumpCache, array[0].pc);
+    l->entry_shift = 4;
+    l->hash_shift = TARGET_PAGE_BITS - TB_JMP_PAGE_BITS;
+    l->page_bits = TB_JMP_PAGE_BITS;
+    l->cache_bits = TB_JMP_CACHE_BITS;
+    l->tb_cs_base_ofs = offsetof(TranslationBlock, cs_base);
+    l->tb_flags_ofs = offsetof(TranslationBlock, flags);
+    l->tb_cflags_ofs = offsetof(TranslationBlock, cflags);
+    l->tb_ptr_ofs = offsetof(TranslationBlock, tc.ptr);
+    l->valid = true;
+#endif
+}
+
+/*
+ * The jump-cache probe of helper_lookup_tb_ptr_jc alone: NULL on a miss.
+ * It reads no guest state and can't fault or leave (no page walk, no
+ * breakpoint exit), so the caller needn't store the guest's globals for
+ * it; the caller looks up a miss with helper_lookup_tb_ptr, which may.
+ */
+const void *HELPER(lookup_tb_ptr_jcp)(CPUArchState *env, uint64_t pc,
+                                      uint64_t cs_base, uint32_t flags)
+{
     CPUState *cpu = env_cpu(env);
     CPUJumpCache *jc = cpu->tb_jmp_cache;
     uint32_t hash = tb_jmp_cache_hash_func(pc);
@@ -743,7 +788,7 @@ const void *HELPER(lookup_tb_ptr_jc)(CPUArchState *env, uint64_t pc,
                tb_cflags(tb) == cpu->tcg_cflags)) {
         return tb->tc.ptr;
     }
-    return HELPER(lookup_tb_ptr)(env);
+    return NULL;
 }
 
 /* Return the current PC from CPU, which may be cached in TB. */
@@ -970,11 +1015,11 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
      * produce a pc-relative displacement to jmp_target_addr[n].
      */
     const TranslationBlock *c_tb = tcg_splitwx_to_rx(tb);
-    uintptr_t offset = tb->jmp_insn_offset[n];
+    uintptr_t offset = tb->jmp[n].insn_offset;
     uintptr_t jmp_rx = (uintptr_t)tb->tc.ptr + offset;
     uintptr_t jmp_rw = jmp_rx - tcg_splitwx_diff;
 
-    tb->jmp_target_addr[n] = addr;
+    tb->jmp[n].target_addr = addr;
     tb_target_set_jmp_target(c_tb, n, jmp_rx, jmp_rw);
 }
 
@@ -985,7 +1030,7 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     uintptr_t old;
 
     qemu_thread_jit_write();
-    assert(n < ARRAY_SIZE(tb->jmp_list_next));
+    assert(n < tb->nb_slots);
     qemu_spin_lock(&tb_next->jmp_lock);
 
     /* make sure the destination TB is valid */
@@ -993,7 +1038,7 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
         goto out_unlock_next;
     }
     /* Atomically claim the jump destination slot only if it was NULL */
-    old = qatomic_cmpxchg(&tb->jmp_dest[n], (uintptr_t)NULL,
+    old = qatomic_cmpxchg(&tb->jmp[n].dest, (uintptr_t)NULL,
                           (uintptr_t)tb_next);
     if (old) {
         goto out_unlock_next;
@@ -1003,7 +1048,7 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     tb_set_jmp_target(tb, n, (uintptr_t)tb_next->tc.ptr);
 
     /* add in TB jmp list */
-    tb->jmp_list_next[n] = tb_next->jmp_list_head;
+    tb->jmp[n].list_next = tb_next->jmp_list_head;
     tb_next->jmp_list_head = (uintptr_t)tb | n;
 
     qemu_spin_unlock(&tb_next->jmp_lock);
@@ -1384,8 +1429,8 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             if (last_tb) {
                 tb_add_jump(last_tb, tb_exit, tb);
                 /* Its goto_tb_dead too, if tb writes them first. */
-                if (last_tb->jmp_dead[tb_exit] && tb->chain_dead_in) {
-                    tb_add_jump(last_tb, last_tb->jmp_dead[tb_exit] - 1, tb);
+                if (last_tb->jmp[tb_exit].dead && tb->chain_dead_in) {
+                    tb_add_jump(last_tb, last_tb->jmp[tb_exit].dead - 1, tb);
                 }
             }
 
@@ -1459,7 +1504,24 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
         assert(tcg_ops->translate_code);
         assert(tcg_ops->get_tb_cpu_state);
         assert(tcg_ops->mmu_index);
+#ifndef CONFIG_USER_ONLY
+        if (tcg_prologue_deferred) {
+            /*
+             * Pin guest registers if no plugin, which would read them
+             * from env, is loaded (plugins are loaded before the vCPUs
+             * are created); then the prologue, which loads and stores
+             * the pinned ones.
+             */
+            tcg_pin_user = tcg_pin && !qemu_plugins_loaded();
+        }
+#endif
         tcg_ops->initialize();
+#ifndef CONFIG_USER_ONLY
+        if (tcg_prologue_deferred) {
+            tcg_prologue_init();
+            tcg_prologue_deferred = false;
+        }
+#endif
         tcg_target_initialized = true;
     }
 

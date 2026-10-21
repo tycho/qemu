@@ -1986,6 +1986,11 @@ static void tcg_out_ldst_save(TCGContext *s, TCGRegSet regs, bool restore,
 #else
 #define TCG_TARGET_NB_PIN_REGS 16
 #endif
+/*
+ * System mode pins only the first seven, x20-x26: callee-saved, so calls
+ * need no saves, and clear of x-tlbpin's x27 and x28.
+ */
+#define TCG_TARGET_NB_PIN_REGS_SYSTEM 7
 static const TCGReg tcg_target_pin_regs[TCG_TARGET_NB_PIN_REGS] = {
     TCG_REG_X20, TCG_REG_X21, TCG_REG_X22, TCG_REG_X23,
     TCG_REG_X24, TCG_REG_X25, TCG_REG_X26, TCG_REG_X27,
@@ -2018,10 +2023,69 @@ static const TCGReg tcg_target_pin_vregs[16] = {
     TCG_REG_V20, TCG_REG_V21, TCG_REG_V22, TCG_REG_V23,
 };
 
+/*
+ * System mode: store the pinned globals with STP where two of them have
+ * adjacent env slots, STR for the rest.  The slow paths share one copy
+ * per TB (TCGContext.pin_st_tail), called with BL: LR is TCG_REG_TMP2,
+ * free in a slow path.
+ */
+static void tcg_out_pinned_st_pairs(TCGContext *s)
+{
+    TCGTemp *t[ARRAY_SIZE(s->pinned)];
+    int n = 0;
+
+    for (int i = 0; i < s->nb_pinned; i++) {
+        TCGTemp *ts = s->pinned[i];
+
+        if (ts->type == TCG_TYPE_I64 && ts->mem_base->reg == TCG_AREG0 &&
+            !(ts->mem_offset & 7) && ts->mem_offset >= -0x200 &&
+            ts->mem_offset < 0x1f8) {
+            t[n++] = ts;
+        } else {
+            tcg_out_st(s, ts->type, ts->reg, ts->mem_base->reg,
+                       ts->mem_offset);
+        }
+    }
+    /* By env offset; n is small. */
+    for (int i = 1; i < n; i++) {
+        for (int j = i; j > 0 && t[j]->mem_offset < t[j - 1]->mem_offset; j--) {
+            TCGTemp *x = t[j];
+
+            t[j] = t[j - 1];
+            t[j - 1] = x;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (i + 1 < n && t[i + 1]->mem_offset == t[i]->mem_offset + 8) {
+            tcg_out_insn(s, ldstpair, STP, t[i]->reg, t[i + 1]->reg,
+                         TCG_AREG0, t[i]->mem_offset, 1, 0);
+            i++;
+        } else {
+            tcg_out_st(s, TCG_TYPE_I64, t[i]->reg, TCG_AREG0,
+                       t[i]->mem_offset);
+        }
+    }
+}
+
+/* The slow paths' shared copy: the stores, then return. */
+static void tcg_out_pinned_st_tail(TCGContext *s)
+{
+    tcg_out_pinned_st_pairs(s);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+}
+
 static void tcg_out_ldst_writeback(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     /* The helper may leave generated code: the pinned globals first. */
-    tcg_out_pinned_st(s);
+    if (s->pin_st_tail) {
+        /* In the same slow-path code: always within BL's reach. */
+        ptrdiff_t offset = tcg_pcrel_diff(s, s->pin_st_tail) >> 2;
+
+        tcg_debug_assert(offset == sextract64(offset, 0, 26));
+        tcg_out_insn(s, branch, BL, offset);
+    } else {
+        tcg_out_pinned_st(s);
+    }
     for (unsigned i = 0; i < lb->nb_wb; i++) {
         const TCGLdstWriteback *wb = &lb->wb[i];
 
@@ -2039,7 +2103,7 @@ static TCGRegSet ldst_outputs(TCGLabelQemuLdst *lb)
 {
     TCGRegSet set = 0;
 
-    if (lb->is_ld) {
+    if (lb->is_ld || lb->atomic) {
         tcg_regset_set_reg(set, lb->datalo_reg);
         if (lb->type == TCG_TYPE_I128) {
             tcg_regset_set_reg(set, lb->datahi_reg);
@@ -2618,6 +2682,192 @@ static const TCGOutOpQemuLdSt outop_qemu_st = {
 };
 
 /*
+ * qemu_atomic: one FEAT_LSE insn with acquire and release semantics (CASAL,
+ * SWPAL, LDADDAL, LDCLRAL, LDSETAL, LDEORAL), the insns the atomic helpers
+ * themselves use.  In system mode the fast path takes a main-TLB entry
+ * whose read and write comparators both equal the page, without flags (no
+ * watchpoint, MMIO, notdirty, discarded write, invalid entry), and an
+ * address aligned to the access size, or to the guest's alignment if
+ * larger; in user mode it tests the alignment only.  The slow path calls
+ * the function the helper calls, cpu_atomic_*_mmu, with the original
+ * MemOpIdx.
+ */
+
+static TCGLabelQemuLdst *prepare_atomic_addr(TCGContext *s, TCGReg *host,
+                                             TCGReg addr_reg, MemOpIdx oi)
+{
+    TCGType addr_type = s->addr_type;
+    MemOp opc = get_memop(oi);
+    unsigned a_bits = MAX(memop_alignment_bits(opc), opc & MO_SIZE);
+    unsigned a_mask = (1u << a_bits) - 1;
+    TCGLabelQemuLdst *ldst = NULL;
+    HostAddress h = { };
+
+    if (tcg_use_softmmu) {
+        unsigned mem_index = get_mmuidx(oi);
+        TCGReg mask = TCG_REG_TMP0, table = TCG_REG_TMP1;
+
+        if (s->tlb_pin_ofs && mem_index == s->tlb_pin_idx) {
+            mask = TCG_REG_TLB_MASK;
+            table = TCG_REG_TLB_TABLE;
+        } else {
+            tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP1,
+                         TCG_AREG0, tlb_mask_table_ofs(s, mem_index), 1, 0);
+        }
+        tcg_out_insn(s, addsub_realshift, AND_LSR, addr_type,
+                     TCG_REG_TMP0, mask, addr_reg,
+                     TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
+        tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP1, table,
+                     TCG_REG_TMP0);
+
+        /* The read and write comparators into TMP0 and TMP2. */
+        QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addr_read) != 0);
+        QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addr_write) != 8);
+        if (addr_type == TCG_TYPE_I64) {
+            tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP2,
+                         TCG_REG_TMP1, 0, 1, 0);
+        } else {
+            tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_TMP0, TCG_REG_TMP1,
+                       offsetof(CPUTLBEntry, addr_read));
+            tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_TMP2, TCG_REG_TMP1,
+                       offsetof(CPUTLBEntry, addr_write));
+        }
+
+        /*
+         * Equal to each other, then the page and alignment bits of the
+         * address equal to them: ccmp leaves NE if the first test failed.
+         */
+        tcg_out_cmp(s, addr_type, TCG_COND_NE, TCG_REG_TMP0, TCG_REG_TMP2, 0);
+        tcg_out_logicali(s, Ilogic_imm_ANDI, addr_type, TCG_REG_TMP0,
+                         addr_reg, (uint64_t)TARGET_PAGE_MASK | a_mask);
+        tcg_out32(s, 0x7a400000 | addr_type << 31 | TCG_REG_TMP2 << 16
+                  | tcg_cond_to_aarch64[TCG_COND_EQ] << 12
+                  | TCG_REG_TMP0 << 5);
+
+        ldst = new_ldst_label(s);
+        ldst->label_ptr[0] = s->code_ptr;
+        tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+
+        tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_TMP1, TCG_REG_TMP1,
+                   offsetof(CPUTLBEntry, addend));
+        h.base = TCG_REG_TMP1;
+        h.index = addr_reg;
+        h.index_ext = addr_type;
+    } else {
+        if (a_mask) {
+            tcg_out_logicali(s, Ilogic_imm_ANDSI, 0, TCG_REG_XZR, addr_reg,
+                             a_mask);
+            ldst = new_ldst_label(s);
+            ldst->label_ptr[0] = s->code_ptr;
+            tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+        }
+        if (guest_base || addr_type == TCG_TYPE_I32) {
+            h.base = TCG_REG_GUEST_BASE;
+            h.index = addr_reg;
+            h.index_ext = addr_type;
+        } else {
+            h.base = addr_reg;
+            h.index = TCG_REG_XZR;
+            h.index_ext = TCG_TYPE_I64;
+        }
+    }
+    if (ldst) {
+        ldst->oi = oi;
+        ldst->addr_reg = addr_reg;
+    }
+    *host = tcg_out_host_addr_reg(s, h);
+    return ldst;
+}
+
+static void tgen_qemu_atomic(TCGContext *s, TCGType type, TCGReg ret,
+                             TCGReg val, TCGReg cmp, TCGReg addr_reg,
+                             MemOpIdx oi, TCGAtomicOp aop)
+{
+    static const uint32_t ldop[TCG_ATOMIC_NB_OPS] = {
+        [TCG_ATOMIC_XCHG] = 0x38e08000,     /* SWPAL */
+        [TCG_ATOMIC_ADD] = 0x38e00000,      /* LDADDAL */
+        [TCG_ATOMIC_AND] = 0x38e01000,      /* LDCLRAL, of ~val */
+        [TCG_ATOMIC_OR] = 0x38e03000,       /* LDSETAL */
+        [TCG_ATOMIC_XOR] = 0x38e02000,      /* LDEORAL */
+        [TCG_ATOMIC_CMPXCHG] = 0x08e0fc00,  /* CASAL */
+    };
+    uint32_t size = (get_memop(oi) & MO_SIZE) << 30;
+    TCGLabelQemuLdst *ldst;
+    TCGReg host;
+
+    /*
+     * A CASAL whose compare fails writes nothing, so its release orders
+     * nothing: as with the helpers, which use the same insn, ordering
+     * that case is the guest front end's concern.
+     */
+    ldst = prepare_atomic_addr(s, &host, addr_reg, oi);
+    switch (aop) {
+    case TCG_ATOMIC_CMPXCHG:
+        /* CASAL overwrites its compare register with the old value. */
+        tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_TMP0, cmp);
+        tcg_out32(s, ldop[aop] | size | TCG_REG_TMP0 << 16 | host << 5 | val);
+        tcg_out_mov(s, TCG_TYPE_I64, ret, TCG_REG_TMP0);
+        break;
+    case TCG_ATOMIC_AND:
+        tcg_out_insn(s, logic_shift, ORN, TCG_TYPE_I64, TCG_REG_TMP0,
+                     TCG_REG_XZR, val);
+        tcg_out32(s, ldop[aop] | size | TCG_REG_TMP0 << 16 | host << 5 | ret);
+        break;
+    default:
+        tcg_out32(s, ldop[aop] | size | val << 16 | host << 5 | ret);
+        break;
+    }
+    if (ldst) {
+        ldst->type = type;
+        ldst->atomic = aop + 1;
+        ldst->datalo_reg = ret;
+        ldst->datahi_reg = val;
+        ldst->cmp_reg = cmp;
+        ldst->raddr = tcg_splitwx_to_rx(s->code_ptr);
+    }
+    /*
+     * The helpers follow a guest atomic with a full barrier under
+     * x-tso=acqrel (cpu_tso_atomic_fence): so does this, on both paths.
+     */
+    if (tcg_tso_mode == TCG_TSO_ACQREL) {
+        tcg_out_mb(s, TCG_MO_ALL);
+    }
+}
+
+static TCGConstraintSetIndex cset_qemu_atomic(TCGType type, unsigned flags)
+{
+    return have_lse ? C_N1_I3(r, r, r, r) : C_NotImplemented;
+}
+
+static const TCGOutOpQemuAtomic outop_qemu_atomic = {
+    .base.static_constraint = C_Dynamic,
+    .base.dynamic_constraint = cset_qemu_atomic,
+    .out = tgen_qemu_atomic,
+};
+
+static bool tcg_out_qemu_atomic_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    const void *fn;
+
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
+        return false;
+    }
+    tcg_out_ldst_writeback(s, lb);
+    tcg_out_ldst_save(s, lb->save_regs, false, 0);
+    fn = tcg_out_atomic_helper_args(s, lb, &ldst_helper_param);
+    tcg_out_call_int(s, fn);
+    tcg_out_pinned_clobbered(s, false, 0);
+    if ((get_memop(lb->oi) & MO_SIZE) <= MO_32) {
+        tcg_out_ext32u(s, lb->datalo_reg, TCG_REG_X0);
+    } else {
+        tcg_out_mov(s, TCG_TYPE_I64, lb->datalo_reg, TCG_REG_X0);
+    }
+    tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
+    tcg_out_goto(s, lb->raddr);
+    return true;
+}
+
+/*
  * A 128-bit guest access into or from a vector register: the fast path is
  * one LDR or STR (Q), which is single-copy atomic for each 64-bit half when
  * aligned, as tcg_can_qemu_ldst_vec() requires.
@@ -2715,6 +2965,12 @@ static TCGReg tcg_out_rcpc_base(TCGContext *s, TCGReg base, int ofs)
     return base;
 }
 
+/*
+ * The offset form's index is the constant 0, which arrives as XZR, or as a
+ * register when an earlier op has loaded the constant into one: an offset
+ * means the offset form whatever the index register.  (A register index
+ * never comes with an offset; base + a register holding 0 is right too.)
+ */
 static void tgen_qemu_ld_x(TCGContext *s, TCGType type, TCGReg data,
                            TCGReg base, TCGReg index, bool index_zero,
                            TCGArg arg)
@@ -2754,7 +3010,7 @@ static void tgen_qemu_ld_x(TCGContext *s, TCGType type, TCGReg data,
     }
     if (shift == TCG_LDST_X_SCALED) {
         tcg_out_insn_ldst_uimm(s, ld_insn(mop, type), data, base, ofs);
-    } else if (index != TCG_REG_XZR) {
+    } else if (index != TCG_REG_XZR && !ofs) {
         tcg_out_ldst_rx(s, ld_insn(mop, type), data, base, index, shift);
     } else {
         tcg_out_insn_ldst_imm(s, ld_insn(mop, type), data, base, ofs);
@@ -2792,7 +3048,7 @@ static void tgen_qemu_st_x(TCGContext *s, TCGType type, TCGReg data,
     }
     if (shift == TCG_LDST_X_SCALED) {
         tcg_out_insn_ldst_uimm(s, st_insn(mop), data, base, ofs);
-    } else if (index != TCG_REG_XZR) {
+    } else if (index != TCG_REG_XZR && !ofs) {
         tcg_out_ldst_rx(s, st_insn(mop), data, base, index, shift);
     } else {
         tcg_out_insn_ldst_imm(s, st_insn(mop), data, base, ofs);
@@ -3162,7 +3418,7 @@ static void tb_set_cond_link(const TranslationBlock *tb, int n, bool linked,
                              uintptr_t d_addr, uintptr_t jmp_rx,
                              uintptr_t jmp_rw)
 {
-    uintptr_t c_rx = (uintptr_t)tb->tc.ptr + tb->jmp_cond[n] - 1;
+    uintptr_t c_rx = (uintptr_t)tb->tc.ptr + tb->jmp[n].cond - 1;
     uintptr_t c_rw = c_rx + (jmp_rw - jmp_rx);
     ptrdiff_t off = d_addr - c_rx;
     uint32_t insn = qatomic_read((uint32_t *)c_rw);
@@ -3177,12 +3433,12 @@ static void tb_set_cond_link(const TranslationBlock *tb, int n, bool linked,
 void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
                               uintptr_t jmp_rx, uintptr_t jmp_rw)
 {
-    uintptr_t d_addr = tb->jmp_target_addr[n];
+    uintptr_t d_addr = tb->jmp[n].target_addr;
     ptrdiff_t d_offset = d_addr - jmp_rx;
     tcg_insn_unit insn;
 
     if (tb->jmp_call & (1u << n)) {
-        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
+        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp[n].reset_offset;
 
         /*
          * A call slot: BL to a TB in range, else BL to the trampoline
@@ -3203,7 +3459,7 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     }
 
     if (tb->jmp_cold & (1u << n)) {
-        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
+        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp[n].reset_offset;
 
         /*
          * To the TB, or by way of the trampoline before the reset label,
@@ -3219,7 +3475,7 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
         }
         qatomic_set((uint32_t *)jmp_rw, insn);
         flush_idcache_range(jmp_rx, jmp_rw, 4);
-        if (tb->jmp_cond[n]) {
+        if (tb->jmp[n].cond) {
             tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw);
         }
         return;
@@ -3229,7 +3485,7 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     if (d_offset == sextract64(d_offset, 0, 28)) {
         insn = deposit32(Ibranch_B, 0, 26, d_offset >> 2);
     } else {
-        uintptr_t i_addr = (uintptr_t)&tb->jmp_target_addr[n];
+        uintptr_t i_addr = (uintptr_t)&tb->jmp[n].target_addr;
         ptrdiff_t i_offset = i_addr - jmp_rx;
 
         /* Note that we asserted this in range in tcg_out_goto_tb. */
@@ -3237,8 +3493,8 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     }
     qatomic_set((uint32_t *)jmp_rw, insn);
     flush_idcache_range(jmp_rx, jmp_rw, 4);
-    if (tb->jmp_cond[n]) {
-        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
+    if (tb->jmp[n].cond) {
+        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp[n].reset_offset;
 
         tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw);
     }
@@ -5737,6 +5993,94 @@ static void tcg_out_ld_st_d8_d15(TCGContext *s, bool load)
     }
 }
 
+/*
+ * x-xpage=stub: the shared jump-cache probe of cross-page direct jumps,
+ * after the epilogue.  Called as helper_lookup_tb_ptr_jcp is: X0 = env,
+ * X1 = pc, X2 = cs_base, W3 = flags; returns the TB's code in X0, or 0.
+ * The same checks as that helper, from tcg_jc_layout, with no frame and
+ * nothing but caller-saved registers: X4-X12, and X16 for far offsets.
+ */
+static void tcg_out_xpage_stub(TCGContext *s)
+{
+    const TCGJumpCacheLayout *l = &tcg_jc_layout;
+    ptrdiff_t miss[8];
+    int nmiss = 0, hs = l->hash_shift, pb = l->page_bits;
+    int cb = l->cache_bits, es = l->entry_shift;
+    ptrdiff_t key_ok = -1;
+
+    tcg_xpage_stub = tcg_splitwx_to_rx(s->code_ptr);
+    tcg_out_bti(s, BTI_C);
+
+    /* X4 = the jump cache; X6 = the entry's offset (tb_jmp_cache_hash_func) */
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_X4, TCG_REG_X0, l->jc_ofs);
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X5, TCG_REG_X1, hs, 63);
+    tcg_out_insn(s, logic_shift, EOR, TCG_TYPE_I64, TCG_REG_X5, TCG_REG_X5,
+                 TCG_REG_X1);
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X6, TCG_REG_X5, (64 - es) & 63,
+                 pb - 1);
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X7, TCG_REG_X5, hs + pb,
+                 hs + cb - 1);
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X7, TCG_REG_X7,
+                 (64 - (pb + es)) & 63, cb - pb - 1);
+    tcg_out_insn(s, logic_shift, ORR, TCG_TYPE_I64, TCG_REG_X6, TCG_REG_X6,
+                 TCG_REG_X7);
+    tcg_out_insn(s, addsub_shift, ADD, TCG_TYPE_I64, TCG_REG_X8, TCG_REG_X4,
+                 TCG_REG_X6);
+
+    /* X9 = the entry's TB; its key against pc ^ salt (or ^ gsalt). */
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_X9, TCG_REG_X8, l->entry_tb_ofs);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_X10, TCG_REG_X8, l->entry_pc_ofs);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_X11, TCG_REG_X4, l->salt_ofs);
+    tcg_out_insn(s, logic_shift, EOR, TCG_TYPE_I64, TCG_REG_X11, TCG_REG_X11,
+                 TCG_REG_X1);
+    tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_EQ, TCG_REG_X10, TCG_REG_X11, false);
+    if (l->global) {
+        key_ok = s->code_ptr - s->code_buf;
+        tcg_out_insn(s, bcond_imm, B_C, TCG_COND_EQ, 0);
+        tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_X11, TCG_REG_X4, l->gsalt_ofs);
+        tcg_out_insn(s, logic_shift, EOR, TCG_TYPE_I64, TCG_REG_X11,
+                     TCG_REG_X11, TCG_REG_X1);
+        tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_EQ, TCG_REG_X10, TCG_REG_X11,
+                    false);
+    }
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+    if (key_ok >= 0) {
+        reloc_pc19(s->code_buf + key_ok, tcg_splitwx_to_rx(s->code_ptr));
+    }
+
+    /* A TB, no breakpoints, and the TB's cs_base, flags and cflags. */
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, cbz, CBZ, TCG_TYPE_I64, TCG_REG_X9, 0);
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_X11, TCG_REG_X0, l->bp_ofs);
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, cbz, CBNZ, TCG_TYPE_I64, TCG_REG_X11, 0);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_X11, TCG_REG_X9, l->tb_cs_base_ofs);
+    tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_EQ, TCG_REG_X11, TCG_REG_X2, false);
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+    tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_X11, TCG_REG_X9, l->tb_flags_ofs);
+    tcg_out_cmp(s, TCG_TYPE_I32, TCG_COND_EQ, TCG_REG_X11, TCG_REG_X3, false);
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+    tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_X11, TCG_REG_X9, l->tb_cflags_ofs);
+    tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_X12, TCG_REG_X0, l->cflags_ofs);
+    tcg_out_cmp(s, TCG_TYPE_I32, TCG_COND_EQ, TCG_REG_X11, TCG_REG_X12, false);
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+
+    /* Hit: the TB's code. */
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_X0, TCG_REG_X9, l->tb_ptr_ofs);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+
+    /* Miss: 0. */
+    for (int i = 0; i < nmiss; i++) {
+        reloc_pc19(s->code_buf + miss[i], tcg_splitwx_to_rx(s->code_ptr));
+    }
+    tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X0, 0);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+}
+
 static void tcg_target_qemu_prologue(TCGContext *s)
 {
     TCGReg r;
@@ -5828,6 +6172,10 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     tcg_out_insn(s, ldstpair, LDP, TCG_REG_FP, TCG_REG_LR,
                  TCG_REG_SP, PUSH_SIZE, 0, 1);
     tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+
+    if (tcg_use_softmmu && tcg_jc_layout.valid) {
+        tcg_out_xpage_stub(s);
+    }
 }
 
 static void tcg_out_tb_start(TCGContext *s)
