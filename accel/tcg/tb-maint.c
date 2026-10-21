@@ -59,7 +59,12 @@
 QEMU_BUILD_BUG_ON(__alignof__(TranslationBlock) < TB_JMP_SLOTS);
 
 #define TB_FOR_EACH_JMP(head_tb, tb, n)                                 \
-    TB_FOR_EACH_TAGGED((head_tb)->jmp_list_head, tb, n, jmp_list_next)
+    for (n = (head_tb)->jmp_list_head & TB_JMP_TAG_MASK,                \
+         tb = (TranslationBlock *)((head_tb)->jmp_list_head &           \
+                                   ~TB_JMP_TAG_MASK);                   \
+         tb; tb = (TranslationBlock *)tb->jmp[n].list_next,             \
+             n = (uintptr_t)tb & TB_JMP_TAG_MASK,                       \
+             tb = (TranslationBlock *)((uintptr_t)tb & ~TB_JMP_TAG_MASK))
 
 static bool tb_cmp(const void *ap, const void *bp)
 {
@@ -827,7 +832,7 @@ static inline void tb_remove_from_jmp_list(TranslationBlock *orig, int n_orig)
     int n;
 
     /* mark the LSB of jmp_dest[] so that no further jumps can be inserted */
-    ptr = qatomic_or_fetch(&orig->jmp_dest[n_orig], 1);
+    ptr = qatomic_or_fetch(&orig->jmp[n_orig].dest, 1);
     dest = (TranslationBlock *)(ptr & ~1);
     if (dest == NULL) {
         return;
@@ -838,7 +843,7 @@ static inline void tb_remove_from_jmp_list(TranslationBlock *orig, int n_orig)
      * While acquiring the lock, the jump might have been removed if the
      * destination TB was invalidated; check again.
      */
-    ptr_locked = qatomic_read(&orig->jmp_dest[n_orig]);
+    ptr_locked = qatomic_read(&orig->jmp[n_orig].dest);
     if (ptr_locked != ptr) {
         qemu_spin_unlock(&dest->jmp_lock);
         /*
@@ -864,12 +869,12 @@ static inline void tb_remove_from_jmp_list(TranslationBlock *orig, int n_orig)
     pprev = &dest->jmp_list_head;
     TB_FOR_EACH_JMP(dest, tb, n) {
         if (tb == orig && n == n_orig) {
-            *pprev = tb->jmp_list_next[n];
-            /* no need to set orig->jmp_dest[n]; setting the LSB was enough */
+            *pprev = tb->jmp[n].list_next;
+            /* no need to set orig->jmp[n].dest; setting the LSB was enough */
             qemu_spin_unlock(&dest->jmp_lock);
             return;
         }
-        pprev = &tb->jmp_list_next[n];
+        pprev = &tb->jmp[n].list_next;
     }
     g_assert_not_reached();
 }
@@ -879,7 +884,7 @@ static inline void tb_remove_from_jmp_list(TranslationBlock *orig, int n_orig)
  */
 void tb_reset_jump(TranslationBlock *tb, int n)
 {
-    uintptr_t addr = (uintptr_t)(tb->tc.ptr + tb->jmp_reset_offset[n]);
+    uintptr_t addr = (uintptr_t)(tb->tc.ptr + tb->jmp[n].reset_offset);
     tb_set_jmp_target(tb, n, addr);
 }
 
@@ -893,7 +898,7 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
 
     TB_FOR_EACH_JMP(dest, tb, n) {
         tb_reset_jump(tb, n);
-        qatomic_and(&tb->jmp_dest[n], (uintptr_t)NULL | 1);
+        qatomic_and(&tb->jmp[n].dest, (uintptr_t)NULL | 1);
         /* No need to clear the list entry; setting the dest ptr is enough */
     }
     dest->jmp_list_head = (uintptr_t)NULL;
@@ -979,7 +984,7 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
         tb_jmp_cache_inval_tb(tb);
 
         /* suppress this TB from its jump lists */
-        for (int n = 0; n < TB_JMP_SLOTS; n++) {
+        for (int n = 0; n < tb->nb_slots; n++) {
             tb_remove_from_jmp_list(tb, n);
         }
 
@@ -991,8 +996,8 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
          * landing (tcg_gen_push_ret): its own jumps lead to its exits.
          */
         if (tb->jmp_call) {
-            for (int n = 0; n < ARRAY_SIZE(tb->jmp_reset_offset); n++) {
-                if (tb->jmp_reset_offset[n] != TB_JMP_OFFSET_INVALID) {
+            for (int n = 0; n < tb->nb_slots; n++) {
+                if (tb->jmp[n].reset_offset != TB_JMP_OFFSET_INVALID) {
                     tb_reset_jump(tb, n);
                 }
             }

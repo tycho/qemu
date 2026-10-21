@@ -616,16 +616,16 @@ static TranslationBlock *region_sample_head(TranslationBlock *tb,
                 head = tb;
                 break;
             }
-            p = src->jmp_list_next[p & TB_JMP_TAG_MASK];
+            p = src->jmp[p & TB_JMP_TAG_MASK].list_next;
         }
         qemu_spin_unlock(&tb->jmp_lock);
         if (head) {
             return head;
         }
     }
-    for (int n = 0; n < TB_JMP_SLOTS; n++) {
+    for (int n = 0; n < tb->nb_slots; n++) {
         TranslationBlock *dst = (TranslationBlock *)
-            (qatomic_read(&tb->jmp_dest[n]) & ~(uintptr_t)1);
+            (qatomic_read(&tb->jmp[n].dest) & ~(uintptr_t)1);
 
         if (dst && dst != tb && tb_page_addr0(dst) != -1 &&
             tb_page_addr0(dst) < at &&
@@ -1057,11 +1057,11 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
      * produce a pc-relative displacement to jmp_target_addr[n].
      */
     const TranslationBlock *c_tb = tcg_splitwx_to_rx(tb);
-    uintptr_t offset = tb->jmp_insn_offset[n];
+    uintptr_t offset = tb->jmp[n].insn_offset;
     uintptr_t jmp_rx = (uintptr_t)tb->tc.ptr + offset;
     uintptr_t jmp_rw = jmp_rx - tcg_splitwx_diff;
 
-    tb->jmp_target_addr[n] = addr;
+    tb->jmp[n].target_addr = addr;
     tb_target_set_jmp_target(c_tb, n, jmp_rx, jmp_rw);
 }
 
@@ -1071,7 +1071,7 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     uintptr_t old;
 
     qemu_thread_jit_write();
-    assert(n < ARRAY_SIZE(tb->jmp_list_next));
+    assert(n < tb->nb_slots);
     qemu_spin_lock(&tb_next->jmp_lock);
 
     /* make sure the destination TB is valid */
@@ -1079,7 +1079,7 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
         goto out_unlock_next;
     }
     /* Atomically claim the jump destination slot only if it was NULL */
-    old = qatomic_cmpxchg(&tb->jmp_dest[n], (uintptr_t)NULL,
+    old = qatomic_cmpxchg(&tb->jmp[n].dest, (uintptr_t)NULL,
                           (uintptr_t)tb_next);
     if (old) {
         goto out_unlock_next;
@@ -1089,7 +1089,7 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     tb_set_jmp_target(tb, n, (uintptr_t)tb_next->tc.ptr);
 
     /* add in TB jmp list */
-    tb->jmp_list_next[n] = tb_next->jmp_list_head;
+    tb->jmp[n].list_next = tb_next->jmp_list_head;
     tb_next->jmp_list_head = (uintptr_t)tb | n;
 
     qemu_spin_unlock(&tb_next->jmp_lock);
@@ -1469,8 +1469,8 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             if (last_tb) {
                 tb_add_jump(last_tb, tb_exit, tb);
                 /* Its goto_tb_dead too, if tb writes them first. */
-                if (last_tb->jmp_dead[tb_exit] && tb->chain_dead_in) {
-                    tb_add_jump(last_tb, last_tb->jmp_dead[tb_exit] - 1, tb);
+                if (last_tb->jmp[tb_exit].dead && tb->chain_dead_in) {
+                    tb_add_jump(last_tb, last_tb->jmp[tb_exit].dead - 1, tb);
                 }
             }
 
