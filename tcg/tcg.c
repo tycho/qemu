@@ -73,6 +73,10 @@ static void tcg_out_nop_fill(tcg_insn_unit *p, int count);
 typedef struct TCGLabelQemuLdst TCGLabelQemuLdst;
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *l);
 static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *l);
+#ifdef TCG_TARGET_HAS_PINNED_ST_PAIRS
+static void tcg_out_pinned_st_pairs(TCGContext *s);
+static void tcg_out_pinned_st_tail(TCGContext *s);
+#endif
 
 /* The CIE and FDE header definitions will be common to all hosts.  */
 typedef struct {
@@ -799,6 +803,20 @@ static int tcg_out_ldst_finalize(TCGContext *s)
 {
     TCGLabelQemuLdst *lb;
 
+#ifdef TCG_TARGET_HAS_PINNED_ST_PAIRS
+    /*
+     * System mode: with two slow paths or more, they store the pinned
+     * globals by calling one copy of the stores, here at the start of the
+     * TB's slow-path code (the code before it ends in a branch).
+     */
+    s->pin_st_tail = NULL;
+    if (tcg_use_softmmu && s->nb_pinned &&
+        !QSIMPLEQ_EMPTY(&s->ldst_labels) &&
+        QSIMPLEQ_NEXT(QSIMPLEQ_FIRST(&s->ldst_labels), next)) {
+        s->pin_st_tail = tcg_splitwx_to_rx(s->code_ptr);
+        tcg_out_pinned_st_tail(s);
+    }
+#endif
     /* qemu_ld/st slow paths */
     QSIMPLEQ_FOREACH(lb, &s->ldst_labels, next) {
         if (lb->is_ld
@@ -1251,6 +1269,12 @@ bool tcg_temp_pin(TCGTemp *ts)
 /* Store every pinned global to its env slot. */
 static void tcg_out_pinned_st(TCGContext *s)
 {
+#ifdef TCG_TARGET_HAS_PINNED_ST_PAIRS
+    if (tcg_use_softmmu) {
+        tcg_out_pinned_st_pairs(s);
+        return;
+    }
+#endif
     for (int i = 0; i < s->nb_pinned; i++) {
         TCGTemp *ts = s->pinned[i];
 

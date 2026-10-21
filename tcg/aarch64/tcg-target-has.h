@@ -11,6 +11,8 @@
 
 #define have_lse    (cpuinfo & CPUINFO_LSE)
 #define have_lse2   (cpuinfo & CPUINFO_LSE2)
+/* tcg_out_pinned_st_pairs, and the slow paths' shared copy of it */
+#define TCG_TARGET_HAS_PINNED_ST_PAIRS
 
 /* optional instructions */
 #define TCG_TARGET_HAS_extr_i64_i32     0
