@@ -1970,7 +1970,7 @@ static void tcg_out_goto_ptr(TCGContext *s, TCGReg a0)
 void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
                               uintptr_t jmp_rx, uintptr_t jmp_rw)
 {
-    uintptr_t addr = tb->jmp_target_addr[n];
+    uintptr_t addr = tb->jmp[n].target_addr;
     ptrdiff_t offset = addr - jmp_rx;
     tcg_insn_unit insn = OPC_JAL; /* rd = TCG_REG_ZERO */
 
