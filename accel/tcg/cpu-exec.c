@@ -1340,12 +1340,21 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             xtcg_stat_inc(XS_LOOP_LOOKUP);
             tb = tb_lookup(cpu, s, false);
             if (tb == NULL) {
+                unsigned flush_count = qatomic_read(&tb_ctx.tb_flush_count);
                 CPUJumpCache *jc;
                 uint32_t h;
 
                 mmap_lock();
                 tb = tb_gen_code(cpu, s);
                 mmap_unlock();
+
+                /*
+                 * In a serial context tb_gen_code may have flushed the
+                 * code buffer, last_tb with it: don't link it.
+                 */
+                if (qatomic_read(&tb_ctx.tb_flush_count) != flush_count) {
+                    last_tb = NULL;
+                }
 
                 /*
                  * We add the TB in the virtual pc hash table
