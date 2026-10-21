@@ -501,12 +501,17 @@ static size_t tcg_n_regions(size_t tb_size, unsigned max_threads)
  * We expect most system emulation to run one or two guests per host.
  * Users running large scale system emulation may want to tweak their
  * runtime setup via the tb-size control on the command line.  [DEV] The
- * fork's default is 4 GiB: a Windows 11 boot generates over 4 GiB of
- * code and flushed a 1 GiB buffer 15 times, retranslating its working set
- * each time.  Only the pages used are touched; still capped at an eighth
- * of host memory.
+ * fork's default is 8 GiB, capped at a quarter of host memory: a Windows
+ * 11 boot filled a 4 GiB buffer once or twice (twice with pinned guest
+ * registers, whose stores make every slow path longer), and each flush
+ * retranslated its working set, 1.5 M blocks.  Only the pages used are
+ * touched: a boot's peak footprint was smaller with 8 GiB than with 4.
  */
-#define DEFAULT_CODE_GEN_BUFFER_SIZE_1 (4 * GiB)
+#define DEFAULT_CODE_GEN_BUFFER_SIZE_1 (8 * GiB)
+#define CODE_GEN_BUFFER_HOST_SHARE 4
+#endif
+#ifndef CODE_GEN_BUFFER_HOST_SHARE
+#define CODE_GEN_BUFFER_HOST_SHARE 8
 #endif
 
 #define DEFAULT_CODE_GEN_BUFFER_SIZE \
@@ -775,7 +780,8 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_threads)
         if (phys_mem == 0) {
             tb_size = DEFAULT_CODE_GEN_BUFFER_SIZE;
         } else {
-            tb_size = QEMU_ALIGN_DOWN(phys_mem / 8, page_size);
+            tb_size = QEMU_ALIGN_DOWN(phys_mem / CODE_GEN_BUFFER_HOST_SHARE,
+                                      page_size);
             tb_size = MIN(DEFAULT_CODE_GEN_BUFFER_SIZE, tb_size);
         }
     }
