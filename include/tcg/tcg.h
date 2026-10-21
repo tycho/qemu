@@ -504,6 +504,8 @@ struct TCGContext {
     tcg_insn_unit *code_buf;      /* pointer for start of tb */
     tcg_insn_unit *code_ptr;      /* pointer for running end of tb */
 
+    /* The goto_tb slots the TB uses so far (tcg_tb_trim_slots). */
+    unsigned goto_tb_slots;
 #ifdef CONFIG_DEBUG_TCG
     int goto_tb_issue_mask;
     const TCGOpcode *vecop_list;
@@ -881,7 +883,7 @@ static inline bool tcg_op_buf_full(void)
      * we have produced "enough" opcodes.  We want to limit TB size
      * such that a RISC host can reasonably use a 16-bit signed
      * branch within the TB.  We also need to be mindful of the
-     * 16-bit unsigned offsets, TranslationBlock.jmp_reset_offset[]
+     * 16-bit unsigned offsets, TranslationBlock.jmp[].reset_offset
      * and TCGContext.gen_insn_end_off[].
      */
     return tcg_ctx->nb_ops >= 4000;
@@ -890,6 +892,11 @@ static inline bool tcg_op_buf_full(void)
 /* pool based memory allocation */
 
 /* user-mode: mmap_lock must be held for tcg_malloc_internal. */
+void *tcg_malloc_internal(TCGContext *s, int size);
+void tcg_pool_reset(TCGContext *s);
+TranslationBlock *tcg_tb_alloc(TCGContext *s);
+void tcg_tb_trim_slots(TCGContext *s, TranslationBlock *tb);
+void tcg_tb_reserve_slots(TCGContext *s, TranslationBlock *tb);
 QEMU_RET_ARG_NONNULL void *tcg_malloc_internal(TCGContext *s, int size);
 QEMU_ARG_NONNULL void tcg_pool_reset(TCGContext *s);
 QEMU_ARG_NONNULL TranslationBlock *tcg_tb_alloc(TCGContext *s);

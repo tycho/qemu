@@ -1347,7 +1347,7 @@ static void tcg_out_goto_ptr(TCGContext *s, TCGReg a0)
 void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
                               uintptr_t jmp_rx, uintptr_t jmp_rw)
 {
-    uintptr_t d_addr = tb->jmp_target_addr[n];
+    uintptr_t d_addr = tb->jmp[n].target_addr;
     ptrdiff_t d_disp = (ptrdiff_t)(d_addr - jmp_rx) >> 2;
     tcg_insn_unit insn;
 
@@ -1355,7 +1355,7 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     if (d_disp == sextreg(d_disp, 0, 26)) {
         insn = encode_sd10k16_insn(OPC_B, d_disp);
     } else {
-        uintptr_t i_addr = (uintptr_t)&tb->jmp_target_addr[n];
+        uintptr_t i_addr = (uintptr_t)&tb->jmp[n].target_addr;
         intptr_t i_disp = i_addr - jmp_rx;
         insn = encode_dsj20_insn(OPC_PCADDU2I, TCG_REG_TMP0, i_disp >> 2);
     }
