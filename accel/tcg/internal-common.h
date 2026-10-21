@@ -27,6 +27,13 @@ extern bool one_insn_per_tb;
 extern bool tcg_ijmp_inline;
 
 /*
+ * tcg_prologue_deferred: system mode generates the prologue when the
+ * first vCPU is created, after the front end has pinned its guest
+ * registers (tcg_pin_system_ok), instead of at accelerator init.
+ */
+extern bool tcg_prologue_deferred;
+
+/*
  * tcg_xpage: with tcg_ijmp_inline, how a direct jump to another page
  * probes the jump cache: in a short helper call that also looks up a miss
  * (TCG_XPAGE_CALL), in generated code as an indirect jump does

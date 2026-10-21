@@ -1986,6 +1986,11 @@ static void tcg_out_ldst_save(TCGContext *s, TCGRegSet regs, bool restore,
 #else
 #define TCG_TARGET_NB_PIN_REGS 16
 #endif
+/*
+ * System mode pins only the first seven, x20-x26: callee-saved, so calls
+ * need no saves, and clear of x-tlbpin's x27 and x28.
+ */
+#define TCG_TARGET_NB_PIN_REGS_SYSTEM 7
 static const TCGReg tcg_target_pin_regs[TCG_TARGET_NB_PIN_REGS] = {
     TCG_REG_X20, TCG_REG_X21, TCG_REG_X22, TCG_REG_X23,
     TCG_REG_X24, TCG_REG_X25, TCG_REG_X26, TCG_REG_X27,
@@ -2018,10 +2023,69 @@ static const TCGReg tcg_target_pin_vregs[16] = {
     TCG_REG_V20, TCG_REG_V21, TCG_REG_V22, TCG_REG_V23,
 };
 
+/*
+ * System mode: store the pinned globals with STP where two of them have
+ * adjacent env slots, STR for the rest.  The slow paths share one copy
+ * per TB (TCGContext.pin_st_tail), called with BL: LR is TCG_REG_TMP2,
+ * free in a slow path.
+ */
+static void tcg_out_pinned_st_pairs(TCGContext *s)
+{
+    TCGTemp *t[ARRAY_SIZE(s->pinned)];
+    int n = 0;
+
+    for (int i = 0; i < s->nb_pinned; i++) {
+        TCGTemp *ts = s->pinned[i];
+
+        if (ts->type == TCG_TYPE_I64 && ts->mem_base->reg == TCG_AREG0 &&
+            !(ts->mem_offset & 7) && ts->mem_offset >= -0x200 &&
+            ts->mem_offset < 0x1f8) {
+            t[n++] = ts;
+        } else {
+            tcg_out_st(s, ts->type, ts->reg, ts->mem_base->reg,
+                       ts->mem_offset);
+        }
+    }
+    /* By env offset; n is small. */
+    for (int i = 1; i < n; i++) {
+        for (int j = i; j > 0 && t[j]->mem_offset < t[j - 1]->mem_offset; j--) {
+            TCGTemp *x = t[j];
+
+            t[j] = t[j - 1];
+            t[j - 1] = x;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (i + 1 < n && t[i + 1]->mem_offset == t[i]->mem_offset + 8) {
+            tcg_out_insn(s, ldstpair, STP, t[i]->reg, t[i + 1]->reg,
+                         TCG_AREG0, t[i]->mem_offset, 1, 0);
+            i++;
+        } else {
+            tcg_out_st(s, TCG_TYPE_I64, t[i]->reg, TCG_AREG0,
+                       t[i]->mem_offset);
+        }
+    }
+}
+
+/* The slow paths' shared copy: the stores, then return. */
+static void tcg_out_pinned_st_tail(TCGContext *s)
+{
+    tcg_out_pinned_st_pairs(s);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+}
+
 static void tcg_out_ldst_writeback(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     /* The helper may leave generated code: the pinned globals first. */
-    tcg_out_pinned_st(s);
+    if (s->pin_st_tail) {
+        /* In the same slow-path code: always within BL's reach. */
+        ptrdiff_t offset = tcg_pcrel_diff(s, s->pin_st_tail) >> 2;
+
+        tcg_debug_assert(offset == sextract64(offset, 0, 26));
+        tcg_out_insn(s, branch, BL, offset);
+    } else {
+        tcg_out_pinned_st(s);
+    }
     for (unsigned i = 0; i < lb->nb_wb; i++) {
         const TCGLdstWriteback *wb = &lb->wb[i];
 

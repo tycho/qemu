@@ -79,6 +79,10 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *l);
 static bool tcg_out_qemu_atomic_slow_path(TCGContext *s,
                                           TCGLabelQemuLdst *l);
 #endif
+#ifdef TCG_TARGET_HAS_PINNED_ST_PAIRS
+static void tcg_out_pinned_st_pairs(TCGContext *s);
+static void tcg_out_pinned_st_tail(TCGContext *s);
+#endif
 
 /* The CIE and FDE header definitions will be common to all hosts.  */
 typedef struct {
@@ -908,6 +912,20 @@ static int tcg_out_ldst_finalize(TCGContext *s)
 {
     TCGLabelQemuLdst *lb;
 
+#ifdef TCG_TARGET_HAS_PINNED_ST_PAIRS
+    /*
+     * System mode: with two slow paths or more, they store the pinned
+     * globals by calling one copy of the stores, here at the start of the
+     * TB's slow-path code (the code before it ends in a branch).
+     */
+    s->pin_st_tail = NULL;
+    if (tcg_use_softmmu && s->nb_pinned &&
+        !QSIMPLEQ_EMPTY(&s->ldst_labels) &&
+        QSIMPLEQ_NEXT(QSIMPLEQ_FIRST(&s->ldst_labels), next)) {
+        s->pin_st_tail = tcg_splitwx_to_rx(s->code_ptr);
+        tcg_out_pinned_st_tail(s);
+    }
+#endif
     /* qemu_ld/st slow paths */
     QSIMPLEQ_FOREACH(lb, &s->ldst_labels, next) {
 #ifdef TCG_TARGET_HAS_QEMU_ATOMIC
@@ -1314,6 +1332,10 @@ static const TCGReg tcg_target_pin_regs[1];
 #define TCG_TARGET_NB_PIN_VREGS 0
 static const TCGReg tcg_target_pin_vregs[1];
 #endif
+#ifndef TCG_TARGET_NB_PIN_REGS_SYSTEM
+#define TCG_TARGET_NB_PIN_REGS_SYSTEM 0
+#endif
+
 #ifndef TCG_TARGET_NB_BOUNDARY_REGS
 #define TCG_TARGET_NB_BOUNDARY_REGS 0
 static const TCGReg tcg_target_boundary_regs[1];
@@ -1367,6 +1389,11 @@ static void tcg_out_boundary_ldst(TCGContext *s, bool load)
     }
 }
 
+bool tcg_pin_system_ok(void)
+{
+    return TCG_TARGET_NB_PIN_REGS_SYSTEM > 0;
+}
+
 bool tcg_temp_pin(TCGTemp *ts)
 {
     TCGContext *s = tcg_ctx;
@@ -1374,8 +1401,12 @@ bool tcg_temp_pin(TCGTemp *ts)
     int nb_int = s->nb_pinned - s->nb_pinned_vec;
     TCGReg reg;
 
-    if (tcg_use_softmmu || !tcg_pin_user ||
-        s->nb_pinned >= ARRAY_SIZE(s->pinned)) {
+    if (!tcg_pin_user || s->nb_pinned >= ARRAY_SIZE(s->pinned)) {
+        return false;
+    }
+    /* System mode: callee-saved registers only (calls keep them), no vectors. */
+    if (tcg_use_softmmu &&
+        (vec || nb_int >= TCG_TARGET_NB_PIN_REGS_SYSTEM)) {
         return false;
     }
     tcg_debug_assert(ts->kind == TEMP_GLOBAL && !ts->indirect_reg &&
@@ -1405,6 +1436,12 @@ bool tcg_temp_pin(TCGTemp *ts)
 /* Store every pinned global to its env slot. */
 static void tcg_out_pinned_st(TCGContext *s)
 {
+#ifdef TCG_TARGET_HAS_PINNED_ST_PAIRS
+    if (tcg_use_softmmu) {
+        tcg_out_pinned_st_pairs(s);
+        return;
+    }
+#endif
     for (int i = 0; i < s->nb_pinned; i++) {
         TCGTemp *ts = s->pinned[i];
 
@@ -1704,6 +1741,14 @@ void tcg_register_thread(void)
             tcg_debug_assert(b >= 0 && b < n);
             s->temps[i].mem_base = &s->temps[b];
         }
+    }
+
+    /* The pinned globals are this context's own temps. */
+    for (i = 0; i < s->nb_pinned; ++i) {
+        ptrdiff_t t = tcg_init_ctx.pinned[i] - tcg_init_ctx.temps;
+
+        tcg_debug_assert(t >= 0 && t < tcg_init_ctx.nb_globals);
+        s->pinned[i] = &s->temps[t];
     }
 
     /* Claim an entry in tcg_ctxs */

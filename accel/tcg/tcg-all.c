@@ -381,10 +381,15 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #if defined(CONFIG_SOFTMMU)
     /*
      * There's no guest base to take into account, so go ahead and
-     * initialize the prologue now.
+     * initialize the prologue now; or, where guest registers may be
+     * pinned, once the front end has pinned them (tcg_exec_realizefn).
      */
     tcg_jc_layout_init();
-    tcg_prologue_init();
+    if (tcg_pin && tcg_pin_system_ok()) {
+        tcg_prologue_deferred = true;
+    } else {
+        tcg_prologue_init();
+    }
 #endif
 
 #ifdef CONFIG_USER_ONLY
@@ -522,6 +527,7 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 }
 
 bool tcg_ijmp_inline;
+bool tcg_prologue_deferred;
 TCGXPage tcg_xpage;
 bool tcg_jcgen;
 bool tcg_jc_keep_pcrel;
