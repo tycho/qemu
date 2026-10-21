@@ -3432,6 +3432,11 @@ void tcg_optimize(TCGContext *s)
             fold_addr_low32(&ctx, op, 2);
             done = fold_qemu_st(&ctx, op);
             break;
+        case INDEX_op_qemu_atomic:
+            /* The old value, zero-extended from the access size. */
+            fold_addr_low32(&ctx, op, 3);
+            done = fold_qemu_ld_1reg(&ctx, op);
+            break;
         case INDEX_op_rems:
         case INDEX_op_remu:
             done = fold_remainder(&ctx, op);

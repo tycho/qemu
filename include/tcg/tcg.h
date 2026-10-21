@@ -143,6 +143,21 @@ typedef struct TCGPool {
    this value, they are statically allocated in the TB stack frame */
 #define TCG_STATIC_CALL_ARGS_SIZE 128
 
+/*
+ * The operation of a qemu_atomic op: it returns the old value of the
+ * memory; CMPXCHG stores the value only if the old value equals the
+ * compare operand (unused by the others).
+ */
+typedef enum TCGAtomicOp {
+    TCG_ATOMIC_XCHG,
+    TCG_ATOMIC_ADD,
+    TCG_ATOMIC_AND,
+    TCG_ATOMIC_OR,
+    TCG_ATOMIC_XOR,
+    TCG_ATOMIC_CMPXCHG,
+    TCG_ATOMIC_NB_OPS,
+} TCGAtomicOp;
+
 typedef enum TCGType {
     TCG_TYPE_I32,
     TCG_TYPE_I64,

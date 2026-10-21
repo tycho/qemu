@@ -455,6 +455,16 @@ extern bool tcg_tlbpin;
 bool tcg_tlbpin_supported(void);
 
 /*
+ * tcg_atomic: guest atomic read-modify-write accesses (xchg, add, and, or,
+ * xor, cmpxchg, up to 64 bits) in parallel mode are host atomic insns
+ * after the guest access's own checks, with the out-of-line helper only
+ * for what those checks don't pass, on backends that support it
+ * (tcg_atomic_supported).
+ */
+extern bool tcg_atomic;
+bool tcg_atomic_supported(void);
+
+/*
  * x-xpage=stub: the layout of the vCPU's jump cache, which the backend's
  * shared jump-cache probe (tcg_xpage_stub) reads; filled in by the
  * accelerator before the prologue is generated.  Offsets marked env are

@@ -55,6 +55,7 @@
 #include "elf.h"
 #include "exec/log.h"
 #include "tcg/tcg-ldst.h"
+#include "accel/tcg/cpu-ldst-common.h"
 #include "tcg/tcg-temp-internal.h"
 #include "tcg-internal.h"
 #include "tcg/perf.h"
@@ -74,6 +75,10 @@ static void tcg_out_nop_fill(tcg_insn_unit *p, int count);
 typedef struct TCGLabelQemuLdst TCGLabelQemuLdst;
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *l);
 static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *l);
+#ifdef TCG_TARGET_HAS_QEMU_ATOMIC
+static bool tcg_out_qemu_atomic_slow_path(TCGContext *s,
+                                          TCGLabelQemuLdst *l);
+#endif
 
 /* The CIE and FDE header definitions will be common to all hosts.  */
 typedef struct {
@@ -126,6 +131,9 @@ struct TCGLabelQemuLdst {
     unsigned nb_wb;
     /* label_ptr[0] is a B to the slow path, in cold code (tcg_tblayout). */
     bool veneer;
+    /* qemu_atomic: its TCGAtomicOp + 1 (else 0), and its compare operand */
+    int atomic;
+    TCGReg cmp_reg;
     QSIMPLEQ_ENTRY(TCGLabelQemuLdst) next;
 };
 
@@ -223,6 +231,10 @@ static void tcg_out_ld_helper_args(TCGContext *s, const TCGLabelQemuLdst *l,
     __attribute__((unused));
 static void tcg_out_ld_helper_ret(TCGContext *s, const TCGLabelQemuLdst *l,
                                   bool load_sign, const TCGLdstHelperParam *p)
+    __attribute__((unused));
+static const void *tcg_out_atomic_helper_args(TCGContext *s,
+                                              const TCGLabelQemuLdst *l,
+                                              const TCGLdstHelperParam *p)
     __attribute__((unused));
 static void tcg_out_st_helper_args(TCGContext *s, const TCGLabelQemuLdst *l,
                                    const TCGLdstHelperParam *p)
@@ -347,6 +359,7 @@ bool tcg_pcid;
 bool tcg_lean;
 bool tcg_alignfold;
 bool tcg_tlbpin;
+bool tcg_atomic;
 TCGJumpCacheLayout tcg_jc_layout;
 const void *tcg_xpage_stub;
 bool tcg_repstr;
@@ -897,6 +910,13 @@ static int tcg_out_ldst_finalize(TCGContext *s)
 
     /* qemu_ld/st slow paths */
     QSIMPLEQ_FOREACH(lb, &s->ldst_labels, next) {
+#ifdef TCG_TARGET_HAS_QEMU_ATOMIC
+        if (lb->atomic) {
+            if (!tcg_out_qemu_atomic_slow_path(s, lb)) {
+                return -2;
+            }
+        } else
+#endif
         if (lb->is_ld
             ? !tcg_out_qemu_ld_slow_path(s, lb)
             : !tcg_out_qemu_st_slow_path(s, lb)) {
@@ -979,6 +999,7 @@ static int tcg_out_pool_finalize(TCGContext *s)
 #define C_O1_I4(O1, I1, I2, I3, I4)     C_PFX5(c_o1_i4_, O1, I1, I2, I3, I4),
 
 #define C_N1_I2(O1, I1, I2)             C_PFX3(c_n1_i2_, O1, I1, I2),
+#define C_N1_I3(O1, I1, I2, I3)         C_PFX4(c_n1_i3_, O1, I1, I2, I3),
 #define C_N1O1_I1(O1, O2, I1)           C_PFX3(c_n1o1_i1_, O1, O2, I1),
 #define C_N2_I1(O1, O2, I1)             C_PFX3(c_n2_i1_, O1, O2, I1),
 
@@ -1006,6 +1027,7 @@ static TCGConstraintSetIndex tcg_target_op_def(TCGOpcode, TCGType, unsigned);
 #undef C_O1_I3
 #undef C_O1_I4
 #undef C_N1_I2
+#undef C_N1_I3
 #undef C_N1O1_I1
 #undef C_N2_I1
 #undef C_O2_I1
@@ -1033,6 +1055,7 @@ typedef struct TCGConstraintSet {
 #define C_O1_I4(O1, I1, I2, I3, I4)     { 1, 4, { #O1, #I1, #I2, #I3, #I4 } },
 
 #define C_N1_I2(O1, I1, I2)             { 1, 2, { "&" #O1, #I1, #I2 } },
+#define C_N1_I3(O1, I1, I2, I3)         { 1, 3, { "&" #O1, #I1, #I2, #I3 } },
 #define C_N1O1_I1(O1, O2, I1)           { 2, 1, { "&" #O1, #O2, #I1 } },
 #define C_N2_I1(O1, O2, I1)             { 2, 1, { "&" #O1, "&" #O2, #I1 } },
 
@@ -1056,6 +1079,7 @@ static const TCGConstraintSet constraint_sets[] = {
 #undef C_O1_I3
 #undef C_O1_I4
 #undef C_N1_I2
+#undef C_N1_I3
 #undef C_N1O1_I1
 #undef C_N2_I1
 #undef C_O2_I1
@@ -1078,6 +1102,7 @@ static const TCGConstraintSet constraint_sets[] = {
 #define C_O1_I4(O1, I1, I2, I3, I4)     C_PFX5(c_o1_i4_, O1, I1, I2, I3, I4)
 
 #define C_N1_I2(O1, I1, I2)             C_PFX3(c_n1_i2_, O1, I1, I2)
+#define C_N1_I3(O1, I1, I2, I3)         C_PFX4(c_n1_i3_, O1, I1, I2, I3)
 #define C_N1O1_I1(O1, O2, I1)           C_PFX3(c_n1o1_i1_, O1, O2, I1)
 #define C_N2_I1(O1, O2, I1)             C_PFX3(c_n2_i1_, O1, O2, I1)
 
@@ -1213,6 +1238,16 @@ typedef struct TCGOutOpQemuLdStX {
     void (*out)(TCGContext *s, TCGType type, TCGReg data, TCGReg base,
                 TCGReg index, bool index_zero, TCGArg arg);
 } TCGOutOpQemuLdStX;
+
+/*
+ * qemu_atomic: @ret = the old value at @addr, updated with @val by @aop
+ * (TCGAtomicOp); for TCG_ATOMIC_CMPXCHG, only if it equals @cmp.
+ */
+typedef struct TCGOutOpQemuAtomic {
+    TCGOutOp base;
+    void (*out)(TCGContext *s, TCGType type, TCGReg ret, TCGReg val,
+                TCGReg cmp, TCGReg addr, MemOpIdx oi, TCGAtomicOp aop);
+} TCGOutOpQemuAtomic;
 
 typedef struct TCGOutOpQemuLdSt2 {
     TCGOutOp base;
@@ -1456,6 +1491,12 @@ static void tcg_out_spin_hint(TCGContext *s)
 }
 #endif
 
+#ifndef TCG_TARGET_HAS_QEMU_ATOMIC
+static const TCGOutOpQemuAtomic outop_qemu_atomic = {
+    .base.static_constraint = C_NotImplemented,
+};
+#endif
+
 #ifndef TCG_TARGET_HAS_LDST_X
 static const TCGOutOpQemuLdStX outop_qemu_ld_x = {
     .base.static_constraint = C_NotImplemented,
@@ -1588,6 +1629,7 @@ static const TCGOutOp * const all_outop[NB_OPS] = {
     OUTOP(INDEX_op_qemu_st, TCGOutOpQemuLdSt, outop_qemu_st),
     OUTOP(INDEX_op_qemu_ld_x, TCGOutOpQemuLdStX, outop_qemu_ld_x),
     OUTOP(INDEX_op_qemu_st_x, TCGOutOpQemuLdStX, outop_qemu_st_x),
+    OUTOP(INDEX_op_qemu_atomic, TCGOutOpQemuAtomic, outop_qemu_atomic),
     OUTOP(INDEX_op_shladd, TCGOutOpShlAdd, outop_shladd),
     OUTOP(INDEX_op_qemu_st2, TCGOutOpQemuLdSt2, outop_qemu_st2),
     OUTOP(INDEX_op_rems, TCGOutOpBinary, outop_rems),
@@ -1787,6 +1829,77 @@ static TCGHelperInfo info_helper_st64_mmu = {
               | dh_typemask(i64, 3)  /* uint64_t data */
               | dh_typemask(i32, 4)  /* unsigned oi */
               | dh_typemask(ptr, 5)  /* uintptr_t ra */
+};
+
+/* The C functions an atomic access's slow path calls (cpu_atomic_*_mmu). */
+static TCGHelperInfo info_atomic_op32 = {
+    .flags = TCG_CALL_NO_WG,
+    .typemask = dh_typemask(i32, 0)
+              | dh_typemask(env, 1)
+              | dh_typemask(i64, 2)  /* vaddr addr */
+              | dh_typemask(i32, 3)  /* uint32_t val */
+              | dh_typemask(i32, 4)  /* MemOpIdx oi */
+              | dh_typemask(ptr, 5)  /* uintptr_t ra */
+};
+
+static TCGHelperInfo info_atomic_op64 = {
+    .flags = TCG_CALL_NO_WG,
+    .typemask = dh_typemask(i64, 0)
+              | dh_typemask(env, 1)
+              | dh_typemask(i64, 2)  /* vaddr addr */
+              | dh_typemask(i64, 3)  /* uint64_t val */
+              | dh_typemask(i32, 4)  /* MemOpIdx oi */
+              | dh_typemask(ptr, 5)  /* uintptr_t ra */
+};
+
+static TCGHelperInfo info_atomic_cx32 = {
+    .flags = TCG_CALL_NO_WG,
+    .typemask = dh_typemask(i32, 0)
+              | dh_typemask(env, 1)
+              | dh_typemask(i64, 2)  /* vaddr addr */
+              | dh_typemask(i32, 3)  /* uint32_t cmpv */
+              | dh_typemask(i32, 4)  /* uint32_t newv */
+              | dh_typemask(i32, 5)  /* MemOpIdx oi */
+              | dh_typemask(ptr, 6)  /* uintptr_t ra */
+};
+
+static TCGHelperInfo info_atomic_cx64 = {
+    .flags = TCG_CALL_NO_WG,
+    .typemask = dh_typemask(i64, 0)
+              | dh_typemask(env, 1)
+              | dh_typemask(i64, 2)  /* vaddr addr */
+              | dh_typemask(i64, 3)  /* uint64_t cmpv */
+              | dh_typemask(i64, 4)  /* uint64_t newv */
+              | dh_typemask(i32, 5)  /* MemOpIdx oi */
+              | dh_typemask(ptr, 6)  /* uintptr_t ra */
+};
+
+/* Indexed by TCGAtomicOp and MO_SIZE; little-endian guest data. */
+static const void * const atomic_helpers[TCG_ATOMIC_NB_OPS][4] = {
+    [TCG_ATOMIC_XCHG] = {
+        cpu_atomic_xchgb_mmu, cpu_atomic_xchgw_le_mmu,
+        cpu_atomic_xchgl_le_mmu, cpu_atomic_xchgq_le_mmu,
+    },
+    [TCG_ATOMIC_ADD] = {
+        cpu_atomic_fetch_addb_mmu, cpu_atomic_fetch_addw_le_mmu,
+        cpu_atomic_fetch_addl_le_mmu, cpu_atomic_fetch_addq_le_mmu,
+    },
+    [TCG_ATOMIC_AND] = {
+        cpu_atomic_fetch_andb_mmu, cpu_atomic_fetch_andw_le_mmu,
+        cpu_atomic_fetch_andl_le_mmu, cpu_atomic_fetch_andq_le_mmu,
+    },
+    [TCG_ATOMIC_OR] = {
+        cpu_atomic_fetch_orb_mmu, cpu_atomic_fetch_orw_le_mmu,
+        cpu_atomic_fetch_orl_le_mmu, cpu_atomic_fetch_orq_le_mmu,
+    },
+    [TCG_ATOMIC_XOR] = {
+        cpu_atomic_fetch_xorb_mmu, cpu_atomic_fetch_xorw_le_mmu,
+        cpu_atomic_fetch_xorl_le_mmu, cpu_atomic_fetch_xorq_le_mmu,
+    },
+    [TCG_ATOMIC_CMPXCHG] = {
+        cpu_atomic_cmpxchgb_mmu, cpu_atomic_cmpxchgw_le_mmu,
+        cpu_atomic_cmpxchgl_le_mmu, cpu_atomic_cmpxchgq_le_mmu,
+    },
 };
 
 static TCGHelperInfo info_helper_st128_mmu = {
@@ -2169,6 +2282,10 @@ static void tcg_context_init(unsigned max_threads)
     init_call_layout(&info_helper_st32_mmu);
     init_call_layout(&info_helper_st64_mmu);
     init_call_layout(&info_helper_st128_mmu);
+    init_call_layout(&info_atomic_op32);
+    init_call_layout(&info_atomic_op64);
+    init_call_layout(&info_atomic_cx32);
+    init_call_layout(&info_atomic_cx64);
 
     tcg_target_init(s);
     if (!tcg_target_ldst_clobber_regs) {
@@ -2951,6 +3068,7 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
 
     case INDEX_op_qemu_ld_x:
     case INDEX_op_qemu_st_x:
+    case INDEX_op_qemu_atomic:
     case INDEX_op_shladd:
         tcg_debug_assert(type <= TCG_TYPE_REG);
         goto do_lookup;
@@ -3607,6 +3725,7 @@ void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs)
             case INDEX_op_qemu_st_vec:
             case INDEX_op_qemu_ld_x:
             case INDEX_op_qemu_st_x:
+            case INDEX_op_qemu_atomic:
                 {
                     const char *s_al, *s_tlb, *s_op, *s_at;
                     TCGArg xarg = op->args[k];
@@ -4464,6 +4583,7 @@ dead_env_store_pass(TCGContext *s)
         case INDEX_op_qemu_st_vec:
         case INDEX_op_qemu_ld_x:
         case INDEX_op_qemu_st_x:
+        case INDEX_op_qemu_atomic:
             dse_keep_only(&dead, dse_scratch_lo, dse_scratch_hi);
             break;
         case INDEX_op_exit_tb:
@@ -4784,6 +4904,7 @@ static void tlb_pin_pass(TCGContext *s)
         case INDEX_op_qemu_st2:
         case INDEX_op_qemu_ld_vec:
         case INDEX_op_qemu_st_vec:
+        case INDEX_op_qemu_atomic:
             counts[get_mmuidx(op->args[def->nb_oargs + def->nb_iargs])]++;
             break;
         default:
@@ -4801,6 +4922,11 @@ static void tlb_pin_pass(TCGContext *s)
     }
 }
 #endif
+
+bool tcg_atomic_supported(void)
+{
+    return tcg_op_supported(INDEX_op_qemu_atomic, TCG_TYPE_I64, 0);
+}
 
 bool tcg_tlbpin_supported(void)
 {
@@ -6157,6 +6283,7 @@ static bool op_is_guest_access(TCGOpcode opc)
     case INDEX_op_qemu_st_vec:
     case INDEX_op_qemu_ld_x:
     case INDEX_op_qemu_st_x:
+    case INDEX_op_qemu_atomic:
         return true;
     default:
         return false;
@@ -9044,6 +9171,15 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         }
         break;
 
+    case INDEX_op_qemu_atomic:
+        {
+            const TCGOutOpQemuAtomic *out = &outop_qemu_atomic;
+
+            out->out(s, type, new_args[0], new_args[1], new_args[2],
+                     new_args[3], new_args[4], new_args[5]);
+        }
+        break;
+
     case INDEX_op_qemu_ld2:
     case INDEX_op_qemu_st2:
         {
@@ -9948,6 +10084,46 @@ static void tcg_out_st_helper_args(TCGContext *s, const TCGLabelQemuLdst *ldst,
     }
 
     tcg_out_helper_load_common_args(s, ldst, parm, info, next_arg);
+}
+
+/*
+ * The arguments of a qemu_atomic slow path's call of cpu_atomic_*_mmu: env,
+ * addr, the compare value for cmpxchg, the value (datahi_reg), oi, ra.
+ * Returns the function; its result is the old value, zero-extended from
+ * the access size to 32 bits (64 for a 64-bit access).
+ */
+static const void *tcg_out_atomic_helper_args(TCGContext *s,
+                                              const TCGLabelQemuLdst *ldst,
+                                              const TCGLdstHelperParam *parm)
+{
+    MemOp size = get_memop(ldst->oi) & MO_SIZE;
+    TCGAtomicOp aop = ldst->atomic - 1;
+    bool cx = aop == TCG_ATOMIC_CMPXCHG;
+    TCGType dtype = size == MO_64 ? TCG_TYPE_I64 : TCG_TYPE_I32;
+    const TCGHelperInfo *info;
+    TCGMovExtend mov[3];
+    unsigned next_arg = 1, nmov = 0;
+
+    tcg_debug_assert(size <= MO_64);
+    if (cx) {
+        info = size == MO_64 ? &info_atomic_cx64 : &info_atomic_cx32;
+    } else {
+        info = size == MO_64 ? &info_atomic_op64 : &info_atomic_op32;
+    }
+
+    tcg_debug_assert(s->addr_type <= TCG_TYPE_REG);
+    nmov += tcg_out_helper_add_mov(mov + nmov, &info->in[next_arg++],
+                                   TCG_TYPE_I64, s->addr_type,
+                                   ldst->addr_reg, -1);
+    if (cx) {
+        nmov += tcg_out_helper_add_mov(mov + nmov, &info->in[next_arg++],
+                                       dtype, ldst->type, ldst->cmp_reg, -1);
+    }
+    nmov += tcg_out_helper_add_mov(mov + nmov, &info->in[next_arg++],
+                                   dtype, ldst->type, ldst->datahi_reg, -1);
+    tcg_out_helper_load_slots(s, nmov, mov, parm);
+    tcg_out_helper_load_common_args(s, ldst, parm, info, next_arg);
+    return atomic_helpers[aop][size];
 }
 
 /*

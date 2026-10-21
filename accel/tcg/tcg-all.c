@@ -1114,6 +1114,21 @@ static void tcg_set_hvtimers(Object *obj, bool value, Error **errp)
     TCG_STATE(obj)->hvtimers = value;
 }
 
+static bool tcg_get_atomic(Object *obj, Error **errp)
+{
+    return tcg_atomic;
+}
+
+static void tcg_set_atomic(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_atomic_supported()) {
+        error_setg(errp, "x-atomic: not supported by this TCG backend "
+                   "or host");
+        return;
+    }
+    tcg_atomic = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1334,6 +1349,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-alignfold",
         "Drop guest alignment checks implied by an earlier check on the "
         "same address registers");
+
+    object_class_property_add_bool(oc, "x-atomic", tcg_get_atomic,
+                                   tcg_set_atomic);
+    object_class_property_set_description(oc, "x-atomic",
+        "Guest atomic read-modify-write accesses as host atomic insns "
+        "inline, with the helper only as the slow path");
 
     object_class_property_add_bool(oc, "x-tlbpin", tcg_get_tlbpin,
                                    tcg_set_tlbpin);

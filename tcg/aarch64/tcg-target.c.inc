@@ -2039,7 +2039,7 @@ static TCGRegSet ldst_outputs(TCGLabelQemuLdst *lb)
 {
     TCGRegSet set = 0;
 
-    if (lb->is_ld) {
+    if (lb->is_ld || lb->atomic) {
         tcg_regset_set_reg(set, lb->datalo_reg);
         if (lb->type == TCG_TYPE_I128) {
             tcg_regset_set_reg(set, lb->datahi_reg);
@@ -2616,6 +2616,192 @@ static const TCGOutOpQemuLdSt outop_qemu_st = {
     .base.static_constraint = C_O0_I2(rz, r),
     .out = tgen_qemu_st,
 };
+
+/*
+ * qemu_atomic: one FEAT_LSE insn with acquire and release semantics (CASAL,
+ * SWPAL, LDADDAL, LDCLRAL, LDSETAL, LDEORAL), the insns the atomic helpers
+ * themselves use.  In system mode the fast path takes a main-TLB entry
+ * whose read and write comparators both equal the page, without flags (no
+ * watchpoint, MMIO, notdirty, discarded write, invalid entry), and an
+ * address aligned to the access size, or to the guest's alignment if
+ * larger; in user mode it tests the alignment only.  The slow path calls
+ * the function the helper calls, cpu_atomic_*_mmu, with the original
+ * MemOpIdx.
+ */
+
+static TCGLabelQemuLdst *prepare_atomic_addr(TCGContext *s, TCGReg *host,
+                                             TCGReg addr_reg, MemOpIdx oi)
+{
+    TCGType addr_type = s->addr_type;
+    MemOp opc = get_memop(oi);
+    unsigned a_bits = MAX(memop_alignment_bits(opc), opc & MO_SIZE);
+    unsigned a_mask = (1u << a_bits) - 1;
+    TCGLabelQemuLdst *ldst = NULL;
+    HostAddress h = { };
+
+    if (tcg_use_softmmu) {
+        unsigned mem_index = get_mmuidx(oi);
+        TCGReg mask = TCG_REG_TMP0, table = TCG_REG_TMP1;
+
+        if (s->tlb_pin_ofs && mem_index == s->tlb_pin_idx) {
+            mask = TCG_REG_TLB_MASK;
+            table = TCG_REG_TLB_TABLE;
+        } else {
+            tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP1,
+                         TCG_AREG0, tlb_mask_table_ofs(s, mem_index), 1, 0);
+        }
+        tcg_out_insn(s, addsub_realshift, AND_LSR, addr_type,
+                     TCG_REG_TMP0, mask, addr_reg,
+                     TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
+        tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP1, table,
+                     TCG_REG_TMP0);
+
+        /* The read and write comparators into TMP0 and TMP2. */
+        QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addr_read) != 0);
+        QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addr_write) != 8);
+        if (addr_type == TCG_TYPE_I64) {
+            tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP2,
+                         TCG_REG_TMP1, 0, 1, 0);
+        } else {
+            tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_TMP0, TCG_REG_TMP1,
+                       offsetof(CPUTLBEntry, addr_read));
+            tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_TMP2, TCG_REG_TMP1,
+                       offsetof(CPUTLBEntry, addr_write));
+        }
+
+        /*
+         * Equal to each other, then the page and alignment bits of the
+         * address equal to them: ccmp leaves NE if the first test failed.
+         */
+        tcg_out_cmp(s, addr_type, TCG_COND_NE, TCG_REG_TMP0, TCG_REG_TMP2, 0);
+        tcg_out_logicali(s, Ilogic_imm_ANDI, addr_type, TCG_REG_TMP0,
+                         addr_reg, (uint64_t)TARGET_PAGE_MASK | a_mask);
+        tcg_out32(s, 0x7a400000 | addr_type << 31 | TCG_REG_TMP2 << 16
+                  | tcg_cond_to_aarch64[TCG_COND_EQ] << 12
+                  | TCG_REG_TMP0 << 5);
+
+        ldst = new_ldst_label(s);
+        ldst->label_ptr[0] = s->code_ptr;
+        tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+
+        tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_TMP1, TCG_REG_TMP1,
+                   offsetof(CPUTLBEntry, addend));
+        h.base = TCG_REG_TMP1;
+        h.index = addr_reg;
+        h.index_ext = addr_type;
+    } else {
+        if (a_mask) {
+            tcg_out_logicali(s, Ilogic_imm_ANDSI, 0, TCG_REG_XZR, addr_reg,
+                             a_mask);
+            ldst = new_ldst_label(s);
+            ldst->label_ptr[0] = s->code_ptr;
+            tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+        }
+        if (guest_base || addr_type == TCG_TYPE_I32) {
+            h.base = TCG_REG_GUEST_BASE;
+            h.index = addr_reg;
+            h.index_ext = addr_type;
+        } else {
+            h.base = addr_reg;
+            h.index = TCG_REG_XZR;
+            h.index_ext = TCG_TYPE_I64;
+        }
+    }
+    if (ldst) {
+        ldst->oi = oi;
+        ldst->addr_reg = addr_reg;
+    }
+    *host = tcg_out_host_addr_reg(s, h);
+    return ldst;
+}
+
+static void tgen_qemu_atomic(TCGContext *s, TCGType type, TCGReg ret,
+                             TCGReg val, TCGReg cmp, TCGReg addr_reg,
+                             MemOpIdx oi, TCGAtomicOp aop)
+{
+    static const uint32_t ldop[TCG_ATOMIC_NB_OPS] = {
+        [TCG_ATOMIC_XCHG] = 0x38e08000,     /* SWPAL */
+        [TCG_ATOMIC_ADD] = 0x38e00000,      /* LDADDAL */
+        [TCG_ATOMIC_AND] = 0x38e01000,      /* LDCLRAL, of ~val */
+        [TCG_ATOMIC_OR] = 0x38e03000,       /* LDSETAL */
+        [TCG_ATOMIC_XOR] = 0x38e02000,      /* LDEORAL */
+        [TCG_ATOMIC_CMPXCHG] = 0x08e0fc00,  /* CASAL */
+    };
+    uint32_t size = (get_memop(oi) & MO_SIZE) << 30;
+    TCGLabelQemuLdst *ldst;
+    TCGReg host;
+
+    /*
+     * A CASAL whose compare fails writes nothing, so its release orders
+     * nothing: as with the helpers, which use the same insn, ordering
+     * that case is the guest front end's concern.
+     */
+    ldst = prepare_atomic_addr(s, &host, addr_reg, oi);
+    switch (aop) {
+    case TCG_ATOMIC_CMPXCHG:
+        /* CASAL overwrites its compare register with the old value. */
+        tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_TMP0, cmp);
+        tcg_out32(s, ldop[aop] | size | TCG_REG_TMP0 << 16 | host << 5 | val);
+        tcg_out_mov(s, TCG_TYPE_I64, ret, TCG_REG_TMP0);
+        break;
+    case TCG_ATOMIC_AND:
+        tcg_out_insn(s, logic_shift, ORN, TCG_TYPE_I64, TCG_REG_TMP0,
+                     TCG_REG_XZR, val);
+        tcg_out32(s, ldop[aop] | size | TCG_REG_TMP0 << 16 | host << 5 | ret);
+        break;
+    default:
+        tcg_out32(s, ldop[aop] | size | val << 16 | host << 5 | ret);
+        break;
+    }
+    if (ldst) {
+        ldst->type = type;
+        ldst->atomic = aop + 1;
+        ldst->datalo_reg = ret;
+        ldst->datahi_reg = val;
+        ldst->cmp_reg = cmp;
+        ldst->raddr = tcg_splitwx_to_rx(s->code_ptr);
+    }
+    /*
+     * The helpers follow a guest atomic with a full barrier under
+     * x-tso=acqrel (cpu_tso_atomic_fence): so does this, on both paths.
+     */
+    if (tcg_tso_mode == TCG_TSO_ACQREL) {
+        tcg_out_mb(s, TCG_MO_ALL);
+    }
+}
+
+static TCGConstraintSetIndex cset_qemu_atomic(TCGType type, unsigned flags)
+{
+    return have_lse ? C_N1_I3(r, r, r, r) : C_NotImplemented;
+}
+
+static const TCGOutOpQemuAtomic outop_qemu_atomic = {
+    .base.static_constraint = C_Dynamic,
+    .base.dynamic_constraint = cset_qemu_atomic,
+    .out = tgen_qemu_atomic,
+};
+
+static bool tcg_out_qemu_atomic_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    const void *fn;
+
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
+        return false;
+    }
+    tcg_out_ldst_writeback(s, lb);
+    tcg_out_ldst_save(s, lb->save_regs, false, 0);
+    fn = tcg_out_atomic_helper_args(s, lb, &ldst_helper_param);
+    tcg_out_call_int(s, fn);
+    tcg_out_pinned_clobbered(s, false, 0);
+    if ((get_memop(lb->oi) & MO_SIZE) <= MO_32) {
+        tcg_out_ext32u(s, lb->datalo_reg, TCG_REG_X0);
+    } else {
+        tcg_out_mov(s, TCG_TYPE_I64, lb->datalo_reg, TCG_REG_X0);
+    }
+    tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
+    tcg_out_goto(s, lb->raddr);
+    return true;
+}
 
 /*
  * A 128-bit guest access into or from a vector register: the fast path is

@@ -149,6 +149,9 @@ DEF(qemu_st_vec, 0, 2, 1,
 /* Guest access at base + (index << shift) or base + offset: tcg_ldst_x_arg. */
 DEF(qemu_ld_x, 1, 2, 1, TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_INT)
 DEF(qemu_st_x, 0, 3, 1, TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_INT)
+/* Atomic read-modify-write: old value; value, compare, addr; oi, TCGAtomicOp */
+DEF(qemu_atomic, 1, 3, 2,
+    TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_INT)
 
 /* Host vector support.  */
 
