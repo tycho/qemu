@@ -2815,6 +2815,7 @@ void tcg_gen_goto_tb(unsigned idx)
     tcg_ctx->goto_tb_issue_mask |= 1 << idx;
 #endif
     plugin_gen_disable_mem_helpers();
+    tcg_ctx->goto_tb_slots |= 1u << idx;
     tcg_gen_op1i(INDEX_op_goto_tb, 0, idx);
 }
 
@@ -2853,6 +2854,7 @@ void tcg_gen_call_tb(unsigned idx, TCGLabel *reset)
     tcg_ctx->goto_tb_issue_mask |= 1 << idx;
 #endif
     plugin_gen_disable_mem_helpers();
+    tcg_ctx->goto_tb_slots |= 1u << idx;
     op = tcg_gen_op2(INDEX_op_call_tb, 0, idx, label_arg(reset));
     add_as_label_use(reset, op);
 }
@@ -2874,6 +2876,7 @@ void tcg_gen_goto_tb_dead(unsigned idx, unsigned exit_idx)
     tcg_ctx->goto_tb_issue_mask |= 1 << idx;
 #endif
     plugin_gen_disable_mem_helpers();
+    tcg_ctx->goto_tb_slots |= 1u << idx | 1u << exit_idx;
     tcg_gen_op2(INDEX_op_goto_tb_dead, 0, idx, exit_idx);
     tcg_ctx->chain_dead_used = true;
 }
