@@ -539,7 +539,7 @@ static void set_jmp_reset_offset(TCGContext *s, int which)
      * We will check for overflow at the end of the opcode loop in
      * tcg_gen_code, where we bound tcg_current_code_size to UINT16_MAX.
      */
-    s->gen_tb->jmp_reset_offset[which] = tcg_current_code_size(s);
+    s->gen_tb->jmp[which].reset_offset = tcg_current_code_size(s);
 }
 
 static void G_GNUC_UNUSED set_jmp_insn_offset(TCGContext *s, int which)
@@ -548,7 +548,7 @@ static void G_GNUC_UNUSED set_jmp_insn_offset(TCGContext *s, int which)
      * We will check for overflow at the end of the opcode loop in
      * tcg_gen_code, where we bound tcg_current_code_size to UINT16_MAX.
      */
-    s->gen_tb->jmp_insn_offset[which] = tcg_current_code_size(s);
+    s->gen_tb->jmp[which].insn_offset = tcg_current_code_size(s);
 }
 
 static uintptr_t G_GNUC_UNUSED get_jmp_target_addr(TCGContext *s, int which)
@@ -557,7 +557,7 @@ static uintptr_t G_GNUC_UNUSED get_jmp_target_addr(TCGContext *s, int which)
      * Return the read-execute version of the pointer, for the benefit
      * of any pc-relative addressing mode.
      */
-    return (uintptr_t)tcg_splitwx_to_rx(&s->gen_tb->jmp_target_addr[which]);
+    return (uintptr_t)tcg_splitwx_to_rx(&s->gen_tb->jmp[which].target_addr);
 }
 
 static int __attribute__((unused))
@@ -2467,6 +2467,8 @@ void *tcg_tb_data_highwater(TCGContext *s)
 TranslationBlock *tcg_tb_alloc(TCGContext *s)
 {
     uintptr_t align = tcg_tbpack ? TCG_TBPACK_ALIGN : qemu_icache_linesize;
+    unsigned nb_slots = TB_JMP_SLOTS;
+    size_t size = tb_struct_size(nb_slots);
     TranslationBlock *tb;
     void *next;
 
@@ -2476,8 +2478,9 @@ TranslationBlock *tcg_tb_alloc(TCGContext *s)
         if (s->lay_on) {
             /* The struct in the chunk's cold part; the code where it was. */
             tb = (void *)ROUND_UP((uintptr_t)s->lay_cold, TCG_TBPACK_ALIGN);
-            s->lay_cold = (void *)ROUND_UP((uintptr_t)(tb + 1),
+            s->lay_cold = (void *)ROUND_UP((uintptr_t)tb + size,
                                            TCG_TBPACK_ALIGN);
+            tb->nb_slots = nb_slots;
             return tb;
         }
         tb = (void *)ROUND_UP((uintptr_t)s->code_gen_ptr, align);
@@ -2487,9 +2490,10 @@ TranslationBlock *tcg_tb_alloc(TCGContext *s)
          * See tcg_region_thread_initial_alloc.
          */
         if (tb) {
-            next = (void *)ROUND_UP((uintptr_t)(tb + 1), align);
+            next = (void *)ROUND_UP((uintptr_t)tb + size, align);
             if (next <= s->code_gen_highwater) {
                 qatomic_set(&s->code_gen_ptr, next);
+                tb->nb_slots = nb_slots;
                 return tb;
             }
         }
@@ -2603,6 +2607,7 @@ void tcg_func_start(TCGContext *s)
     s->call_ret_set = false;
     s->current_frame_offset = s->frame_start;
 
+    s->goto_tb_slots = 0;
 #ifdef CONFIG_DEBUG_TCG
     s->goto_tb_issue_mask = 0;
 #endif
@@ -4967,6 +4972,57 @@ static void tlb_pin_pass(TCGContext *s)
     }
 }
 #endif
+
+/*
+ * A TB struct is allocated with all TB_JMP_SLOTS goto_tb slots
+ * (tcg_tb_alloc); once the front end has translated the block, before any
+ * host code, it keeps only TB_JMP_SLOTS_SMALL if no higher slot was issued
+ * (goto_tb, goto_tb_dead, call_tb: goto_tb_issue_mask).  The struct lies
+ * at the cold cursor with tcg_tblayout, else right before the code: the
+ * cursor or the code start moves.  A translation retried for the backend
+ * gets all the slots back first.
+ */
+static uintptr_t tb_struct_end(TCGContext *s, TranslationBlock *tb,
+                               unsigned nb_slots)
+{
+    uintptr_t align = s->lay_on || tcg_tbpack ? TCG_TBPACK_ALIGN
+                                              : qemu_icache_linesize;
+
+    return ROUND_UP((uintptr_t)tb + tb_struct_size(nb_slots), align);
+}
+
+static void tb_struct_resize(TCGContext *s, TranslationBlock *tb,
+                             unsigned nb_slots)
+{
+    uintptr_t from = tb_struct_end(s, tb, tb->nb_slots);
+    uintptr_t to = tb_struct_end(s, tb, nb_slots);
+
+    if (s->lay_on) {
+        tcg_debug_assert((uintptr_t)s->lay_cold == from);
+        s->lay_cold = (void *)to;
+    } else {
+        tcg_debug_assert((uintptr_t)s->code_gen_ptr == from);
+        tcg_debug_assert((uintptr_t)tcg_splitwx_to_rw(tb->tc.ptr) == from);
+        qatomic_set(&s->code_gen_ptr, (void *)to);
+        tb->tc.ptr = tcg_splitwx_to_rx((void *)to);
+    }
+    tb->nb_slots = nb_slots;
+}
+
+void tcg_tb_trim_slots(TCGContext *s, TranslationBlock *tb)
+{
+    if (tb->nb_slots > TB_JMP_SLOTS_SMALL &&
+        !(s->goto_tb_slots >> TB_JMP_SLOTS_SMALL)) {
+        tb_struct_resize(s, tb, TB_JMP_SLOTS_SMALL);
+    }
+}
+
+void tcg_tb_reserve_slots(TCGContext *s, TranslationBlock *tb)
+{
+    if (tb->nb_slots < TB_JMP_SLOTS) {
+        tb_struct_resize(s, tb, TB_JMP_SLOTS);
+    }
+}
 
 bool tcg_atomic_supported(void)
 {
@@ -11164,14 +11220,14 @@ static void tcg_note_cond_link(TCGContext *s, int n)
     TCGRelocation *r;
 
     if (!tcg_goto_tb_cold || !l || s->lay_cold_now ||
-        s->gen_tb->jmp_insn_offset[n] != s->slot_label_off) {
+        s->gen_tb->jmp[n].insn_offset != s->slot_label_off) {
         return;
     }
     r = QSIMPLEQ_FIRST(&l->relocs);
     if (!r || QSIMPLEQ_NEXT(r, next) || !tcg_cond_link_reloc(r->type)) {
         return;
     }
-    s->gen_tb->jmp_cond[n] = tcg_ptr_byte_diff(r->ptr, s->code_buf) + 1;
+    s->gen_tb->jmp[n].cond = tcg_ptr_byte_diff(r->ptr, s->code_buf) + 1;
 #endif
 }
 
@@ -11326,17 +11382,17 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 #endif
 
     /* Initialize goto_tb jump offsets. */
-    for (int n = 0; n < TB_JMP_SLOTS; n++) {
-        tb->jmp_reset_offset[n] = TB_JMP_OFFSET_INVALID;
-        tb->jmp_insn_offset[n] = TB_JMP_OFFSET_INVALID;
+    for (int n = 0; n < tb->nb_slots; n++) {
+        tb->jmp[n].reset_offset = TB_JMP_OFFSET_INVALID;
+        tb->jmp[n].insn_offset = TB_JMP_OFFSET_INVALID;
+        tb->jmp[n].cond = 0;
+        tb->jmp[n].dead = 0;
     }
     tb->jmp_call = 0;
     tb->jmp_cold = 0;
     tb->jmp_far = 0;
-    memset(tb->jmp_cond, 0, sizeof(tb->jmp_cond));
     s->slot_label = NULL;
     memset(s->call_tb_reset, 0, sizeof(s->call_tb_reset));
-    memset(tb->jmp_dead, 0, sizeof(tb->jmp_dead));
 
     /*
      * tcg_tblayout: code from the first cold label after the TB's last
@@ -11521,7 +11577,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             break;
         case INDEX_op_goto_tb_dead:
             tcg_reg_alloc_chain_store(s, false);
-            s->gen_tb->jmp_dead[op->args[1]] = op->args[0] + 1;
+            s->gen_tb->jmp[op->args[1]].dead = op->args[0] + 1;
 #ifdef TCG_TARGET_HAS_GOTO_TB_COLD
             if (s->goto_tb_cold) {
                 /* One insn, a NOP while unlinked. */
@@ -11705,12 +11761,12 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     }
 
     /* A call_tb or goto_tb_cold slot, while unlinked, leads to its label. */
-    for (int n = 0; n < ARRAY_SIZE(tb->jmp_reset_offset); n++) {
+    for (int n = 0; n < tb->nb_slots; n++) {
         TCGLabel *l = s->call_tb_reset[n];
 
         if (l) {
             tcg_debug_assert(l->has_value);
-            tb->jmp_reset_offset[n] =
+            tb->jmp[n].reset_offset =
                 tcg_ptr_byte_diff(l->u.value_ptr,
                                   tcg_splitwx_to_rx(s->code_buf));
         }

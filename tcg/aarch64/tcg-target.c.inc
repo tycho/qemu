@@ -3418,7 +3418,7 @@ static void tb_set_cond_link(const TranslationBlock *tb, int n, bool linked,
                              uintptr_t d_addr, uintptr_t jmp_rx,
                              uintptr_t jmp_rw)
 {
-    uintptr_t c_rx = (uintptr_t)tb->tc.ptr + tb->jmp_cond[n] - 1;
+    uintptr_t c_rx = (uintptr_t)tb->tc.ptr + tb->jmp[n].cond - 1;
     uintptr_t c_rw = c_rx + (jmp_rw - jmp_rx);
     ptrdiff_t off = d_addr - c_rx;
     uint32_t insn = qatomic_read((uint32_t *)c_rw);
@@ -3433,12 +3433,12 @@ static void tb_set_cond_link(const TranslationBlock *tb, int n, bool linked,
 void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
                               uintptr_t jmp_rx, uintptr_t jmp_rw)
 {
-    uintptr_t d_addr = tb->jmp_target_addr[n];
+    uintptr_t d_addr = tb->jmp[n].target_addr;
     ptrdiff_t d_offset = d_addr - jmp_rx;
     tcg_insn_unit insn;
 
     if (tb->jmp_call & (1u << n)) {
-        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
+        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp[n].reset_offset;
 
         /*
          * A call slot: BL to a TB in range, else BL to the trampoline
@@ -3459,7 +3459,7 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     }
 
     if (tb->jmp_cold & (1u << n)) {
-        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
+        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp[n].reset_offset;
 
         /*
          * To the TB, or by way of the trampoline before the reset label,
@@ -3475,7 +3475,7 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
         }
         qatomic_set((uint32_t *)jmp_rw, insn);
         flush_idcache_range(jmp_rx, jmp_rw, 4);
-        if (tb->jmp_cond[n]) {
+        if (tb->jmp[n].cond) {
             tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw);
         }
         return;
@@ -3485,7 +3485,7 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     if (d_offset == sextract64(d_offset, 0, 28)) {
         insn = deposit32(Ibranch_B, 0, 26, d_offset >> 2);
     } else {
-        uintptr_t i_addr = (uintptr_t)&tb->jmp_target_addr[n];
+        uintptr_t i_addr = (uintptr_t)&tb->jmp[n].target_addr;
         ptrdiff_t i_offset = i_addr - jmp_rx;
 
         /* Note that we asserted this in range in tcg_out_goto_tb. */
@@ -3493,8 +3493,8 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     }
     qatomic_set((uint32_t *)jmp_rw, insn);
     flush_idcache_range(jmp_rx, jmp_rw, 4);
-    if (tb->jmp_cond[n]) {
-        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
+    if (tb->jmp[n].cond) {
+        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp[n].reset_offset;
 
         tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw);
     }
