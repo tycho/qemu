@@ -5743,6 +5743,94 @@ static void tcg_out_ld_st_d8_d15(TCGContext *s, bool load)
     }
 }
 
+/*
+ * x-xpage=stub: the shared jump-cache probe of cross-page direct jumps,
+ * after the epilogue.  Called as helper_lookup_tb_ptr_jcp is: X0 = env,
+ * X1 = pc, X2 = cs_base, W3 = flags; returns the TB's code in X0, or 0.
+ * The same checks as that helper, from tcg_jc_layout, with no frame and
+ * nothing but caller-saved registers: X4-X12, and X16 for far offsets.
+ */
+static void tcg_out_xpage_stub(TCGContext *s)
+{
+    const TCGJumpCacheLayout *l = &tcg_jc_layout;
+    ptrdiff_t miss[8];
+    int nmiss = 0, hs = l->hash_shift, pb = l->page_bits;
+    int cb = l->cache_bits, es = l->entry_shift;
+    ptrdiff_t key_ok = -1;
+
+    tcg_xpage_stub = tcg_splitwx_to_rx(s->code_ptr);
+    tcg_out_bti(s, BTI_C);
+
+    /* X4 = the jump cache; X6 = the entry's offset (tb_jmp_cache_hash_func) */
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_X4, TCG_REG_X0, l->jc_ofs);
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X5, TCG_REG_X1, hs, 63);
+    tcg_out_insn(s, logic_shift, EOR, TCG_TYPE_I64, TCG_REG_X5, TCG_REG_X5,
+                 TCG_REG_X1);
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X6, TCG_REG_X5, (64 - es) & 63,
+                 pb - 1);
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X7, TCG_REG_X5, hs + pb,
+                 hs + cb - 1);
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X7, TCG_REG_X7,
+                 (64 - (pb + es)) & 63, cb - pb - 1);
+    tcg_out_insn(s, logic_shift, ORR, TCG_TYPE_I64, TCG_REG_X6, TCG_REG_X6,
+                 TCG_REG_X7);
+    tcg_out_insn(s, addsub_shift, ADD, TCG_TYPE_I64, TCG_REG_X8, TCG_REG_X4,
+                 TCG_REG_X6);
+
+    /* X9 = the entry's TB; its key against pc ^ salt (or ^ gsalt). */
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_X9, TCG_REG_X8, l->entry_tb_ofs);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_X10, TCG_REG_X8, l->entry_pc_ofs);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_X11, TCG_REG_X4, l->salt_ofs);
+    tcg_out_insn(s, logic_shift, EOR, TCG_TYPE_I64, TCG_REG_X11, TCG_REG_X11,
+                 TCG_REG_X1);
+    tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_EQ, TCG_REG_X10, TCG_REG_X11, false);
+    if (l->global) {
+        key_ok = s->code_ptr - s->code_buf;
+        tcg_out_insn(s, bcond_imm, B_C, TCG_COND_EQ, 0);
+        tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_X11, TCG_REG_X4, l->gsalt_ofs);
+        tcg_out_insn(s, logic_shift, EOR, TCG_TYPE_I64, TCG_REG_X11,
+                     TCG_REG_X11, TCG_REG_X1);
+        tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_EQ, TCG_REG_X10, TCG_REG_X11,
+                    false);
+    }
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+    if (key_ok >= 0) {
+        reloc_pc19(s->code_buf + key_ok, tcg_splitwx_to_rx(s->code_ptr));
+    }
+
+    /* A TB, no breakpoints, and the TB's cs_base, flags and cflags. */
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, cbz, CBZ, TCG_TYPE_I64, TCG_REG_X9, 0);
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_X11, TCG_REG_X0, l->bp_ofs);
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, cbz, CBNZ, TCG_TYPE_I64, TCG_REG_X11, 0);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_X11, TCG_REG_X9, l->tb_cs_base_ofs);
+    tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_EQ, TCG_REG_X11, TCG_REG_X2, false);
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+    tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_X11, TCG_REG_X9, l->tb_flags_ofs);
+    tcg_out_cmp(s, TCG_TYPE_I32, TCG_COND_EQ, TCG_REG_X11, TCG_REG_X3, false);
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+    tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_X11, TCG_REG_X9, l->tb_cflags_ofs);
+    tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_X12, TCG_REG_X0, l->cflags_ofs);
+    tcg_out_cmp(s, TCG_TYPE_I32, TCG_COND_EQ, TCG_REG_X11, TCG_REG_X12, false);
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+
+    /* Hit: the TB's code. */
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_X0, TCG_REG_X9, l->tb_ptr_ofs);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+
+    /* Miss: 0. */
+    for (int i = 0; i < nmiss; i++) {
+        reloc_pc19(s->code_buf + miss[i], tcg_splitwx_to_rx(s->code_ptr));
+    }
+    tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X0, 0);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+}
+
 static void tcg_target_qemu_prologue(TCGContext *s)
 {
     TCGReg r;
@@ -5834,6 +5922,10 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     tcg_out_insn(s, ldstpair, LDP, TCG_REG_FP, TCG_REG_LR,
                  TCG_REG_SP, PUSH_SIZE, 0, 1);
     tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+
+    if (tcg_use_softmmu && tcg_jc_layout.valid) {
+        tcg_out_xpage_stub(s);
+    }
 }
 
 static void tcg_out_tb_start(TCGContext *s)

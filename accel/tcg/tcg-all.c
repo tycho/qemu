@@ -383,6 +383,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
      * There's no guest base to take into account, so go ahead and
      * initialize the prologue now.
      */
+    tcg_jc_layout_init();
     tcg_prologue_init();
 #endif
 
@@ -521,6 +522,7 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 }
 
 bool tcg_ijmp_inline;
+TCGXPage tcg_xpage;
 bool tcg_jcgen;
 bool tcg_jc_keep_pcrel;
 bool tcg_jc_global;
@@ -773,6 +775,29 @@ static bool tcg_get_region(Object *obj, Error **errp)
 static void tcg_set_region(Object *obj, bool value, Error **errp)
 {
     tcg_region = value;
+}
+
+static const char *const tcg_xpage_names[] = {
+    [TCG_XPAGE_CALL] = "call",
+    [TCG_XPAGE_INLINE] = "inline",
+    [TCG_XPAGE_PROBE] = "probe",
+    [TCG_XPAGE_STUB] = "stub",
+};
+
+static char *tcg_get_xpage(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_xpage_names[tcg_xpage]);
+}
+
+static void tcg_set_xpage(Object *obj, const char *value, Error **errp)
+{
+    for (int i = 0; i < ARRAY_SIZE(tcg_xpage_names); i++) {
+        if (!strcmp(value, tcg_xpage_names[i])) {
+            tcg_xpage = i;
+            return;
+        }
+    }
+    error_setg(errp, "x-xpage: 'call', 'inline', 'probe' or 'stub'");
 }
 
 static bool tcg_get_tblookup(Object *obj, Error **errp)
@@ -1194,6 +1219,15 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "indirect jumps (in a short helper call at direct jumps to "
         "another page), and pack TB structs next to their code (x86 "
         "guests)");
+
+    object_class_property_add_str(oc, "x-xpage", tcg_get_xpage,
+                                  tcg_set_xpage);
+    object_class_property_set_description(oc, "x-xpage",
+        "With x-tblookup, probe the jump cache at direct jumps to another "
+        "page in a short helper call ('call'), in generated code "
+        "('inline'), or in a call that only probes, the full lookup "
+        "following on a miss: to C ('probe') or to a shared generated "
+        "probe ('stub')");
 
     object_class_property_add_bool(oc, "x-addr32",
                                    tcg_get_addr32, tcg_set_addr32);
