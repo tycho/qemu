@@ -2257,7 +2257,7 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
         return;
     }
     /* patch the branch destination */
-    uintptr_t addr = tb->jmp_target_addr[n];
+    uintptr_t addr = tb->jmp[n].target_addr;
     intptr_t disp = addr - (jmp_rx - 2);
     qatomic_set((int32_t *)jmp_rw, disp / 2);
     /* no need to flush icache explicitly */
