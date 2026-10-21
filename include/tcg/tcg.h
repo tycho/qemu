@@ -385,6 +385,11 @@ typedef struct TCGLazyMap {
 } TCGLazyMap;
 
 struct TCGContext {
+    /*
+     * System mode: the shared store of the pinned globals that this TB's
+     * slow paths call (tcg_out_ldst_finalize), or NULL.
+     */
+    const tcg_insn_unit *pin_st_tail;
     uintptr_t pool_cur, pool_end;
     TCGPool *pool_first, *pool_current, *pool_first_large;
     int nb_labels;
