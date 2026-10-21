@@ -454,6 +454,17 @@ void tcg_gen_qemu_st_vec2_chk(TCGv_vec, TCGTemp *, MemOp,
 
 /* Atomic ops */
 
+/**
+ * tcg_mo_needed:
+ * @type: TCGBar
+ *
+ * Return the orders of @type that the guest's memory order requires and
+ * the host's ordinary accesses don't provide: those for which guest loads
+ * and stores get a barrier.  It says nothing about the host's atomic
+ * operations.
+ */
+TCGBar tcg_mo_needed(TCGBar type);
+
 void tcg_gen_atomic_cmpxchg_i32_chk(TCGv_i32, TCGTemp *, TCGv_i32, TCGv_i32,
                                     TCGArg, MemOp, TCGType);
 void tcg_gen_atomic_cmpxchg_i64_chk(TCGv_i64, TCGTemp *, TCGv_i64, TCGv_i64,
