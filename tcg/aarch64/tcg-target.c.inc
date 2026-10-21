@@ -2715,6 +2715,12 @@ static TCGReg tcg_out_rcpc_base(TCGContext *s, TCGReg base, int ofs)
     return base;
 }
 
+/*
+ * The offset form's index is the constant 0, which arrives as XZR, or as a
+ * register when an earlier op has loaded the constant into one: an offset
+ * means the offset form whatever the index register.  (A register index
+ * never comes with an offset; base + a register holding 0 is right too.)
+ */
 static void tgen_qemu_ld_x(TCGContext *s, TCGType type, TCGReg data,
                            TCGReg base, TCGReg index, bool index_zero,
                            TCGArg arg)
@@ -2754,7 +2760,7 @@ static void tgen_qemu_ld_x(TCGContext *s, TCGType type, TCGReg data,
     }
     if (shift == TCG_LDST_X_SCALED) {
         tcg_out_insn_ldst_uimm(s, ld_insn(mop, type), data, base, ofs);
-    } else if (index != TCG_REG_XZR) {
+    } else if (index != TCG_REG_XZR && !ofs) {
         tcg_out_ldst_rx(s, ld_insn(mop, type), data, base, index, shift);
     } else {
         tcg_out_insn_ldst_imm(s, ld_insn(mop, type), data, base, ofs);
@@ -2792,7 +2798,7 @@ static void tgen_qemu_st_x(TCGContext *s, TCGType type, TCGReg data,
     }
     if (shift == TCG_LDST_X_SCALED) {
         tcg_out_insn_ldst_uimm(s, st_insn(mop), data, base, ofs);
-    } else if (index != TCG_REG_XZR) {
+    } else if (index != TCG_REG_XZR && !ofs) {
         tcg_out_ldst_rx(s, st_insn(mop), data, base, index, shift);
     } else {
         tcg_out_insn_ldst_imm(s, st_insn(mop), data, base, ofs);
