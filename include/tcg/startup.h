@@ -521,4 +521,13 @@ extern bool tcg_hyperv;
 /* tcg_hyperv: also the SynIC and synthetic timers (hv-synic, hv-stimer). */
 extern bool tcg_hvtimers;
 
+/*
+ * tcg_tlbpin: in system mode, the TLB mask and table of the mmu index most
+ * of a TB's guest accesses use stay in two host registers, loaded at the
+ * TB's start and after every call, on backends that support it
+ * (tcg_tlbpin_supported).
+ */
+extern bool tcg_tlbpin;
+bool tcg_tlbpin_supported(void);
+
 #endif
