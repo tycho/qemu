@@ -108,6 +108,40 @@ void x86_tsc_counter_set(CPUX86State *env, uint64_t tsc)
 #endif
 }
 
+/*
+ * The TSC of a vCPU whose offset is the shared base: time since the VM
+ * started, in ns, stopped while the VM is (Hyper-V's partition reference
+ * time is this in 100 ns units).
+ */
+uint64_t x86_tsc_counter_partition(void)
+{
+#if HOST_COUNTER_SUPPORTED
+    return tsc_counter_now() + tsc_counter_base;
+#else
+    return 0;
+#endif
+}
+
+int64_t x86_tsc_counter_base(void)
+{
+#if HOST_COUNTER_SUPPORTED
+    return tsc_counter_base;
+#else
+    return 0;
+#endif
+}
+
+/*
+ * After loading @env's TSC: make its offset the shared base, so that the
+ * partition's time continues from the loaded state.
+ */
+void x86_tsc_counter_rebase(CPUX86State *env)
+{
+#if HOST_COUNTER_SUPPORTED
+    tsc_counter_base = env->tsc_counter_offset;
+#endif
+}
+
 /* A vCPU's TSC at reset: the shared base, so that all vCPUs agree. */
 void x86_tsc_counter_reset(CPUX86State *env)
 {
