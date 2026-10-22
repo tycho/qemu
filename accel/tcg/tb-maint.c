@@ -1011,6 +1011,26 @@ TranslationBlock *tb_link_page(TranslationBlock *tb)
     return tb;
 }
 
+/*
+ * Whether the code of @tb has bytes in [@start, @last], a range within
+ * one page, counting its bytes as PAGE_FOR_EACH_TB's callers do.
+ */
+static bool tb_code_overlaps(const TranslationBlock *tb, tb_page_addr_t start,
+                             tb_page_addr_t last)
+{
+    tb_page_addr_t p0 = tb_page_addr0(tb), p1 = tb_page_addr1(tb);
+    tb_page_addr_t last0 = p0 + tb->size - 1;
+
+    if (p0 == -1) {
+        return false;
+    }
+    if (p0 <= last && MIN(last0, p0 | ~TARGET_PAGE_MASK) >= start) {
+        return true;
+    }
+    return p1 != -1 && p1 <= last &&
+           p1 + (last0 & ~TARGET_PAGE_MASK) >= start;
+}
+
 #ifdef CONFIG_USER_ONLY
 /*
  * Invalidate all TBs which intersect with the target address range.
@@ -1089,6 +1109,17 @@ bool tb_invalidate_phys_page_unwind(CPUState *cpu, tb_page_addr_t addr,
         }
         do_tb_phys_invalidate(tb, true);
     }
+    /*
+     * The current TB may be off the page's list already, invalidated
+     * while it runs: a store of its own to its code must stop it all
+     * the same.
+     */
+    if (!current_tb_modified && current_tb &&
+        (tb_cflags(current_tb) & CF_COUNT_MASK) != 1 &&
+        tb_code_overlaps(current_tb, addr, last)) {
+        current_tb_modified = true;
+        cpu_restore_state_from_tb(cpu, current_tb, pc);
+    }
 
     if (current_tb_modified) {
         /* Force execution of one insn next time.  */
@@ -1154,6 +1185,17 @@ tb_invalidate_phys_page_range__locked(CPUState *cpu,
             }
             do_tb_phys_invalidate(tb, true);
         }
+    }
+    /*
+     * The current TB may be off the page's list already, invalidated
+     * while it runs: a store of its own to its code must stop it all
+     * the same.
+     */
+    if (!current_tb_modified && current_tb &&
+        (tb_cflags(current_tb) & CF_COUNT_MASK) != 1 &&
+        tb_code_overlaps(current_tb, start, last)) {
+        current_tb_modified = true;
+        cpu_restore_state_from_tb(cpu, current_tb, retaddr);
     }
 
     /* if no code remaining, no need to continue to use slow writes */

@@ -64,6 +64,24 @@ static void gen_NM_exception(DisasContext *s)
     gen_exception(s, EXCP07_PREX);
 }
 
+/*
+ * The CR0 checks of an MMX or 3DNow! instruction that validate_vex
+ * doesn't see: #UD with EM, else #NM with TS.  Return false if the
+ * instruction raises one.
+ */
+static bool gen_check_cr0_mmx(DisasContext *s)
+{
+    if (s->flags & HF_EM_MASK) {
+        gen_illegal_opcode(s);
+        return false;
+    }
+    if (s->flags & HF_TS_MASK) {
+        gen_NM_exception(s);
+        return false;
+    }
+    return true;
+}
+
 static void gen_lea_modrm(DisasContext *s, X86DecodedInsn *decode)
 {
     AddressParts *mem = &decode->mem;
@@ -514,12 +532,7 @@ static void gen_3dnow(DisasContext *s, X86DecodedInsn *decode)
         gen_illegal_opcode(s);
         return;
     }
-    if (s->flags & HF_TS_MASK) {
-        gen_NM_exception(s);
-        return;
-    }
-    if (s->flags & HF_EM_MASK) {
-        gen_illegal_opcode(s);
+    if (!gen_check_cr0_mmx(s)) {
         return;
     }
 
@@ -961,8 +974,6 @@ BINARY_INT_SSE(PUNPCKHQDQ, punpckhqdq)
 BINARY_INT_SSE(VPACKUSDW,  packusdw)
 BINARY_INT_SSE(VPERMILPS,  vpermilps)
 BINARY_INT_SSE(VPERMILPD,  vpermilpd)
-BINARY_INT_SSE(VMASKMOVPS, vpmaskmovd)
-BINARY_INT_SSE(VMASKMOVPD, vpmaskmovq)
 
 BINARY_INT_SSE(PMULDQ,    pmuldq)
 
@@ -1100,7 +1111,6 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
 VEXW_AVX(VPSLLV,    vpsllv)
 VEXW_AVX(VPSRLV,    vpsrlv)
 VEXW_AVX(VPSRAV,    vpsrav)
-VEXW_AVX(VPMASKMOV, vpmaskmov)
 
 /* Same as above, but with extra arguments to the helper.  */
 static inline void gen_vsib_avx(DisasContext *s, X86DecodedInsn *decode,
@@ -1821,10 +1831,83 @@ static void gen_CMP(DisasContext *s, X86DecodedInsn *decode)
     gen_dfv_movcond(s, decode, cond, dfv, ot, cout);
 }
 
+/*
+ * x86 makes a locked CMPXCHG a full barrier: it always writes the
+ * destination, writing back the old value when the compare fails.  The
+ * host's cmpxchg makes no write when the compare fails, and is then no
+ * more than an acquire load on some hosts (Arm's CASAL), which doesn't
+ * order earlier guest accesses before it.  So after a failed compare,
+ * issue a full barrier and try again: the first attempt wrote nothing
+ * and its result is dropped; the second, ordered after every earlier
+ * access, is the one that counts.
+ *
+ * Not needed without CF_PARALLEL, where the cmpxchg is a load and a store
+ * that always writes, nor on hosts whose ordinary accesses already have
+ * x86's order (tcg_mo_needed): x86 and s390x, whose compare-and-swap is a
+ * full barrier whether or not the compare succeeds.
+ */
+static bool gen_cmpxchg_retry(DisasContext *s)
+{
+    return (tb_cflags(s->base.tb) & CF_PARALLEL) && tcg_mo_needed(TCG_MO_ALL);
+}
+
+static void gen_cmpxchg_locked_tl(DisasContext *s, TCGv oldv, TCGv cmpv,
+                                  TCGv newv, MemOp mop)
+{
+    tcg_gen_atomic_cmpxchg_tl(oldv, s->A0, cmpv, newv, s->mem_index, mop);
+    if (gen_cmpxchg_retry(s)) {
+        TCGLabel *done = gen_new_label();
+
+        tcg_gen_brcond_tl(TCG_COND_EQ, oldv, cmpv, done);
+        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+        tcg_gen_atomic_cmpxchg_tl(oldv, s->A0, cmpv, newv, s->mem_index, mop);
+        gen_set_label(done);
+    }
+}
+
+static void gen_cmpxchg_locked_i64(DisasContext *s, TCGv_i64 oldv,
+                                   TCGv_i64 cmpv, TCGv_i64 newv, MemOp mop)
+{
+    tcg_gen_atomic_cmpxchg_i64(oldv, s->A0, cmpv, newv, s->mem_index, mop);
+    if (gen_cmpxchg_retry(s)) {
+        TCGLabel *done = gen_new_label();
+
+        tcg_gen_brcond_i64(TCG_COND_EQ, oldv, cmpv, done);
+        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+        tcg_gen_atomic_cmpxchg_i64(oldv, s->A0, cmpv, newv, s->mem_index, mop);
+        gen_set_label(done);
+    }
+}
+
+#ifdef TARGET_X86_64
+static void gen_cmpxchg_locked_i128(DisasContext *s, TCGv_i128 oldv,
+                                    TCGv_i128 cmpv, TCGv_i128 newv, MemOp mop)
+{
+    tcg_gen_atomic_cmpxchg_i128(oldv, s->A0, cmpv, newv, s->mem_index, mop);
+    if (gen_cmpxchg_retry(s)) {
+        TCGLabel *done = gen_new_label();
+        TCGv_i64 lo = tcg_temp_new_i64();
+        TCGv_i64 hi = tcg_temp_new_i64();
+        TCGv_i64 cmp_lo = tcg_temp_new_i64();
+        TCGv_i64 cmp_hi = tcg_temp_new_i64();
+
+        tcg_gen_extr_i128_i64(lo, hi, oldv);
+        tcg_gen_extr_i128_i64(cmp_lo, cmp_hi, cmpv);
+        tcg_gen_xor_i64(lo, lo, cmp_lo);
+        tcg_gen_xor_i64(hi, hi, cmp_hi);
+        tcg_gen_or_i64(lo, lo, hi);
+        tcg_gen_brcondi_i64(TCG_COND_EQ, lo, 0, done);
+        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+        tcg_gen_atomic_cmpxchg_i128(oldv, s->A0, cmpv, newv,
+                                    s->mem_index, mop);
+        gen_set_label(done);
+    }
+}
+#endif
+
 static void gen_CMPccXADD(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGLabel *label_top = gen_new_label();
-    TCGLabel *label_bottom = gen_new_label();
     TCGv oldv = tcg_temp_new();
     TCGv newv = tcg_temp_new();
     TCGv cmpv = tcg_temp_new();
@@ -1906,12 +1989,14 @@ static void gen_CMPccXADD(DisasContext *s, X86DecodedInsn *decode)
     tcg_gen_movcond_tl(cond, newv, cmp_lhs, cmp_rhs, newv, s->cc_srcT);
     tcg_gen_atomic_cmpxchg_tl(oldv, s->A0, s->cc_srcT, newv, s->mem_index, ot_full);
 
-    /* Exit unconditionally if cmpxchg succeeded.  */
-    tcg_gen_brcond_tl(TCG_COND_EQ, oldv, s->cc_srcT, label_bottom);
-
-    /* Try again if there was actually a store to make.  */
-    tcg_gen_brcond_tl(cond, cmp_lhs, cmp_rhs, label_top);
-    gen_set_label(label_bottom);
+    /*
+     * Try again until the cmpxchg succeeds, also when the condition is
+     * false and the store writes back the value loaded: x86 always writes
+     * the destination, and that locked write orders the insn as a full
+     * barrier.  The load at label_top is not ordered after earlier
+     * stores, and a failed cmpxchg makes no write (gen_cmpxchg_retry).
+     */
+    tcg_gen_brcond_tl(TCG_COND_NE, oldv, s->cc_srcT, label_top);
 
     /* Store old value to registers only after a successful store.  */
     gen_writeback(s, decode, 1, s->cc_srcT);
@@ -1937,8 +2022,7 @@ static void gen_CMPXCHG(DisasContext *s, X86DecodedInsn *decode)
 
     tcg_gen_ext_tl(cmpv, cpu_regs[R_EAX], ot);
     if (s->prefix & PREFIX_LOCK) {
-        tcg_gen_atomic_cmpxchg_tl(oldv, s->A0, cmpv, newv,
-                                  s->mem_index, ot | MO_LE);
+        gen_cmpxchg_locked_tl(s, oldv, cmpv, newv, ot | MO_LE);
     } else {
         tcg_gen_ext_tl(oldv, s->T0, ot);
         if (decode->op[0].has_ea) {
@@ -1983,21 +2067,27 @@ static void gen_CMPXCHG16B(DisasContext *s, X86DecodedInsn *decode)
 #ifdef TARGET_X86_64
     MemOp mop = MO_LE | MO_128 | MO_ALIGN;
     TCGv_i64 t0, t1;
-    TCGv_i128 cmp, val;
+    TCGv_i128 cmp, val, old;
 
     cmp = tcg_temp_new_i128();
     val = tcg_temp_new_i128();
+    /* A retry after a failed compare needs the new value again. */
+    if ((s->prefix & PREFIX_LOCK) && gen_cmpxchg_retry(s)) {
+        old = tcg_temp_new_i128();
+    } else {
+        old = val;
+    }
     tcg_gen_concat_i64_i128(cmp, cpu_regs[R_EAX], cpu_regs[R_EDX]);
     tcg_gen_concat_i64_i128(val, cpu_regs[R_EBX], cpu_regs[R_ECX]);
 
     /* Only require atomic with LOCK; non-parallel handled in generator. */
     if (s->prefix & PREFIX_LOCK) {
-        tcg_gen_atomic_cmpxchg_i128(val, s->A0, cmp, val, s->mem_index, mop);
+        gen_cmpxchg_locked_i128(s, old, cmp, val, mop);
     } else {
-        tcg_gen_nonatomic_cmpxchg_i128(val, s->A0, cmp, val, s->mem_index, mop);
+        tcg_gen_nonatomic_cmpxchg_i128(old, s->A0, cmp, val, s->mem_index, mop);
     }
 
-    tcg_gen_extr_i128_i64(s->T0, s->T1, val);
+    tcg_gen_extr_i128_i64(s->T0, s->T1, old);
 
     /* Determine success after the fact. */
     t0 = tcg_temp_new_i64();
@@ -2038,7 +2128,7 @@ static void gen_CMPXCHG8B(DisasContext *s, X86DecodedInsn *decode)
 
     /* Only require atomic with LOCK; non-parallel handled in generator. */
     if (s->prefix & PREFIX_LOCK) {
-        tcg_gen_atomic_cmpxchg_i64(old, s->A0, cmp, val, s->mem_index, MO_LEUQ);
+        gen_cmpxchg_locked_i64(s, old, cmp, val, MO_LEUQ);
     } else {
         tcg_gen_nonatomic_cmpxchg_i64(old, s->A0, cmp, val,
                                       s->mem_index, MO_LEUQ);
@@ -2181,6 +2271,9 @@ static void gen_DIV(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_EMMS(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (!gen_check_cr0_mmx(s)) {
+        return;
+    }
     gen_helper_emms(tcg_env);
 }
 
@@ -3458,6 +3551,12 @@ static void gen_PUSHF(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_helper_read_eflags(s->T0, tcg_env);
+    /*
+     * The helper left env's flags state as the full flags, consistent: a
+     * fault in the push keeps it rather than restore the CC_OP the insn
+     * started with.
+     */
+    tcg_set_insn_start_param(s->base.insn_start, 1, CC_OP_DYNAMIC);
     gen_push_v(s, s->T0);
     assume_cc_op(s, CC_OP_EFLAGS);
 }
@@ -4721,6 +4820,29 @@ static inline void gen_maskmov(DisasContext *s, X86DecodedInsn *decode,
     }
 }
 
+/* The loads take the address only: masked-off elements must not fault. */
+static inline void gen_maskmov_ld(DisasContext *s, X86DecodedInsn *decode,
+                                  SSEFunc_0_eppt xmm, SSEFunc_0_eppt ymm)
+{
+    if (!s->vex_l) {
+        xmm(tcg_env, OP_PTR0, OP_PTR1, s->A0);
+    } else {
+        ymm(tcg_env, OP_PTR0, OP_PTR1, s->A0);
+    }
+}
+
+static void gen_VMASKMOVPD(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_maskmov_ld(s, decode, gen_helper_vpmaskmovq_ld_xmm,
+                   gen_helper_vpmaskmovq_ld_ymm);
+}
+
+static void gen_VMASKMOVPS(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_maskmov_ld(s, decode, gen_helper_vpmaskmovd_ld_xmm,
+                   gen_helper_vpmaskmovd_ld_ymm);
+}
+
 static void gen_VMASKMOVPD_st(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_maskmov(s, decode, gen_helper_vpmaskmovq_st_xmm, gen_helper_vpmaskmovq_st_ymm);
@@ -4854,6 +4976,15 @@ static void gen_VMOVSS_st(DisasContext *s, X86DecodedInsn *decode)
 
     tcg_gen_ld_i32(tmp, OP_PTR2, offsetof(ZMMReg, ZMM_L(0)));
     tcg_gen_qemu_st_i32(tmp, s->A0, s->mem_index, MO_LEUL);
+}
+
+static void gen_VPMASKMOV(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (s->vex_w) {
+        gen_VMASKMOVPD(s, decode);
+    } else {
+        gen_VMASKMOVPS(s, decode);
+    }
 }
 
 static void gen_VPMASKMOV_st(DisasContext *s, X86DecodedInsn *decode)
