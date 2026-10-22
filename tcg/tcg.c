@@ -357,6 +357,7 @@ bool tcg_retstack_addr64;
 bool tcg_tb_flags_canon;
 TCGJumpCacheLayout tcg_jc_layout;
 const void *tcg_xpage_stub;
+bool tcg_addr32;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
