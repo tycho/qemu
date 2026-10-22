@@ -353,6 +353,17 @@ void tcg_gen_br(TCGLabel *l)
     add_as_label_use(l, tcg_gen_op1(INDEX_op_br, 0, label_arg(l)));
 }
 
+/*
+ * The host's constant-rate counter (host/counter.h), raw ticks; with
+ * @ordered, not read before earlier instructions complete.  Only where
+ * tcg_op_supported(INDEX_op_host_counter).
+ */
+void tcg_gen_host_counter_i64(TCGv_i64 ret, bool ordered)
+{
+    tcg_gen_op2(INDEX_op_host_counter, TCG_TYPE_I64, tcgv_i64_arg(ret),
+                ordered);
+}
+
 void tcg_gen_mb(TCGBar mb_type)
 {
 #ifdef CONFIG_USER_ONLY
