@@ -106,10 +106,10 @@ static void tcg_vm_change_state(void *opaque, bool running, RunState state)
 static int tcg_init_machine(AccelState *as, MachineState *ms)
 {
     TCGState *s = TCG_STATE(as);
+    CPUClass *cc = CPU_CLASS(object_class_by_name(target_cpu_type()));
     unsigned max_threads = 1;
 
 #ifndef CONFIG_USER_ONLY
-    CPUClass *cc = CPU_CLASS(object_class_by_name(target_cpu_type()));
     bool mttcg_supported = cc->tcg_ops->mttcg_supported;
 
     switch (s->mttcg_enabled) {
@@ -168,6 +168,10 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     tcg_fpcheck_runtime = s->i386_runtime;
     tcg_iopl_runtime = s->i386_runtime;
 
+    tcg_jcgen = cc->tcg_ops->jmp_cache_salt;
+#ifdef CONFIG_USER_ONLY
+    tcg_jc_ctx = tcg_jcgen && tcg_ijmp_inline;
+#endif
     page_init();
     tb_htable_init();
     tcg_init(s->tb_size * MiB, s->splitwx_enabled, max_threads);
@@ -178,6 +182,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
      * initialize the prologue now; or, where guest registers may be
      * pinned, once the front end has pinned them (tcg_exec_realizefn).
      */
+    tcg_jc_layout_init();
     if (tcg_pin && tcg_pin_system_ok()) {
         tcg_prologue_deferred = true;
     } else {
@@ -241,6 +246,12 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 
     s->tb_size = value;
 }
+
+bool tcg_ijmp_inline;
+TCGXPage tcg_xpage;
+bool tcg_jcgen;
+bool tcg_jc_ctx;
+bool tcg_jc_keep_pcrel;
 
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
@@ -509,6 +520,73 @@ static void tcg_set_region(Object *obj, bool value, Error **errp)
     tcg_region = value;
 }
 
+static const char *const tcg_xpage_names[] = {
+    [TCG_XPAGE_CALL] = "call",
+    [TCG_XPAGE_STUB] = "stub",
+};
+
+static char *tcg_get_xpage(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_xpage_names[tcg_xpage]);
+}
+
+static void tcg_set_xpage(Object *obj, const char *value, Error **errp)
+{
+    for (int i = 0; i < ARRAY_SIZE(tcg_xpage_names); i++) {
+        if (!strcmp(value, tcg_xpage_names[i])) {
+            tcg_xpage = i;
+            return;
+        }
+    }
+    error_setg(errp, "x-xpage: 'call' or 'stub'");
+}
+
+static bool tcg_get_tblookup(Object *obj, Error **errp)
+{
+    return tcg_ijmp_inline;
+}
+
+static void tcg_set_tblookup(Object *obj, bool value, Error **errp)
+{
+    tcg_ijmp_inline = value;
+    tcg_tbpack = value;
+    tcg_jc_keep_pcrel = value;
+    tcg_tb_flags_canon = value;
+    tcg_retstack = value;
+    tcg_goto_tb_cold = value;
+}
+
+static char *tcg_get_tblayout(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_tblayout ? "split" : "packed");
+}
+
+static void tcg_set_tblayout(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "packed")) {
+        tcg_tblayout = false;
+    } else if (!strcmp(value, "split")) {
+        if (!tcg_can_tblayout()) {
+            error_setg(errp, "x-tblayout=split: not on this host");
+            return;
+        }
+        tcg_tblayout = true;
+    } else {
+        error_setg(errp, "Invalid 'x-tblayout' setting %s (packed, split)",
+                   value);
+    }
+}
+
+static bool tcg_get_bti(Object *obj, Error **errp)
+{
+    return tcg_bti;
+}
+
+static void tcg_set_bti(Object *obj, bool value, Error **errp)
+{
+    tcg_bti = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -644,6 +722,33 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Let a translation block loop back to its own start instead of "
         "chaining to itself, keeping the loop's guest registers in host "
         "registers (not with plugins or icount)");
+
+    object_class_property_add_bool(oc, "x-tblookup",
+                                   tcg_get_tblookup, tcg_set_tblookup);
+    object_class_property_set_description(oc, "x-tblookup",
+        "Find the next TB from generated code: probe the jump cache at "
+        "indirect jumps (in a short helper call at direct jumps to "
+        "another page), and pack TB structs next to their code (x86 "
+        "guests)");
+
+    object_class_property_add_str(oc, "x-xpage", tcg_get_xpage,
+                                  tcg_set_xpage);
+    object_class_property_set_description(oc, "x-xpage",
+        "With x-tblookup, probe the jump cache at direct jumps to another "
+        "page in a short helper call ('call') or in a shared generated "
+        "probe, the full lookup following on a miss ('stub')");
+
+    object_class_property_add_str(oc, "x-tblayout",
+                                  tcg_get_tblayout, tcg_set_tblayout);
+    object_class_property_set_description(oc, "x-tblayout",
+        "Where TB structs and the code of unlinked exits go: packed, with "
+        "the code (default); split, out of the code stream, which leaves "
+        "the code of TBs translated together side by side");
+
+    object_class_property_add_bool(oc, "x-bti", tcg_get_bti, tcg_set_bti);
+    object_class_property_set_description(oc, "x-bti",
+        "Where the host has BTI, guard generated code with it (default); "
+        "off: no landing pads and no guarded pages");
 }
 
 static const TypeInfo tcg_accel_type = {

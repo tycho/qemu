@@ -26,7 +26,6 @@
 #include "exec/mmap-lock.h"
 #include "tb-internal.h"
 #include "exec/tb-flush.h"
-#include "qemu/cacheinfo.h"
 #include "qemu/target-info.h"
 #include "exec/log.h"
 #include "exec/icount.h"
@@ -105,9 +104,9 @@ static int64_t decode_sleb128(const uint8_t **pp)
 /* tcg_lazysync map: the register byte of a constant-valued global. */
 #define LAZY_WB_CONST 0xff
 
-static int encode_search(TranslationBlock *tb, uint8_t *block)
+static int encode_search(TranslationBlock *tb, uint8_t *block,
+                         uint8_t *highwater)
 {
-    uint8_t *highwater = tcg_ctx->code_gen_highwater;
     uint64_t *insn_data = tcg_ctx->gen_insn_data;
     uint16_t *insn_end_off = tcg_ctx->gen_insn_end_off;
     uint8_t *p = block;
@@ -248,7 +247,7 @@ static int cpu_unwind_data_from_tb(TranslationBlock *tb, uintptr_t host_pc,
                                    uint64_t *data)
 {
     uintptr_t iter_pc = (uintptr_t)tb->tc.ptr;
-    const uint8_t *p = tb->tc.ptr + tb->tc.size;
+    const uint8_t *p = tb->tc.search;
     int i, j, num_insns = tb->icount;
 
     host_pc -= GETPC_ADJ;
@@ -376,6 +375,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     tb_page_addr_t phys_pc, phys_p2;
     tcg_insn_unit *gen_code_buf;
     int gen_code_size, search_size, max_insns;
+    uint8_t *search, *search_hw;
     int64_t ti;
     void *host_pc;
 
@@ -495,19 +495,47 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
                           "Restarting code generation with re-locked pages");
             goto restart_translate;
 
+        case -4:
+            /* tcg_tblayout: code too far from code it branches to. */
+            qemu_log_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT,
+                          "Restarting code generation without cold code\n");
+            goto restart_translate;
+
         default:
             g_assert_not_reached();
         }
     }
     tcg_ctx->gen_tb = NULL;
 
-    search_size = encode_search(tb, (void *)gen_code_buf + gen_code_size);
+    /*
+     * The unwind data follows the code, or with tcg_tblayout goes to the
+     * chunk's cold part with the TB struct: then nothing but code and its
+     * constant pool sits between one TB's code and the next.
+     */
+    if (tcg_ctx->lay_on) {
+        search = tcg_ctx->lay_cold;
+        search_hw = tcg_tb_data_highwater(tcg_ctx);
+    } else {
+        search = (uint8_t *)gen_code_buf + gen_code_size;
+        search_hw = tcg_ctx->code_gen_highwater;
+    }
+    search_size = encode_search(tb, search, search_hw);
     if (unlikely(search_size < 0)) {
         trace_tb_gen_code_buffer_overflow("encode_search");
         tb_unlock_pages(tb);
+        if (tcg_ctx->lay_on) {
+            /* tcg_tblayout: the chunk's hot or cold part is full. */
+            tcg_ctx->lay_hot_end = tcg_ctx->lay_chunk;
+        }
         goto buffer_overflow;
     }
     tb->tc.size = gen_code_size;
+    tb->tc.search = tcg_splitwx_to_rx(search);
+    if (tcg_ctx->lay_on) {
+        tcg_ctx->lay_cold = (void *)ROUND_UP((uintptr_t)search + search_size,
+                                             CODE_GEN_ALIGN);
+        search_size = 0;
+    }
 
     /*
      * For CF_PCREL, attribute all executions of the generated code
@@ -643,10 +671,13 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 
     /* if the TB already exists, discard what we just translated */
     if (unlikely(existing_tb != tb)) {
-        uintptr_t orig_aligned = (uintptr_t)gen_code_buf;
-
-        orig_aligned -= ROUND_UP(sizeof(*tb), qemu_icache_linesize);
-        qatomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);
+        /*
+         * Give back the TB and its code: tcg_tb_alloc put the TB first,
+         * or with tcg_tblayout elsewhere (its cold part stays used).
+         */
+        qatomic_set(&tcg_ctx->code_gen_ptr,
+                    tcg_ctx->lay_on ? tcg_splitwx_to_rw(tb->tc.ptr)
+                                    : (void *)tb);
         tcg_tb_remove(tb);
         return existing_tb;
     }
@@ -736,6 +767,33 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
  * Called by generic code at e.g. cpu reset after cpu creation,
  * therefore we must be prepared to allocate the jump cache.
  */
+void tcg_retstack_reset(CPUState *cpu)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+    if (jc && jc->retring) {
+        memset(jc->retring, 0, TCG_RETSTACK_SIZE);
+        *(uintptr_t *)((char *)cpu_env(cpu) + tcg_retsp_off) =
+            (uintptr_t)jc->retring + TCG_RETSTACK_SIZE / 2;
+    }
+}
+
+uintptr_t tcg_retstack_fault(CPUState *cpu, uintptr_t addr)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    uintptr_t page = qemu_real_host_page_size(), ring;
+
+    if (!jc || !jc->retring) {
+        return 0;
+    }
+    ring = (uintptr_t)jc->retring;
+    if (addr + page < ring || addr >= ring + TCG_RETSTACK_SIZE + page ||
+        (addr >= ring && addr < ring + TCG_RETSTACK_SIZE)) {
+        return 0;
+    }
+    return ring + TCG_RETSTACK_SIZE / 2;
+}
+
 void tcg_flush_jmp_cache(CPUState *cpu)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
@@ -744,7 +802,18 @@ void tcg_flush_jmp_cache(CPUState *cpu)
     if (unlikely(jc == NULL)) {
         return;
     }
+    tcg_retstack_reset(cpu);
 
+    if (tcg_jcgen) {
+        uint64_t salt = qatomic_read(&jc->salt) + TB_JMP_SALT_STEP;
+
+        /* Once every 65536 flushes the salt comes round: clear for real. */
+        if (salt != 0) {
+            qatomic_set(&jc->salt, salt);
+            return;
+        }
+        qatomic_set(&jc->salt, 0);
+    }
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
         qatomic_set(&jc->array[i].tb, NULL);
     }

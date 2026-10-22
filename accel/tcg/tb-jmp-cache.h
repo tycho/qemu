@@ -12,7 +12,10 @@
 #include "qemu/rcu.h"
 #include "exec/cpu-common.h"
 
-#define TB_JMP_CACHE_BITS 12
+/* log2 of the entries per vCPU; a compile-time constant, overridable. */
+#ifndef TB_JMP_CACHE_BITS
+#define TB_JMP_CACHE_BITS 16
+#endif
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
 
 /*
@@ -24,10 +27,33 @@
  */
 typedef struct CPUJumpCache {
     struct rcu_head rcu;
+    /*
+     * tcg_jcgen: entries store pc ^ salt, and a flush moves the salt on
+     * instead of clearing every entry.  The salt lives in bits 48-63,
+     * which a guest pc never needs to tell two addresses apart on x86
+     * (canonical 64-bit addresses, 32-bit ones otherwise).  Zero without
+     * tcg_jcgen.
+     */
+    uint64_t salt;
+    /*
+     * tcg_jc_ctx: the TB state (cs_base, flags, cflags) every entry under
+     * the current salt was made for.  A lookup in another state moves the
+     * salt on first, so the generated lookup needn't compare them.
+     */
+    uint64_t ctx_cs_base;
+    uint32_t ctx_flags;
+    uint32_t ctx_cflags;
     struct {
         TranslationBlock *tb;
         vaddr pc;
     } array[TB_JMP_CACHE_SIZE];
+    /*
+     * tcg_retstack: the return stack's ring, cleared with the cache: its
+     * host code is for the TB state of the cache.
+     */
+    void *retring;
 } CPUJumpCache;
+
+#define TB_JMP_SALT_STEP (1ull << 48)
 
 #endif /* ACCEL_TCG_TB_JMP_CACHE_H */
