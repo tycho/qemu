@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
@@ -25,6 +26,15 @@
 #include "qemu/atomic128.h"
 #include "tcg/tcg.h"
 #include "helper-tcg.h"
+#include "accel/tcg/probe.h"
+#include "exec/target_page.h"
+#include "exec/translation-block.h"
+#include "accel/tcg/helper-retaddr.h"
+#ifdef CONFIG_USER_ONLY
+#include "exec/page-protection.h"
+#include "user/page-protection.h"
+#include "user/guest-host.h"
+#endif
 
 void helper_boundw(CPUX86State *env, target_ulong a0, int v)
 {
@@ -54,3 +64,153 @@ void helper_boundl(CPUX86State *env, target_ulong a0, int v)
         raise_exception_ra(env, EXCP05_BOUND, GETPC());
     }
 }
+
+/*
+ * Fast REP STOS and REP MOVS (x-repstr): as many whole elements as the
+ * guest pages allow, with the widest host stores (memset, memmove), the
+ * way a CPU with fast string operations does them.  The pages must be
+ * plain RAM the guest may access as it is now: not code that self-
+ * modifying-code tracking protects, not I/O, no watchpoints; at the first
+ * page that isn't, or at REP_FAST_MAX bytes, stop, and the instruction's
+ * element loop (or its next run) goes on from there.  Returns whether
+ * any element was done; RCX, RDI and RSI are updated to match.
+ */
+#define REP_FAST_MAX (64 * KiB)
+
+static vaddr rep_linear(target_ulong reg, uint64_t amask, bool base,
+                        target_ulong segbase, bool code64)
+{
+    vaddr a = reg & amask;
+
+    if (base) {
+        a += segbase;
+    }
+    return code64 ? a : (uint32_t)a;
+}
+
+/* Host address of [addr, addr + len) for @type, within one page, or NULL. */
+static void *rep_host(CPUX86State *env, vaddr addr, int len,
+                      MMUAccessType type, int mmu_idx, uintptr_t ra)
+{
+#ifdef CONFIG_USER_ONLY
+    int need = type == MMU_DATA_STORE ? PAGE_WRITE : PAGE_READ;
+
+    if ((page_get_flags(addr) & (PAGE_VALID | need)) != (PAGE_VALID | need)) {
+        return NULL;
+    }
+    return g2h(env_cpu(env), addr);
+#else
+    void *host;
+    int flags = probe_access_flags(env, addr, len, type, mmu_idx, true,
+                                   &host, ra);
+
+    return flags ? NULL : host;
+#endif
+}
+
+uint32_t helper_rep_fast(CPUX86State *env, uint32_t desc)
+{
+    MemOp ot = extract32(desc, 0, 2);
+    MemOp aflag = extract32(desc, 2, 2);
+    bool movs = extract32(desc, 4, 1);
+    int src_seg = extract32(desc, 5, 3);
+    bool dst_base = extract32(desc, 8, 1);
+    bool src_base = extract32(desc, 9, 1);
+    bool code64 = extract32(desc, 10, 1);
+    int mmu_idx = extract32(desc, 11, 5);
+    int size = 1 << ot;
+    uint64_t amask = MAKE_64BIT_MASK(0, 8 << aflag);
+    uint64_t count = env->regs[R_ECX] & amask;
+    uint64_t pat = 0;
+    uint64_t done = 0;
+    uintptr_t ra = GETPC();
+    /* Other vCPUs or threads see the stores in order with the rest. */
+    bool order = env_cpu(env)->tcg_cflags & CF_PARALLEL;
+
+    if (env->df != 1) {
+        return 0;
+    }
+    if (!movs) {
+        for (int i = 0; i < 8; i += size) {
+            pat |= (env->regs[R_EAX] & MAKE_64BIT_MASK(0, 8 * size)) << 8 * i;
+        }
+    }
+    if (order) {
+        /* The bulk stores come after the guest's earlier accesses. */
+        smp_mb();
+    }
+    while (count && done < REP_FAST_MAX) {
+        target_ulong rdi = env->regs[R_EDI] & amask;
+        target_ulong rsi = env->regs[R_ESI] & amask;
+        vaddr dst = rep_linear(rdi, amask, dst_base,
+                               env->segs[R_ES].base, code64);
+        vaddr src = rep_linear(rsi, amask, src_base,
+                               env->segs[src_seg].base, code64);
+        uint64_t n = count;
+        uint64_t bytes;
+        void *hd, *hs = NULL;
+
+        /* Within a page, without wrapping the register or the address. */
+        n = MIN(n, (TARGET_PAGE_SIZE - (dst & ~TARGET_PAGE_MASK)) / size);
+        n = MIN(n, (amask - rdi) / size + 1);
+        n = MIN(n, (REP_FAST_MAX - done) / size);
+        if (!code64) {
+            n = MIN(n, (UINT32_MAX - (uint32_t)dst) / size + 1);
+        }
+        if (movs) {
+            n = MIN(n, (TARGET_PAGE_SIZE - (src & ~TARGET_PAGE_MASK)) / size);
+            n = MIN(n, (amask - rsi) / size + 1);
+            if (!code64) {
+                n = MIN(n, (UINT32_MAX - (uint32_t)src) / size + 1);
+            }
+            /*
+             * A destination just above the source repeats what the copy
+             * wrote: copy at most the distance at a time, as x86's
+             * element by element copy does.
+             */
+            if (dst > src && dst - src < n * size) {
+                n = (dst - src) / size;
+            }
+        }
+        if (n == 0) {
+            break;
+        }
+        bytes = n * size;
+        hd = rep_host(env, dst, bytes, MMU_DATA_STORE, mmu_idx, ra);
+        if (movs) {
+            hs = rep_host(env, src, bytes, MMU_DATA_LOAD, mmu_idx, ra);
+        }
+        if (!hd || (movs && !hs)) {
+            break;
+        }
+        set_helper_retaddr(ra);
+        if (movs) {
+            memmove(hd, hs, bytes);
+        } else if (size == 1) {
+            memset(hd, (uint8_t)pat, bytes);
+        } else {
+            uint64_t i;
+
+            for (i = 0; i + 8 <= bytes; i += 8) {
+                memcpy(hd + i, &pat, 8);
+            }
+            memcpy(hd + i, &pat, bytes - i);
+        }
+        clear_helper_retaddr();
+        env->regs[R_EDI] = (env->regs[R_EDI] & ~amask) |
+                           ((rdi + bytes) & amask);
+        if (movs) {
+            env->regs[R_ESI] = (env->regs[R_ESI] & ~amask) |
+                               ((rsi + bytes) & amask);
+        }
+        count -= n;
+        env->regs[R_ECX] = (env->regs[R_ECX] & ~amask) | count;
+        done += bytes;
+    }
+    if (order) {
+        /* And before its later ones. */
+        smp_mb();
+    }
+    return done != 0;
+}
+
