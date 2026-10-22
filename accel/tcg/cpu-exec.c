@@ -37,6 +37,7 @@
 #include "exec/cputlb.h"
 #include "tcg/tcg.h"
 #include "tcg/startup.h"
+#include "qemu/plugin.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
 #include "exec/log.h"
@@ -52,7 +53,6 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "tcg/startup.h"
-#include "qemu/plugin.h"
 #if !defined(CONFIG_USER_ONLY)
 #include "accel/tcg/iommu.h"
 #endif
@@ -332,7 +332,6 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
         jc->ctx_cs_base = s.cs_base;
         jc->ctx_flags = s.flags;
         jc->ctx_cflags = s.cflags;
-        key = s.pc ^ qatomic_read(&jc->salt);
     }
 
     /*
@@ -789,6 +788,7 @@ void tcg_jc_layout_init(void)
     TCGJumpCacheLayout *l = &tcg_jc_layout;
 
     QEMU_BUILD_BUG_ON(sizeof(((CPUJumpCache *)0)->array[0]) != 16);
+    l->global = tcg_jc_global;
     l->jc_ofs = (int)offsetof(CPUState, tb_jmp_cache) -
                   (int)sizeof(CPUState);
     l->bp_ofs = (int)offsetof(CPUState, breakpoints.tqh_first) -
@@ -796,6 +796,7 @@ void tcg_jc_layout_init(void)
     l->cflags_ofs = (int)offsetof(CPUState, tcg_cflags) -
                   (int)sizeof(CPUState);
     l->salt_ofs = offsetof(CPUJumpCache, salt);
+    l->gsalt_ofs = offsetof(CPUJumpCache, gsalt);
     l->entry_tb_ofs = offsetof(CPUJumpCache, array[0].tb);
     l->entry_pc_ofs = offsetof(CPUJumpCache, array[0].pc);
     l->entry_shift = 4;

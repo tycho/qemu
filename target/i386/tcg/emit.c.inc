@@ -5495,8 +5495,12 @@ static void gen_POP(DisasContext *s, X86DecodedInsn *decode)
          * faults doesn't write it, and the stack pointer update after it
          * doesn't read it.  T0 is a copy for the writeback.
          */
+        bool old;
+
         gen_lea_ss_ofs(s, s->A0, cpu_regs[R_ESP], 0);
+        old = gen_stack_private(true);
         gen_op_ld_v(s, MO_TL, cpu_regs[op->n], s->A0);
+        gen_stack_private(old);
         tcg_gen_mov_tl(s->T0, cpu_regs[op->n]);
         gen_pop_update(s, MO_TL);
         return;
