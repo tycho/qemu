@@ -91,7 +91,7 @@ target_ulong helper_cc_compute_nz(target_ulong dst, target_ulong src1,
         op = cc_op_lazy_plain(op);
     }
     xtcg_stat_inc(XS_CC_NZ);
-    xtcg_hist_inc(XH_CC_NZ_OP, op);
+    xtcg_hist_inc(XH_CC_NZ_OP, op & 0xff);
     if (CC_OP_HAS_EFLAGS(op)) {
         return ~src1 & CC_Z;
     } else {
