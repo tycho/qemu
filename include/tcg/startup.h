@@ -232,6 +232,22 @@ void tcg_set_env_scratch(intptr_t ofs, intptr_t size);
  */
 extern bool tcg_region;
 
+/*
+ * With tcg_region, the profile samples (one per millisecond) after which a
+ * loop's blocks are translated as one multi-block region (0: never).
+ * User mode, and only for TBs that aren't PC-relative.
+ */
+extern unsigned tcg_superblock;
+
+/*
+ * The most blocks of a unit (0: none; with or without tcg_superblock's
+ * sampled loops): in user mode,
+ * a TB that isn't a sampled loop head is translated with the blocks its
+ * direct jumps reach, at or after its start on its page and the next,
+ * whether or not they have run.
+ */
+extern unsigned tcg_units;
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size

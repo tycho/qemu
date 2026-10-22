@@ -1638,6 +1638,22 @@ tb_page_addr_t get_page_addr_code_hostp(CPUArchState *env, vaddr addr,
     return qemu_ram_addr_from_host_nofail(p);
 }
 
+tb_page_addr_t get_page_addr_code_probe(CPUArchState *env, vaddr addr)
+{
+    CPUTLBEntryFull *full;
+    void *p;
+    int flags;
+
+    flags = probe_access_internal(env_cpu(env), addr, 1, MMU_INST_FETCH,
+                                  cpu_mmu_index(env_cpu(env), true), true,
+                                  &p, &full, 0, false);
+    if ((flags & TLB_INVALID_MASK) || p == NULL ||
+        full->lg_page_size < TARGET_PAGE_BITS) {
+        return -1;
+    }
+    return qemu_ram_addr_from_host_nofail(p);
+}
+
 /* Load/store with atomicity primitives. */
 #include "ldst_atomicity.c.inc"
 
