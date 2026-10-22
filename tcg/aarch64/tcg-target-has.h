@@ -18,6 +18,9 @@
 /* qemu_atomic, with FEAT_LSE (its constraint set says) */
 #define TCG_TARGET_HAS_QEMU_ATOMIC
 
+/* tcg_out_pinned_st_pairs, and the slow paths' shared copy of it */
+#define TCG_TARGET_HAS_PINNED_ST_PAIRS
+
 /*
  * MO_ACQ_REL guest accesses: LDAPR/STLR.  Unaligned ones rely on FEAT_LSE2
  * (they must not cross 16 bytes; the backend checks).
@@ -66,7 +69,26 @@
 #define TCG_TARGET_HAS_minmax_vec       1
 #define TCG_TARGET_HAS_bitsel_vec       1
 #define TCG_TARGET_HAS_cmpsel_vec       0
+#define TCG_TARGET_HAS_extract_vec      1
+#define TCG_TARGET_HAS_insert_vec       1
+#define TCG_TARGET_HAS_movz_vec         1
 #define TCG_TARGET_HAS_tst_vec          1
+#define TCG_TARGET_HAS_concat_vec       1
+#define TCG_TARGET_HAS_qemu_ldst_vec    1
+#define TCG_TARGET_HAS_perm_vec         1
+#define TCG_TARGET_HAS_tbl_vec          1
+#define TCG_TARGET_HAS_zip_vec          1
+#define TCG_TARGET_HAS_ext_vec          1
+#define TCG_TARGET_HAS_widen_vec        1
+#define TCG_TARGET_HAS_mulw_vec         1
+#define TCG_TARGET_HAS_addp_vec         1
+#define TCG_TARGET_HAS_dot4_vec         1
+#define TCG_TARGET_HAS_sha1_vec         1
+#define TCG_TARGET_HAS_aes_vec          1
+#define TCG_TARGET_HAS_narrow_vec       1
+#define TCG_TARGET_HAS_abd_vec          1
+#define TCG_TARGET_HAS_addlp_vec        1
+#define TCG_TARGET_HAS_avgr_vec         1
 
 #define TCG_TARGET_extract_valid(type, ofs, len)   1
 #define TCG_TARGET_sextract_valid(type, ofs, len)  1

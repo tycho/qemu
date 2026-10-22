@@ -234,6 +234,294 @@ void tcg_gen_dup_i64_vec(unsigned vece, TCGv_vec r, TCGv_i64 a)
     vec_gen_2(INDEX_op_dup_vec, type, vece, ri, ai);
 }
 
+void tcg_gen_concat_i64_vec(TCGv_vec r, TCGv_i64 lo, TCGv_i64 hi)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_assert_listed_vecop(INDEX_op_concat_i64_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_concat_i64_vec,
+                                         TCG_TYPE_V128, MO_64) > 0);
+    vec_gen_3(INDEX_op_concat_i64_vec, TCG_TYPE_V128, MO_64, temp_arg(rt),
+              tcgv_i64_arg(lo), tcgv_i64_arg(hi));
+}
+
+void tcg_gen_perm_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                      uint32_t pattern)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(vece >= MO_16 && vece <= MO_64);
+    tcg_assert_listed_vecop(INDEX_op_perm_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_perm_vec,
+                                         TCG_TYPE_V128, vece) > 0);
+    vec_gen_4(INDEX_op_perm_vec, TCG_TYPE_V128, vece, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b), pattern);
+}
+
+/*
+ * r = a table lookup in a by the bytes of b: byte i of r is byte b[i] of a,
+ * or 0 if b[i] is 16 or more (AArch64 TBL).  V128 only.
+ */
+void tcg_gen_tbl_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_assert_listed_vecop(INDEX_op_tbl_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_tbl_vec,
+                                         TCG_TYPE_V128, MO_8) > 0);
+    vec_gen_3(INDEX_op_tbl_vec, TCG_TYPE_V128, MO_8, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b));
+}
+
+void tcg_gen_zip_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                     bool high)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_assert_listed_vecop(INDEX_op_zip_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_zip_vec,
+                                         TCG_TYPE_V128, vece) > 0);
+    vec_gen_4(INDEX_op_zip_vec, TCG_TYPE_V128, vece, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b), high);
+}
+
+void tcg_gen_ext_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, unsigned n)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(n <= 15);
+    tcg_assert_listed_vecop(INDEX_op_ext_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_ext_vec,
+                                         TCG_TYPE_V128, MO_8) > 0);
+    vec_gen_4(INDEX_op_ext_vec, TCG_TYPE_V128, MO_8, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b), n);
+}
+
+void tcg_gen_widen_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                       bool is_signed, bool high)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(vece <= MO_32);
+    tcg_assert_listed_vecop(INDEX_op_widen_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_widen_vec,
+                                         TCG_TYPE_V128, vece) > 0);
+    vec_gen_3(INDEX_op_widen_vec, TCG_TYPE_V128, vece, temp_arg(rt),
+              tcgv_vec_arg(a), is_signed | high << 1);
+}
+
+void tcg_gen_mulw_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                      bool is_signed, bool high)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(vece <= MO_32);
+    tcg_assert_listed_vecop(INDEX_op_mulw_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_mulw_vec,
+                                         TCG_TYPE_V128, vece) > 0);
+    vec_gen_4(INDEX_op_mulw_vec, TCG_TYPE_V128, vece, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b), is_signed | high << 1);
+}
+
+void tcg_gen_addp_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_assert_listed_vecop(INDEX_op_addp_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_addp_vec,
+                                         TCG_TYPE_V128, vece) > 0);
+    vec_gen_3(INDEX_op_addp_vec, TCG_TYPE_V128, vece, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b));
+}
+
+static void do_dot4(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c,
+                    TCGOpcode opc)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(tcgv_vec_temp(a)->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(tcgv_vec_temp(b)->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(tcgv_vec_temp(c)->base_type == TCG_TYPE_V128);
+    tcg_assert_listed_vecop(opc);
+    tcg_debug_assert(tcg_can_emit_vec_op(opc, TCG_TYPE_V128, MO_32) > 0);
+    vec_gen_4(opc, TCG_TYPE_V128, MO_32, temp_arg(rt), tcgv_vec_arg(a),
+              tcgv_vec_arg(b), tcgv_vec_arg(c));
+}
+
+void tcg_gen_sdot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c)
+{
+    do_dot4(r, a, b, c, INDEX_op_sdot4_vec);
+}
+
+void tcg_gen_udot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c)
+{
+    do_dot4(r, a, b, c, INDEX_op_udot4_vec);
+}
+
+void tcg_gen_usdot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c)
+{
+    do_dot4(r, a, b, c, INDEX_op_usdot4_vec);
+}
+
+static void do_crypto(TCGOpcode opc, unsigned vece, int nargs, TCGv_vec r,
+                      TCGv_vec a, TCGv_vec b, TCGv_vec c)
+{
+    tcg_debug_assert(tcgv_vec_temp(r)->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(tcgv_vec_temp(a)->base_type == TCG_TYPE_V128);
+    tcg_assert_listed_vecop(opc);
+    tcg_debug_assert(tcg_can_emit_vec_op(opc, TCG_TYPE_V128, vece) > 0);
+    switch (nargs) {
+    case 1:
+        vec_gen_2(opc, TCG_TYPE_V128, vece, tcgv_vec_arg(r), tcgv_vec_arg(a));
+        break;
+    case 2:
+        vec_gen_3(opc, TCG_TYPE_V128, vece, tcgv_vec_arg(r), tcgv_vec_arg(a),
+                  tcgv_vec_arg(b));
+        break;
+    default:
+        vec_gen_4(opc, TCG_TYPE_V128, vece, tcgv_vec_arg(r), tcgv_vec_arg(a),
+                  tcgv_vec_arg(b), tcgv_vec_arg(c));
+        break;
+    }
+}
+
+void tcg_gen_sha1c_vec(TCGv_vec r, TCGv_vec a, TCGv_vec e, TCGv_vec w)
+{
+    do_crypto(INDEX_op_sha1c_vec, MO_32, 3, r, a, e, w);
+}
+
+void tcg_gen_sha1p_vec(TCGv_vec r, TCGv_vec a, TCGv_vec e, TCGv_vec w)
+{
+    do_crypto(INDEX_op_sha1p_vec, MO_32, 3, r, a, e, w);
+}
+
+void tcg_gen_sha1m_vec(TCGv_vec r, TCGv_vec a, TCGv_vec e, TCGv_vec w)
+{
+    do_crypto(INDEX_op_sha1m_vec, MO_32, 3, r, a, e, w);
+}
+
+void tcg_gen_aese_vec(TCGv_vec r, TCGv_vec a, TCGv_vec k)
+{
+    do_crypto(INDEX_op_aese_vec, MO_8, 2, r, a, k, NULL);
+}
+
+void tcg_gen_aesd_vec(TCGv_vec r, TCGv_vec a, TCGv_vec k)
+{
+    do_crypto(INDEX_op_aesd_vec, MO_8, 2, r, a, k, NULL);
+}
+
+void tcg_gen_aesmc_vec(TCGv_vec r, TCGv_vec a)
+{
+    do_crypto(INDEX_op_aesmc_vec, MO_8, 1, r, a, NULL, NULL);
+}
+
+void tcg_gen_aesimc_vec(TCGv_vec r, TCGv_vec a)
+{
+    do_crypto(INDEX_op_aesimc_vec, MO_8, 1, r, a, NULL, NULL);
+}
+
+void tcg_gen_narrow_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                        TCGNarrow kind, unsigned shift, bool round)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(vece <= MO_32);
+    tcg_debug_assert(shift <= 8 << vece);
+    tcg_debug_assert(!round || shift);
+    tcg_assert_listed_vecop(INDEX_op_narrow_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_narrow_vec,
+                                         TCG_TYPE_V128, vece) > 0);
+    vec_gen_4(INDEX_op_narrow_vec, TCG_TYPE_V128, vece, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b),
+              shift | kind << 8 | round << 12);
+}
+
+void tcg_gen_abd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                     bool is_signed)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(vece <= MO_32);
+    tcg_assert_listed_vecop(INDEX_op_abd_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_abd_vec,
+                                         TCG_TYPE_V128, vece) > 0);
+    vec_gen_4(INDEX_op_abd_vec, TCG_TYPE_V128, vece, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b), is_signed);
+}
+
+void tcg_gen_addlp_vec(unsigned vece, TCGv_vec r, TCGv_vec a, bool is_signed)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(vece <= MO_32);
+    tcg_assert_listed_vecop(INDEX_op_addlp_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_addlp_vec,
+                                         TCG_TYPE_V128, vece) > 0);
+    vec_gen_3(INDEX_op_addlp_vec, TCG_TYPE_V128, vece, temp_arg(rt),
+              tcgv_vec_arg(a), is_signed);
+}
+
+void tcg_gen_avgr_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(vece <= MO_32);
+    tcg_assert_listed_vecop(INDEX_op_avgr_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_avgr_vec,
+                                         TCG_TYPE_V128, vece) > 0);
+    vec_gen_3(INDEX_op_avgr_vec, TCG_TYPE_V128, vece, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b));
+}
+
+void tcg_gen_extract_vec_i64(unsigned vece, TCGv_i64 r, TCGv_vec a,
+                             unsigned idx)
+{
+    TCGTemp *at = tcgv_vec_temp(a);
+
+    tcg_debug_assert(idx < tcg_type_size(at->base_type) >> vece);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_extract_vec,
+                                         at->base_type, vece) > 0);
+    vec_gen_3(INDEX_op_extract_vec, at->base_type, vece, tcgv_i64_arg(r),
+              temp_arg(at), idx);
+}
+
+void tcg_gen_insert_vec_i64(unsigned vece, TCGv_vec r, TCGv_vec a,
+                            TCGv_i64 b, unsigned idx)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+    TCGTemp *at = tcgv_vec_temp(a);
+
+    tcg_debug_assert(at->base_type == rt->base_type);
+    tcg_debug_assert(idx < tcg_type_size(rt->base_type) >> vece);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_insert_vec,
+                                         rt->base_type, vece) > 0);
+    vec_gen_4(INDEX_op_insert_vec, rt->base_type, vece, temp_arg(rt),
+              temp_arg(at), tcgv_i64_arg(b), idx);
+}
+
+void tcg_gen_movz_vec_i64(unsigned vece, TCGv_vec r, TCGv_i64 b)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_movz_vec,
+                                         rt->base_type, vece) > 0);
+    vec_gen_2(INDEX_op_movz_vec, rt->base_type, vece, temp_arg(rt),
+              tcgv_i64_arg(b));
+}
+
 void tcg_gen_dup_i32_vec(unsigned vece, TCGv_vec r, TCGv_i32 a)
 {
     TCGArg ri = tcgv_vec_arg(r);

@@ -156,6 +156,11 @@ typedef struct DisasContext {
 
     sigjmp_buf jmpbuf;
     TCGOp *prev_insn_start;
+    /*
+     * tcg_vexzero: the ymm registers whose upper half a VEX.128 write left
+     * to be zeroed (gen_vexzero_flush), one bit per register.
+     */
+    uint16_t ymmh_pending;
     TCGOp *prev_insn_end;
 } DisasContext;
 
@@ -396,8 +401,41 @@ static void assume_cc_op(DisasContext *s, CCOp op)
     set_cc_op_1(s, op, false);
 }
 
+/*
+ * Zero the upper halves that VEX.128 writes left pending, where the state
+ * becomes visible: before helpers and exits (gen_update_cc_op), at the end
+ * of the block, and before an insn that uses the upper halves.
+ */
+static void gen_vexzero_flush(DisasContext *s)
+{
+    TCGv_vec zero = NULL;
+
+    if (!s->ymmh_pending) {
+        return;
+    }
+    /* One zero register for all the stores, where the host has vectors. */
+    if (tcg_op_supported(INDEX_op_mov_vec, TCG_TYPE_V128, 0)) {
+        zero = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_dupi_vec(MO_64, zero, 0);
+    }
+    for (int i = 0; s->ymmh_pending; ++i) {
+        int ofs = offsetof(CPUX86State, xmm_regs[i].ZMM_X(1));
+
+        if (!(s->ymmh_pending & (1u << i))) {
+            continue;
+        }
+        if (zero) {
+            tcg_gen_st_vec(zero, tcg_env, ofs);
+        } else {
+            tcg_gen_gvec_dup_imm(MO_64, ofs, 16, 16, 0);
+        }
+        s->ymmh_pending &= ~(1u << i);
+    }
+}
+
 static void gen_update_cc_op(DisasContext *s)
 {
+    gen_vexzero_flush(s);
     if (s->cc_op_dirty) {
         tcg_gen_movi_i32(cpu_cc_op, s->cc_op);
         s->cc_op_dirty = false;
@@ -2298,6 +2336,59 @@ static inline void gen_stq_env_A0(DisasContext *s, int offset)
 }
 
 /*
+ * Store a 128-bit value loaded from guest memory to CPU state.  With
+ * tcg_vecld, put it together in a host vector register and store it in one
+ * piece: a following vector load of the same bytes then finds one store
+ * to forward from (in the TB, TCG uses the register directly), where two
+ * 64-bit stores would make some hosts wait.
+ */
+static void gen_st_i128_env(TCGv_i128 t, int offset)
+{
+    if (tcg_vecld &&
+        tcg_can_emit_vec_op(INDEX_op_concat_i64_vec, TCG_TYPE_V128, MO_64)) {
+        TCGv_i64 lo = tcg_temp_new_i64();
+        TCGv_i64 hi = tcg_temp_new_i64();
+        TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_extr_i128_i64(lo, hi, t);
+        tcg_gen_concat_i64_vec(v, lo, hi);
+        tcg_gen_st_vec(v, tcg_env, offset);
+    } else {
+        tcg_gen_st_i128(t, tcg_env, offset);
+    }
+}
+
+/*
+ * With tcg_vecmem, a 128-bit guest access whose atomicity a host vector
+ * access can give goes straight between guest memory and a vector.
+ */
+static bool gen_ld_vec_env(DisasContext *s, TCGv addr, int offset, MemOp mop)
+{
+    TCGv_vec v;
+
+    if (!tcg_vecmem || !tcg_can_qemu_ldst_vec(mop)) {
+        return false;
+    }
+    v = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_qemu_ld_vec(v, addr, s->mem_index, mop);
+    tcg_gen_st_vec(v, tcg_env, offset);
+    return true;
+}
+
+static bool gen_st_vec_env(DisasContext *s, TCGv addr, int offset, MemOp mop)
+{
+    TCGv_vec v;
+
+    if (!tcg_vecmem || !tcg_can_qemu_ldst_vec(mop)) {
+        return false;
+    }
+    v = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(v, tcg_env, offset);
+    tcg_gen_qemu_st_vec(v, addr, s->mem_index, mop);
+    return true;
+}
+
+/*
  * The atomicity of a 16-byte vector access: with AVX, x86 makes an aligned
  * one atomic as a whole.  Under x-tso-vec=none, where vector accesses are
  * not ordered (tcg_tso_vec_none), only each 8-byte half is, so that the
@@ -2320,10 +2411,14 @@ static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align,
     MemOp atom = sse_atom(s, atomic_move);
     MemOp mop = MO_128 | MO_LE | atom | (align ? MO_ALIGN_16 : 0);
     int mem_index = s->mem_index;
-    TCGv_i128 t = tcg_temp_new_i128();
+    TCGv_i128 t;
 
+    if (gen_ld_vec_env(s, s->A0, offset, mop)) {
+        return;
+    }
+    t = tcg_temp_new_i128();
     tcg_gen_qemu_ld_i128(t, s->A0, mem_index, mop);
-    tcg_gen_st_i128(t, tcg_env, offset);
+    gen_st_i128_env(t, offset);
 }
 
 static inline void gen_sto_env_A0(DisasContext *s, int offset, bool align,
@@ -2332,8 +2427,12 @@ static inline void gen_sto_env_A0(DisasContext *s, int offset, bool align,
     MemOp atom = sse_atom(s, atomic_move);
     MemOp mop = MO_128 | MO_LE | atom | (align ? MO_ALIGN_16 : 0);
     int mem_index = s->mem_index;
-    TCGv_i128 t = tcg_temp_new_i128();
+    TCGv_i128 t;
 
+    if (gen_st_vec_env(s, s->A0, offset, mop)) {
+        return;
+    }
+    t = tcg_temp_new_i128();
     tcg_gen_ld_i128(t, tcg_env, offset);
     tcg_gen_qemu_st_i128(t, s->A0, mem_index, mop);
 }
@@ -2346,12 +2445,28 @@ static void gen_ldy_env_A0(DisasContext *s, int offset, bool align)
     TCGv_i128 t1 = tcg_temp_new_i128();
     TCGv a0_hi = tcg_temp_new();
 
+    if (tcg_vecmem && tcg_can_qemu_ldst_vec(mop)) {
+        TCGv_vec v0 = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec v1 = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        /*
+         * Both halves are loaded before either is stored, as below.  x86
+         * doesn't order the accesses that make up one instruction's
+         * access, so they are ordered against other accesses as one.
+         */
+        tcg_gen_addi_tl(a0_hi, s->A0, 16);
+        tcg_gen_qemu_ld_vec2(v0, s->A0, mop | (align ? MO_ALIGN_32 : 0),
+                             v1, a0_hi, mop, mem_index);
+        tcg_gen_st_vec(v0, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));
+        tcg_gen_st_vec(v1, tcg_env, offset + offsetof(YMMReg, YMM_X(1)));
+        return;
+    }
     tcg_gen_qemu_ld_i128(t0, s->A0, mem_index, mop | (align ? MO_ALIGN_32 : 0));
     tcg_gen_addi_tl(a0_hi, s->A0, 16);
     tcg_gen_qemu_ld_i128(t1, a0_hi, mem_index, mop);
 
-    tcg_gen_st_i128(t0, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));
-    tcg_gen_st_i128(t1, tcg_env, offset + offsetof(YMMReg, YMM_X(1)));
+    gen_st_i128_env(t0, offset + offsetof(YMMReg, YMM_X(0)));
+    gen_st_i128_env(t1, offset + offsetof(YMMReg, YMM_X(1)));
 }
 
 static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
@@ -2361,6 +2476,18 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
     TCGv_i128 t = tcg_temp_new_i128();
     TCGv a0_hi = tcg_temp_new();
 
+    if (tcg_vecmem && tcg_can_qemu_ldst_vec(mop)) {
+        TCGv_vec v0 = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec v1 = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        /* One access, as for gen_ldy_env_A0. */
+        tcg_gen_ld_vec(v0, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));
+        tcg_gen_ld_vec(v1, tcg_env, offset + offsetof(YMMReg, YMM_X(1)));
+        tcg_gen_addi_tl(a0_hi, s->A0, 16);
+        tcg_gen_qemu_st_vec2(v0, s->A0, mop | (align ? MO_ALIGN_32 : 0),
+                             v1, a0_hi, mop, mem_index);
+        return;
+    }
     tcg_gen_ld_i128(t, tcg_env, offset + offsetof(YMMReg, YMM_X(0)));
     tcg_gen_qemu_st_i128(t, s->A0, mem_index, mop | (align ? MO_ALIGN_32 : 0));
     tcg_gen_addi_tl(a0_hi, s->A0, 16);
@@ -3714,6 +3841,7 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
 
     dc->cc_op = CC_OP_DYNAMIC;
     dc->cc_op_dirty = false;
+    dc->ymmh_pending = 0;
     /* select memory access functions */
     dc->mem_index = cpu_mmu_index(cpu, false);
     dc->cpuid_features = env->features[FEAT_1_EDX];
@@ -3767,7 +3895,8 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     if (tb_cflags(dcbase->tb) & CF_PCREL) {
         pc_arg &= ~TARGET_PAGE_MASK;
     }
-    tcg_gen_insn_start(pc_arg, dc->cc_op, 0);
+    tcg_gen_insn_start(pc_arg, dc->cc_op,
+                       (uint64_t)dc->ymmh_pending << X86_INSN_YMMH_SHIFT);
 }
 
 static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
@@ -3776,6 +3905,7 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     bool orig_cc_op_dirty = dc->cc_op_dirty;
     CCOp orig_cc_op = dc->cc_op;
     target_ulong orig_pc_save = dc->pc_save;
+    uint16_t orig_ymmh_pending = dc->ymmh_pending;
 
 #ifdef TARGET_VSYSCALL_PAGE
     /*
@@ -3801,6 +3931,7 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         assert(dc->cc_op_dirty == orig_cc_op_dirty);
         assert(dc->cc_op == orig_cc_op);
         assert(dc->pc_save == orig_pc_save);
+        dc->ymmh_pending = orig_ymmh_pending;
         dc->base.num_insns--;
         tcg_remove_ops_after(dc->prev_insn_end);
         dc->base.insn_start = dc->prev_insn_start;
@@ -3834,6 +3965,11 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
+
+    if (dc->base.is_jmp != DISAS_NORETURN) {
+        gen_vexzero_flush(dc);
+    }
+    assert(!dc->ymmh_pending);
 
     switch (dc->base.is_jmp) {
     case DISAS_NORETURN:
