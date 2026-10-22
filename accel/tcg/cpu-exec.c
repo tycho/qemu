@@ -445,6 +445,48 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
 const void *HELPER(lookup_tb_ptr_jc)(CPUArchState *env, uint64_t pc,
                                      uint64_t cs_base, uint32_t flags)
 {
+    const void *ptr = HELPER(lookup_tb_ptr_jcp)(env, pc, cs_base, flags);
+
+    return ptr ? ptr : HELPER(lookup_tb_ptr)(env);
+}
+
+/* x-xpage=stub: the jump cache's layout for the backend's probe. */
+void tcg_jc_layout_init(void)
+{
+#ifndef CONFIG_USER_ONLY
+    TCGJumpCacheLayout *l = &tcg_jc_layout;
+
+    QEMU_BUILD_BUG_ON(sizeof(((CPUJumpCache *)0)->array[0]) != 16);
+    l->jc_ofs = (int)offsetof(CPUState, tb_jmp_cache) -
+                  (int)sizeof(CPUState);
+    l->bp_ofs = (int)offsetof(CPUState, breakpoints.tqh_first) -
+                  (int)sizeof(CPUState);
+    l->cflags_ofs = (int)offsetof(CPUState, tcg_cflags) -
+                  (int)sizeof(CPUState);
+    l->salt_ofs = offsetof(CPUJumpCache, salt);
+    l->entry_tb_ofs = offsetof(CPUJumpCache, array[0].tb);
+    l->entry_pc_ofs = offsetof(CPUJumpCache, array[0].pc);
+    l->entry_shift = 4;
+    l->hash_shift = TARGET_PAGE_BITS - TB_JMP_PAGE_BITS;
+    l->page_bits = TB_JMP_PAGE_BITS;
+    l->cache_bits = TB_JMP_CACHE_BITS;
+    l->tb_cs_base_ofs = offsetof(TranslationBlock, cs_base);
+    l->tb_flags_ofs = offsetof(TranslationBlock, flags);
+    l->tb_cflags_ofs = offsetof(TranslationBlock, cflags);
+    l->tb_ptr_ofs = offsetof(TranslationBlock, tc.ptr);
+    l->valid = true;
+#endif
+}
+
+/*
+ * The jump-cache probe of helper_lookup_tb_ptr_jc alone: NULL on a miss.
+ * It reads no guest state and can't fault or leave (no page walk, no
+ * breakpoint exit), so the caller needn't store the guest's globals for
+ * it; the caller looks up a miss with helper_lookup_tb_ptr, which may.
+ */
+const void *HELPER(lookup_tb_ptr_jcp)(CPUArchState *env, uint64_t pc,
+                                      uint64_t cs_base, uint32_t flags)
+{
     CPUState *cpu = env_cpu(env);
     CPUJumpCache *jc = cpu->tb_jmp_cache;
     uint32_t hash = tb_jmp_cache_hash_func(pc);
@@ -458,7 +500,7 @@ const void *HELPER(lookup_tb_ptr_jc)(CPUArchState *env, uint64_t pc,
                tb_cflags(tb) == cpu->tcg_cflags)) {
         return tb->tc.ptr;
     }
-    return HELPER(lookup_tb_ptr)(env);
+    return NULL;
 }
 
 /* Return the current PC from CPU, which may be cached in TB. */

@@ -114,4 +114,30 @@ uintptr_t tcg_retstack_fault(CPUState *cpu, uintptr_t addr);
  */
 extern bool tcg_tb_flags_canon;
 
+/*
+ * x-xpage=stub: the layout of the vCPU's jump cache, which the backend's
+ * shared jump-cache probe (tcg_xpage_stub) reads; filled in by the
+ * accelerator before the prologue is generated.  Offsets marked env are
+ * relative to the env pointer.
+ */
+typedef struct TCGJumpCacheLayout {
+    bool valid;
+    bool global;            /* tcg_jc_global: also match gsalt */
+    int jc_ofs;             /* env: CPUState.tb_jmp_cache */
+    int bp_ofs;             /* env: CPUState.breakpoints.tqh_first */
+    int cflags_ofs;         /* env: CPUState.tcg_cflags */
+    int salt_ofs, gsalt_ofs;
+    int entry_tb_ofs, entry_pc_ofs, entry_shift;
+    int hash_shift, page_bits, cache_bits;
+    int tb_cs_base_ofs, tb_flags_ofs, tb_cflags_ofs, tb_ptr_ofs;
+} TCGJumpCacheLayout;
+
+extern TCGJumpCacheLayout tcg_jc_layout;
+
+/*
+ * The backend's shared jump-cache probe, called as
+ * helper_lookup_tb_ptr_jcp (env, pc, cs_base, flags) is, or NULL.
+ */
+extern const void *tcg_xpage_stub;
+
 #endif

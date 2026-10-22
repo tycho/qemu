@@ -27,6 +27,20 @@ extern bool one_insn_per_tb;
 extern bool tcg_ijmp_inline;
 
 /*
+ * tcg_xpage: with tcg_ijmp_inline, how a direct jump to another page
+ * probes the jump cache: in a short helper call that also looks up a miss
+ * (TCG_XPAGE_CALL), or in a call to the backend's shared generated probe
+ * (tcg_xpage_stub; else the same probe in C), which reads no guest state,
+ * followed on a miss by the full lookup (TCG_XPAGE_STUB).
+ */
+typedef enum {
+    TCG_XPAGE_CALL,
+    TCG_XPAGE_STUB,
+} TCGXPage;
+extern TCGXPage tcg_xpage;
+void tcg_jc_layout_init(void);
+
+/*
  * tcg_jcgen: flushing a vCPU's jump cache moves its salt on (O(1))
  * instead of clearing every entry (see CPUJumpCache); set from the
  * target's TCGCPUOps.jmp_cache_salt.
