@@ -3443,6 +3443,7 @@ void tcg_optimize(TCGContext *s)
             break;
         case INDEX_op_qemu_atomic:
             /* The old value, zero-extended from the access size. */
+            fold_addr_low32(&ctx, op, 3);
             done = fold_qemu_ld_1reg(&ctx, op);
             break;
         case INDEX_op_rems:
