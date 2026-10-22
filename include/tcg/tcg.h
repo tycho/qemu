@@ -342,6 +342,8 @@ typedef struct TCGTemp {
      * 0: a global in a host register at every TB boundary.
      */
     unsigned int boundary:2;
+    /* 1 + its index in TCGContext.chain_dead, or 0 (tcg_chain_dead_add). */
+    unsigned int chain_dead:4;
 
     int64_t val;
     struct TCGTemp *mem_base;
@@ -538,6 +540,10 @@ struct TCGContext {
     /* tcg_gen_push_ret() for a call that leaves through goto_ptr. */
     TCGLabel *call_ret, *call_land;
     bool call_ret_set;
+    /* The chain-dead globals (tcg_chain_dead_add); used by this TB. */
+    TCGTemp *chain_dead[8];
+    int nb_chain_dead;
+    bool chain_dead_used;
 
 #ifdef CONFIG_PLUGIN
     /*

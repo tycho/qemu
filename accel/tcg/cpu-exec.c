@@ -1126,6 +1126,10 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             /* See if we can patch the calling TB. */
             if (last_tb) {
                 tb_add_jump(last_tb, tb_exit, tb);
+                /* Its goto_tb_dead too, if tb writes them first. */
+                if (last_tb->jmp_dead[tb_exit] && tb->chain_dead_in) {
+                    tb_add_jump(last_tb, last_tb->jmp_dead[tb_exit] - 1, tb);
+                }
             }
 
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);

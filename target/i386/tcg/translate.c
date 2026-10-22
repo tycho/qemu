@@ -81,7 +81,7 @@
 //#define MACRO_TEST   1
 
 /* global register indexes */
-static TCGv cpu_cc_dst, cpu_cc_src, cpu_cc_src2;
+static TCGv cpu_cc_dst, cpu_cc_src, cpu_cc_src2, cpu_cc_dst2;
 static TCGv cpu_eip;
 static TCGv_i32 cpu_cc_op;
 static TCGv cpu_regs[CPU_NB_EREGS];
@@ -141,6 +141,14 @@ typedef struct DisasContext {
     bool rs_call;
     bool rs_ret;
     target_ulong rs_next;
+    /*
+     * tcg_flags_dead: the last op before the first insn; whether CC_OP
+     * has left the TB's entry state, and whether nothing read that state
+     * before (the TB is chain_dead_in).
+     */
+    TCGOp *cc_entry_op;
+    bool cc_entry_done;
+    bool cc_entry_dead;
     bool cc_op_dirty;
     /*
      * The insn stores to memory after its flags consumers run (its
@@ -150,6 +158,12 @@ typedef struct DisasContext {
     bool cc_keep;
 
     CCOp cc_op;  /* current CC operation */
+    /*
+     * With tcg_flags_guess, the CC operation the block was entered with
+     * when it was translated, while cc_op is still that dynamic state;
+     * else CC_OP_DYNAMIC.
+     */
+    CCOp cc_op_guess;
     int mem_index; /* select memory access functions */
     uint32_t flags; /* all execution flags */
     int cpuid_features;
@@ -335,6 +349,7 @@ enum {
     USES_CC_SRC  = 2,
     USES_CC_SRC2 = 4,
     USES_CC_SRCT = 8,
+    USES_CC_DST2 = 16,
 };
 
 /* Bit set if the global variable is live after setting CC_OP to X.  */
@@ -359,7 +374,15 @@ static const uint8_t cc_op_live_[] = {
     [CC_OP_ADCOX] = USES_CC_DST | USES_CC_SRC | USES_CC_SRC2,
     [CC_OP_POPCNT] = USES_CC_DST,
     [CC_OP_SBB_SELF] = USES_CC_DST,
+    [CC_OP_INCLB ... CC_OP_DECLQ] =
+        USES_CC_DST | USES_CC_SRC | USES_CC_SRC2 | USES_CC_DST2,
 };
+
+/* A lazy INC/DEC: CC_OP holds the earlier operation too (cpu.h). */
+static bool cc_op_lazy(CCOp op)
+{
+    return op >= CC_OP_INCLB && op <= CC_OP_DECLQ;
+}
 
 static uint8_t cc_op_live(CCOp op)
 {
@@ -373,12 +396,32 @@ static uint8_t cc_op_live(CCOp op)
      */
     result = cc_op_live_[op];
     assert(result);
+    if (op == CC_OP_DYNAMIC && tcg_lazy_incdec) {
+        result |= USES_CC_DST2;
+    }
     return result;
+}
+
+/* x-flags=dead: in user mode, and not with RF or single-stepping. */
+static bool use_flags_dead(DisasContext *s)
+{
+#ifdef CONFIG_USER_ONLY
+    return tcg_flags_dead && s->jmp_opt;
+#else
+    return false;
+#endif
 }
 
 static void set_cc_op_1(DisasContext *s, CCOp op, bool dirty)
 {
     int dead;
+
+    if (!s->cc_entry_done && s->cc_op == CC_OP_DYNAMIC &&
+        op != CC_OP_DYNAMIC) {
+        s->cc_entry_done = true;
+        s->cc_entry_dead = use_flags_dead(s) && !cc_op_lazy(op) &&
+                           !tcg_chain_dead_read_since(s->cc_entry_op);
+    }
 
     if (s->cc_op == op) {
         return;
@@ -398,12 +441,18 @@ static void set_cc_op_1(DisasContext *s, CCOp op, bool dirty)
     if (dead & USES_CC_SRCT) {
         s->cc_srcT = NULL;
     }
+    if (dead & USES_CC_DST2) {
+        tcg_gen_discard_tl(cpu_cc_dst2);
+    }
 
+    /* A lazy INC/DEC's CC_OP is only ever set at run time. */
+    assert(!dirty || !cc_op_lazy(op));
     if (dirty && s->cc_op == CC_OP_DYNAMIC) {
         tcg_gen_discard_i32(cpu_cc_op);
     }
     s->cc_op_dirty = dirty;
     s->cc_op = op;
+    s->cc_op_guess = CC_OP_DYNAMIC;
 }
 
 static void set_cc_op(DisasContext *s, CCOp op)
@@ -899,7 +948,7 @@ static void gen_mov_eflags(DisasContext *s, TCGv reg)
     src2 = cpu_cc_src2;
 
     /* Take care to not read values that are not live.  */
-    live = cc_op_live(s->cc_op) & ~USES_CC_SRCT;
+    live = cc_op_live(s->cc_op) & ~(USES_CC_SRCT | USES_CC_DST2);
     dead = live ^ (USES_CC_DST | USES_CC_SRC | USES_CC_SRC2);
     if (dead) {
         TCGv zero = tcg_constant_tl(0);
@@ -914,6 +963,12 @@ static void gen_mov_eflags(DisasContext *s, TCGv reg)
         }
     }
 
+    if (cc_op_lazy(s->cc_op) ||
+        (s->cc_op == CC_OP_DYNAMIC && tcg_lazy_incdec)) {
+        gen_helper_cc_compute_all2(reg, dst, src1, src2, cpu_cc_dst2,
+                                   cpu_cc_op);
+        return;
+    }
     if (s->cc_op != CC_OP_DYNAMIC) {
         cc_op = tcg_constant_i32(s->cc_op);
     } else {
@@ -986,6 +1041,103 @@ static CCPrepare gen_prepare_val_nz(TCGv src, MemOp size, bool eqz)
 }
 
 /* compute eflags.C, trying to store it in reg if not NULL */
+/* CF from the CC_OP in env, through the helper. */
+static void gen_compute_c_helper(TCGv reg)
+{
+    if (tcg_lazy_incdec) {
+        gen_helper_cc_compute_c2(reg, cpu_cc_dst, cpu_cc_src, cpu_cc_src2,
+                                 cpu_cc_dst2, cpu_cc_op);
+    } else {
+        gen_helper_cc_compute_c(reg, cpu_cc_dst, cpu_cc_src, cpu_cc_src2,
+                                cpu_cc_op);
+    }
+}
+
+/*
+ * CF from a dynamic CC operation, inline for the one the block was entered
+ * with when it was translated (s->cc_op_guess), and through the helper for
+ * any other.  Only operations whose CF is a simple function of CC_DST and
+ * CC_SRC are guessed; returns false, with nothing emitted, for the others.
+ */
+static bool gen_compute_c_guess(DisasContext *s, TCGv reg)
+{
+    CCOp op = s->cc_op_guess;
+    TCGLabel *slow, *done;
+    TCGv t;
+    MemOp size;
+
+    switch (op) {
+    case CC_OP_LOGICB ... CC_OP_LOGICQ:
+    case CC_OP_POPCNT:
+    case CC_OP_EFLAGS:
+    case CC_OP_SARB ... CC_OP_SARQ:
+    case CC_OP_ADDB ... CC_OP_ADDQ:
+    case CC_OP_SUBB ... CC_OP_SUBQ:
+    case CC_OP_INCB ... CC_OP_INCQ:
+    case CC_OP_DECB ... CC_OP_DECQ:
+    case CC_OP_SHLB ... CC_OP_SHLQ:
+    case CC_OP_MULB ... CC_OP_MULQ:
+    case CC_OP_SBB_SELF:
+    case CC_OP_ADCX:
+    case CC_OP_ADCOX:
+        break;
+    default:
+        return false;
+    }
+
+    slow = gen_new_label();
+    done = gen_new_label();
+    tcg_gen_brcondi_i32(TCG_COND_NE, cpu_cc_op, op, slow);
+    switch (op) {
+    case CC_OP_LOGICB ... CC_OP_LOGICQ:
+    case CC_OP_POPCNT:
+        tcg_gen_movi_tl(reg, 0);
+        break;
+    case CC_OP_EFLAGS:
+    case CC_OP_SARB ... CC_OP_SARQ:
+        tcg_gen_andi_tl(reg, cpu_cc_src, CC_C);
+        break;
+    case CC_OP_ADDB ... CC_OP_ADDQ:
+        /* (DATA_TYPE)CC_DST < (DATA_TYPE)CC_SRC */
+        size = cc_op_size(op);
+        t = tcg_temp_new();
+        tcg_gen_ext_tl(reg, cpu_cc_dst, size);
+        tcg_gen_ext_tl(t, cpu_cc_src, size);
+        tcg_gen_setcond_tl(TCG_COND_LTU, reg, reg, t);
+        break;
+    case CC_OP_SUBB ... CC_OP_SUBQ:
+        /* (DATA_TYPE)(CC_DST + CC_SRC) < (DATA_TYPE)CC_SRC */
+        size = cc_op_size(op);
+        t = tcg_temp_new();
+        tcg_gen_add_tl(reg, cpu_cc_dst, cpu_cc_src);
+        tcg_gen_ext_tl(reg, reg, size);
+        tcg_gen_ext_tl(t, cpu_cc_src, size);
+        tcg_gen_setcond_tl(TCG_COND_LTU, reg, reg, t);
+        break;
+    case CC_OP_INCB ... CC_OP_INCQ:
+    case CC_OP_DECB ... CC_OP_DECQ:
+        tcg_gen_mov_tl(reg, cpu_cc_src);
+        break;
+    case CC_OP_SHLB ... CC_OP_SHLQ:
+        tcg_gen_extract_tl(reg, cpu_cc_src, (8 << cc_op_size(op)) - 1, 1);
+        break;
+    case CC_OP_MULB ... CC_OP_MULQ:
+        tcg_gen_setcondi_tl(TCG_COND_NE, reg, cpu_cc_src, 0);
+        break;
+    case CC_OP_SBB_SELF:
+        tcg_gen_andi_tl(reg, cpu_cc_dst, 1);
+        break;
+    default: /* CC_OP_ADCX, CC_OP_ADCOX */
+        tcg_gen_mov_tl(reg, cpu_cc_dst);
+        break;
+    }
+    tcg_gen_br(done);
+    gen_set_label(slow);
+    gen_compute_c_helper(reg);
+    gen_set_label(done);
+    return true;
+}
+
 static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
 {
     MemOp size;
@@ -1050,16 +1202,19 @@ static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
                              .reg = cpu_cc_src, .imm = CC_C };
 
     default:
-       /* The need to compute only C from CC_OP_DYNAMIC is important
-          in efficiently implementing e.g. INC at the start of a TB.  */
-       gen_update_cc_op(s);
-       if (!reg) {
-           reg = tcg_temp_new();
-       }
-       gen_helper_cc_compute_c(reg, cpu_cc_dst, cpu_cc_src,
-                               cpu_cc_src2, cpu_cc_op);
-       return (CCPrepare) { .cond = TCG_COND_NE, .reg = reg,
-                            .rhs_type = CC_PREPARE_DIRECT };
+        /*
+         * The need to compute only C from CC_OP_DYNAMIC is important
+         * in efficiently implementing e.g. INC at the start of a TB.
+         */
+        gen_update_cc_op(s);
+        if (!reg) {
+            reg = tcg_temp_new();
+        }
+        if (s->cc_op != CC_OP_DYNAMIC || !gen_compute_c_guess(s, reg)) {
+            gen_compute_c_helper(reg);
+        }
+        return (CCPrepare) { .cond = TCG_COND_NE, .reg = reg,
+                             .rhs_type = CC_PREPARE_DIRECT };
     }
 }
 
@@ -2513,6 +2668,16 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
         /* jump to same page: we can use a direct jump */
         TCGLabel *req = translator_edge_check(&s->base, new_pc);
 
+        int dslot = tb_num + 4;
+
+        /*
+         * x-flags=dead: first a jump that the main loop links only to a
+         * TB that overwrites the condition codes, before they are stored;
+         * in TBs with slots to spare.
+         */
+        if (use_flags_dead(s) && dslot <= TB_EXIT_IDXMAX) {
+            tcg_gen_goto_tb_dead(dslot, tb_num);
+        }
         tcg_gen_goto_tb(tb_num);
         if (req) {
             gen_set_label(req);
@@ -4093,11 +4258,18 @@ void tcg_x86_init(void)
                                     "cc_src");
     cpu_cc_src2 = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, cc_src2),
                                      "cc_src2");
+    cpu_cc_dst2 = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, cc_dst2),
+                                     "cc_dst2");
     cpu_eip = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, eip), eip_name);
     tcg_retsp_off = offsetof(CPUX86State, retsp);
 #ifdef TARGET_X86_64
     tcg_retstack_addr64 = true;
 #endif
+    tcg_chain_dead_add(tcgv_i32_temp(cpu_cc_op));
+    tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_dst));
+    tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_src));
+    tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_src2));
+    tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_dst2));
 
     for (i = 0; i < CPU_NB_EREGS; ++i) {
         cpu_regs[i] = tcg_global_mem_new(tcg_env,
@@ -4257,6 +4429,8 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
 
     dc->cc_op = CC_OP_DYNAMIC;
     dc->cc_op_dirty = false;
+    /* The block is translated when it is first entered. */
+    dc->cc_op_guess = tcg_flags_guess ? env->cc_op : CC_OP_DYNAMIC;
     dc->ymmh_pending = 0;
     /* select memory access functions */
     dc->mem_index = cpu_mmu_index(cpu, false);
@@ -4298,6 +4472,8 @@ static void i386_tr_tb_start(DisasContextBase *db, CPUState *cpu)
         dc->fp_entry_and = tcg_last_op();
         tcg_gen_brcondi_i32(TCG_COND_NE, t, 0, dc->fp_entry_label);
     }
+    dc->cc_entry_op = tcg_last_op();
+    dc->cc_entry_done = dc->cc_entry_dead = false;
 }
 
 static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
@@ -4313,7 +4489,9 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     if (tb_cflags(dcbase->tb) & CF_PCREL) {
         pc_arg &= ~TARGET_PAGE_MASK;
     }
-    tcg_gen_insn_start(pc_arg, dc->cc_op,
+    /* A lazy INC/DEC's CC_OP is already in env, set at run time. */
+    tcg_gen_insn_start(pc_arg,
+                       cc_op_lazy(dc->cc_op) ? CC_OP_DYNAMIC : dc->cc_op,
                        (uint64_t)dc->ymmh_pending << X86_INSN_YMMH_SHIFT);
 }
 
@@ -4386,6 +4564,8 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
+
+    dc->base.tb->chain_dead_in = dc->cc_entry_done && dc->cc_entry_dead;
 
     if (dc->base.is_jmp != DISAS_NORETURN) {
         gen_vexzero_flush(dc);
