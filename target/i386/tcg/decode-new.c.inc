@@ -3223,12 +3223,13 @@ static bool validate_cr0_exceptions(DisasContext *s, X86DecodedInsn *decode)
         break;
     }
 
-    if (s->flags & HF_TS_MASK) {
-        gen_NM_exception(s);
+    /* EM comes first, and does not apply to VEX instructions. */
+    if (!(s->prefix & PREFIX_VEX) && (s->flags & HF_EM_MASK)) {
+        gen_illegal_opcode(s);
         return false;
     }
-    if (s->flags & HF_EM_MASK) {
-        gen_illegal_opcode(s);
+    if (s->flags & HF_TS_MASK) {
+        gen_NM_exception(s);
         return false;
     }
     return true;
