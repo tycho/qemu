@@ -1861,17 +1861,6 @@ static void tcg_out_extrl_i64_i32(TCGContext *s, TCGReg rd, TCGReg rn)
     tcg_out_mov(s, TCG_TYPE_I32, rd, rn);
 }
 
-/*
- * ISB rather than YIELD: on current Apple cores YIELD costs no more than
- * a NOP, while ISB holds the core for some tens of cycles, as x86 PAUSE
- * does.
- */
-#define TCG_TARGET_HAS_SPIN_HINT
-static void tcg_out_spin_hint(TCGContext *s)
-{
-    tcg_out32(s, 0xd5033fdf); /* isb */
-}
-
 #define TCG_TARGET_HAS_host_counter
 static void tgen_host_counter(TCGContext *s, TCGReg a0, bool ordered)
 {
@@ -1885,6 +1874,17 @@ static const TCGOutOpHostCounter outop_host_counter = {
     .base.static_constraint = C_O1_I0(r),
     .out_r = tgen_host_counter,
 };
+
+/*
+ * ISB rather than YIELD: on current Apple cores YIELD costs no more than
+ * a NOP, while ISB holds the core for some tens of cycles, as x86 PAUSE
+ * does.
+ */
+#define TCG_TARGET_HAS_SPIN_HINT
+static void tcg_out_spin_hint(TCGContext *s)
+{
+    tcg_out32(s, 0xd5033fdf); /* isb */
+}
 
 static void tcg_out_mb(TCGContext *s, unsigned a0)
 {
@@ -1918,38 +1918,6 @@ static void tcg_out_qemu_st_direct(TCGContext *s, MemOp memop,
 static const TCGLdstHelperParam ldst_helper_param = {
     .ntmp = 1, .tmp = { TCG_REG_TMP0 }
 };
-
-/*
- * The out-of-line path of an MO_ACQ_REL access that crosses a 16-byte
- * boundary (see tcg_out_acqrel_check), and in system mode also of its
- * TLB miss (see prepare_host_addr): call helper_tso_cross_ld/st, which
- * perform the access and, if it crosses, count the crossing and have the
- * insn promoted (retranslated with MO_ACQ_REL_CROSS, whose code has no
- * check).
- *
- * The access goes through a helper rather than out-of-line code because
- * a fault must be unwound to its guest insn, which works from the
- * helper's return address (in the insn's code) but not from a host pc
- * out here.
- */
-static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
-{
-    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
-        return false;
-    }
-    if (lb->is_ld) {
-        tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
-        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X4, lb->site);
-        tcg_out_call_int(s, (const void *)helper_tso_cross_ld);
-        tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
-    } else {
-        tcg_out_st_helper_args(s, lb, &ldst_helper_param);
-        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X5, lb->site);
-        tcg_out_call_int(s, (const void *)helper_tso_cross_st);
-    }
-    tcg_out_goto(s, lb->raddr);
-    return true;
-}
 
 /*
  * Around a guest access slow path's helper call: save @regs below SP, or
@@ -2135,7 +2103,7 @@ static TCGRegSet ldst_outputs(TCGLabelQemuLdst *lb)
 {
     TCGRegSet set = 0;
 
-    if (lb->is_ld) {
+    if (lb->is_ld || lb->atomic) {
         tcg_regset_set_reg(set, lb->datalo_reg);
         if (lb->type == TCG_TYPE_I128) {
             tcg_regset_set_reg(set, lb->datahi_reg);
@@ -2166,6 +2134,43 @@ static bool tcg_out_ldst_slow_entry(TCGContext *s, TCGLabelQemuLdst *lb)
 
     return lb->veneer ? reloc_pc26(lb->label_ptr[0], target)
                       : reloc_pc19(lb->label_ptr[0], target);
+}
+
+/*
+ * The out-of-line path of an MO_ACQ_REL access that crosses a 16-byte
+ * boundary (see tcg_out_acqrel_check), and in system mode also of its
+ * TLB miss (see prepare_host_addr): call helper_tso_cross_ld/st, which
+ * perform the access and, if it crosses, count the crossing and have the
+ * insn promoted (retranslated with MO_ACQ_REL_CROSS, whose code has no
+ * check).
+ *
+ * The access goes through a helper rather than out-of-line code because
+ * a fault must be unwound to its guest insn, which works from the
+ * helper's return address (in the insn's code) but not from a host pc
+ * out here.
+ */
+static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
+        return false;
+    }
+    tcg_out_ldst_writeback(s, lb);
+    tcg_out_ldst_save(s, lb->save_regs, false, 0);
+    if (lb->is_ld) {
+        tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
+        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X4, lb->site);
+        tcg_out_call_int(s, (const void *)helper_tso_cross_ld);
+        tcg_out_pinned_clobbered(s, false, 0);
+        tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
+    } else {
+        tcg_out_st_helper_args(s, lb, &ldst_helper_param);
+        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X5, lb->site);
+        tcg_out_call_int(s, (const void *)helper_tso_cross_st);
+        tcg_out_pinned_clobbered(s, false, 0);
+    }
+    tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
+    tcg_out_goto(s, lb->raddr);
+    return true;
 }
 
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
@@ -2700,13 +2705,19 @@ static TCGLabelQemuLdst *prepare_atomic_addr(TCGContext *s, TCGReg *host,
 
     if (tcg_use_softmmu) {
         unsigned mem_index = get_mmuidx(oi);
+        TCGReg mask = TCG_REG_TMP0, table = TCG_REG_TMP1;
 
-        tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP1,
-                     TCG_AREG0, tlb_mask_table_ofs(s, mem_index), 1, 0);
+        if (s->tlb_pin_ofs && mem_index == s->tlb_pin_idx) {
+            mask = TCG_REG_TLB_MASK;
+            table = TCG_REG_TLB_TABLE;
+        } else {
+            tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP1,
+                         TCG_AREG0, tlb_mask_table_ofs(s, mem_index), 1, 0);
+        }
         tcg_out_insn(s, addsub_realshift, AND_LSR, addr_type,
-                     TCG_REG_TMP0, TCG_REG_TMP0, addr_reg,
+                     TCG_REG_TMP0, mask, addr_reg,
                      TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
-        tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP1, TCG_REG_TMP1,
+        tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP1, table,
                      TCG_REG_TMP0);
 
         /* The read and write comparators into TMP0 and TMP2. */
@@ -2838,20 +2849,23 @@ static bool tcg_out_qemu_atomic_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     const void *fn;
 
-    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
         return false;
     }
+    tcg_out_ldst_writeback(s, lb);
+    tcg_out_ldst_save(s, lb->save_regs, false, 0);
     fn = tcg_out_atomic_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, fn);
+    tcg_out_pinned_clobbered(s, false, 0);
     if ((get_memop(lb->oi) & MO_SIZE) <= MO_32) {
         tcg_out_ext32u(s, lb->datalo_reg, TCG_REG_X0);
     } else {
         tcg_out_mov(s, TCG_TYPE_I64, lb->datalo_reg, TCG_REG_X0);
     }
+    tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
     tcg_out_goto(s, lb->raddr);
     return true;
 }
-
 
 /*
  * A 128-bit guest access into or from a vector register: the fast path is
@@ -5968,6 +5982,17 @@ QEMU_BUILD_BUG_ON(FRAME_SIZE >= (1 << 14));
 /* We're expecting to use a single ADDI insn.  */
 QEMU_BUILD_BUG_ON(FRAME_SIZE - PUSH_SIZE > 0xfff);
 
+/* STP or LDP (SIMD&FP, 64-bit, signed offset) of d8..d15 at PUSH_D8. */
+static void tcg_out_ld_st_d8_d15(TCGContext *s, bool load)
+{
+    for (int r = 8; r <= 14; r += 2) {
+        int ofs = PUSH_D8 + (r - 8) * 8;
+
+        tcg_out32(s, (load ? 0x6d400000 : 0x6d000000) | (ofs / 8) << 15
+                  | (r + 1) << 10 | TCG_REG_SP << 5 | r);
+    }
+}
+
 /*
  * x-xpage=stub: the shared jump-cache probe of cross-page direct jumps,
  * after the epilogue.  Called as helper_lookup_tb_ptr_jcp is: X0 = env,
@@ -6056,17 +6081,6 @@ static void tcg_out_xpage_stub(TCGContext *s)
     tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
 }
 
-/* STP or LDP (SIMD&FP, 64-bit, signed offset) of d8..d15 at PUSH_D8. */
-static void tcg_out_ld_st_d8_d15(TCGContext *s, bool load)
-{
-    for (int r = 8; r <= 14; r += 2) {
-        int ofs = PUSH_D8 + (r - 8) * 8;
-
-        tcg_out32(s, (load ? 0x6d400000 : 0x6d000000) | (ofs / 8) << 15
-                  | (r + 1) << 10 | TCG_REG_SP << 5 | r);
-    }
-}
-
 static void tcg_target_qemu_prologue(TCGContext *s)
 {
     TCGReg r;
@@ -6116,11 +6130,11 @@ static void tcg_target_qemu_prologue(TCGContext *s)
 
     tcg_out_mov(s, TCG_TYPE_PTR, TCG_AREG0, tcg_target_call_iarg_regs[0]);
     tcg_out_pinned_ld(s);
-    tcg_out_boundary_ldst(s, true);
     if (tcg_retstack_reg >= 0) {
         tcg_out_ld(s, TCG_TYPE_I64, tcg_retstack_reg, TCG_AREG0,
                    tcg_retsp_off);
     }
+    tcg_out_boundary_ldst(s, true);
     tcg_out_insn(s, bcond_reg, BR, tcg_target_call_iarg_regs[1]);
 
     /*
@@ -6134,11 +6148,11 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     /* TB epilogue */
     tb_ret_addr = tcg_splitwx_to_rx(s->code_ptr);
     tcg_out_bti(s, BTI_J);
+    tcg_out_pinned_st(s);
     if (tcg_retstack_reg >= 0) {
         tcg_out_st(s, TCG_TYPE_I64, tcg_retstack_reg, TCG_AREG0,
                    tcg_retsp_off);
     }
-    tcg_out_pinned_st(s);
     tcg_out_boundary_ldst(s, false);
 
     /* Remove TCG locals stack space.  */
