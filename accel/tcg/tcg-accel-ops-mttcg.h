@@ -13,4 +13,7 @@
 /* start an mttcg vCPU thread */
 void mttcg_start_vcpu_thread(CPUState *cpu);
 
+/* x-haltpoll: the longest a halted vCPU spins before it sleeps, ns */
+extern int64_t mttcg_haltpoll_ns;
+
 #endif /* TCG_ACCEL_OPS_MTTCG_H */

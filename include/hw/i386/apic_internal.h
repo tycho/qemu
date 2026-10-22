@@ -189,6 +189,11 @@ struct APICCommonState {
     hwaddr vapic_paddr; /* note: persistence via kvmvapic */
     uint32_t extended_log_dest;
     bool lockless_tpr; /* x-lockless-tpr: TPR accesses without the BQL */
+    bool vcpu_timer;   /* x-vcpu-timer: the timer fires on its vCPU */
+    int64_t vdeadline; /* ... its expiry (QEMU_CLOCK_VIRTUAL), or INT64_MAX */
+    int timer_due;     /* ... expired, for the vCPU to fire */
+    bool posted;       /* x-posted: fixed edge IPIs posted without the BQL */
+    uint64_t pir[4] QEMU_ALIGNED(64); /* ... posted vectors, not yet in IRR */
 };
 
 typedef struct VAPICState {
