@@ -87,6 +87,80 @@ bool qemu_tcg_mttcg_enabled(void)
 }
 #endif /* !CONFIG_USER_ONLY */
 
+/*
+ * [DEV] The fork's defaults: on aarch64 hosts, every adopted setting is
+ * on, host-aware ("auto" where a setting has it).  Applied through the
+ * properties, so a default behaves exactly as the same setting given on
+ * the command line or in QEMU_XTCG, which can still override it.
+ */
+static void xtcg_fork_defaults(Object *obj)
+{
+#if defined(__aarch64__)
+    static const char *const defaults[][2] = {
+        { "x-tso", "auto" },
+        { "x-tso-vec", "none" },
+        { "x-tso-stack", "on" },
+        { "x-lean", "on" },
+        { "x-ssefp", "auto" },
+        { "x-simd", "on" },
+        { "x-regcache", "on" },
+        { "x-pin", "on" },
+        { "x-pinvec", "on" },
+        { "x-pincc", "on" },
+        { "x-pinpc", "on" },
+        { "x-ccregs", "on" },
+        { "x-lazyinc", "on" },
+        { "x-flags", "dead" },
+        { "x-repstr", "on" },
+        { "x-vexzero", "on" },
+        { "x-crypto", "on" },
+        { "x-alignfold", "on" },
+        { "x-region", "on" },
+#ifdef CONFIG_USER_ONLY
+        /* Sampled loops cost more than they give next to units (user only). */
+        { "x-superblock", "units-only" },
+#else
+        { "x-superblock", "units" },
+#endif
+        { "x-tblookup", "on" },
+        { "x-xpage", "stub" },
+        { "x-tblayout", "split" },
+        { "x-i386-runtime", "on" },
+        { "x-addr32", "on" },
+        { "x-iofast", "on" },
+        { "x-hosttime", "on" },
+        { "x-tlb-grow", "1" },
+        { "x-pause", "hint" },
+        { "x-cr3-flush", "nonglobal" },
+        { "x-haltpoll", "50" },
+        { "x-apictimer", "auto" },
+        { "x-apicpost", "auto" },
+        { "x-tlbpin", "on" },
+#ifdef CONFIG_DARWIN
+        { "x-jitwx", "lazy" },
+        { "x-hostpoll", "kqueue" },
+#endif
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(defaults); i++) {
+        object_property_parse(obj, defaults[i][0], defaults[i][1],
+                              &error_abort);
+    }
+    /* Inline atomics need FEAT_LSE: on where the backend has them. */
+    if (tcg_atomic_supported()) {
+        object_property_parse(obj, "x-atomic", "on", &error_abort);
+    }
+    /* Ordered accesses' slow paths through a thunk per layout chunk. */
+    object_property_parse(obj, "x-slowthunk", "on", &error_abort);
+    /* Exit-request checks on cycle edges (needs x-region). */
+    object_property_parse(obj, "x-edgesys", "on", &error_abort);
+    /* Crossings found by fault: on where the host raises the fault. */
+    if (tcg_tso_fault_supported()) {
+        object_property_parse(obj, "x-tso-fault", "on", &error_abort);
+    }
+#endif
+}
+
 static void tcg_accel_instance_init(Object *obj)
 {
     TCGState *s = TCG_STATE(obj);
@@ -99,6 +173,7 @@ static void tcg_accel_instance_init(Object *obj)
 #endif
     s->apictimer = ON_OFF_AUTO_OFF;
     s->apicpost = ON_OFF_AUTO_OFF;
+    xtcg_fork_defaults(obj);
 }
 
 bool one_insn_per_tb;
