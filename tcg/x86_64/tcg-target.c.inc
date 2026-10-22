@@ -1074,6 +1074,13 @@ static inline void tcg_out_pushi(TCGContext *s, tcg_target_long val)
     }
 }
 
+#define TCG_TARGET_HAS_SPIN_HINT
+static void tcg_out_spin_hint(TCGContext *s)
+{
+    tcg_out8(s, 0xf3); /* pause */
+    tcg_out8(s, 0x90);
+}
+
 static void tcg_out_mb(TCGContext *s, unsigned a0)
 {
     /* Given the strength of x86 memory ordering, we only need care for
