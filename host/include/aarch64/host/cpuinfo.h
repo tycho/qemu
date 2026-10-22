@@ -19,6 +19,9 @@
 #define CPUINFO_SHA1            (1u << 12)
 #define CPUINFO_DOTPROD         (1u << 13)
 #define CPUINFO_I8MM            (1u << 14)
+#define CPUINFO_AFP             (1u << 7)
+#define CPUINFO_RPRES           (1u << 8)
+#define CPUINFO_FRINTTS         (1u << 9)
 
 /* Initialized with a constructor. */
 extern unsigned cpuinfo;
