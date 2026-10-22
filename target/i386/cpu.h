@@ -2380,6 +2380,14 @@ typedef struct CPUArchState {
     /* Bitmap of available CPU topology levels for this CPU. */
     DECLARE_BITMAP(avail_cpu_topo, CPU_TOPOLOGY_LEVEL__MAX);
 
+    /*
+     * TCG's synthetic timers: next expiry, queued expiration messages
+     * (reset by x86_tcg_hyperv_reset)
+     */
+    uint64_t hv_stimer_expiry[HV_STIMER_COUNT];
+    uint64_t hv_stimer_msg_exp[HV_STIMER_COUNT];
+    uint8_t hv_stimer_msg_sint[HV_STIMER_COUNT]; /* the SINT + 1, or 0 */
+
     /* The earlier operation's CC_DST, for CC_OP_INCL* and CC_OP_DECL*. */
     target_ulong cc_dst2;
 
@@ -2582,6 +2590,7 @@ struct ArchCPU {
     int32_t hv_max_vps;
 
     bool xen_vapic;
+    bool hv_stimer_attached; /* TCG's synthetic timers use the APIC's */
 };
 
 typedef struct X86CPUModel X86CPUModel;
@@ -2859,6 +2868,9 @@ void cpu_x86_update_dr7(CPUX86State *env, uint32_t new_dr7);
 uint64_t cpu_get_tsc(CPUX86State *env);
 void x86_tsc_counter_set(CPUX86State *env, uint64_t tsc);
 void x86_tsc_counter_reset(CPUX86State *env);
+uint64_t x86_tsc_counter_partition(void);
+int64_t x86_tsc_counter_base(void);
+void x86_tsc_counter_rebase(CPUX86State *env);
 
 #define CPU_RESOLVING_TYPE TYPE_X86_CPU
 
@@ -3110,6 +3122,20 @@ static inline bool hyperv_feat_enabled(X86CPU *cpu, int feat)
 {
     return !!(cpu->hyperv_features & BIT(feat));
 }
+
+/* The Hyper-V enlightenments TCG implements (tcg_hyperv). */
+#define TCG_HYPERV_FEATURES (BIT(HYPERV_FEAT_RELAXED) | \
+                             BIT(HYPERV_FEAT_VPINDEX) | \
+                             BIT(HYPERV_FEAT_TIME) | \
+                             BIT(HYPERV_FEAT_FREQUENCIES) | \
+                             TCG_HYPERV_TIMER_FEATURES)
+/* ... with x-hvtimers */
+#define TCG_HYPERV_TIMER_FEATURES (BIT(HYPERV_FEAT_SYNIC) | \
+                                   BIT(HYPERV_FEAT_STIMER) | \
+                                   BIT(HYPERV_FEAT_STIMER_DIRECT))
+
+bool x86_tcg_hyperv(X86CPU *cpu);
+void x86_tcg_hyperv_reset(X86CPU *cpu);
 
 static inline uint64_t cr4_reserved_bits(CPUX86State *env)
 {

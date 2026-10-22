@@ -194,6 +194,15 @@ struct APICCommonState {
     int timer_due;     /* ... expired, for the vCPU to fire */
     bool posted;       /* x-posted: fixed edge IPIs posted without the BQL */
     uint64_t pir[4] QEMU_ALIGNED(64); /* ... posted vectors, not yet in IRR */
+    /*
+     * Another per-vCPU timer device (Hyper-V's synthetic timers, see
+     * apic_xtimer_init), run on this vCPU:
+     */
+    void (*xtimer_cb)(void *opaque);  /* ... in its POLL pass */
+    void (*xtimer_eoi)(void *opaque); /* ... and after every EOI */
+    void *xtimer_opaque;
+    QEMUTimer *xtimer;  /* its deadline */
+    int xdue;           /* ... has passed, for the vCPU to run xtimer_cb */
 };
 
 typedef struct VAPICState {
