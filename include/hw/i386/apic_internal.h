@@ -188,6 +188,7 @@ struct APICCommonState {
     DeviceState *vapic;
     hwaddr vapic_paddr; /* note: persistence via kvmvapic */
     uint32_t extended_log_dest;
+    bool lockless_tpr; /* x-lockless-tpr: TPR accesses without the BQL */
 };
 
 typedef struct VAPICState {

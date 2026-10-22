@@ -32,6 +32,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "qemu/timer.h"
+#include "qemu/main-loop.h"
 #include "system/system.h"
 #include "system/replay.h"
 #include "system/reset.h"
@@ -854,6 +855,78 @@ static const MemoryRegionOps cmos_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/*
+ * x-lockless-uip: the ports are lockless_io.  Guests poll register A for
+ * the update-in-progress bit by writing the index and reading the data
+ * port, millions of times while they wait for the once-a-second update
+ * (Windows XP: tens of millions per boot).  Those two accesses take no
+ * BQL; everything else takes it here.  The UIP value is computed from
+ * guest time as update_in_progress() does, except while the update timer
+ * latches UIP into register A: that case writes state, so it takes the
+ * lock.  The fields read without it change only under the BQL, and a read
+ * that races with such a change is as if it came just before it.
+ */
+static bool cmos_read_uip_lockless(MC146818RtcState *s, uint8_t *val)
+{
+    uint8_t a = qatomic_read(&s->cmos_data[RTC_REG_A]);
+    uint64_t guest_nsec;
+
+    if (!rtc_running(s)) {
+        *val = a;
+        return true;
+    }
+    if (timer_pending(s->update_timer) &&
+        qemu_clock_get_ns(rtc_clock) >=
+        timer_expire_time_ns(s->update_timer) - UIP_HOLD_LENGTH) {
+        return false;
+    }
+    guest_nsec = get_rtc_ns_since_last_update(s);
+    if ((guest_nsec % NANOSECONDS_PER_SECOND) >=
+        (NANOSECONDS_PER_SECOND - UIP_HOLD_LENGTH)) {
+        a |= REG_A_UIP;
+    }
+    *val = a;
+    return true;
+}
+
+static uint64_t cmos_ioport_read_lockless(void *opaque, hwaddr addr,
+                                          unsigned size)
+{
+    MC146818RtcState *s = opaque;
+    uint8_t val;
+
+    if ((addr & 1) && qatomic_read(&s->cmos_index) == RTC_REG_A &&
+        cmos_read_uip_lockless(s, &val)) {
+        trace_mc146818_rtc_ioport_read(RTC_REG_A, val);
+        return val;
+    }
+    BQL_LOCK_GUARD();
+    return cmos_ioport_read(opaque, addr, size);
+}
+
+static void cmos_ioport_write_lockless(void *opaque, hwaddr addr,
+                                       uint64_t data, unsigned size)
+{
+    MC146818RtcState *s = opaque;
+
+    if ((addr & 1) == 0) {
+        qatomic_set(&s->cmos_index, data & 0x7f);
+        return;
+    }
+    BQL_LOCK_GUARD();
+    cmos_ioport_write(opaque, addr, data, size);
+}
+
+static const MemoryRegionOps cmos_lockless_ops = {
+    .read = cmos_ioport_read_lockless,
+    .write = cmos_ioport_write_lockless,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
 static void rtc_get_date(Object *obj, struct tm *current_tm, Error **errp)
 {
     MC146818RtcState *s = MC146818_RTC(obj);
@@ -910,13 +983,20 @@ static void rtc_realizefn(DeviceState *dev, Error **errp)
     s->suspend_notifier.notify = rtc_notify_suspend;
     qemu_register_suspend_notifier(&s->suspend_notifier);
 
-    memory_region_init_io(&s->io, OBJECT(s), &cmos_ops, s, "rtc", 2);
+    memory_region_init_io(&s->io, OBJECT(s),
+                          s->lockless_uip ? &cmos_lockless_ops : &cmos_ops,
+                          s, "rtc", 2);
     isa_register_ioport(isadev, &s->io, s->io_base);
 
     /* register rtc 0x70 port for coalesced_pio */
     memory_region_set_flush_coalesced(&s->io);
-    memory_region_init_io(&s->coalesced_io, OBJECT(s), &cmos_ops,
+    memory_region_init_io(&s->coalesced_io, OBJECT(s),
+                          s->lockless_uip ? &cmos_lockless_ops : &cmos_ops,
                           s, "rtc-index", 1);
+    if (s->lockless_uip) {
+        memory_region_enable_lockless_io(&s->io);
+        memory_region_enable_lockless_io(&s->coalesced_io);
+    }
     memory_region_add_subregion(&s->io, 0, &s->coalesced_io);
     memory_region_add_coalescing(&s->coalesced_io, 0, 1);
 
@@ -953,6 +1033,7 @@ static const Property mc146818rtc_properties[] = {
     DEFINE_PROP_UINT8("irq", MC146818RtcState, isairq, RTC_ISA_IRQ),
     DEFINE_PROP_LOSTTICKPOLICY("lost_tick_policy", MC146818RtcState,
                                lost_tick_policy, LOST_TICK_POLICY_DISCARD),
+    DEFINE_PROP_BOOL("x-lockless-uip", MC146818RtcState, lockless_uip, false),
 };
 
 static void rtc_reset_enter(Object *obj, ResetType type)
