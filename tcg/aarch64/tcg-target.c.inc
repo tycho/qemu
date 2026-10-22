@@ -1931,6 +1931,192 @@ static const TCGLdstHelperParam ldst_helper_param = {
 };
 
 /*
+ * Around a guest access slow path's helper call: save @regs below SP, or
+ * restore them except @keep (the access's outputs) and release the area.
+ */
+static void tcg_out_ldst_save(TCGContext *s, TCGRegSet regs, bool restore,
+                              TCGRegSet keep)
+{
+    uint64_t vregs = (uint64_t)regs >> TCG_REG_V0;
+    uint64_t xregs = regs & MAKE_64BIT_MASK(0, TCG_REG_V0);
+    unsigned nv = ctpop64(vregs), nx = ctpop64(xregs), size, off = 0;
+
+    size = nv * 16 + ROUND_UP(nx * 8, 16);
+    if (size == 0) {
+        return;
+    }
+    if (!restore) {
+        tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64,
+                     TCG_REG_SP, TCG_REG_SP, size);
+    }
+    for (; vregs; vregs &= vregs - 1) {
+        TCGReg r = TCG_REG_V0 + ctz64(vregs);
+
+        if (!restore) {
+            tcg_out_st(s, TCG_TYPE_V128, r, TCG_REG_SP, off);
+        } else if (!tcg_regset_test_reg(keep, r)) {
+            tcg_out_ld(s, TCG_TYPE_V128, r, TCG_REG_SP, off);
+        }
+        off += 16;
+    }
+    for (; xregs; xregs &= xregs - 1) {
+        TCGReg r = ctz64(xregs);
+
+        if (!restore) {
+            tcg_out_st(s, TCG_TYPE_I64, r, TCG_REG_SP, off);
+        } else if (!tcg_regset_test_reg(keep, r)) {
+            tcg_out_ld(s, TCG_TYPE_I64, r, TCG_REG_SP, off);
+        }
+        off += 8;
+    }
+    if (restore) {
+        tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64,
+                     TCG_REG_SP, TCG_REG_SP, size);
+    }
+}
+
+/* tcg_lazysync: store the dirty globals before the slow path's call. */
+/*
+ * Registers for pinned globals (tcg_temp_pin): the callee-saved ones not
+ * otherwise reserved (x28 holds guest_base or the return stack), which
+ * helpers keep, then caller-saved ones above the argument registers, which
+ * are stored around calls and reloaded after them
+ * (tcg_out_pinned_clobbered).  On Linux hosts x18 is an ordinary
+ * caller-saved register, unless the host code uses it for a shadow call
+ * stack: a seventeenth.
+ */
+#if defined(CONFIG_LINUX) && !__has_feature(shadow_call_stack)
+#define TCG_TARGET_NB_PIN_REGS 17
+#else
+#define TCG_TARGET_NB_PIN_REGS 16
+#endif
+/*
+ * System mode pins only the first seven, x20-x26: callee-saved, so calls
+ * need no saves, and clear of x-tlbpin's x27 and x28.
+ */
+#define TCG_TARGET_NB_PIN_REGS_SYSTEM 7
+static const TCGReg tcg_target_pin_regs[TCG_TARGET_NB_PIN_REGS] = {
+    TCG_REG_X20, TCG_REG_X21, TCG_REG_X22, TCG_REG_X23,
+    TCG_REG_X24, TCG_REG_X25, TCG_REG_X26, TCG_REG_X27,
+    TCG_REG_X8, TCG_REG_X9, TCG_REG_X10, TCG_REG_X11,
+    TCG_REG_X12, TCG_REG_X13, TCG_REG_X14, TCG_REG_X15,
+#if TCG_TARGET_NB_PIN_REGS > 16
+    TCG_REG_X18,
+#endif
+};
+
+/*
+ * Registers for boundary globals (tcg_boundary_global_add): two argument
+ * registers, which the allocator uses between TB boundaries as before.
+ */
+#define TCG_TARGET_NB_BOUNDARY_REGS 2
+static const TCGReg tcg_target_boundary_regs[TCG_TARGET_NB_BOUNDARY_REGS] = {
+    TCG_REG_X6, TCG_REG_X7,
+};
+
+/*
+ * Vector registers for pinned V128 globals: v8-v23, the ones Arm's vector
+ * PCS preserves whole, leaving v0-v7 and v24-v31 to the allocator.  Only
+ * with tcg_vregs_all, whose prologue keeps the caller's d8-d15.
+ */
+#define TCG_TARGET_NB_PIN_VREGS (tcg_vregs_all ? 16 : 0)
+static const TCGReg tcg_target_pin_vregs[16] = {
+    TCG_REG_V8, TCG_REG_V9, TCG_REG_V10, TCG_REG_V11,
+    TCG_REG_V12, TCG_REG_V13, TCG_REG_V14, TCG_REG_V15,
+    TCG_REG_V16, TCG_REG_V17, TCG_REG_V18, TCG_REG_V19,
+    TCG_REG_V20, TCG_REG_V21, TCG_REG_V22, TCG_REG_V23,
+};
+
+/*
+ * System mode: store the pinned globals with STP where two of them have
+ * adjacent env slots, STR for the rest.  The slow paths share one copy
+ * per TB (TCGContext.pin_st_tail), called with BL: LR is TCG_REG_TMP2,
+ * free in a slow path.
+ */
+static void tcg_out_pinned_st_pairs(TCGContext *s)
+{
+    TCGTemp *t[ARRAY_SIZE(s->pinned)];
+    int n = 0;
+
+    for (int i = 0; i < s->nb_pinned; i++) {
+        TCGTemp *ts = s->pinned[i];
+
+        if (ts->type == TCG_TYPE_I64 && ts->mem_base->reg == TCG_AREG0 &&
+            !(ts->mem_offset & 7) && ts->mem_offset >= -0x200 &&
+            ts->mem_offset < 0x1f8) {
+            t[n++] = ts;
+        } else {
+            tcg_out_st(s, ts->type, ts->reg, ts->mem_base->reg,
+                       ts->mem_offset);
+        }
+    }
+    /* By env offset; n is small. */
+    for (int i = 1; i < n; i++) {
+        for (int j = i; j > 0 && t[j]->mem_offset < t[j - 1]->mem_offset; j--) {
+            TCGTemp *x = t[j];
+
+            t[j] = t[j - 1];
+            t[j - 1] = x;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (i + 1 < n && t[i + 1]->mem_offset == t[i]->mem_offset + 8) {
+            tcg_out_insn(s, ldstpair, STP, t[i]->reg, t[i + 1]->reg,
+                         TCG_AREG0, t[i]->mem_offset, 1, 0);
+            i++;
+        } else {
+            tcg_out_st(s, TCG_TYPE_I64, t[i]->reg, TCG_AREG0,
+                       t[i]->mem_offset);
+        }
+    }
+}
+
+/* The slow paths' shared copy: the stores, then return. */
+static void tcg_out_pinned_st_tail(TCGContext *s)
+{
+    tcg_out_pinned_st_pairs(s);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+}
+
+static void tcg_out_ldst_writeback(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    /* The helper may leave generated code: the pinned globals first. */
+    if (s->pin_st_tail) {
+        /* In the same slow-path code: always within BL's reach. */
+        ptrdiff_t offset = tcg_pcrel_diff(s, s->pin_st_tail) >> 2;
+
+        tcg_debug_assert(offset == sextract64(offset, 0, 26));
+        tcg_out_insn(s, branch, BL, offset);
+    } else {
+        tcg_out_pinned_st(s);
+    }
+    for (unsigned i = 0; i < lb->nb_wb; i++) {
+        const TCGLdstWriteback *wb = &lb->wb[i];
+
+        if (wb->is_const) {
+            tcg_out_movi(s, wb->type, TCG_REG_TMP0, wb->val);
+            tcg_out_st(s, wb->type, TCG_REG_TMP0, wb->base, wb->offset);
+        } else {
+            tcg_out_st(s, wb->type, wb->reg, wb->base, wb->offset);
+        }
+    }
+}
+
+/* The registers a load's slow path sets, not to be restored over. */
+static TCGRegSet ldst_outputs(TCGLabelQemuLdst *lb)
+{
+    TCGRegSet set = 0;
+
+    if (lb->is_ld || lb->atomic) {
+        tcg_regset_set_reg(set, lb->datalo_reg);
+        if (lb->type == TCG_TYPE_I128) {
+            tcg_regset_set_reg(set, lb->datahi_reg);
+        }
+    }
+    return set;
+}
+
+/*
  * tcg_tblayout: a branch to the slow path, which goes to the cold part,
  * where the fast path's conditional branch can reach it.
  */
@@ -1952,6 +2138,186 @@ static bool tcg_out_ldst_slow_entry(TCGContext *s, TCGLabelQemuLdst *lb)
 
     return lb->veneer ? reloc_pc26(lb->label_ptr[0], target)
                       : reloc_pc19(lb->label_ptr[0], target);
+}
+
+/*
+ * The out-of-line path of an MO_ACQ_REL access that crosses a 16-byte
+ * boundary (see tcg_out_acqrel_check), and in system mode also of its
+ * TLB miss (see prepare_host_addr): call helper_tso_cross_ld/st, which
+ * perform the access and, if it crosses, count the crossing and have the
+ * insn promoted (retranslated with MO_ACQ_REL_CROSS, whose code has no
+ * check).
+ *
+ * The access goes through a helper rather than out-of-line code because
+ * a fault must be unwound to its guest insn, which works from the
+ * helper's return address (in the insn's code) but not from a host pc
+ * out here.
+ */
+/*
+ * tcg_slowthunk: the thunk at the start of a chunk's cold part, called
+ * from an MO_ACQ_REL access's slow path with LR pointing at the access's
+ * descriptor (TSO_THUNK_*).  It saves the general registers by number
+ * below SP, has helper_tso_cross_thunk perform the access, reloads them
+ * (except the scratch x16 and x17; on macOS not x18, the platform
+ * register), and with them a load's result; then the pinned TLB mask and
+ * table if the descriptor names them, and goes where the helper said.
+ * The slow path saves only vector registers: the thunk keeps every
+ * general one.
+ */
+#define TCG_TARGET_HAS_SLOW_THUNK
+#define SLOW_THUNK_FRAME 256
+
+static void tcg_out_slow_thunk(TCGContext *s)
+{
+    tcg_insn_unit *skip;
+
+    tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,
+                 SLOW_THUNK_FRAME);
+    for (TCGReg r = TCG_REG_X0; r < TCG_REG_X30; r += 2) {
+        tcg_out_insn(s, ldstpair, STP, r, r + 1, TCG_REG_SP, r * 8, 1, 0);
+    }
+    tcg_out_st(s, TCG_TYPE_I64, TCG_REG_LR, TCG_REG_SP, 30 * 8);
+    tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_X0, TCG_AREG0);
+    tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_X1, TCG_REG_SP, 0);
+    tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_X2, TCG_REG_LR);
+    tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP0,
+                 (intptr_t)helper_tso_cross_thunk);
+    tcg_out_insn(s, bcond_reg, BLR, TCG_REG_TMP0);
+    tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_REG_X0);
+    for (TCGReg r = TCG_REG_X0; r < TCG_REG_X30; r += 2) {
+        if (r == TCG_REG_X16) {
+            continue;
+        }
+#ifdef CONFIG_DARWIN
+        if (r == TCG_REG_X18) {
+            tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_X19, TCG_REG_SP, 19 * 8);
+            continue;
+        }
+#endif
+        tcg_out_insn(s, ldstpair, LDP, r, r + 1, TCG_REG_SP, r * 8, 1, 0);
+    }
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_LR, TCG_REG_SP, 30 * 8);
+    tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,
+                 SLOW_THUNK_FRAME);
+    /* The TLB descriptor's offset: the flags' upper half. */
+    tcg_out_ldst(s, Ildst_imm_LDRSHX, TCG_REG_TMP1, TCG_REG_LR, 4 * 4 + 2, 1);
+    skip = s->code_ptr;
+    tcg_out_insn(s, cbz, CBZ, TCG_TYPE_I64, TCG_REG_TMP1, 0);
+    tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP1, TCG_AREG0,
+                 TCG_REG_TMP1);
+    tcg_out_insn(s, ldstpair, LDP, TCG_REG_TLB_MASK, TCG_REG_TLB_TABLE,
+                 TCG_REG_TMP1, 0, 1, 0);
+    reloc_pc19(skip, tcg_splitwx_to_rx(s->code_ptr));
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_TMP0);
+}
+
+/*
+ * tcg_slowthunk: the slow path as a call to the chunk's thunk and the
+ * access's descriptor, for 32- and 64-bit values in general registers.
+ */
+static bool tcg_out_acqrel_thunk(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    TCGRegSet vregs = lb->save_regs & ~MAKE_64BIT_MASK(0, TCG_REG_V0);
+    const tcg_insn_unit *desc;
+    ptrdiff_t offset;
+    uint32_t flags;
+
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
+        return false;
+    }
+    tcg_out_ldst_writeback(s, lb);
+    tcg_out_ldst_save(s, vregs, false, 0);
+    offset = tcg_pcrel_diff(s, s->lay_thunk) >> 2;
+    tcg_debug_assert(offset == sextract64(offset, 0, 26));
+    tcg_out_insn(s, branch, BL, offset);
+
+    desc = tcg_splitwx_to_rx(s->code_ptr);
+    flags = lb->addr_reg | lb->datalo_reg << 5
+            | (uint32_t)(uint16_t)s->tlb_pin_ofs << 16;
+    if (lb->is_ld) {
+        flags |= TSO_THUNK_IS_LD;
+    }
+    if (s->addr_type == TCG_TYPE_I32) {
+        flags |= TSO_THUNK_ADDR32;
+    }
+    if (lb->type == TCG_TYPE_I64) {
+        flags |= TSO_THUNK_DATA64;
+    }
+    if (!vregs) {
+        flags |= TSO_THUNK_DIRECT;
+    }
+    tcg_out32(s, tcg_ptr_byte_diff(lb->raddr, desc));
+    tcg_out32(s, lb->oi);
+    tcg_out32(s, lb->site);
+    tcg_out32(s, lb->site >> 32);
+    tcg_out32(s, flags);
+    if (vregs) {
+        tcg_out_ldst_save(s, vregs, true, 0);
+        tcg_out_goto(s, lb->raddr);
+    }
+    return true;
+}
+
+/*
+ * tcg_slowthunk: whether the TB may use the thunk, which keeps general
+ * registers only: not with pinned vector globals, which the inline path
+ * reloads after its call.
+ */
+static bool tcg_slow_thunk_ok(TCGContext *s)
+{
+    if (!tcg_slowthunk || !s->lay_thunk || !s->lay_cold_now) {
+        return false;
+    }
+    for (int i = 0; i < s->nb_pinned; i++) {
+        if (s->pinned[i]->type == TCG_TYPE_V128) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    if ((lb->type == TCG_TYPE_I32 || lb->type == TCG_TYPE_I64) &&
+        lb->addr_reg < TCG_REG_X30 && lb->datalo_reg < TCG_REG_X30 &&
+        tcg_slow_thunk_ok(s)) {
+        return tcg_out_acqrel_thunk(s, lb);
+    }
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
+        return false;
+    }
+    tcg_out_ldst_writeback(s, lb);
+    tcg_out_ldst_save(s, lb->save_regs, false, 0);
+    if (lb->is_ld) {
+        tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
+        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X4, lb->site);
+        tcg_out_call_int(s, (const void *)helper_tso_cross_ld);
+        tcg_out_pinned_clobbered(s, false, 0);
+        tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
+    } else {
+        tcg_out_st_helper_args(s, lb, &ldst_helper_param);
+        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X5, lb->site);
+        tcg_out_call_int(s, (const void *)helper_tso_cross_st);
+        tcg_out_pinned_clobbered(s, false, 0);
+    }
+    tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
+    tcg_out_goto(s, lb->raddr);
+    return true;
+}
+
+/* A folded access's slow path: the helper's address argument plus addr_ofs. */
+static void tcg_out_ldst_addr_ofs(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    TCGReg r = tcg_target_call_iarg_regs[1];
+    AArch64Insn insn = lb->addr_ofs < 0 ? Iaddsub_imm_SUBI : Iaddsub_imm_ADDI;
+    uint64_t v = lb->addr_ofs < 0 ? -lb->addr_ofs : lb->addr_ofs;
+
+    if (v & 0xfff000) {
+        tcg_out_insn_addsub_imm(s, insn, 1, r, r, v & 0xfff000);
+    }
+    if (v & 0xfff) {
+        tcg_out_insn_addsub_imm(s, insn, 1, r, r, v & 0xfff);
+    }
 }
 
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
@@ -2665,13 +3031,19 @@ static TCGLabelQemuLdst *prepare_atomic_addr(TCGContext *s, TCGReg *host,
 
     if (tcg_use_softmmu) {
         unsigned mem_index = get_mmuidx(oi);
+        TCGReg mask = TCG_REG_TMP0, table = TCG_REG_TMP1;
 
-        tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP1,
-                     TCG_AREG0, tlb_mask_table_ofs(s, mem_index), 1, 0);
+        if (s->tlb_pin_ofs && mem_index == s->tlb_pin_idx) {
+            mask = TCG_REG_TLB_MASK;
+            table = TCG_REG_TLB_TABLE;
+        } else {
+            tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP1,
+                         TCG_AREG0, tlb_mask_table_ofs(s, mem_index), 1, 0);
+        }
         tcg_out_insn(s, addsub_realshift, AND_LSR, addr_type,
-                     TCG_REG_TMP0, TCG_REG_TMP0, addr_reg,
+                     TCG_REG_TMP0, mask, addr_reg,
                      TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
-        tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP1, TCG_REG_TMP1,
+        tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP1, table,
                      TCG_REG_TMP0);
 
         /* The read and write comparators into TMP0 and TMP2. */
@@ -2803,20 +3175,23 @@ static bool tcg_out_qemu_atomic_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     const void *fn;
 
-    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
         return false;
     }
+    tcg_out_ldst_writeback(s, lb);
+    tcg_out_ldst_save(s, lb->save_regs, false, 0);
     fn = tcg_out_atomic_helper_args(s, lb, &ldst_helper_param);
     tcg_out_call_int(s, fn);
+    tcg_out_pinned_clobbered(s, false, 0);
     if ((get_memop(lb->oi) & MO_SIZE) <= MO_32) {
         tcg_out_ext32u(s, lb->datalo_reg, TCG_REG_X0);
     } else {
         tcg_out_mov(s, TCG_TYPE_I64, lb->datalo_reg, TCG_REG_X0);
     }
+    tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
     tcg_out_goto(s, lb->raddr);
     return true;
 }
-
 
 /*
  * A 128-bit guest access into or from a vector register: the fast path is

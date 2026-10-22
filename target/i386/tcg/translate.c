@@ -37,7 +37,6 @@
 #include "tcg/startup.h"
 #include "host/counter.h"
 #include "decode-new.h"
-#include "tcg/startup.h"
 
 #include "exec/log.h"
 
@@ -412,7 +411,8 @@ static uint8_t cc_op_live(CCOp op)
 static bool use_flags_dead(DisasContext *s)
 {
 #ifdef CONFIG_USER_ONLY
-    return tcg_flags_dead && s->jmp_opt;
+    /* Not with CC_DST and CC_SRC as boundary globals (tcg_cc_regs). */
+    return tcg_flags_dead && s->jmp_opt && !tcg_ctx->nb_boundary;
 #else
     return false;
 #endif
@@ -2303,7 +2303,9 @@ static void gen_push_v(DisasContext *s, TCGv val)
         TCGv addr = tcg_temp_new();
 
         gen_lea_ss_ofs(s, addr, cpu_regs[R_ESP], -size);
+        old = gen_stack_private(true);
         gen_op_st_v(s, d_ot, val, addr);
+        gen_stack_private(old);
         tcg_gen_subi_tl(cpu_regs[R_ESP], cpu_regs[R_ESP], size);
         return;
     }
@@ -2618,11 +2620,13 @@ static void gen_ret_landing(DisasContext *s, TCGLabel *land, int slot)
 /* A goto_tb slot for the return landing other than @used, or -1. */
 static int ret_landing_slot(DisasContext *s, int used)
 {
-    if (s->rs_land_unlinked) {
+    int slot = used < 0 ? 0 : used ^ 1;
+
+    if (!translator_use_goto_tb(&s->base, rs_next_pc(s)) ||
+        !translator_goto_tb_slot(&s->base, &slot)) {
         return -1;
     }
-    return translator_use_goto_tb(&s->base, rs_next_pc(s))
-           ? (used < 0 ? 0 : used ^ 1) : -1;
+    return slot;
 }
 
 /*
@@ -2735,18 +2739,6 @@ gen_eob(DisasContext *s, int mode)
          * checks HF_INHIBIT_IRQ): chain to its block.
          */
         req = translator_edge_check(&s->base, s->base.pc_first);
-        tcg_gen_lookup_and_goto_ptr();
-    } else if (inhibit_reset && exit_irq_only(s) &&
-               (mode == DISAS_EOB_NEXT || mode == DISAS_EOB_INHIBIT_IRQ ||
-                mode == DISAS_JUMP)) {
-        /* The shadow is over: leave only if an interrupt may be taken. */
-        gen_exit_if_irq_pending(s, false);
-        tcg_gen_lookup_and_goto_ptr();
-    } else if (mode == DISAS_EOB_INHIBIT_IRQ && exit_irq_only(s)) {
-        /*
-         * No interrupt is taken in the shadow (x86_cpu_interrupts_enabled
-         * checks HF_INHIBIT_IRQ): chain to its block.
-         */
         tcg_gen_lookup_and_goto_ptr();
     } else {
         tcg_gen_exit_tb(NULL, 0);
@@ -4810,7 +4802,6 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     DisasContext *dc = container_of(dcbase, DisasContext, base);
 
     dc->base.tb->chain_dead_in = dc->cc_entry_done && dc->cc_entry_dead;
-
     if (dc->base.is_jmp != DISAS_NORETURN) {
         gen_vexzero_flush(dc);
     }
