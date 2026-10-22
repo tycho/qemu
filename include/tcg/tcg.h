@@ -125,6 +125,21 @@ typedef struct TCGPool {
    this value, they are statically allocated in the TB stack frame */
 #define TCG_STATIC_CALL_ARGS_SIZE 128
 
+/*
+ * The operation of a qemu_atomic op: it returns the old value of the
+ * memory; CMPXCHG stores the value only if the old value equals the
+ * compare operand (unused by the others).
+ */
+typedef enum TCGAtomicOp {
+    TCG_ATOMIC_XCHG,
+    TCG_ATOMIC_ADD,
+    TCG_ATOMIC_AND,
+    TCG_ATOMIC_OR,
+    TCG_ATOMIC_XOR,
+    TCG_ATOMIC_CMPXCHG,
+    TCG_ATOMIC_NB_OPS,
+} TCGAtomicOp;
+
 typedef enum TCGType {
     TCG_TYPE_I32,
     TCG_TYPE_I64,
@@ -355,6 +370,10 @@ static inline TCGRegSet output_pref(const TCGOp *op, unsigned i)
 }
 
 struct TCGContext {
+    /* The open run of grouped guest accesses (tcg_tso_vec_group). */
+    bool tso_run_ld;            /* loads not yet ordered before later ops */
+    bool tso_run_st;            /* the run's stores have had their barrier */
+    bool tso_run_emit;          /* a grouped access is being emitted */
     uintptr_t pool_cur, pool_end;
     TCGPool *pool_first, *pool_current, *pool_first_large;
     int nb_labels;
@@ -446,6 +465,33 @@ struct TCGContext {
 
     uint16_t gen_insn_end_off[TCG_MAX_INSNS];
     uint64_t *gen_insn_data;
+
+    /*
+     * The guest pc of each insn, as the translator saw it (insn_pc is the
+     * one being translated), and during code generation the index of the
+     * insn being emitted: backends use gen_insn_pc[gen_cur_insn] to name
+     * the guest insn of an op.
+     */
+    uint64_t insn_pc;
+    uint64_t gen_insn_pc[TCG_MAX_INSNS];
+    int gen_cur_insn;
+
+    /*
+     * The guest accesses being generated are to memory that only the
+     * current guest thread uses (an x86 stack slot).  Set by the front
+     * end, cleared at the start of each insn; with x-tso-stack, qemu-user
+     * gives such accesses no memory-order constraint.
+     */
+    bool ldst_private;
+    /*
+     * The guest accesses being generated move data to or from the guest's
+     * vector or floating-point registers.  Set by the front end, cleared at
+     * the start of each insn; with x-tso-vec=none they get no memory-order
+     * constraint unless atomic as a whole.
+     */
+    bool ldst_vector;
+    /* The guest access being generated gets no memory-order constraint. */
+    bool ldst_unordered;
 
     /* Exit to translator on overflow. */
     sigjmp_buf jmp_trans;

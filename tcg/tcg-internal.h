@@ -105,4 +105,7 @@ TCGOp *tcg_op_insert_after(TCGContext *s, TCGOp *op,
  */
 bool tcg_op_imm_match(TCGOpcode op, TCGType type, tcg_target_ulong imm);
 
+/* End the open run of grouped guest accesses (tcg_tso_vec_group). */
+void tcg_tso_run_end(void);
+
 #endif /* TCG_INTERNAL_H */

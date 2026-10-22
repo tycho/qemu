@@ -270,6 +270,89 @@ static void tcg_set_i386_runtime(Object *obj, bool value, Error **errp)
     TCG_STATE(obj)->i386_runtime = value;
 }
 
+static const char * const tcg_tso_names[] = {
+    [TCG_TSO_BARRIER] = "barrier",
+    [TCG_TSO_ACQREL] = "acqrel",
+    [TCG_TSO_NONE] = "none",
+};
+
+static char *tcg_get_tso(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_tso_names[tcg_tso_mode]);
+}
+
+static void tcg_set_tso(Object *obj, const char *value, Error **errp)
+{
+    tcg_reserial = false;
+    if (!strcmp(value, "auto")) {
+        tcg_tso_mode = tcg_can_ldst_acqrel() ? TCG_TSO_ACQREL
+                                             : TCG_TSO_BARRIER;
+        tcg_reserial = true;
+        return;
+    }
+    for (int i = 0; i < ARRAY_SIZE(tcg_tso_names); i++) {
+        if (tcg_tso_names[i] && !strcmp(value, tcg_tso_names[i])) {
+            if (i == TCG_TSO_ACQREL && !tcg_can_ldst_acqrel()) {
+                error_setg(errp, "x-tso=acqrel is not supported on this host");
+                return;
+            }
+            tcg_tso_mode = i;
+            return;
+        }
+    }
+    error_setg(errp, "Invalid 'x-tso' value: %s", value);
+}
+
+static bool tcg_get_tso_stack(Object *obj, Error **errp)
+{
+    return tcg_tso_stack;
+}
+
+static void tcg_set_tso_stack(Object *obj, bool value, Error **errp)
+{
+    tcg_tso_stack = value;
+}
+
+static char *tcg_get_tso_vec(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_tso_vec_atomic ? "atomic" :
+                    tcg_tso_vec_none ? "none" :
+                    tcg_tso_vec_group ? "group" : "strict");
+}
+
+static void tcg_set_tso_vec(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "strict")) {
+        tcg_tso_vec_group = false;
+        tcg_tso_vec_none = false;
+    } else if (!strcmp(value, "group")) {
+        tcg_tso_vec_group = true;
+        tcg_tso_vec_none = false;
+    } else if (!strcmp(value, "none") || !strcmp(value, "atomic")) {
+        tcg_tso_vec_group = true;
+        tcg_tso_vec_none = true;
+    } else {
+        error_setg(errp, "Invalid 'x-tso-vec' value: %s", value);
+        return;
+    }
+    tcg_tso_vec_atomic = !strcmp(value, "atomic");
+}
+
+static bool tcg_get_atomic(Object *obj, Error **errp)
+{
+    return tcg_atomic;
+}
+
+static void tcg_set_atomic(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_atomic_supported()) {
+        error_setg(errp, "x-atomic: not supported by this TCG backend "
+                   "or host");
+        return;
+    }
+    tcg_atomic = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -308,6 +391,37 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "x86 system mode: leave CR0.MP/EM/TS and EFLAGS.IOPL out of the "
         "TB flags and check them at run time, so one translation serves "
         "every FPU and IOPL state");
+
+    object_class_property_add_str(oc, "x-tso", tcg_get_tso, tcg_set_tso);
+    object_class_property_set_description(oc, "x-tso",
+        "Guest memory ordering: barrier (default), "
+        "acqrel (load-acquire/store-release accesses), "
+        "auto (acqrel where the host supports it, else barrier, and in "
+        "user mode serial code again once a single thread is left), "
+        "none (no barriers: unsafe, for measurement)");
+
+    object_class_property_add_bool(oc, "x-atomic", tcg_get_atomic,
+                                   tcg_set_atomic);
+    object_class_property_set_description(oc, "x-atomic",
+        "Guest atomic read-modify-write accesses as host atomic insns "
+        "inline, with the helper only as the slow path");
+
+    object_class_property_add_str(oc, "x-tso-vec", tcg_get_tso_vec,
+                                  tcg_set_tso_vec);
+    object_class_property_set_description(oc, "x-tso-vec",
+        "Guest accesses wider than 8 bytes the guest doesn't make atomic: "
+        "strict (each ordered, default), group (with x-tso=acqrel, "
+        "barriers only where a run of them begins and ends: not exact), "
+        "none (as group, and accesses to and from vector and "
+        "floating-point registers unordered and atomic only in parts: "
+        "not exact), atomic (as none, except the vector moves of 16-byte "
+        "atomic loads and stores)");
+
+    object_class_property_add_bool(oc, "x-tso-stack",
+                                   tcg_get_tso_stack, tcg_set_tso_stack);
+    object_class_property_set_description(oc, "x-tso-stack",
+        "qemu-user: guest accesses to the thread's own stack (x86: RSP-based, "
+        "push/pop/call/ret) get no memory-order constraint");
 }
 
 static const TypeInfo tcg_accel_type = {

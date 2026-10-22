@@ -438,6 +438,22 @@ typedef enum {
     Istxp_LDXP       = 0xc8600000,
     Istxp_STXP       = 0xc8200000,
 
+    /* Load-acquire RCpc and store-release, [Xn] only (FEAT_LRCPC) */
+    Ildapr_B         = 0x38bfc000,
+    Ildapr_H         = 0x78bfc000,
+    Ildapr_W         = 0xb8bfc000,
+    Ildapr_X         = 0xf8bfc000,
+    Istlr_B          = 0x089ffc00,
+    Istlr_H          = 0x489ffc00,
+    Istlr_W          = 0x889ffc00,
+    Istlr_X          = 0xc89ffc00,
+    /* Sign-extending load-acquire RCpc, offset 0 (FEAT_LRCPC2) */
+    Ildapurs_BW      = 0x19c00000,
+    Ildapurs_BX      = 0x19800000,
+    Ildapurs_HW      = 0x59c00000,
+    Ildapurs_HX      = 0x59800000,
+    Ildapurs_WX      = 0x99800000,
+
     /* Load/store register.  Described here as 3.3.12, but the helper
        that emits them can transform to 3.3.10 or 3.3.13.  */
     Ildst_imm_STRB   = 0x38000000 | LDST_ST << 22 | MO_8 << 30,
@@ -532,6 +548,9 @@ typedef enum {
     Icsel_CSINC        = 0x1a800400,
     Icsel_CSINV        = 0x5a800000,
     Icsel_CSNEG        = 0x5a800400,
+
+    /* Conditional compare (immediate).  */
+    Iccmp_imm_CCMP     = 0x7a400800,
 
     /* Data-processing (1 source) instructions.  */
     Irr_sf_CLZ         = 0x5ac01000,
@@ -837,6 +856,15 @@ static void tcg_out_insn_csel(TCGContext *s, AArch64Insn insn, TCGType ext,
                               TCGReg rd, TCGReg rn, TCGReg rm, TCGCond c)
 {
     tcg_out32(s, insn | ext << 31 | rm << 16 | rn << 5 | rd
+              | tcg_cond_to_aarch64[c] << 12);
+}
+
+static void tcg_out_insn_ccmp_imm(TCGContext *s, AArch64Insn insn,
+                                  TCGType ext, TCGReg rn, unsigned imm5,
+                                  unsigned nzcv, TCGCond c)
+{
+    tcg_debug_assert(imm5 < 32 && nzcv < 16);
+    tcg_out32(s, insn | ext << 31 | imm5 << 16 | rn << 5 | nzcv
               | tcg_cond_to_aarch64[c] << 12);
 }
 
@@ -1632,14 +1660,54 @@ bool tcg_target_has_memory_bswap(MemOp memop)
     return false;
 }
 
+static void tcg_out_qemu_ld_direct(TCGContext *s, MemOp memop, TCGType ext,
+                                   TCGReg data_r, HostAddress h);
+static void tcg_out_qemu_st_direct(TCGContext *s, MemOp memop,
+                                   TCGReg data_r, HostAddress h);
+
 static const TCGLdstHelperParam ldst_helper_param = {
     .ntmp = 1, .tmp = { TCG_REG_TMP0 }
 };
+
+/*
+ * The out-of-line path of an MO_ACQ_REL access that crosses a 16-byte
+ * boundary (see tcg_out_acqrel_check), and in system mode also of its
+ * TLB miss (see prepare_host_addr): call helper_tso_cross_ld/st, which
+ * perform the access and, if it crosses, count the crossing and have the
+ * insn promoted (retranslated with MO_ACQ_REL_CROSS, whose code has no
+ * check).
+ *
+ * The access goes through a helper rather than out-of-line code because
+ * a fault must be unwound to its guest insn, which works from the
+ * helper's return address (in the insn's code) but not from a host pc
+ * out here.
+ */
+static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+        return false;
+    }
+    if (lb->is_ld) {
+        tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
+        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X4, lb->site);
+        tcg_out_call_int(s, (const void *)helper_tso_cross_ld);
+        tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
+    } else {
+        tcg_out_st_helper_args(s, lb, &ldst_helper_param);
+        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X5, lb->site);
+        tcg_out_call_int(s, (const void *)helper_tso_cross_st);
+    }
+    tcg_out_goto(s, lb->raddr);
+    return true;
+}
 
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     MemOp opc = get_memop(lb->oi);
 
+    if (lb->fallback) {
+        return tcg_out_acqrel_fallback(s, lb);
+    }
     if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
         return false;
     }
@@ -1655,6 +1723,9 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     MemOp opc = get_memop(lb->oi);
 
+    if (lb->fallback) {
+        return tcg_out_acqrel_fallback(s, lb);
+    }
     if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
         return false;
     }
@@ -1663,6 +1734,24 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     tcg_out_call_int(s, qemu_st_helpers[opc & MO_SIZE]);
     tcg_out_goto(s, lb->raddr);
     return true;
+}
+
+/* An access that LDAPR or STLR may not do: bigger than a byte, unaligned. */
+static bool acqrel_may_cross(MemOp memop)
+{
+    unsigned s_bits = memop & MO_SIZE;
+
+    return s_bits != MO_8 && memop_alignment_bits(memop) < s_bits;
+}
+
+/*
+ * In system mode, an MO_ACQ_REL access that may cross 16 bytes tests the
+ * TLB and the crossing with one branch, to one out-of-line path.
+ */
+static bool acqrel_onepath(MemOp memop)
+{
+    return tcg_use_softmmu && (memop & MO_ACQ_REL)
+           && !(memop & MO_ACQ_REL_CROSS) && acqrel_may_cross(memop);
 }
 
 /* We expect to use a 7-bit scaled negative offset from ENV.  */
@@ -1676,7 +1765,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
  */
 static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
                                            TCGReg addr_reg, MemOpIdx oi,
-                                           bool is_ld)
+                                           bool is_ld, bool onepath)
 {
     TCGType addr_type = s->addr_type;
     TCGLabelQemuLdst *ldst = NULL;
@@ -1730,7 +1819,11 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
          * we check that we don't cross pages using the address of the
          * last byte of the access.
          */
-        if (a_mask >= s_mask) {
+        if (a_mask >= s_mask || onepath) {
+            /*
+             * With onepath, an access that stays within 16 bytes stays
+             * within the page, so the first byte decides.
+             */
             addr_adj = addr_reg;
         } else {
             addr_adj = TCG_REG_TMP2;
@@ -1746,9 +1839,25 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         /* Perform the address comparison. */
         tcg_out_cmp(s, addr_type, TCG_COND_NE, TCG_REG_TMP0, TCG_REG_TMP2, 0);
 
-        /* If not equal, we jump to the slow path. */
-        ldst->label_ptr[0] = s->code_ptr;
-        tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+        if (onepath) {
+            /*
+             * On a hit, test for a 16-byte crossing; a miss sets C and
+             * clears Z, which reads as a crossing.  Both go to the
+             * out-of-line helper call (tcg_out_acqrel_fallback).
+             */
+            tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I32, TCG_REG_TMP2,
+                             addr_reg, 15);
+            tcg_out_insn(s, ccmp_imm, CCMP, TCG_TYPE_I32, TCG_REG_TMP2,
+                         16 - (1 << s_bits), 2, TCG_COND_EQ);
+            ldst->fallback = true;
+            ldst->site = s->gen_insn_pc[s->gen_cur_insn];
+            ldst->label_ptr[0] = s->code_ptr;
+            tcg_out_insn(s, bcond_imm, B_C, TCG_COND_GTU, 0);
+        } else {
+            /* If not equal, we jump to the slow path. */
+            ldst->label_ptr[0] = s->code_ptr;
+            tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+        }
 
         h->base = TCG_REG_TMP1;
         h->index = addr_reg;
@@ -1782,6 +1891,129 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
     }
 
     return ldst;
+}
+
+/*
+ * LDAPR and STLR fault on an access that crosses a 16-byte boundary, even
+ * with FEAT_LSE2.  Test accesses that may cross (not known aligned, and
+ * bigger than a byte) on the guest address, whose low bits the host
+ * address shares, and branch to the out-of-line helper call
+ * (tcg_out_acqrel_fallback).
+ */
+static TCGLabelQemuLdst *tcg_out_acqrel_check(TCGContext *s, MemOpIdx oi,
+                                              TCGReg addr_reg, bool is_ld)
+{
+    MemOp memop = get_memop(oi);
+    unsigned s_bits = memop & MO_SIZE;
+    TCGLabelQemuLdst *lb;
+
+    /*
+     * With tcg_tso_cross_faults, the crossing access faults instead and the
+     * fault handler promotes it (tcg_target_insn_is_acqrel_ldst).
+     */
+    if (!acqrel_may_cross(memop) || acqrel_onepath(memop) ||
+        tcg_tso_cross_faults) {
+        return NULL;
+    }
+    tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I32, TCG_REG_TMP0,
+                     addr_reg, 15);
+    tcg_out_cmp(s, TCG_TYPE_I32, TCG_COND_GTU, TCG_REG_TMP0,
+                16 - (1 << s_bits), true);
+
+    lb = new_ldst_label(s);
+    lb->is_ld = is_ld;
+    lb->oi = oi;
+    lb->addr_reg = addr_reg;
+    lb->site = s->gen_insn_pc[s->gen_cur_insn];
+    lb->fallback = true;
+    lb->label_ptr[0] = s->code_ptr;
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_GTU, 0);
+    return lb;
+}
+
+/*
+ * The insns an MO_ACQ_REL access of more than a byte is emitted as, which
+ * raise an alignment fault when the access crosses 16 bytes: LDAPR and
+ * STLR, and LDAPUR, LDAPURS and STLUR (any size).
+ */
+#define TCG_TARGET_ACQREL_LDST_INSN
+static bool tcg_target_insn_is_acqrel_ldst(uint32_t insn)
+{
+    return (insn & 0x3ffffc00) == 0x38bfc000 ||     /* LDAPR */
+           (insn & 0x3ffffc00) == 0x089ffc00 ||     /* STLR */
+           (insn & 0x3f200c00) == 0x19000000;       /* LDAPUR*, STLUR */
+}
+
+/* Form the host address in one register, for insns without indexing. */
+static TCGReg tcg_out_host_addr_reg(TCGContext *s, HostAddress h)
+{
+    if (h.index == TCG_REG_XZR) {
+        return h.base;
+    }
+    if (h.index_ext == TCG_TYPE_I32) {
+        /* add tmp2, base, index, uxtw */
+        tcg_out_insn(s, addsub_ext, ADD, TCG_TYPE_I64, TCG_REG_TMP2,
+                     h.base, h.index, MO_32, 0);
+    } else {
+        tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP2, h.base, h.index);
+    }
+    return TCG_REG_TMP2;
+}
+
+static void tcg_out_qemu_ld_acquire(TCGContext *s, MemOp memop, TCGType ext,
+                                    TCGReg data_r, TCGReg base)
+{
+    uint32_t insn;
+
+    switch (memop & MO_SSIZE) {
+    case MO_UB:
+        insn = Ildapr_B;
+        break;
+    case MO_UW:
+        insn = Ildapr_H;
+        break;
+    case MO_UL:
+        insn = Ildapr_W;
+        break;
+    case MO_UQ:
+        insn = Ildapr_X;
+        break;
+    case MO_SB:
+        if (have_lrcpc2) {
+            insn = ext ? Ildapurs_BX : Ildapurs_BW;
+            break;
+        }
+        tcg_out32(s, Ildapr_B | base << 5 | data_r);
+        tcg_out_ext8s(s, ext, data_r, data_r);
+        return;
+    case MO_SW:
+        if (have_lrcpc2) {
+            insn = ext ? Ildapurs_HX : Ildapurs_HW;
+            break;
+        }
+        tcg_out32(s, Ildapr_H | base << 5 | data_r);
+        tcg_out_ext16s(s, ext, data_r, data_r);
+        return;
+    case MO_SL:
+        if (have_lrcpc2) {
+            insn = Ildapurs_WX;
+            break;
+        }
+        tcg_out32(s, Ildapr_W | base << 5 | data_r);
+        tcg_out_ext32s(s, data_r, data_r);
+        return;
+    default:
+        g_assert_not_reached();
+    }
+    tcg_out32(s, insn | base << 5 | data_r);
+}
+
+static void tcg_out_qemu_st_release(TCGContext *s, MemOp memop,
+                                    TCGReg data_r, TCGReg base)
+{
+    static const uint32_t insn[4] = { Istlr_B, Istlr_H, Istlr_W, Istlr_X };
+
+    tcg_out32(s, insn[memop & MO_SIZE] | base << 5 | data_r);
 }
 
 static void tcg_out_qemu_ld_direct(TCGContext *s, MemOp memop, TCGType ext,
@@ -1846,14 +2078,48 @@ static void tcg_out_qemu_st_direct(TCGContext *s, MemOp memop,
     }
 }
 
+/*
+ * An MO_ACQ_REL_CROSS access (of a promoted guest insn) that may cross
+ * 16 bytes, which LDAPR and STLR may not do: a plain access, which may,
+ * and a barrier.  A load is followed by the barrier a load-acquire
+ * stands for, ordering it before every later access; a store follows a
+ * barrier.  Neither is single-copy atomic across 16 bytes, which is not
+ * required of an access that is not aligned (MO_ATOM_IFALIGN).  In user
+ * mode a load that faults on its second page is reported at that page's
+ * first byte, where x86 reports it, as the hosts report the first byte
+ * that faulted.
+ */
+static bool acqrel_cross(MemOp memop)
+{
+    return (memop & MO_ACQ_REL_CROSS) && acqrel_may_cross(memop);
+}
+
 static void tgen_qemu_ld(TCGContext *s, TCGType data_type, TCGReg data_reg,
                          TCGReg addr_reg, MemOpIdx oi)
 {
     TCGLabelQemuLdst *ldst;
     HostAddress h;
 
-    ldst = prepare_host_addr(s, &h, addr_reg, oi, true);
-    tcg_out_qemu_ld_direct(s, get_memop(oi), data_type, data_reg, h);
+    ldst = prepare_host_addr(s, &h, addr_reg, oi, true,
+                             acqrel_onepath(get_memop(oi)));
+    if (acqrel_cross(get_memop(oi))) {
+        tcg_out_qemu_ld_direct(s, get_memop(oi) &
+                               ~(MO_ACQ_REL | MO_ACQ_REL_CROSS),
+                               data_type, data_reg, h);
+        tcg_out_mb(s, TCG_MO_LD_LD | TCG_MO_LD_ST);
+    } else if (get_memop(oi) & MO_ACQ_REL) {
+        TCGReg host = tcg_out_host_addr_reg(s, h);
+        TCGLabelQemuLdst *fb = tcg_out_acqrel_check(s, oi, addr_reg, true);
+
+        tcg_out_qemu_ld_acquire(s, get_memop(oi), data_type, data_reg, host);
+        if (fb) {
+            fb->type = data_type;
+            fb->datalo_reg = data_reg;
+            fb->raddr = tcg_splitwx_to_rx(s->code_ptr);
+        }
+    } else {
+        tcg_out_qemu_ld_direct(s, get_memop(oi), data_type, data_reg, h);
+    }
 
     if (ldst) {
         ldst->type = data_type;
@@ -1873,8 +2139,24 @@ static void tgen_qemu_st(TCGContext *s, TCGType data_type, TCGReg data_reg,
     TCGLabelQemuLdst *ldst;
     HostAddress h;
 
-    ldst = prepare_host_addr(s, &h, addr_reg, oi, false);
-    tcg_out_qemu_st_direct(s, get_memop(oi), data_reg, h);
+    ldst = prepare_host_addr(s, &h, addr_reg, oi, false,
+                             acqrel_onepath(get_memop(oi)));
+    if (acqrel_cross(get_memop(oi))) {
+        tcg_out_mb(s, TCG_MO_LD_ST | TCG_MO_ST_ST);
+        tcg_out_qemu_st_direct(s, get_memop(oi), data_reg, h);
+    } else if (get_memop(oi) & MO_ACQ_REL) {
+        TCGReg host = tcg_out_host_addr_reg(s, h);
+        TCGLabelQemuLdst *fb = tcg_out_acqrel_check(s, oi, addr_reg, false);
+
+        tcg_out_qemu_st_release(s, get_memop(oi), data_reg, host);
+        if (fb) {
+            fb->type = data_type;
+            fb->datalo_reg = data_reg;
+            fb->raddr = tcg_splitwx_to_rx(s->code_ptr);
+        }
+    } else {
+        tcg_out_qemu_st_direct(s, get_memop(oi), data_reg, h);
+    }
 
     if (ldst) {
         ldst->type = data_type;
@@ -1888,6 +2170,183 @@ static const TCGOutOpQemuLdSt outop_qemu_st = {
     .out = tgen_qemu_st,
 };
 
+/*
+ * qemu_atomic: one FEAT_LSE insn with acquire and release semantics (CASAL,
+ * SWPAL, LDADDAL, LDCLRAL, LDSETAL, LDEORAL), the insns the atomic helpers
+ * themselves use.  In system mode the fast path takes a main-TLB entry
+ * whose read and write comparators both equal the page, without flags (no
+ * watchpoint, MMIO, notdirty, discarded write, invalid entry), and an
+ * address aligned to the access size, or to the guest's alignment if
+ * larger; in user mode it tests the alignment only.  The slow path calls
+ * the function the helper calls, cpu_atomic_*_mmu, with the original
+ * MemOpIdx.
+ */
+
+static TCGLabelQemuLdst *prepare_atomic_addr(TCGContext *s, TCGReg *host,
+                                             TCGReg addr_reg, MemOpIdx oi)
+{
+    TCGType addr_type = s->addr_type;
+    MemOp opc = get_memop(oi);
+    unsigned a_bits = MAX(memop_alignment_bits(opc), opc & MO_SIZE);
+    unsigned a_mask = (1u << a_bits) - 1;
+    TCGLabelQemuLdst *ldst = NULL;
+    HostAddress h = { };
+
+    if (tcg_use_softmmu) {
+        unsigned mem_index = get_mmuidx(oi);
+
+        tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP1,
+                     TCG_AREG0, tlb_mask_table_ofs(s, mem_index), 1, 0);
+        tcg_out_insn(s, addsub_realshift, AND_LSR, addr_type,
+                     TCG_REG_TMP0, TCG_REG_TMP0, addr_reg,
+                     TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
+        tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP1, TCG_REG_TMP1,
+                     TCG_REG_TMP0);
+
+        /* The read and write comparators into TMP0 and TMP2. */
+        QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addr_read) != 0);
+        QEMU_BUILD_BUG_ON(offsetof(CPUTLBEntry, addr_write) != 8);
+        if (addr_type == TCG_TYPE_I64) {
+            tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP2,
+                         TCG_REG_TMP1, 0, 1, 0);
+        } else {
+            tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_TMP0, TCG_REG_TMP1,
+                       offsetof(CPUTLBEntry, addr_read));
+            tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_TMP2, TCG_REG_TMP1,
+                       offsetof(CPUTLBEntry, addr_write));
+        }
+
+        /*
+         * Equal to each other, then the page and alignment bits of the
+         * address equal to them: ccmp leaves NE if the first test failed.
+         */
+        tcg_out_cmp(s, addr_type, TCG_COND_NE, TCG_REG_TMP0, TCG_REG_TMP2, 0);
+        tcg_out_logicali(s, Ilogic_imm_ANDI, addr_type, TCG_REG_TMP0,
+                         addr_reg, (uint64_t)TARGET_PAGE_MASK | a_mask);
+        tcg_out32(s, 0x7a400000 | addr_type << 31 | TCG_REG_TMP2 << 16
+                  | tcg_cond_to_aarch64[TCG_COND_EQ] << 12
+                  | TCG_REG_TMP0 << 5);
+
+        ldst = new_ldst_label(s);
+        ldst->label_ptr[0] = s->code_ptr;
+        tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+
+        tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_TMP1, TCG_REG_TMP1,
+                   offsetof(CPUTLBEntry, addend));
+        h.base = TCG_REG_TMP1;
+        h.index = addr_reg;
+        h.index_ext = addr_type;
+    } else {
+        if (a_mask) {
+            tcg_out_logicali(s, Ilogic_imm_ANDSI, 0, TCG_REG_XZR, addr_reg,
+                             a_mask);
+            ldst = new_ldst_label(s);
+            ldst->label_ptr[0] = s->code_ptr;
+            tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+        }
+        if (guest_base || addr_type == TCG_TYPE_I32) {
+            h.base = TCG_REG_GUEST_BASE;
+            h.index = addr_reg;
+            h.index_ext = addr_type;
+        } else {
+            h.base = addr_reg;
+            h.index = TCG_REG_XZR;
+            h.index_ext = TCG_TYPE_I64;
+        }
+    }
+    if (ldst) {
+        ldst->oi = oi;
+        ldst->addr_reg = addr_reg;
+    }
+    *host = tcg_out_host_addr_reg(s, h);
+    return ldst;
+}
+
+static void tgen_qemu_atomic(TCGContext *s, TCGType type, TCGReg ret,
+                             TCGReg val, TCGReg cmp, TCGReg addr_reg,
+                             MemOpIdx oi, TCGAtomicOp aop)
+{
+    static const uint32_t ldop[TCG_ATOMIC_NB_OPS] = {
+        [TCG_ATOMIC_XCHG] = 0x38e08000,     /* SWPAL */
+        [TCG_ATOMIC_ADD] = 0x38e00000,      /* LDADDAL */
+        [TCG_ATOMIC_AND] = 0x38e01000,      /* LDCLRAL, of ~val */
+        [TCG_ATOMIC_OR] = 0x38e03000,       /* LDSETAL */
+        [TCG_ATOMIC_XOR] = 0x38e02000,      /* LDEORAL */
+        [TCG_ATOMIC_CMPXCHG] = 0x08e0fc00,  /* CASAL */
+    };
+    uint32_t size = (get_memop(oi) & MO_SIZE) << 30;
+    TCGLabelQemuLdst *ldst;
+    TCGReg host;
+
+    /*
+     * A CASAL whose compare fails writes nothing, so its release orders
+     * nothing: as with the helpers, which use the same insn, ordering
+     * that case is the guest front end's concern.
+     */
+    ldst = prepare_atomic_addr(s, &host, addr_reg, oi);
+    switch (aop) {
+    case TCG_ATOMIC_CMPXCHG:
+        /* CASAL overwrites its compare register with the old value. */
+        tcg_out_mov(s, TCG_TYPE_I64, TCG_REG_TMP0, cmp);
+        tcg_out32(s, ldop[aop] | size | TCG_REG_TMP0 << 16 | host << 5 | val);
+        tcg_out_mov(s, TCG_TYPE_I64, ret, TCG_REG_TMP0);
+        break;
+    case TCG_ATOMIC_AND:
+        tcg_out_insn(s, logic_shift, ORN, TCG_TYPE_I64, TCG_REG_TMP0,
+                     TCG_REG_XZR, val);
+        tcg_out32(s, ldop[aop] | size | TCG_REG_TMP0 << 16 | host << 5 | ret);
+        break;
+    default:
+        tcg_out32(s, ldop[aop] | size | val << 16 | host << 5 | ret);
+        break;
+    }
+    if (ldst) {
+        ldst->type = type;
+        ldst->atomic = aop + 1;
+        ldst->datalo_reg = ret;
+        ldst->datahi_reg = val;
+        ldst->cmp_reg = cmp;
+        ldst->raddr = tcg_splitwx_to_rx(s->code_ptr);
+    }
+    /*
+     * The helpers follow a guest atomic with a full barrier under
+     * x-tso=acqrel (cpu_tso_atomic_fence): so does this, on both paths.
+     */
+    if (tcg_tso_mode == TCG_TSO_ACQREL) {
+        tcg_out_mb(s, TCG_MO_ALL);
+    }
+}
+
+static TCGConstraintSetIndex cset_qemu_atomic(TCGType type, unsigned flags)
+{
+    return have_lse ? C_N1_I3(r, r, r, r) : C_NotImplemented;
+}
+
+static const TCGOutOpQemuAtomic outop_qemu_atomic = {
+    .base.static_constraint = C_Dynamic,
+    .base.dynamic_constraint = cset_qemu_atomic,
+    .out = tgen_qemu_atomic,
+};
+
+static bool tcg_out_qemu_atomic_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    const void *fn;
+
+    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+        return false;
+    }
+    fn = tcg_out_atomic_helper_args(s, lb, &ldst_helper_param);
+    tcg_out_call_int(s, fn);
+    if ((get_memop(lb->oi) & MO_SIZE) <= MO_32) {
+        tcg_out_ext32u(s, lb->datalo_reg, TCG_REG_X0);
+    } else {
+        tcg_out_mov(s, TCG_TYPE_I64, lb->datalo_reg, TCG_REG_X0);
+    }
+    tcg_out_goto(s, lb->raddr);
+    return true;
+}
+
+
 static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
                                    TCGReg addr_reg, MemOpIdx oi, bool is_ld)
 {
@@ -1896,7 +2355,7 @@ static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
     TCGReg base;
     bool use_pair;
 
-    ldst = prepare_host_addr(s, &h, addr_reg, oi, is_ld);
+    ldst = prepare_host_addr(s, &h, addr_reg, oi, is_ld, false);
 
     /* Compose the final address, as LDP/STP have no indexing. */
     if (h.index == TCG_REG_XZR) {
@@ -1911,6 +2370,18 @@ static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
             /* add base, base, index */
             tcg_out_insn(s, addsub_shift, ADD, 1, base, h.base, h.index);
         }
+    }
+
+    if (get_memop(oi) & MO_ACQ_REL) {
+        /*
+         * x-tso=acqrel, 16-byte aligned (tcg_ldst_i128_acqrel): FEAT_LRCPC3
+         * LDIAPP / STILP, a load-acquire / store-release pair that is
+         * single-copy atomic with FEAT_LSE2.  No barrier.
+         */
+        tcg_debug_assert(have_lrcpc3 && have_lse2);
+        tcg_out32(s, (is_ld ? 0xd9401800 : 0xd9001800)
+                  | datahi << 16 | base << 5 | datalo);
+        goto done;
     }
 
     use_pair = h.aa.atom < MO_128 || have_lse2;
@@ -1978,6 +2449,7 @@ static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
         }
     }
 
+ done:
     if (ldst) {
         ldst->type = TCG_TYPE_I128;
         ldst->datalo_reg = datalo;

@@ -191,6 +191,20 @@ static inline void begin_parallel_context(CPUState *cs)
     }
 }
 
+/*
+ * Shared memory was mapped: another process may access guest memory, so
+ * code stays parallel even when this process has one thread again.
+ */
+extern bool parallel_shared;
+
+/**
+ * end_parallel_context: @cs is the only CPU left
+ *
+ * Called by the exiting thread with clone_lock held, after its CPU left
+ * the CPU list.  With tcg_reserial, @cs runs serial code again.
+ */
+void end_parallel_context(CPUState *cs);
+
 /**
  * init_main_thread: Set CPU state for main thread
  * @cs: CPU context to set

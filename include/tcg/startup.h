@@ -37,6 +37,89 @@ extern bool tcg_fpcheck_runtime;
  */
 extern bool tcg_iopl_runtime;
 
+/*
+ * How guest memory ordering is implemented for ordinary guest loads and
+ * stores (accel property x-tso).
+ */
+typedef enum TCGTsoMode {
+    TCG_TSO_BARRIER,    /* a barrier before each access (default) */
+    TCG_TSO_ACQREL,     /* load-acquire / store-release accesses */
+    TCG_TSO_NONE,       /* no barriers at all: UNSAFE, for measurement */
+} TCGTsoMode;
+
+extern TCGTsoMode tcg_tso_mode;
+
+/*
+ * User mode: when the last thread but one exits, the remaining CPU goes
+ * back to serial code, as before the first thread was created (x-tso=auto).
+ */
+extern bool tcg_reserial;
+
+/*
+ * Guest accesses wider than 8 bytes that the guest doesn't make atomic
+ * (accel property x-tso-vec): each ordered like any access (false, the
+ * default), or, under TCG_TSO_ACQREL, as runs with barriers only where a
+ * run begins and ends (true).  Not exact: see tcg_tso_run_end().
+ */
+extern bool tcg_tso_vec_group;
+
+/*
+ * x-tso-vec=none: guest accesses the front end marks as moving vector or
+ * floating-point register data (TCGContext.ldst_vector) get no
+ * memory-order constraint, unless the guest makes them atomic as a whole.
+ * Implies tcg_tso_vec_group for the remaining wide accesses.
+ */
+extern bool tcg_tso_vec_none;
+
+/*
+ * x-tso-vec=atomic: as x-tso-vec=none, but the front end keeps the
+ * whole atomicity, and so the order, of the vector accesses a guest may
+ * use as 16-byte atomic loads and stores.  With x-tso-vec=none it makes
+ * vector accesses atomic only in parts.
+ */
+extern bool tcg_tso_vec_atomic;
+
+/*
+ * In qemu-user, guest accesses the front end marks as thread-private
+ * (TCGContext.ldst_private: x86 RSP-based and implicit stack accesses)
+ * get no memory-order constraint (accel property x-tso-stack).
+ */
+extern bool tcg_tso_stack;
+
+/*
+ * With TCG_TSO_ACQREL, a guest insn whose MO_ACQ_REL accesses have crossed
+ * a 16-byte boundary is promoted: retranslated with MO_ACQ_REL_CROSS, a
+ * form that handles any alignment without a data-dependent branch.
+ *
+ * tcg_tso_cross_count counts one crossing at guest insn @pc, and returns
+ * true once the insn is promoted; tcg_tso_cross_promoted returns true if
+ * it has been.
+ */
+bool tcg_tso_cross_count(uint64_t pc);
+bool tcg_tso_cross_promoted(uint64_t pc);
+
+/*
+ * User mode: the host's alignment-fault handler deals with MO_ACQ_REL
+ * accesses that cross 16 bytes (LDAPR and STLR fault on them), so the
+ * backend emits no inline check.  tcg_insn_is_acqrel_ldst tells whether
+ * the generated insn at host address @pc is such an access.
+ */
+extern bool tcg_tso_cross_faults;
+bool tcg_insn_is_acqrel_ldst(uintptr_t pc);
+
+/* True if the host backend can emit MO_ACQ_REL accesses. */
+bool tcg_can_ldst_acqrel(void);
+
+/*
+ * tcg_atomic: guest atomic read-modify-write accesses (xchg, add, and, or,
+ * xor, cmpxchg, up to 64 bits) in parallel mode are host atomic insns
+ * after the guest access's own checks, with the out-of-line helper only
+ * for what those checks don't pass, on backends that support it
+ * (tcg_atomic_supported).
+ */
+extern bool tcg_atomic;
+bool tcg_atomic_supported(void);
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size
