@@ -1055,6 +1055,20 @@ static void tcg_set_hvtimers(Object *obj, bool value, Error **errp)
     TCG_STATE(obj)->hvtimers = value;
 }
 
+static bool tcg_get_tlbpin(Object *obj, Error **errp)
+{
+    return tcg_tlbpin;
+}
+
+static void tcg_set_tlbpin(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_tlbpin_supported()) {
+        error_setg(errp, "x-tlbpin: not supported by this TCG backend");
+        return;
+    }
+    tcg_tlbpin = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1354,6 +1368,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "x86 system mode, with x-hyperv: also implement hv-synic, hv-stimer "
         "and hv-stimer-direct (the SynIC's message page and Hyper-V's "
         "synthetic timers), and turn them on by default");
+
+    object_class_property_add_bool(oc, "x-tlbpin", tcg_get_tlbpin,
+                                   tcg_set_tlbpin);
+    object_class_property_set_description(oc, "x-tlbpin",
+        "Keep the TLB mask and table of a block's main mmu index in host "
+        "registers (system mode)");
 }
 
 static const TypeInfo tcg_accel_type = {
