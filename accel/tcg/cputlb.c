@@ -1280,7 +1280,8 @@ io_prepare(hwaddr *out_offset, CPUState *cpu, CPUTLBEntryFull *full,
     section = full->section;
     mr_offset = full->xlat_offset + addr;
     cpu->mem_io_pc = retaddr;
-    if (!cpu->neg.can_do_io) {
+    if (tcg_iolazy_active() ? !cpu_io_last_insn(retaddr)
+                            : !cpu->neg.can_do_io) {
         cpu_io_recompile(cpu, retaddr);
     }
 
