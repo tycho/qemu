@@ -758,6 +758,16 @@ static void tcg_set_pincc(Object *obj, bool value, Error **errp)
     tcg_pin_cc = value;
 }
 
+static bool tcg_get_pinpc(Object *obj, Error **errp)
+{
+    return tcg_pin_pc;
+}
+
+static void tcg_set_pinpc(Object *obj, bool value, Error **errp)
+{
+    tcg_pin_pc = value;
+}
+
 static bool tcg_get_ccregs(Object *obj, Error **errp)
 {
     return tcg_cc_regs;
@@ -1194,6 +1204,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-pincc",
         "With x-pin, keep the guest's condition-code operation in a host "
         "register across TBs too, where the host has one to spare");
+
+    object_class_property_add_bool(oc, "x-pinpc", tcg_get_pinpc,
+                                   tcg_set_pinpc);
+    object_class_property_set_description(oc, "x-pinpc",
+        "With x-pin, in system mode, keep the guest PC in a host register "
+        "across TBs, ahead of the guest's general registers");
 
     object_class_property_add_bool(oc, "x-ccregs", tcg_get_ccregs,
                                    tcg_set_ccregs);
