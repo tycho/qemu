@@ -94,7 +94,14 @@ uint64_t cpu_get_tsc(CPUX86State *env)
 {
 #if HOST_COUNTER_SUPPORTED
     if (tcg_tsc_counter) {
-        return tsc_counter_now() + env->tsc_counter_offset;
+        uint64_t tsc = tsc_counter_now() + env->tsc_counter_offset;
+
+        /* The vCPU's own reads strictly increase (tsc_counter_last). */
+        if (current_cpu == env_cpu(env)) {
+            tsc = MAX(tsc, env->tsc_counter_last + 1);
+            env->tsc_counter_last = tsc;
+        }
+        return tsc;
     }
 #endif
     return cpus_get_elapsed_ticks();
@@ -105,6 +112,7 @@ void x86_tsc_counter_set(CPUX86State *env, uint64_t tsc)
 {
 #if HOST_COUNTER_SUPPORTED
     env->tsc_counter_offset = tsc - tsc_counter_now();
+    env->tsc_counter_last = 0;
 #endif
 }
 
@@ -115,6 +123,7 @@ void x86_tsc_counter_reset(CPUX86State *env)
     if (tcg_tsc_counter) {
         tsc_counter_init_once();
         env->tsc_counter_offset = tsc_counter_base;
+        env->tsc_counter_last = 0;
     }
 #endif
 }

@@ -2265,6 +2265,11 @@ static bool gen_tsc_counter(DisasContext *s, bool ordered)
 #ifndef CONFIG_USER_ONLY
     tcg_gen_ld_i64(o, tcg_env, offsetof(CPUX86State, tsc_counter_offset));
     tcg_gen_add_i64(t, t, o);
+    /* Strictly increasing on this vCPU (tsc_counter_last). */
+    tcg_gen_ld_i64(o, tcg_env, offsetof(CPUX86State, tsc_counter_last));
+    tcg_gen_addi_i64(o, o, 1);
+    tcg_gen_umax_i64(t, t, o);
+    tcg_gen_st_i64(t, tcg_env, offsetof(CPUX86State, tsc_counter_last));
     tcg_gen_ld_i64(o, tcg_env, offsetof(CPUX86State, tsc_offset));
     tcg_gen_add_i64(t, t, o);
 #endif
