@@ -4424,6 +4424,16 @@ void tcg_x86_init(void)
                                          reg_names[i]);
     }
 
+#ifndef CONFIG_USER_ONLY
+    /*
+     * With tcg_pin_pc, EIP first: in system mode TBs are PC-relative, and
+     * every exit adds its displacement to EIP; the next TB reads it.
+     */
+    if (tcg_pin_user && tcg_pin_pc) {
+        tcg_temp_pin(tcgv_tl_temp(cpu_eip));
+    }
+#endif
+
     /*
      * With tcg_pin_user, as many general registers as the backend allows
      * stay in host registers across TBs, the most used first: summed over

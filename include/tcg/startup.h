@@ -175,11 +175,15 @@ extern bool tcg_lazysync_user;
  * tcg_pin_cc: with tcg_pin_user, a front end pins the global that holds
  * its lazy condition-code operation, when a register is left after its
  * guest registers.
+ * tcg_pin_pc: with tcg_pin_user, in system mode, a front end whose TBs are
+ * PC-relative pins the global that holds the guest PC first: every TB
+ * exit adds to it.
  */
 extern bool tcg_pin;
 extern bool tcg_pin_user;
 extern bool tcg_pin_vec;
 extern bool tcg_pin_cc;
+extern bool tcg_pin_pc;
 
 /*
  * tcg_pin_system_ok: whether the backend can pin guest registers in system
