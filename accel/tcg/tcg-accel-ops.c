@@ -30,6 +30,7 @@
 #include "accel/accel-cpu-ops.h"
 #include "accel/tcg/cpu-loop.h"
 #include "system/tcg.h"
+#include "tcg/startup.h"
 #include "system/replay.h"
 #include "exec/icount.h"
 #include "qemu/main-loop.h"
@@ -50,6 +51,61 @@
 #include "tcg-accel-ops-icount.h"
 
 /* common functionality among all TCG variants */
+
+#ifdef CONFIG_POSIX
+static struct sigaction tso_fault_oldact;
+
+/*
+ * tcg_tso_fault: an ordered guest access that crosses 16 bytes raises an
+ * alignment fault in generated code; resume it at its out-of-line path,
+ * which performs it and has the guest insn retranslated.  Anything else
+ * goes to the handler that was there before.
+ */
+static void tso_fault_handler(int sig, siginfo_t *info, void *puc)
+{
+    if (info->si_code == BUS_ADRALN && current_cpu &&
+        tcg_tso_fault_resume(puc)) {
+        return;
+    }
+    if (tso_fault_oldact.sa_flags & SA_SIGINFO) {
+        tso_fault_oldact.sa_sigaction(sig, info, puc);
+    } else if (tso_fault_oldact.sa_handler != SIG_DFL &&
+               tso_fault_oldact.sa_handler != SIG_IGN) {
+        tso_fault_oldact.sa_handler(sig);
+    } else {
+        /* The faulting insn runs again and takes the default action. */
+        signal(SIGBUS, SIG_DFL);
+    }
+}
+
+/* Called by each vCPU thread before it runs guest code. */
+void tcg_tso_fault_thread_init(void)
+{
+    static gsize installed;
+    sigset_t set;
+
+    if (!tcg_tso_fault) {
+        return;
+    }
+    if (g_once_init_enter(&installed)) {
+        struct sigaction act = {
+            .sa_sigaction = tso_fault_handler,
+            .sa_flags = SA_SIGINFO,
+        };
+
+        sigemptyset(&act.sa_mask);
+        sigaction(SIGBUS, &act, &tso_fault_oldact);
+        g_once_init_leave(&installed, 1);
+    }
+    sigemptyset(&set);
+    sigaddset(&set, SIGBUS);
+    pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+}
+#else
+void tcg_tso_fault_thread_init(void)
+{
+}
+#endif
 
 void tcg_cpu_init_cflags(CPUState *cpu, bool parallel)
 {

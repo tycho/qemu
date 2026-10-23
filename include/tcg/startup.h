@@ -95,6 +95,18 @@ bool tcg_tso_cross_promoted(uint64_t pc);
 extern bool tcg_tso_cross_faults;
 bool tcg_insn_is_acqrel_ldst(uintptr_t pc);
 
+/*
+ * tcg_tso_fault: system mode tests a 16-byte crossing by the alignment
+ * fault too, on backends that support it (tcg_tso_fault_supported).  The
+ * vCPU thread's SIGBUS handler resumes a faulting access at its
+ * out-of-line path, which handles the crossing: tcg_tso_fault_resume
+ * moves the PC of the signal context @puc there, or returns false if the
+ * fault isn't such an access.
+ */
+extern bool tcg_tso_fault;
+bool tcg_tso_fault_supported(void);
+bool tcg_tso_fault_resume(void *puc);
+
 /* True if the host backend can emit MO_ACQ_REL accesses. */
 bool tcg_can_ldst_acqrel(void);
 
