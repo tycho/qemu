@@ -102,10 +102,15 @@ static void tcg_vm_change_state(void *opaque, bool running, RunState state)
 }
 #endif
 
+/* Settings that translated code depends on are fixed from here on. */
+static bool tcg_machine_inited;
+
 static int tcg_init_machine(AccelState *as, MachineState *ms)
 {
     TCGState *s = TCG_STATE(as);
     unsigned max_threads = 1;
+
+    tcg_machine_inited = true;
 
 #ifndef CONFIG_USER_ONLY
     CPUClass *cc = CPU_CLASS(object_class_by_name(target_cpu_type()));
@@ -262,6 +267,7 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 }
 
 bool tcg_iolast;
+bool tcg_iolazy;
 bool tcg_mmio_lockless;
 bool tcg_exit_irq_only;
 
@@ -299,6 +305,21 @@ static bool tcg_get_iofast(Object *obj, Error **errp)
 static void tcg_set_iofast(Object *obj, bool value, Error **errp)
 {
     TCG_STATE(obj)->iofast = value;
+}
+
+static bool tcg_get_iolazy(Object *obj, Error **errp)
+{
+    return tcg_iolazy;
+}
+
+static void tcg_set_iolazy(Object *obj, bool value, Error **errp)
+{
+    /* TBs translated with one value don't work with the other. */
+    if (tcg_machine_inited && value != tcg_iolazy) {
+        error_setg(errp, "x-iolazy: cannot be changed at run time");
+        return;
+    }
+    tcg_iolazy = value;
 }
 
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
@@ -339,6 +360,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "with icount), MMIO to lockless_io regions without the BQL, the "
         "x86 APIC's TPR and the RTC's update polls without the BQL, and "
         "no kvmvapic option ROM");
+
+    object_class_property_add_bool(oc, "x-iolazy",
+                                   tcg_get_iolazy, tcg_set_iolazy);
+    object_class_property_set_description(oc, "x-iolazy",
+        "System mode without icount: no can_do_io stores in TBs; an I/O "
+        "access finds from the unwind data whether its insn is the TB's "
+        "last");
 }
 
 static const TypeInfo tcg_accel_type = {
