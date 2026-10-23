@@ -12,6 +12,7 @@
 #include "exec/cpu-common.h"
 #include "exec/translation-block.h"
 #include "exec/mmap-lock.h"
+#include "exec/icount.h"
 #include "accel/tcg/tb-cpu-state.h"
 
 extern int64_t max_delay;
@@ -67,6 +68,18 @@ extern bool tcg_jc_keep_pcrel;
  */
 extern bool tcg_iolast;
 bool tb_io_insn_known(vaddr pc);
+
+/*
+ * tcg_iolazy: without icount, TBs don't store can_do_io; an access to
+ * I/O memory from generated code is allowed in a TB's last insn alone
+ * (cpu_io_last_insn), as the stores would allow it.
+ */
+extern bool tcg_iolazy;
+
+static inline bool tcg_iolazy_active(void)
+{
+    return tcg_iolazy && !icount_enabled();
+}
 
 /*
  * tcg_mmio_lockless: MMIO from generated code to a lockless_io region
@@ -227,6 +240,7 @@ void page_table_config_init(void);
 
 #ifndef CONFIG_USER_ONLY
 G_NORETURN void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr);
+bool cpu_io_last_insn(uintptr_t retaddr);
 #endif /* CONFIG_USER_ONLY */
 
 void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr);
