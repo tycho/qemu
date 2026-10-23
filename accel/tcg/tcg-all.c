@@ -149,6 +149,10 @@ static void xtcg_fork_defaults(Object *obj)
     if (tcg_atomic_supported()) {
         object_property_parse(obj, "x-atomic", "on", &error_abort);
     }
+    /* Crossings found by fault: on where the host raises the fault. */
+    if (tcg_tso_fault_supported()) {
+        object_property_parse(obj, "x-tso-fault", "on", &error_abort);
+    }
 #endif
 }
 
@@ -706,6 +710,21 @@ static void tcg_set_atomic(Object *obj, bool value, Error **errp)
     tcg_atomic = value;
 }
 
+static bool tcg_get_tso_fault(Object *obj, Error **errp)
+{
+    return tcg_tso_fault;
+}
+
+static void tcg_set_tso_fault(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_tso_fault_supported()) {
+        error_setg(errp, "x-tso-fault: not supported by this TCG backend "
+                   "or host");
+        return;
+    }
+    tcg_tso_fault = value;
+}
+
 static bool tcg_get_simd(Object *obj, Error **errp)
 {
     return tcg_vecld && tcg_vecmem && tcg_vperm && tcg_vpermvar && tcg_vint;
@@ -1201,6 +1220,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-atomic",
         "Guest atomic read-modify-write accesses as host atomic insns "
         "inline, with the helper only as the slow path");
+
+    object_class_property_add_bool(oc, "x-tso-fault", tcg_get_tso_fault,
+                                   tcg_set_tso_fault);
+    object_class_property_set_description(oc, "x-tso-fault",
+        "System mode, with x-tso=acqrel: an ordered access that crosses "
+        "16 bytes is found by the host's alignment fault, not tested "
+        "in line");
 
     object_class_property_add_str(oc, "x-tso-vec", tcg_get_tso_vec,
                                   tcg_set_tso_vec);
