@@ -50,6 +50,7 @@
 #include "accel/accel-cpu-ops.h"
 #include "accel/tcg/cpu-ops.h"
 #include "internal-common.h"
+#include "qemu/xtcg-stats.h"
 #include "qapi/visitor.h"
 #include "tcg-accel-ops-mttcg.h"
 
@@ -1150,6 +1151,16 @@ static void tcg_set_tlbpin(Object *obj, bool value, Error **errp)
     tcg_tlbpin = value;
 }
 
+static bool tcg_get_xtcg_stats(Object *obj, Error **errp)
+{
+    return xtcg_stats;
+}
+
+static void tcg_set_xtcg_stats(Object *obj, bool value, Error **errp)
+{
+    xtcg_stats_enable(value);
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1461,6 +1472,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-tlbpin",
         "Keep the TLB mask and table of a block's main mmu index in host "
         "registers (system mode)");
+
+    object_class_property_add_bool(oc, "x-stats",
+                                   tcg_get_xtcg_stats,
+                                   tcg_set_xtcg_stats);
+    object_class_property_set_description(oc, "x-stats",
+        "xtcg: count TCG events and print them to stderr at exit");
 }
 
 static const TypeInfo tcg_accel_type = {
