@@ -156,8 +156,10 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
      * local APIC has no kvmvapic option ROM, which patches a guest's TPR
      * accesses into port I/O so that KVM avoids an exit per access, but
      * under TCG makes each one an I/O exit and invalidates code on its
-     * ROM page.  The device settings are accelerator compat properties,
-     * so an explicit -global still wins.
+     * ROM page.  Without icount, TBs don't store can_do_io: an I/O access
+     * finds from the TB's unwind data whether its insn is the TB's last.
+     * The device settings are accelerator compat properties, so an
+     * explicit -global still wins.
      */
     if (s->iofast) {
         static GlobalProperty iofast_props[] = {
@@ -168,6 +170,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
         AccelClass *ac = ACCEL_GET_CLASS(as);
 
         tcg_iolast = true;
+        tcg_iolazy = true;
         tcg_mmio_lockless = true;
         tcg_exit_irq_only = true;
         if (!ac->compat_props) {
@@ -262,6 +265,7 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 }
 
 bool tcg_iolast;
+bool tcg_iolazy;
 bool tcg_mmio_lockless;
 bool tcg_exit_irq_only;
 
@@ -335,10 +339,10 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "x-iofast",
                                    tcg_get_iofast, tcg_set_iofast);
     object_class_property_set_description(oc, "x-iofast",
-        "System mode: end TBs after instructions known to do I/O (not "
-        "with icount), MMIO to lockless_io regions without the BQL, the "
-        "x86 APIC's TPR and the RTC's update polls without the BQL, and "
-        "no kvmvapic option ROM");
+        "System mode: end TBs after instructions known to do I/O and no "
+        "can_do_io stores in TBs (not with icount), MMIO to lockless_io "
+        "regions without the BQL, the x86 APIC's TPR and the RTC's update "
+        "polls without the BQL, and no kvmvapic option ROM");
 }
 
 static const TypeInfo tcg_accel_type = {
