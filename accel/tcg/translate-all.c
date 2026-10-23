@@ -789,6 +789,25 @@ static bool tb_io_insn_add(vaddr pc)
  *
  * Called by softmmu_template.h, with iothread mutex not held.
  */
+/*
+ * tcg_iolazy: whether the guest insn whose code @retaddr is in is the last
+ * of its TB, where can_do_io would be true.  True where @retaddr names no
+ * TB: outside generated code, where cpu_exec leaves can_do_io true, and
+ * for a helper that passed no return address (where can_do_io could be
+ * false, but cpu_io_recompile would find no TB to unwind).
+ */
+bool cpu_io_last_insn(uintptr_t retaddr)
+{
+    uint64_t data[INSN_START_WORDS];
+    TranslationBlock *tb;
+
+    if (!in_code_gen_buffer((const void *)(retaddr - tcg_splitwx_diff))) {
+        return true;
+    }
+    tb = tcg_tb_lookup(retaddr);
+    return !tb || cpu_unwind_data_from_tb(tb, retaddr, data) == 1;
+}
+
 void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
 {
     TranslationBlock *tb;

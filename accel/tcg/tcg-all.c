@@ -151,6 +151,8 @@ static void xtcg_fork_defaults(Object *obj)
     if (tcg_atomic_supported()) {
         object_property_parse(obj, "x-atomic", "on", &error_abort);
     }
+    /* No can_do_io stores (not with icount, which needs them). */
+    object_property_parse(obj, "x-iolazy", "on", &error_abort);
     /* Crossings found by fault: on where the host raises the fault. */
     if (tcg_tso_fault_supported()) {
         object_property_parse(obj, "x-tso-fault", "on", &error_abort);
@@ -192,11 +194,16 @@ static void tcg_vm_change_state(void *opaque, bool running, RunState state)
 }
 #endif
 
+/* Settings that translated code depends on are fixed from here on. */
+static bool tcg_machine_inited;
+
 static int tcg_init_machine(AccelState *as, MachineState *ms)
 {
     TCGState *s = TCG_STATE(as);
     CPUClass *cc = CPU_CLASS(object_class_by_name(target_cpu_type()));
     unsigned max_threads = 1;
+
+    tcg_machine_inited = true;
 
 #ifndef CONFIG_USER_ONLY
     bool mttcg_supported = cc->tcg_ops->mttcg_supported;
@@ -547,6 +554,7 @@ bool tcg_jc_keep_pcrel;
 bool tcg_jc_global;
 
 bool tcg_iolast;
+bool tcg_iolazy;
 bool tcg_mmio_lockless;
 bool tcg_exit_irq_only;
 
@@ -972,6 +980,21 @@ static void tcg_set_iofast(Object *obj, bool value, Error **errp)
     TCG_STATE(obj)->iofast = value;
 }
 
+static bool tcg_get_iolazy(Object *obj, Error **errp)
+{
+    return tcg_iolazy;
+}
+
+static void tcg_set_iolazy(Object *obj, bool value, Error **errp)
+{
+    /* TBs translated with one value don't work with the other. */
+    if (tcg_machine_inited && value != tcg_iolazy) {
+        error_setg(errp, "x-iolazy: cannot be changed at run time");
+        return;
+    }
+    tcg_iolazy = value;
+}
+
 static bool tcg_get_hosttime(Object *obj, Error **errp)
 {
     return TCG_STATE(obj)->hosttime;
@@ -1369,6 +1392,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "with icount), MMIO to lockless_io regions without the BQL, the "
         "x86 APIC's TPR and the RTC's update polls without the BQL, and "
         "no kvmvapic option ROM");
+
+    object_class_property_add_bool(oc, "x-iolazy",
+                                   tcg_get_iolazy, tcg_set_iolazy);
+    object_class_property_set_description(oc, "x-iolazy",
+        "System mode without icount: no can_do_io stores in TBs; an I/O "
+        "access finds from the unwind data whether its insn is the TB's "
+        "last");
 
     object_class_property_add_bool(oc, "x-hosttime",
                                    tcg_get_hosttime, tcg_set_hosttime);
