@@ -108,7 +108,6 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-pin", "on" },
         { "x-pinvec", "on" },
         { "x-pincc", "on" },
-        { "x-pinpc", "on" },
         { "x-ccregs", "on" },
         { "x-lazyinc", "on" },
         { "x-flags", "dead" },
