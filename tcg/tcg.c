@@ -1197,6 +1197,47 @@ bool tcg_insn_is_acqrel_ldst(uintptr_t pc)
 #endif
 }
 
+bool tcg_tso_fault;
+
+bool tcg_tso_fault_supported(void)
+{
+#ifdef TCG_TARGET_HAS_TSO_FAULT_PATH
+    static int probed;
+
+    if (!probed) {
+        probed = tcg_target_tso_fault_probe() ? 1 : -1;
+    }
+    return probed > 0;
+#else
+    return false;
+#endif
+}
+
+bool tcg_tso_fault_resume(void *puc)
+{
+#ifdef TCG_TARGET_HAS_TSO_FAULT_PATH
+    uintptr_t pc, path;
+
+    if (!tcg_tso_fault) {
+        return false;
+    }
+    pc = tcg_target_signal_pc(puc);
+    if (!in_code_gen_buffer((void *)(pc - tcg_splitwx_diff - 8)) ||
+        !in_code_gen_buffer((void *)(pc - tcg_splitwx_diff)) ||
+        !tcg_insn_is_acqrel_ldst(pc)) {
+        return false;
+    }
+    path = tcg_target_tso_fault_path(pc);
+    if (!path) {
+        return false;
+    }
+    tcg_target_set_signal_pc(puc, path);
+    return true;
+#else
+    return false;
+#endif
+}
+
 #ifndef CONFIG_TCG_INTERPRETER
 /* Validate CPUTLBDescFast placement. */
 QEMU_BUILD_BUG_ON((int)(offsetof(CPUNegativeOffsetState, tlb.f[0]) -

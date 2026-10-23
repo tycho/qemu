@@ -1839,7 +1839,17 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         /* Perform the address comparison. */
         tcg_out_cmp(s, addr_type, TCG_COND_NE, TCG_REG_TMP0, TCG_REG_TMP2, 0);
 
-        if (onepath) {
+        if (onepath && tcg_tso_fault) {
+            /*
+             * A miss goes to the out-of-line helper call; a crossing
+             * faults, and the fault handler resumes it there too
+             * (tcg_target_tso_fault_path).
+             */
+            ldst->fallback = true;
+            ldst->site = s->gen_insn_pc[s->gen_cur_insn];
+            ldst->label_ptr[0] = s->code_ptr;
+            tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+        } else if (onepath) {
             /*
              * On a hit, test for a 16-byte crossing; a miss sets C and
              * clears Z, which reads as a crossing.  Both go to the
@@ -1943,6 +1953,122 @@ static bool tcg_target_insn_is_acqrel_ldst(uint32_t insn)
            (insn & 0x3ffffc00) == 0x089ffc00 ||     /* STLR */
            (insn & 0x3f200c00) == 0x19000000;       /* LDAPUR*, STLUR */
 }
+
+#if defined(CONFIG_DARWIN) || defined(CONFIG_LINUX)
+/*
+ * tcg_tso_fault (system mode): an MO_ACQ_REL access that may cross 16
+ * bytes is "b.ne path; add x30, base, index; ldapr/stlr ..., [x30]"
+ * (prepare_host_addr, onepath).  Resume a crossing one at the branch's
+ * target, the out-of-line path that handles a TLB miss and a crossing:
+ * the state there is the state at the access, but for X30, which the
+ * path doesn't read.  0 if the code before @pc isn't that.
+ */
+#define TCG_TARGET_HAS_TSO_FAULT_PATH
+static uintptr_t tcg_target_tso_fault_path(uintptr_t pc)
+{
+    const uint32_t *p = (const uint32_t *)pc;
+    uint32_t b = p[-2], add = p[-1];
+
+    if ((add & 0x1f) != TCG_REG_TMP2 ||
+        ((add & 0xff200000) != 0x8b000000 &&      /* ADD, shifted */
+         (add & 0xffe00000) != 0x8b200000)) {     /* ADD, extended */
+        return 0;
+    }
+    if ((b & 0xff00001f) != (0x54000000 | COND_NE)) {
+        return 0;
+    }
+    return pc - 8 + ((intptr_t)sextract32(b, 5, 19) << 2);
+}
+
+/* The PC of a POSIX signal context (ucontext_t). */
+#ifdef CONFIG_DARWIN
+#include <sys/ucontext.h>
+static uintptr_t tcg_target_signal_pc(void *puc)
+{
+    return ((ucontext_t *)puc)->uc_mcontext->__ss.__pc;
+}
+
+static void tcg_target_set_signal_pc(void *puc, uintptr_t pc)
+{
+    ((ucontext_t *)puc)->uc_mcontext->__ss.__pc = pc;
+}
+#else
+static uintptr_t tcg_target_signal_pc(void *puc)
+{
+    return ((ucontext_t *)puc)->uc_mcontext.pc;
+}
+
+static void tcg_target_set_signal_pc(void *puc, uintptr_t pc)
+{
+    ((ucontext_t *)puc)->uc_mcontext.pc = pc;
+}
+#endif
+
+static sigjmp_buf tso_fault_probe_jmp;
+/* volatile: written by the signal handler, read after siglongjmp. */
+static volatile int tso_fault_probe_code;
+
+static void tso_fault_probe_handler(int sig, siginfo_t *info, void *puc)
+{
+    tso_fault_probe_code = sig == SIGBUS ? info->si_code : -1;
+    siglongjmp(tso_fault_probe_jmp, 1);
+}
+
+/*
+ * Whether this host raises the alignment fault the design relies on
+ * (SCTLR_ELx.nAA clear): a load-acquire crossing 16 bytes must fault
+ * with BUS_ADRALN, and so must a store-release crossing into an
+ * inaccessible page, before that fault and without writing the first
+ * page.  LDAR stands in for LDAPR, which the assembler may not accept:
+ * nAA governs both.
+ */
+static bool tcg_target_tso_fault_probe(void)
+{
+    struct sigaction act = { .sa_flags = SA_SIGINFO }, old_bus, old_segv;
+    long pg = qemu_real_host_page_size();
+    sigset_t set, old_set;
+    uint64_t val = 0;
+    uint8_t *m;
+    bool ok = false;
+
+    m = mmap(NULL, 2 * pg, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) {
+        return false;
+    }
+    if (mprotect(m + pg, pg, PROT_NONE)) {
+        munmap(m, 2 * pg);
+        return false;
+    }
+    act.sa_sigaction = tso_fault_probe_handler;
+    sigemptyset(&act.sa_mask);
+    sigaction(SIGBUS, &act, &old_bus);
+    sigaction(SIGSEGV, &act, &old_segv);
+    sigemptyset(&set);
+    sigaddset(&set, SIGBUS);
+    sigaddset(&set, SIGSEGV);
+    pthread_sigmask(SIG_UNBLOCK, &set, &old_set);
+
+    tso_fault_probe_code = 0;
+    if (!sigsetjmp(tso_fault_probe_jmp, 1)) {
+        asm volatile("ldar %0, [%1]" : "+r"(val) : "r"(m + 12) : "memory");
+    }
+    if (tso_fault_probe_code == BUS_ADRALN) {
+        tso_fault_probe_code = 0;
+        if (!sigsetjmp(tso_fault_probe_jmp, 1)) {
+            asm volatile("stlr %0, [%1]"
+                         : : "r"(~val), "r"(m + pg - 4) : "memory");
+        }
+        ok = tso_fault_probe_code == BUS_ADRALN && m[pg - 4] == 0;
+    }
+
+    pthread_sigmask(SIG_SETMASK, &old_set, NULL);
+    sigaction(SIGBUS, &old_bus, NULL);
+    sigaction(SIGSEGV, &old_segv, NULL);
+    munmap(m, 2 * pg);
+    return ok;
+}
+#endif
 
 /* Form the host address in one register, for insns without indexing. */
 static TCGReg tcg_out_host_addr_reg(TCGContext *s, HostAddress h)
