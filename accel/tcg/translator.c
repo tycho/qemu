@@ -1089,7 +1089,9 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             gen_set_label(r->label[r->next]);
 #ifndef CONFIG_USER_ONLY
             /* The last insn's block may branch back to this one. */
-            set_can_do_io(db, false);
+            if (!tcg_iolazy_active()) {
+                set_can_do_io(db, false);
+            }
 #endif
             db->pc_next = r->pc[r->next++];
             db->is_jmp = r->stubbing ? DISAS_TOO_MANY : DISAS_NEXT;
