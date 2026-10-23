@@ -1089,7 +1089,9 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             gen_set_label(r->label[r->next]);
 #ifndef CONFIG_USER_ONLY
             /* The last insn's block may branch back to this one. */
-            set_can_do_io(db, false);
+            if (!tcg_iolazy_active()) {
+                set_can_do_io(db, false);
+            }
 #endif
             db->pc_next = r->pc[r->next++];
             db->is_jmp = r->stubbing ? DISAS_TOO_MANY : DISAS_NEXT;
@@ -1133,16 +1135,20 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
      * there, and every reader (cputlb.c, watchpoint.c, icount) is in
      * system_ss, so skip the two stores per TB entirely.
      */
-    if (db->num_insns == 1) {
+    if (tcg_iolazy_active()) {
+        /* I/O finds whether its insn is the last (cpu_io_last_insn). */
+    } else if (db->num_insns == 1) {
         tcg_debug_assert(first_insn_start == db->insn_start);
     } else {
         tcg_debug_assert(first_insn_start != db->insn_start);
         tcg_ctx->emit_before_op = first_insn_start;
         set_can_do_io(db, false);
     }
-    tcg_ctx->emit_before_op = db->insn_start;
-    set_can_do_io(db, true);
-    tcg_ctx->emit_before_op = NULL;
+    if (!tcg_iolazy_active()) {
+        tcg_ctx->emit_before_op = db->insn_start;
+        set_can_do_io(db, true);
+        tcg_ctx->emit_before_op = NULL;
+    }
 #endif
 
     /* May be used by disas_log or plugin callbacks. */
