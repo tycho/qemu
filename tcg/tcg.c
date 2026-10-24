@@ -2660,6 +2660,7 @@ void tcg_prologue_init(void)
 
 void tcg_func_start(TCGContext *s)
 {
+    s->align_access = false;
     s->tso_run_ld = false;
     s->tso_run_st = false;
     s->tso_run_emit = false;
@@ -4899,11 +4900,22 @@ static void align_form_of(AlignForm *d, const AlignForm *form,
 static void __attribute__((noinline))
 align_fold_pass(TCGContext *s)
 {
-    AlignForm *form = g_new0(AlignForm, s->nb_temps);
-    unsigned *ver = g_new0(unsigned, s->nb_globals);
+    AlignForm *form;
+    unsigned *ver;
     AlignFact fact[ALIGN_FACTS];
     unsigned nfact = 0, next = 0;
     TCGOp *op;
+
+    /* Nothing to fold without an access that checks its alignment. */
+    if (!s->align_access) {
+        return;
+    }
+    /* The forms of globals are never read; the others' start unknown. */
+    form = tcg_malloc(s->nb_temps * sizeof(AlignForm));
+    memset(form + s->nb_globals, 0,
+           (s->nb_temps - s->nb_globals) * sizeof(AlignForm));
+    ver = tcg_malloc(s->nb_globals * sizeof(unsigned));
+    memset(ver, 0, s->nb_globals * sizeof(unsigned));
 
     QTAILQ_FOREACH(op, &s->ops, link) {
         TCGOpcode opc = op->opc;
@@ -5007,8 +5019,6 @@ align_fold_pass(TCGContext *s)
             }
         }
     }
-    g_free(form);
-    g_free(ver);
 }
 
 #ifdef TCG_TARGET_HAS_TLB_PIN
@@ -5054,8 +5064,8 @@ static void tlb_pin_pass(TCGContext *s)
 /*
  * A TB struct is allocated with all TB_JMP_SLOTS goto_tb slots
  * (tcg_tb_alloc); once the front end has translated the block, before any
- * host code, it keeps only TB_JMP_SLOTS_SMALL if no higher slot was issued
- * (goto_tb, goto_tb_dead, call_tb: goto_tb_issue_mask).  The struct lies
+ * host code, it keeps those up to the highest slot issued (goto_tb,
+ * goto_tb_dead, call_tb: goto_tb_slots), none if none was.  The struct lies
  * at the cold cursor with tcg_tblayout, else right before the code: the
  * cursor or the code start moves.  A translation retried for the backend
  * gets all the slots back first.
@@ -5089,9 +5099,10 @@ static void tb_struct_resize(TCGContext *s, TranslationBlock *tb,
 
 void tcg_tb_trim_slots(TCGContext *s, TranslationBlock *tb)
 {
-    if (tb->nb_slots > TB_JMP_SLOTS_SMALL &&
-        !(s->goto_tb_slots >> TB_JMP_SLOTS_SMALL)) {
-        tb_struct_resize(s, tb, TB_JMP_SLOTS_SMALL);
+    unsigned nb_slots = 32 - clz32(s->goto_tb_slots);
+
+    if (nb_slots < tb->nb_slots) {
+        tb_struct_resize(s, tb, nb_slots);
     }
 }
 
@@ -10940,10 +10951,30 @@ static void narrow32_brcond(const uint8_t *cls, TCGOp *op)
  * a zero extension), whose low 32 bits are those of the 32-bit shift of
  * the low 32 bits.
  */
+/*
+ * The classes set since the last reset are listed in @set (@n of them,
+ * room for nb_temps): a reset clears those, or every class once the list
+ * is full.
+ */
+static void narrow32_reset(TCGContext *s, uint8_t *cls, uint16_t *set,
+                           unsigned *n)
+{
+    if (*n < s->nb_temps) {
+        for (unsigned i = 0; i < *n; i++) {
+            cls[set[i]] = 0;
+        }
+    } else {
+        memset(cls, 0, s->nb_temps);
+    }
+    *n = 0;
+}
+
 static GHashTable *narrow32_walk(TCGContext *s)
 {
     uint8_t *cls = tcg_malloc(s->nb_temps);
-    GHashTable *shifts = g_hash_table_new(NULL, NULL);
+    uint16_t *set = tcg_malloc(s->nb_temps * sizeof(uint16_t));
+    unsigned nset = 0;
+    GHashTable *shifts = NULL;
     TCGOp *op;
 
     memset(cls, 0, s->nb_temps);
@@ -10952,13 +10983,13 @@ static GHashTable *narrow32_walk(TCGContext *s)
         int nb_o;
 
         if (def->flags & TCG_OPF_BB_EXIT) {
-            memset(cls, 0, s->nb_temps);
+            narrow32_reset(s, cls, set, &nset);
             continue;
         }
         switch (op->opc) {
         case INDEX_op_set_label:
         case INDEX_op_call:
-            memset(cls, 0, s->nb_temps);
+            narrow32_reset(s, cls, set, &nset);
             continue;
         case INDEX_op_discard:
             cls[temp_idx(arg_temp(op->args[0]))] = 0;
@@ -10973,6 +11004,9 @@ static GHashTable *narrow32_walk(TCGContext *s)
                 arg_temp(op->args[2])->val < 32 &&
                 narrow32_is(cls, op->args[1],
                             op->opc == INDEX_op_sar ? N32_SEXT : N32_ZEXT)) {
+                if (!shifts) {
+                    shifts = g_hash_table_new(NULL, NULL);
+                }
                 g_hash_table_add(shifts, op);
             }
             break;
@@ -10981,10 +11015,16 @@ static GHashTable *narrow32_walk(TCGContext *s)
         }
         nb_o = op->opc == INDEX_op_call ? TCGOP_CALLO(op) : def->nb_oargs;
         for (int i = 0; i < nb_o; i++) {
-            TCGTemp *ts = arg_temp(op->args[i]);
+            size_t t = temp_idx(arg_temp(op->args[i]));
+            uint8_t c = nb_o == 1 && op->opc != INDEX_op_call
+                        ? narrow32_def_class(op, cls) : 0;
 
-            cls[temp_idx(ts)] = nb_o == 1 && op->opc != INDEX_op_call
-                                ? narrow32_def_class(op, cls) : 0;
+            if (c && !cls[t] && nset < s->nb_temps) {
+                set[nset++] = t;
+            } else if (c && !cls[t]) {
+                nset = s->nb_temps;     /* full: the next reset clears all */
+            }
+            cls[t] = c;
         }
     }
     return shifts;
@@ -11146,7 +11186,7 @@ static void narrow32_pass(TCGContext *s)
             }
         }
         if (TCGOP_TYPE(x) != TCG_TYPE_I64 ||
-            !(narrow32_op(x) || g_hash_table_contains(shifts, x)) ||
+            !(narrow32_op(x) || (shifts && g_hash_table_contains(shifts, x))) ||
             arg_temp(x->args[0]) != t || !narrow32_consts(x) ||
             !tcg_op_supported(x->opc, TCG_TYPE_I32, 0)) {
             continue;
@@ -11161,7 +11201,9 @@ static void narrow32_pass(TCGContext *s)
         x->output_pref[0] = op->output_pref[0];
         tcg_op_remove(s, op);
     }
-    g_hash_table_destroy(shifts);
+    if (shifts) {
+        g_hash_table_destroy(shifts);
+    }
     narrow32_bypass(s);
 }
 #endif
