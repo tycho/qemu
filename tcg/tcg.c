@@ -348,6 +348,7 @@ unsigned tcg_superblock;
 unsigned tcg_units;
 bool tcg_tbpack;
 bool tcg_tblayout;
+bool tcg_slowthunk;
 bool tcg_bti = true;
 bool tcg_retstack;
 intptr_t tcg_retsp_off;
@@ -2491,6 +2492,7 @@ static void tb_layout_chunk(TCGContext *s)
         /* The rest of the region, after the last chunk, packed. */
         qatomic_set(&s->code_gen_ptr, MIN(p, end));
         s->lay_chunk = NULL;
+        s->lay_thunk = NULL;
         return;
     }
     s->lay_chunk = p;
@@ -2499,6 +2501,25 @@ static void tb_layout_chunk(TCGContext *s)
                                                   : TBLAYOUT_HOT64), 16);
     s->lay_cold = s->lay_hot_end;
     s->lay_cold_end = p + size;
+    s->lay_thunk = NULL;
+#ifdef TCG_TARGET_HAS_SLOW_THUNK
+    if (tcg_slowthunk) {
+        tcg_insn_unit *code_ptr = s->code_ptr;
+        bool cold_now = s->lay_cold_now;
+
+        /* The thunk first in the cold part, built in place. */
+        s->code_ptr = s->lay_cold;
+        s->lay_cold_now = true;
+        tcg_out_slow_thunk(s);
+        flush_idcache_range((uintptr_t)tcg_splitwx_to_rx(s->lay_cold),
+                            (uintptr_t)s->lay_cold,
+                            tcg_ptr_byte_diff(s->code_ptr, s->lay_cold));
+        s->lay_thunk = tcg_splitwx_to_rx(s->lay_cold);
+        s->lay_cold = (void *)ROUND_UP((uintptr_t)s->code_ptr, 16);
+        s->code_ptr = code_ptr;
+        s->lay_cold_now = cold_now;
+    }
+#endif
     qatomic_set(&s->code_gen_ptr, p);
     s->code_gen_highwater = (uint8_t *)s->lay_hot_end - TCG_HIGHWATER;
     s->lay_on = true;

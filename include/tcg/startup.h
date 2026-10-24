@@ -357,6 +357,14 @@ extern bool tcg_tblayout;
 bool tcg_can_tblayout(void);
 
 /*
+ * tcg_slowthunk: with tcg_tblayout, each chunk starts its cold part with
+ * a thunk that performs an MO_ACQ_REL access's out-of-line path from a
+ * descriptor; the access's slow path is then a call and the descriptor,
+ * not its own argument setup and helper call.
+ */
+extern bool tcg_slowthunk;
+
+/*
  * tcg_bti: where the host has BTI, the code buffer is mapped as guarded
  * pages and generated code has landing pads at indirect branch targets
  * (the default).  Without it neither: fewer host insns, no BTI checks on
