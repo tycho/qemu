@@ -2425,13 +2425,15 @@ void tcg_init(size_t tb_size, int splitwx, unsigned max_threads)
 
 /*
  * tcg_tblayout: a region is used in chunks of up to TBLAYOUT_CHUNK bytes,
- * hot code in the first TBLAYOUT_HOT_EIGHTHS eighths, TB structs and cold
- * code in the rest, so every branch between them stays in range.  A chunk
- * ends when either part has less than TBLAYOUT_RESERVE left, more than one
- * TB's worth.
+ * hot code first, TB structs and cold code in the rest, so every branch
+ * between them stays in range.  A chunk ends when either part has less
+ * than TBLAYOUT_RESERVE left, more than one TB's worth.  The hot part's
+ * share, in 64ths, follows the share the hot code took of the chunks
+ * before (s->lay_hot64), starting from TBLAYOUT_HOT64, so that neither
+ * part is left with much unused when the other fills.
  */
 #define TBLAYOUT_CHUNK          (16 * MiB)
-#define TBLAYOUT_HOT_EIGHTHS    3
+#define TBLAYOUT_HOT64          24
 #define TBLAYOUT_RESERVE        (64 * KiB)
 
 bool tcg_can_tblayout(void)
@@ -2471,6 +2473,16 @@ static void tb_layout_chunk(TCGContext *s)
         return;
     }
     if (base && p >= base && p < (uint8_t *)s->lay_cold_end) {
+        /* Not after a failed TB used the chunk up (lay_hot_end reset). */
+        if (s->lay_hot_end != base) {
+            uint64_t hot = p - base;
+            uint64_t cold = (uint8_t *)s->lay_cold - (uint8_t *)s->lay_hot_end;
+            unsigned last = s->lay_hot64 ? s->lay_hot64 : TBLAYOUT_HOT64;
+            unsigned h = (hot * 64 + (hot + cold) / 2) / (hot + cold);
+
+            /* Averaged with the chunks before. */
+            s->lay_hot64 = MIN(MAX((last + h + 1) / 2, 8), 56);
+        }
         p = s->lay_cold_end;
     }
     p = (uint8_t *)ROUND_UP((uintptr_t)p, 16);
@@ -2482,7 +2494,9 @@ static void tb_layout_chunk(TCGContext *s)
         return;
     }
     s->lay_chunk = p;
-    s->lay_hot_end = p + ROUND_DOWN(size / 8 * TBLAYOUT_HOT_EIGHTHS, 16);
+    s->lay_hot_end = p + ROUND_DOWN(size / 64 *
+                                    (s->lay_hot64 ? s->lay_hot64
+                                                  : TBLAYOUT_HOT64), 16);
     s->lay_cold = s->lay_hot_end;
     s->lay_cold_end = p + size;
     qatomic_set(&s->code_gen_ptr, p);
