@@ -123,9 +123,11 @@ static gboolean tb_tree_stats_iter(gpointer key, gpointer value, gpointer data)
         tst->cross_page++;
     }
 #endif
-    if (tb->jmp[0].reset_offset != TB_JMP_OFFSET_INVALID) {
+    if (tb->nb_slots > 0 &&
+        tb->jmp[0].reset_offset != TB_JMP_OFFSET_INVALID) {
         tst->direct_jmp_count++;
-        if (tb->jmp[1].reset_offset != TB_JMP_OFFSET_INVALID) {
+        if (tb->nb_slots > 1 &&
+            tb->jmp[1].reset_offset != TB_JMP_OFFSET_INVALID) {
             tst->direct_jmp2_count++;
         }
     }

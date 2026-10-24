@@ -168,7 +168,6 @@ struct TranslationBlock {
      * Jumps are numbered 0 to TB_JMP_SLOTS - 1, except TB_EXIT_REQUESTED.
      */
 #define TB_JMP_SLOTS 8
-#define TB_JMP_SLOTS_SMALL 2
 #define TB_JMP_OFFSET_INVALID UINT32_MAX /* indicates no jump generated */
     /*
      * The goto_tb slots that leave by a host call (tcg_gen_call_tb), and
