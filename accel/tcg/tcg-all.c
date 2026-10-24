@@ -953,6 +953,16 @@ static void tcg_set_tblayout(Object *obj, const char *value, Error **errp)
     }
 }
 
+static bool tcg_get_slowthunk(Object *obj, Error **errp)
+{
+    return tcg_slowthunk;
+}
+
+static void tcg_set_slowthunk(Object *obj, bool value, Error **errp)
+{
+    tcg_slowthunk = value;
+}
+
 static bool tcg_get_bti(Object *obj, Error **errp)
 {
     return tcg_bti;
@@ -1399,6 +1409,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Where TB structs and the code of unlinked exits go: packed, with "
         "the code (default); split, out of the code stream, which leaves "
         "the code of TBs translated together side by side");
+
+    object_class_property_add_bool(oc, "x-slowthunk", tcg_get_slowthunk,
+                                   tcg_set_slowthunk);
+    object_class_property_set_description(oc, "x-slowthunk",
+        "x-tblayout=split: ordered accesses' slow paths call a shared thunk "
+        "with a descriptor");
 
     object_class_property_add_bool(oc, "x-bti", tcg_get_bti, tcg_set_bti);
     object_class_property_set_description(oc, "x-bti",
