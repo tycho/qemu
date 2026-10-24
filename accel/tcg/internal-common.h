@@ -241,6 +241,8 @@ void page_table_config_init(void);
 #ifndef CONFIG_USER_ONLY
 G_NORETURN void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr);
 bool cpu_io_last_insn(uintptr_t retaddr);
+/* tcg_edge_sys: whether I/O at @retaddr may run without recompiling. */
+bool cpu_io_edge_ok(uintptr_t retaddr);
 #endif /* CONFIG_USER_ONLY */
 
 void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr);
