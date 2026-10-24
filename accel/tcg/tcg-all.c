@@ -291,10 +291,12 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 
     /*
      * With x-cr3-flush=nonglobal, each tlb also lists the slots it fills
-     * with non-global entries.  The lists start empty: they are kept from
-     * the start or not at all, whatever the setting later.
+     * with non-global entries, and keeps a bitmap of the host pages it
+     * maps writable.  Both start empty: they are kept from the start or
+     * not at all, whatever the setting later.
      */
     tcg_tlb_nglist = tcg_cr3_flush == TCG_CR3_FLUSH_NONGLOBAL;
+    tcg_tlb_dirtyfilter = tcg_tlb_nglist;
 #endif
 
     tcg_allowed = true;
