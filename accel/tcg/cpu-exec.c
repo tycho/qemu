@@ -1318,6 +1318,12 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
     return false;
 }
 
+/*
+ * tcg_superblock with edge checks: a request seen at an exit that names no
+ * TB (exit_tb(NULL, 0)) samples the next TB the main loop runs instead.
+ */
+static __thread bool region_sample_next;
+
 static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
                                     vaddr pc, TranslationBlock **last_tb,
                                     int *tb_exit)
@@ -1327,8 +1333,12 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
     if (*tb_exit != TB_EXIT_REQUESTED) {
         *last_tb = tb;
         /* A TB that checks the request on its exits left on it. */
-        if (tcg_superblock && tb && unlikely(cpu_loop_exit_requested(cpu))) {
-            region_sample(cpu, tb);
+        if (tcg_superblock && unlikely(cpu_loop_exit_requested(cpu))) {
+            if (tb) {
+                region_sample(cpu, tb);
+            } else if (tcg_edge_sys) {
+                region_sample_next = true;
+            }
         }
         return;
     }
@@ -1385,7 +1395,25 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 
         while (!cpu_handle_interrupt(cpu, &last_tb)) {
             TranslationBlock *tb;
-            TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
+            TCGTBCPUState s;
+
+#ifndef CONFIG_USER_ONLY
+            /*
+             * tcg_edge_sys: TBs needn't check the exit request on entry,
+             * so the main loop doesn't enter one with a request pending
+             * (an interrupt that handling the last one raised, say): it
+             * handles it first, as a TB's entry check would have; not
+             * before a TB that must run uninterrupted (CF_NOIRQ), which
+             * cpu_handle_interrupt leaves the request to.
+             */
+            if (tcg_edge_sys && tcg_region && !icount_enabled() &&
+                unlikely(cpu_loop_exit_requested(cpu)) &&
+                !(cpu->cflags_next_tb != -1 &&
+                  (cpu->cflags_next_tb & CF_NOIRQ))) {
+                continue;
+            }
+#endif
+            s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
             s.cflags = cpu->cflags_next_tb;
 
             /*
@@ -1456,6 +1484,10 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 }
             }
 
+            if (unlikely(region_sample_next)) {
+                region_sample_next = false;
+                region_sample(cpu, tb);
+            }
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
 
             /* Try to align the host and virtual clocks
