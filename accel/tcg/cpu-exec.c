@@ -201,8 +201,21 @@ static bool tb_lookup_cmp(const void *p, const void *d)
     return false;
 }
 
-static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
+/*
+ * The TB for state @s, whose first page is @stale's if @stale is
+ * non-NULL: tcg_jcrevalidate, a jump-cache entry for s.pc under an older
+ * salt, which is the answer if it still matches.
+ */
+static TranslationBlock *tb_htable_lookup_stale(CPUState *cpu,
+                                                TCGTBCPUState s,
+                                                TranslationBlock *stale)
 {
+    /*
+     * The page walks may leave the vCPU's execution (an accessed bit set
+     * through MMIO), during which a full flush may free @stale: it is
+     * read only while no flush has happened since this snapshot.
+     */
+    unsigned flush_count = qatomic_read(&tb_ctx.tb_flush_count);
     tb_page_addr_t phys_pc;
     struct tb_desc desc;
     uint32_t h;
@@ -214,9 +227,22 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
         return NULL;
     }
     desc.page_addr0 = phys_pc;
+    /* Again after the comparison: its second page's walk may invalidate it. */
+    if (stale && flush_count == qatomic_read(&tb_ctx.tb_flush_count) &&
+        !(tb_cflags(stale) & CF_INVALID) &&
+        tb_lookup_cmp(stale, &desc) &&
+        flush_count == qatomic_read(&tb_ctx.tb_flush_count) &&
+        !(qatomic_read(&stale->cflags) & CF_INVALID)) {
+        return stale;
+    }
     h = tb_hash_func(phys_pc, (s.cflags & CF_PCREL ? 0 : s.pc),
                      s.flags, s.cs_base, s.cflags);
     return qht_lookup_custom(&tb_ctx.htable, &desc, h, tb_lookup_cmp);
+}
+
+static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
+{
+    return tb_htable_lookup_stale(cpu, s, NULL);
 }
 
 /* The key stored with a jump-cache entry for @pc. */
@@ -307,7 +333,18 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
         jc->ctx_cflags = s.cflags;
     }
 
-    tb = tb_htable_lookup(cpu, s);
+    /*
+     * tcg_jcrevalidate: an entry for this pc made under an older salt (a
+     * flush of the non-global translations since, a CR3 write) holds the
+     * TB that was right then; it is again if it matches the current
+     * state and pages, as the hash table's would.
+     */
+    if (tcg_jcrevalidate && tb && tcg_jcgen &&
+        !((jc->array[hash].pc ^ s.pc) & ~TB_JMP_SALT_MASK)) {
+        tb = tb_htable_lookup_stale(cpu, s, tb);
+    } else {
+        tb = tb_htable_lookup(cpu, s);
+    }
     if (tb == NULL) {
         return NULL;
     }
