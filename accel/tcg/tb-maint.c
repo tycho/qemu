@@ -1391,6 +1391,40 @@ tcg_target_ulong helper_tso_cross_ld(CPUArchState *env, uint64_t addr,
     }
 }
 
+uintptr_t helper_tso_cross_thunk(CPUArchState *env, uint64_t *regs,
+                                 const uint32_t *desc)
+{
+    uintptr_t retaddr = (uintptr_t)desc + (int32_t)desc[0];
+    MemOpIdx oi = desc[1];
+    uint64_t site = desc[2] | (uint64_t)desc[3] << 32;
+    uint32_t flags = desc[4];
+    uint64_t addr = regs[flags & 31];
+    unsigned data = (flags >> 5) & 31;
+
+    if (flags & TSO_THUNK_ADDR32) {
+        addr = (uint32_t)addr;
+    }
+    if (flags & TSO_THUNK_IS_LD) {
+        MemOp mop = get_memop(oi);
+        uint64_t val = helper_tso_cross_ld(env, addr, oi, retaddr, site);
+
+        /* As tcg_out_ld_helper_ret extends it. */
+        if (mop & MO_SIGN) {
+            val = sextract64(val, 0, memop_size(mop) * 8);
+        }
+        if (!(flags & TSO_THUNK_DATA64)) {
+            val = (uint32_t)val;
+        }
+        regs[data] = val;
+    } else {
+        helper_tso_cross_st(env, addr, regs[data], oi, retaddr, site);
+    }
+    if (flags & TSO_THUNK_DIRECT) {
+        return retaddr;
+    }
+    return (uintptr_t)(desc + TSO_THUNK_DESC_WORDS);
+}
+
 void helper_tso_cross_st(CPUArchState *env, uint64_t addr, uint64_t val,
                          MemOpIdx oi, uintptr_t retaddr, uint64_t site)
 {

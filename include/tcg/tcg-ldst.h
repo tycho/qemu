@@ -72,4 +72,29 @@ tcg_target_ulong helper_tso_cross_ld(CPUArchState *env, uint64_t addr,
 void helper_tso_cross_st(CPUArchState *env, uint64_t addr, uint64_t val,
                          MemOpIdx oi, uintptr_t retaddr, uint64_t site);
 
+/*
+ * tcg_slowthunk: the descriptor of an MO_ACQ_REL access, in its slow
+ * path's code after the call to the thunk: the access's return address,
+ * relative to the descriptor; its MemOpIdx; its insn's guest pc (low,
+ * high); and a word of flags, with the address register in bits 0-4,
+ * the data register in bits 5-9, and in bits 16-31 the env offset of the
+ * TLB fast descriptor whose mask and table the thunk loads on its way
+ * back (0: none).
+ */
+#define TSO_THUNK_DESC_WORDS    5
+#define TSO_THUNK_IS_LD         (1u << 10)
+#define TSO_THUNK_ADDR32        (1u << 11)  /* zero-extend the address */
+#define TSO_THUNK_DATA64        (1u << 12)  /* a 64-bit load result */
+#define TSO_THUNK_DIRECT        (1u << 13)  /* back to the return address */
+
+/*
+ * tcg_slowthunk: perform the access of descriptor @desc, whose address
+ * and stored value are in @regs, the host's general registers by number
+ * as the thunk saved them; a load's result goes there too.  Returns
+ * where the thunk goes on: the access's return address
+ * (TSO_THUNK_DIRECT), else the code after the descriptor.
+ */
+uintptr_t helper_tso_cross_thunk(CPUArchState *env, uint64_t *regs,
+                                 const uint32_t *desc);
+
 #endif /* TCG_LDST_H */
