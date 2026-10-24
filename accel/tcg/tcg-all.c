@@ -153,6 +153,8 @@ static void xtcg_fork_defaults(Object *obj)
     }
     /* No can_do_io stores (not with icount, which needs them). */
     object_property_parse(obj, "x-iolazy", "on", &error_abort);
+    /* Non-global TLB flushes from a list of filled slots. */
+    object_property_parse(obj, "x-tlb-nglist", "on", &error_abort);
     /* Crossings found by fault: on where the host raises the fault. */
     if (tcg_tso_fault_supported()) {
         object_property_parse(obj, "x-tso-fault", "on", &error_abort);
@@ -1119,6 +1121,21 @@ static void tcg_set_cr3_flush(Object *obj, const char *value, Error **errp)
                "(all, paging, nonglobal)", value);
 }
 
+static bool tcg_get_tlb_nglist(Object *obj, Error **errp)
+{
+    return tcg_tlb_nglist;
+}
+
+static void tcg_set_tlb_nglist(Object *obj, bool value, Error **errp)
+{
+    /* The lists start empty: they are kept from the start or not at all. */
+    if (tcg_machine_inited && value != tcg_tlb_nglist) {
+        error_setg(errp, "x-tlb-nglist: cannot be changed at run time");
+        return;
+    }
+    tcg_tlb_nglist = value;
+}
+
 static bool tcg_get_pcid(Object *obj, Error **errp)
 {
     return tcg_pcid;
@@ -1458,6 +1475,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "paging (not the physical-address ones, which don't depend on "
         "CR3), or nonglobal (as paging, but keep global pages, as a MOV "
         "to CR3 without PCIDs does)");
+
+    object_class_property_add_bool(oc, "x-tlb-nglist", tcg_get_tlb_nglist,
+                                   tcg_set_tlb_nglist);
+    object_class_property_set_description(oc, "x-tlb-nglist",
+        "Each TLB lists the slots it fills with non-global entries, so that "
+        "a flush of those (an x86 CR3 write) needs no scan of the table");
 
     object_class_property_add_bool(oc, "x-pcid", tcg_get_pcid, tcg_set_pcid);
     object_class_property_set_description(oc, "x-pcid",
