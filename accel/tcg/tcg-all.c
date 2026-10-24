@@ -1135,6 +1135,24 @@ static void tcg_set_tlb_nglist(Object *obj, bool value, Error **errp)
     tcg_tlb_nglist = value;
 }
 
+static bool tcg_get_tlb_dirtyfilter(Object *obj, Error **errp)
+{
+    return tcg_tlb_dirtyfilter;
+}
+
+static void tcg_set_tlb_dirtyfilter(Object *obj, bool value, Error **errp)
+{
+    /* The bitmaps start empty: they are kept from the start or not at all. */
+    if (tcg_machine_inited) {
+        if (value != tcg_tlb_dirtyfilter) {
+            error_setg(errp,
+                       "x-tlb-dirtyfilter: cannot be changed at run time");
+        }
+        return;
+    }
+    tcg_tlb_dirtyfilter = value;
+}
+
 static bool tcg_get_pcid(Object *obj, Error **errp)
 {
     return tcg_pcid;
@@ -1470,6 +1488,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-tlb-nglist",
         "Each TLB lists the slots it fills with non-global entries, so that "
         "a flush of those (an x86 CR3 write) needs no scan of the table");
+
+    object_class_property_add_bool(oc, "x-tlb-dirtyfilter",
+                                   tcg_get_tlb_dirtyfilter,
+                                   tcg_set_tlb_dirtyfilter);
+    object_class_property_set_description(oc, "x-tlb-dirtyfilter",
+        "Each TLB keeps a bitmap of the host pages it maps writable, so "
+        "that protecting a page of translated code scans only the TLBs "
+        "that may map it");
 
     object_class_property_add_bool(oc, "x-pcid", tcg_get_pcid, tcg_set_pcid);
     object_class_property_set_description(oc, "x-pcid",
