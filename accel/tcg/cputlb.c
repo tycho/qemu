@@ -167,7 +167,9 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
  * @desc: The CPUTLBDesc portion of the TLB
  * @fast: The CPUTLBDescFast portion of the same TLB
  *
- * Called with tlb_lock_held.
+ * Called with tlb_lock_held.  Returns true if the table was reallocated,
+ * which leaves its contents undefined, whatever its new size: the caller
+ * must flush it.
  *
  * We have two main constraints when resizing a TLB: (1) we only resize it
  * on a TLB flush (otherwise we'd have to take a perf hit by either rehashing
@@ -202,7 +204,7 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
  * high), since otherwise we are likely to have a significant amount of
  * conflict misses.
  */
-static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
+static bool tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
                                   int64_t now)
 {
     size_t old_size = tlb_n_entries(fast);
@@ -243,7 +245,7 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
         if (window_expired) {
             tlb_window_reset(desc, now, desc->n_used_entries);
         }
-        return;
+        return false;
     }
 
     g_free(fast->table);
@@ -275,6 +277,7 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
         fast->table = g_try_new(CPUTLBEntry, new_size);
         desc->fulltlb = g_try_new(CPUTLBEntryFull, new_size);
     }
+    return true;
 }
 
 static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
@@ -441,8 +444,7 @@ static void tlb_flush_nonglobal_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
         tlb_flush_one_mmuidx_locked(cpu, mmu_idx, now);
         return;
     }
-    tlb_mmu_resize_locked(desc, fast, now);
-    if (tlb_n_entries(fast) != n) {
+    if (tlb_mmu_resize_locked(desc, fast, now)) {
         tlb_mmu_flush_locked(desc, fast);
         return;
     }
