@@ -55,5 +55,7 @@ typedef struct CPUJumpCache {
 } CPUJumpCache;
 
 #define TB_JMP_SALT_STEP (1ull << 48)
+/* The bits of an entry's key that hold the salt. */
+#define TB_JMP_SALT_MASK (~0ull << 48)
 
 #endif /* ACCEL_TCG_TB_JMP_CACHE_H */
