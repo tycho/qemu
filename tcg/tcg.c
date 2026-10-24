@@ -1972,6 +1972,7 @@ void tcg_prologue_init(void)
 
 void tcg_func_start(TCGContext *s)
 {
+    s->align_access = false;
     tcg_pool_reset(s);
     s->nb_temps = s->nb_globals;
 
@@ -3716,11 +3717,22 @@ static void align_form_of(AlignForm *d, const AlignForm *form,
 static void __attribute__((noinline))
 align_fold_pass(TCGContext *s)
 {
-    AlignForm *form = g_new0(AlignForm, s->nb_temps);
-    unsigned *ver = g_new0(unsigned, s->nb_globals);
+    AlignForm *form;
+    unsigned *ver;
     AlignFact fact[ALIGN_FACTS];
     unsigned nfact = 0, next = 0;
     TCGOp *op;
+
+    /* Nothing to fold without an access that checks its alignment. */
+    if (!s->align_access) {
+        return;
+    }
+    /* The forms of globals are never read; the others' start unknown. */
+    form = tcg_malloc(s->nb_temps * sizeof(AlignForm));
+    memset(form + s->nb_globals, 0,
+           (s->nb_temps - s->nb_globals) * sizeof(AlignForm));
+    ver = tcg_malloc(s->nb_globals * sizeof(unsigned));
+    memset(ver, 0, s->nb_globals * sizeof(unsigned));
 
     QTAILQ_FOREACH(op, &s->ops, link) {
         TCGOpcode opc = op->opc;
@@ -3822,8 +3834,6 @@ align_fold_pass(TCGContext *s)
             }
         }
     }
-    g_free(form);
-    g_free(ver);
 }
 
 /* Reachable analysis : remove unreachable code.  */

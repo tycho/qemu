@@ -426,6 +426,8 @@ struct TCGContext {
      * carry-using opcodes like addco+addci.
      */
     bool carry_live;
+    /* tcg_alignfold: a guest access of this TB checks its alignment. */
+    bool align_access;
 
     GHashTable *const_table[TCG_TYPE_COUNT];
     TCGTempSet free_temps[TCG_TYPE_COUNT];
