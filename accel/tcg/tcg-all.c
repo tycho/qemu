@@ -158,6 +158,8 @@ static void xtcg_fork_defaults(Object *obj)
     object_property_parse(obj, "x-tlb-dirtyfilter", "on", &error_abort);
     /* Ordered accesses' slow paths through a thunk per layout chunk. */
     object_property_parse(obj, "x-slowthunk", "on", &error_abort);
+    /* Stale jump-cache entries that still match, before the hash table. */
+    object_property_parse(obj, "x-jcrevalidate", "on", &error_abort);
     /* Crossings found by fault: on where the host raises the fault. */
     if (tcg_tso_fault_supported()) {
         object_property_parse(obj, "x-tso-fault", "on", &error_abort);
@@ -965,6 +967,16 @@ static void tcg_set_slowthunk(Object *obj, bool value, Error **errp)
     tcg_slowthunk = value;
 }
 
+static bool tcg_get_jcrevalidate(Object *obj, Error **errp)
+{
+    return tcg_jcrevalidate;
+}
+
+static void tcg_set_jcrevalidate(Object *obj, bool value, Error **errp)
+{
+    tcg_jcrevalidate = value;
+}
+
 static bool tcg_get_bti(Object *obj, Error **errp)
 {
     return tcg_bti;
@@ -1417,6 +1429,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-slowthunk",
         "x-tblayout=split: ordered accesses' slow paths call a shared thunk "
         "with a descriptor");
+
+    object_class_property_add_bool(oc, "x-jcrevalidate",
+                                   tcg_get_jcrevalidate,
+                                   tcg_set_jcrevalidate);
+    object_class_property_set_description(oc, "x-jcrevalidate",
+        "On a jump-cache miss, reuse the entry for the same pc made before "
+        "the last flush if its TB still matches, before the hash table");
 
     object_class_property_add_bool(oc, "x-bti", tcg_get_bti, tcg_set_bti);
     object_class_property_set_description(oc, "x-bti",

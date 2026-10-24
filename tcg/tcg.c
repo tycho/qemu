@@ -348,6 +348,7 @@ unsigned tcg_superblock;
 unsigned tcg_units;
 bool tcg_tbpack;
 bool tcg_tblayout;
+bool tcg_jcrevalidate;
 bool tcg_slowthunk;
 bool tcg_bti = true;
 bool tcg_retstack;
