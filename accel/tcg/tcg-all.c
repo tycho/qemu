@@ -152,6 +152,8 @@ static void xtcg_fork_defaults(Object *obj)
     }
     /* No can_do_io stores (not with icount, which needs them). */
     object_property_parse(obj, "x-iolazy", "on", &error_abort);
+    /* Non-global TLB flushes from a list of filled slots. */
+    object_property_parse(obj, "x-tlb-nglist", "on", &error_abort);
     /* Crossings found by fault: on where the host raises the fault. */
     if (tcg_tso_fault_supported()) {
         object_property_parse(obj, "x-tso-fault", "on", &error_abort);
