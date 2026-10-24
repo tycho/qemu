@@ -99,6 +99,12 @@ struct TranslationBlock {
      * leave its TB (do_tb_phys_invalidate).
      */
     bool loops;
+    /*
+     * System mode (tcg_edge_sys): an I/O access in the TB's last insn
+     * needn't end a TB of its own: every exit checks the exit request,
+     * or the TB has no edge checks (its successors check on entry).
+     */
+    bool edge_end;
 
     /* size of target code for this block (1 <= size <= TARGET_PAGE_SIZE) */
     uint16_t size;
