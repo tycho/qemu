@@ -1926,17 +1926,10 @@ static const TCGLdstHelperParam ldst_helper_param = {
 static void tcg_out_ldst_save(TCGContext *s, TCGRegSet regs, bool restore,
                               TCGRegSet keep)
 {
-    unsigned nv = 0, nx = 0, size, off = 0;
+    uint64_t vregs = (uint64_t)regs >> TCG_REG_V0;
+    uint64_t xregs = regs & MAKE_64BIT_MASK(0, TCG_REG_V0);
+    unsigned nv = ctpop64(vregs), nx = ctpop64(xregs), size, off = 0;
 
-    for (TCGReg r = TCG_REG_X0; r <= TCG_REG_V31; r++) {
-        if (tcg_regset_test_reg(regs, r)) {
-            if (r >= TCG_REG_V0) {
-                nv++;
-            } else {
-                nx++;
-            }
-        }
-    }
     size = nv * 16 + ROUND_UP(nx * 8, 16);
     if (size == 0) {
         return;
@@ -1945,25 +1938,25 @@ static void tcg_out_ldst_save(TCGContext *s, TCGRegSet regs, bool restore,
         tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64,
                      TCG_REG_SP, TCG_REG_SP, size);
     }
-    for (TCGReg r = TCG_REG_V0; r <= TCG_REG_V31; r++) {
-        if (tcg_regset_test_reg(regs, r)) {
-            if (!restore) {
-                tcg_out_st(s, TCG_TYPE_V128, r, TCG_REG_SP, off);
-            } else if (!tcg_regset_test_reg(keep, r)) {
-                tcg_out_ld(s, TCG_TYPE_V128, r, TCG_REG_SP, off);
-            }
-            off += 16;
+    for (; vregs; vregs &= vregs - 1) {
+        TCGReg r = TCG_REG_V0 + ctz64(vregs);
+
+        if (!restore) {
+            tcg_out_st(s, TCG_TYPE_V128, r, TCG_REG_SP, off);
+        } else if (!tcg_regset_test_reg(keep, r)) {
+            tcg_out_ld(s, TCG_TYPE_V128, r, TCG_REG_SP, off);
         }
+        off += 16;
     }
-    for (TCGReg r = TCG_REG_X0; r < TCG_REG_V0; r++) {
-        if (tcg_regset_test_reg(regs, r)) {
-            if (!restore) {
-                tcg_out_st(s, TCG_TYPE_I64, r, TCG_REG_SP, off);
-            } else if (!tcg_regset_test_reg(keep, r)) {
-                tcg_out_ld(s, TCG_TYPE_I64, r, TCG_REG_SP, off);
-            }
-            off += 8;
+    for (; xregs; xregs &= xregs - 1) {
+        TCGReg r = ctz64(xregs);
+
+        if (!restore) {
+            tcg_out_st(s, TCG_TYPE_I64, r, TCG_REG_SP, off);
+        } else if (!tcg_regset_test_reg(keep, r)) {
+            tcg_out_ld(s, TCG_TYPE_I64, r, TCG_REG_SP, off);
         }
+        off += 8;
     }
     if (restore) {
         tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64,
