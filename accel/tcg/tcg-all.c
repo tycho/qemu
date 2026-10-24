@@ -324,6 +324,16 @@ static void tcg_set_tblayout(Object *obj, const char *value, Error **errp)
     }
 }
 
+static bool tcg_get_jcrevalidate(Object *obj, Error **errp)
+{
+    return tcg_jcrevalidate;
+}
+
+static void tcg_set_jcrevalidate(Object *obj, bool value, Error **errp)
+{
+    tcg_jcrevalidate = value;
+}
+
 static bool tcg_get_bti(Object *obj, Error **errp)
 {
     return tcg_bti;
@@ -386,6 +396,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Where TB structs and the code of unlinked exits go: packed, with "
         "the code (default); split, out of the code stream, which leaves "
         "the code of TBs translated together side by side");
+
+    object_class_property_add_bool(oc, "x-jcrevalidate",
+                                   tcg_get_jcrevalidate,
+                                   tcg_set_jcrevalidate);
+    object_class_property_set_description(oc, "x-jcrevalidate",
+        "On a jump-cache miss, reuse the entry for the same pc made before "
+        "the last flush if its TB still matches, before the hash table");
 
     object_class_property_add_bool(oc, "x-bti", tcg_get_bti, tcg_set_bti);
     object_class_property_set_description(oc, "x-bti",

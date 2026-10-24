@@ -67,6 +67,13 @@ extern bool tcg_tbpack;
  */
 extern bool tcg_tblayout;
 
+/*
+ * tcg_jcrevalidate: a jump-cache miss on an entry for the same pc under
+ * an older salt checks that entry's TB against the current state and
+ * pages before the hash table.
+ */
+extern bool tcg_jcrevalidate;
+
 /* Whether the backend can do tcg_tblayout. */
 bool tcg_can_tblayout(void);
 
