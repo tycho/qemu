@@ -5064,8 +5064,8 @@ static void tlb_pin_pass(TCGContext *s)
 /*
  * A TB struct is allocated with all TB_JMP_SLOTS goto_tb slots
  * (tcg_tb_alloc); once the front end has translated the block, before any
- * host code, it keeps only TB_JMP_SLOTS_SMALL if no higher slot was issued
- * (goto_tb, goto_tb_dead, call_tb: goto_tb_issue_mask).  The struct lies
+ * host code, it keeps those up to the highest slot issued (goto_tb,
+ * goto_tb_dead, call_tb: goto_tb_slots), none if none was.  The struct lies
  * at the cold cursor with tcg_tblayout, else right before the code: the
  * cursor or the code start moves.  A translation retried for the backend
  * gets all the slots back first.
@@ -5099,9 +5099,10 @@ static void tb_struct_resize(TCGContext *s, TranslationBlock *tb,
 
 void tcg_tb_trim_slots(TCGContext *s, TranslationBlock *tb)
 {
-    if (tb->nb_slots > TB_JMP_SLOTS_SMALL &&
-        !(s->goto_tb_slots >> TB_JMP_SLOTS_SMALL)) {
-        tb_struct_resize(s, tb, TB_JMP_SLOTS_SMALL);
+    unsigned nb_slots = 32 - clz32(s->goto_tb_slots);
+
+    if (nb_slots < tb->nb_slots) {
+        tb_struct_resize(s, tb, nb_slots);
     }
 }
 
