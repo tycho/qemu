@@ -415,6 +415,8 @@ struct TCGContext {
      */
     void *lay_chunk, *lay_hot_end, *lay_cold, *lay_cold_end;
     bool lay_on, lay_retry, lay_cold_now;
+    /* The next chunk's hot part, in 64ths, or 0 for the initial share. */
+    unsigned lay_hot64;
     /*
      * tcg_goto_tb_cold: the last label emitted, and its offset in the
      * code, for a goto_tb slot right at it (TranslationBlock.jmp_cond).
