@@ -1587,7 +1587,7 @@ io_prepare(hwaddr *out_offset, CPUState *cpu, CPUTLBEntryFull *full,
     mr_offset = full->xlat_offset + addr;
     cpu->mem_io_pc = retaddr;
     if (tcg_iolazy_active() ? !cpu_io_last_insn(retaddr)
-                            : !cpu->neg.can_do_io) {
+                            : !cpu->neg.can_do_io || !cpu_io_edge_ok(retaddr)) {
         cpu_io_recompile(cpu, retaddr);
     }
 

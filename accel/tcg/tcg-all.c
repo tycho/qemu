@@ -871,6 +871,21 @@ static void tcg_set_pinpc(Object *obj, bool value, Error **errp)
     tcg_pin_pc = value;
 }
 
+static bool tcg_get_edgesys(Object *obj, Error **errp)
+{
+    return tcg_edge_sys;
+}
+
+static void tcg_set_edgesys(Object *obj, bool value, Error **errp)
+{
+    /* TBs record whether their I/O may skip recompiling (edge_end). */
+    if (tcg_machine_inited && value != tcg_edge_sys) {
+        error_setg(errp, "x-edgesys: cannot be changed at run time");
+        return;
+    }
+    tcg_edge_sys = value;
+}
+
 static bool tcg_get_ccregs(Object *obj, Error **errp)
 {
     return tcg_cc_regs;
@@ -1398,6 +1413,11 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-pinpc",
         "With x-pin, in system mode, keep the guest PC in a host register "
         "across TBs, ahead of the guest's general registers");
+    object_class_property_add_bool(oc, "x-edgesys", tcg_get_edgesys,
+                                   tcg_set_edgesys);
+    object_class_property_set_description(oc, "x-edgesys",
+        "With x-region, in system mode: check the exit request on the exits "
+        "that may close a cycle instead of at every TB entry");
 
     object_class_property_add_bool(oc, "x-ccregs", tcg_get_ccregs,
                                    tcg_set_ccregs);
