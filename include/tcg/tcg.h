@@ -583,6 +583,8 @@ struct TCGContext {
      * carry-using opcodes like addco+addci.
      */
     bool carry_live;
+    /* tcg_alignfold: a guest access of this TB checks its alignment. */
+    bool align_access;
 
     /*
      * tcg_tlbpin: the offset from env of the pinned mmu index's
