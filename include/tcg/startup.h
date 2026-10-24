@@ -498,6 +498,13 @@ extern TCGCR3Flush tcg_cr3_flush;
 extern bool tcg_tlb_nglist;
 
 /*
+ * tcg_tlb_dirtyfilter: each softmmu tlb keeps a bitmap of the host pages
+ * of its writable RAM entries, so that clearing a page's dirty state
+ * (code translated from it) scans only the tlbs that may map it.
+ */
+extern bool tcg_tlb_dirtyfilter;
+
+/*
  * x86 guests: offer PCIDs (CPUID PCID and INVPCID; the TCG accelerator
  * property x-pcid).
  */
