@@ -358,6 +358,7 @@ bool tcg_addr32;
 bool tcg_tsc_counter;
 bool tcg_pause_hint;
 TCGCR3Flush tcg_cr3_flush;
+bool tcg_tlb_nglist;
 bool tcg_pcid;
 
 bool tcg_lean;

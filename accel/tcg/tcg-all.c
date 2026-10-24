@@ -288,6 +288,13 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 
     /* x-hostpoll: how the main loop waits for a timeout (no ppoll) */
     qemu_host_poll = s->hostpoll;
+
+    /*
+     * With x-cr3-flush=nonglobal, each tlb also lists the slots it fills
+     * with non-global entries.  The lists start empty: they are kept from
+     * the start or not at all, whatever the setting later.
+     */
+    tcg_tlb_nglist = tcg_cr3_flush == TCG_CR3_FLUSH_NONGLOBAL;
 #endif
 
     tcg_allowed = true;
