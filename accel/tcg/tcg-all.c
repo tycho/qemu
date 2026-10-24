@@ -145,6 +145,13 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     }
 
     qemu_add_vm_change_state_handler(tcg_vm_change_state, NULL);
+
+    /*
+     * With x-cr3-flush=nonglobal, each tlb also lists the slots it fills
+     * with non-global entries.  The lists start empty: they are kept from
+     * the start or not at all, whatever the setting later.
+     */
+    tcg_tlb_nglist = tcg_cr3_flush == TCG_CR3_FLUSH_NONGLOBAL;
 #endif
 
     tcg_allowed = true;

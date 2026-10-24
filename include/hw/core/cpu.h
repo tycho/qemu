@@ -295,6 +295,13 @@ typedef struct CPUTLBDesc {
      */
     bool has_global;
     /*
+     * tcg_tlb_nglist: how many tlb slots were filled with a non-global
+     * entry since the last flush; the slots are listed after fulltlb's
+     * entries (tlb_ng_slots).  In has_global's padding: this struct's
+     * size moves CPUState's fields relative to env in every build.
+     */
+    uint16_t ng_count;
+    /*
      * Describe a region covering all of the large pages allocated
      * into the tlb.  When any page within this region is flushed,
      * we must flush the entire tlb.  The region is matched if
