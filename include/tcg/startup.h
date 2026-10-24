@@ -491,6 +491,13 @@ typedef enum TCGCR3Flush {
 extern TCGCR3Flush tcg_cr3_flush;
 
 /*
+ * tcg_tlb_nglist: each softmmu tlb lists the slots it fills with
+ * non-global entries, so that a flush of the non-global entries (an x86
+ * CR3 write) clears those instead of scanning the table.
+ */
+extern bool tcg_tlb_nglist;
+
+/*
  * x86 guests: offer PCIDs (CPUID PCID and INVPCID; the TCG accelerator
  * property x-pcid).
  */
