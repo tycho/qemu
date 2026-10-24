@@ -356,6 +356,9 @@ static void tcg_region_assign(TCGContext *s, size_t curr_region)
     s->code_gen_ptr = start;
     s->code_gen_buffer_size = end - start;
     s->code_gen_highwater = end - TCG_HIGHWATER;
+    /* tcg_tblayout: no chunk carries over into a newly assigned region. */
+    s->lay_chunk = NULL;
+    s->lay_thunk = NULL;
 }
 
 static bool tcg_region_alloc__locked(TCGContext *s)
