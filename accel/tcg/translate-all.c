@@ -804,7 +804,27 @@ bool cpu_io_last_insn(uintptr_t retaddr)
         return true;
     }
     tb = tcg_tb_lookup(retaddr);
-    return !tb || cpu_unwind_data_from_tb(tb, retaddr, data) == 1;
+    if (!tb) {
+        return true;
+    }
+    /*
+     * tcg_edge_sys: only where every exit checks, so that an interrupt
+     * the access makes pending is taken right after the insn.
+     */
+    return cpu_unwind_data_from_tb(tb, retaddr, data) == 1 &&
+           (!tcg_edge_sys || tb->edge_end);
+}
+
+bool cpu_io_edge_ok(uintptr_t retaddr)
+{
+    TranslationBlock *tb;
+
+    if (!tcg_edge_sys ||
+        !in_code_gen_buffer((const void *)(retaddr - tcg_splitwx_diff))) {
+        return true;
+    }
+    tb = tcg_tb_lookup(retaddr);
+    return !tb || tb->edge_end;
 }
 
 void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)

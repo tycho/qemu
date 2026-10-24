@@ -52,6 +52,12 @@ bool translator_io_start(DisasContextBase *db)
     if (db->is_jmp == DISAS_NEXT) {
         db->is_jmp = DISAS_TOO_MANY;
     }
+#ifndef CONFIG_USER_ONLY
+    /* tcg_edge_sys: an interrupt it makes pending is taken right after it. */
+    if (db->edge_checks) {
+        db->edge_end = true;
+    }
+#endif
     return true;
 }
 
@@ -123,7 +129,8 @@ TCGLabel *translator_edge_check(DisasContextBase *db, vaddr dest)
     TCGLabel *exit;
     TCGv_i32 count;
 
-    if (!db->edge_checks || dest > db->pc_first) {
+    if ((!db->edge_checks && !db->edge_end) ||
+        (dest > db->pc_first && !db->edge_end)) {
         return NULL;
     }
     exit = gen_new_label();
@@ -1042,8 +1049,19 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 #ifdef CONFIG_USER_ONLY
     db->edge_checks = tcg_region && ops->edge_checks &&
                       !(cflags & (CF_NOIRQ | CF_USE_ICOUNT));
+    db->edge_end = false;
 #else
-    db->edge_checks = false;
+    /*
+     * tcg_edge_sys: the same in system mode, except that an interrupt an
+     * insn makes pending (I/O) is taken right after it: a TB with such an
+     * insn checks on every exit (edge_end), as does a TB that runs I/O
+     * uninterrupted (CF_NOIRQ, cpu_io_recompile), which has no checks of
+     * its own and is followed by none at the next TB's entry.
+     */
+    db->edge_checks = tcg_edge_sys && tcg_region && ops->edge_checks &&
+                      !(cflags & (CF_NOIRQ | CF_USE_ICOUNT));
+    db->edge_end = tcg_edge_sys && tcg_region && ops->edge_checks &&
+                   (cflags & CF_NOIRQ) && !(cflags & CF_USE_ICOUNT);
 #endif
 
     ops->init_disas_context(db, cpu);
@@ -1189,6 +1207,9 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         if (tcg_iolast && !icount_enabled() &&
             tb_io_insn_known(insn_pc)) {
             db->is_jmp = DISAS_TOO_MANY;
+            if (db->edge_checks) {
+                db->edge_end = true;
+            }
             break;
         }
 
@@ -1263,6 +1284,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         }
     }
     gen_tb_end(tb, cflags, icount_start_insn, db->num_insns);
+    /* Every exit checks, or the entry checks (no edge checks at all). */
+    tb->edge_end = db->edge_end || !db->edge_checks;
 
 #ifndef CONFIG_USER_ONLY
     /*

@@ -91,6 +91,12 @@ struct DisasContextBase {
      */
     bool edge_checks;
     /*
+     * In system mode with edge checks: whether every exit of the TB
+     * checks, because an insn in it may make an interrupt pending (I/O)
+     * that must be taken right after it (TranslationBlock.edge_end).
+     */
+    bool edge_end;
+    /*
      * A multi-block region (translator_region_target), or NULL; whether
      * this TB may become one; the goto_tb slots it has used.
      */

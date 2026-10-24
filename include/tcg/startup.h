@@ -197,7 +197,11 @@ extern bool tcg_pin_vec;
 extern bool tcg_pin_cc;
 extern bool tcg_pin_pc;
 /*
+ * tcg_edge_sys: with tcg_region, in system mode as in user mode, TBs check
+ * the exit request on the exits that may close a cycle instead of at
+ * their entry; a TB with I/O checks on every exit.  Not with icount.
  */
+extern bool tcg_edge_sys;
 
 /*
  * tcg_pin_system_ok: whether the backend can pin guest registers in system
