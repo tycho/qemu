@@ -170,11 +170,24 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
  */
 #define CPU_TLB_NG_SLOTS 256
 
-/* A tlb's CPUTLBEntryFull array of @n entries, and room for its list. */
+/*
+ * tcg_tlb_dirtyfilter: after the list, a bitmap of 8 bits per entry, with
+ * the bit of the host page of every writable RAM entry filled since the
+ * last flush set, so that tlb_reset_dirty can skip a table that cannot
+ * map the pages it protects.  Entries flushed or evicted since leave
+ * their bit set.
+ */
+#define CPU_TLB_WMAP_BITS_PER_ENTRY 8
+
+/* A tlb's CPUTLBEntryFull array of @n entries, its list and its bitmap. */
 static CPUTLBEntryFull *tlb_fulltlb_alloc(size_t n, bool try)
 {
     size_t size = n * sizeof(CPUTLBEntryFull)
                   + CPU_TLB_NG_SLOTS * sizeof(uint32_t);
+
+    if (tcg_tlb_dirtyfilter) {
+        size += n * CPU_TLB_WMAP_BITS_PER_ENTRY / 8;
+    }
 
     return try ? g_try_malloc(size) : g_malloc(size);
 }
@@ -182,6 +195,20 @@ static CPUTLBEntryFull *tlb_fulltlb_alloc(size_t n, bool try)
 static inline uint32_t *tlb_ng_slots(CPUTLBDesc *desc, CPUTLBDescFast *fast)
 {
     return (uint32_t *)(desc->fulltlb + tlb_n_entries(fast));
+}
+
+static inline uint8_t *tlb_wmap(CPUTLBDesc *desc, CPUTLBDescFast *fast)
+{
+    return (uint8_t *)(tlb_ng_slots(desc, fast) + CPU_TLB_NG_SLOTS);
+}
+
+/* The bit of the bitmap for the host page at @host. */
+static inline size_t tlb_wmap_bit(CPUTLBDescFast *fast, uintptr_t host)
+{
+    unsigned bits = ctz64(tlb_n_entries(fast) * CPU_TLB_WMAP_BITS_PER_ENTRY);
+    uint64_t page = host >> TARGET_PAGE_BITS;
+
+    return (page * 0x9e3779b97f4a7c15ull) >> (64 - bits);
 }
 
 /**
@@ -306,6 +333,10 @@ static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
 {
     desc->has_global = false;
     desc->ng_count = 0;
+    if (tcg_tlb_dirtyfilter) {
+        memset(tlb_wmap(desc, fast), 0,
+               tlb_n_entries(fast) * CPU_TLB_WMAP_BITS_PER_ENTRY / 8);
+    }
     desc->n_used_entries = 0;
     desc->large_page_addr = -1;
     desc->large_page_mask = -1;
@@ -1026,6 +1057,34 @@ static inline void copy_tlb_helper_locked(CPUTLBEntry *d, const CPUTLBEntry *s)
     *d = *s;
 }
 
+/*
+ * tcg_tlb_dirtyfilter: whether the tlb may hold a writable RAM entry for a
+ * host page in [@start, @start + @length).  Ranges of more than 16 pages
+ * are not filtered.
+ */
+static bool tlb_wmap_may_hold(CPUTLBDesc *desc, CPUTLBDescFast *fast,
+                              uintptr_t start, uintptr_t length)
+{
+    uintptr_t first = start >> TARGET_PAGE_BITS;
+    uintptr_t last = (start + length - 1) >> TARGET_PAGE_BITS;
+    uint8_t *map;
+    uintptr_t page;
+
+    if (!tcg_tlb_dirtyfilter || length == 0 || length > 16 * TARGET_PAGE_SIZE
+        || start + length - 1 < start) {
+        return true;
+    }
+    map = tlb_wmap(desc, fast);
+    for (page = first; page <= last; page++) {
+        size_t bit = tlb_wmap_bit(fast, page << TARGET_PAGE_BITS);
+
+        if (map[bit / 8] & (1 << (bit % 8))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* This is a cross vCPU call (i.e. another vCPU resetting the flags of
  * the target vCPU).
  * We must take tlb_c.lock to avoid racing with another vCPU update. The only
@@ -1042,6 +1101,10 @@ void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
         unsigned int n = tlb_n_entries(fast);
         unsigned int i;
 
+        /* The victim tlb's entries came from the table, bits and all. */
+        if (!tlb_wmap_may_hold(desc, fast, start, length)) {
+            continue;
+        }
         for (i = 0; i < n; i++) {
             tlb_reset_dirty_range_locked(&desc->fulltlb[i], &fast->table[i],
                                          start, length);
@@ -1272,6 +1335,12 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         desc->has_global = true;
     }
     tlb_ng_note(desc, cpu_tlb_fast(cpu, mmu_idx), index, full->global);
+    if (tcg_tlb_dirtyfilter && is_ram && (prot & PAGE_WRITE)) {
+        CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
+        size_t bit = tlb_wmap_bit(fast, addend);
+
+        tlb_wmap(desc, fast)[bit / 8] |= 1 << (bit % 8);
+    }
     full = &desc->fulltlb[index];
     full->xlat_offset = iotlb - addr_page;
     full->section = section;
