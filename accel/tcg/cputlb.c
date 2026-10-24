@@ -52,6 +52,7 @@
 #include "qemu/plugin-memory.h"
 #endif
 #include "tcg/tcg-ldst.h"
+#include "tcg/startup.h"
 #include "backend-ldst.h"
 
 
@@ -162,6 +163,27 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
     }
 }
 
+/*
+ * tcg_tlb_nglist: up to CPU_TLB_NG_SLOTS slots filled with a non-global
+ * entry since the last flush are listed after fulltlb's entries; past
+ * that, ng_count only counts, and a non-global flush scans the table.
+ */
+#define CPU_TLB_NG_SLOTS 256
+
+/* A tlb's CPUTLBEntryFull array of @n entries, and room for its list. */
+static CPUTLBEntryFull *tlb_fulltlb_alloc(size_t n, bool try)
+{
+    size_t size = n * sizeof(CPUTLBEntryFull)
+                  + CPU_TLB_NG_SLOTS * sizeof(uint32_t);
+
+    return try ? g_try_malloc(size) : g_malloc(size);
+}
+
+static inline uint32_t *tlb_ng_slots(CPUTLBDesc *desc, CPUTLBDescFast *fast)
+{
+    return (uint32_t *)(desc->fulltlb + tlb_n_entries(fast));
+}
+
 /**
  * tlb_mmu_resize_locked() - perform TLB resize bookkeeping; resize if necessary
  * @desc: The CPUTLBDesc portion of the TLB
@@ -255,7 +277,7 @@ static bool tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
     /* desc->n_used_entries is cleared by the caller */
     fast->mask = (new_size - 1) << CPU_TLB_ENTRY_BITS;
     fast->table = g_try_new(CPUTLBEntry, new_size);
-    desc->fulltlb = g_try_new(CPUTLBEntryFull, new_size);
+    desc->fulltlb = tlb_fulltlb_alloc(new_size, true);
 
     /*
      * If the allocations fail, try smaller sizes. We just freed some
@@ -275,7 +297,7 @@ static bool tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
         g_free(fast->table);
         g_free(desc->fulltlb);
         fast->table = g_try_new(CPUTLBEntry, new_size);
-        desc->fulltlb = g_try_new(CPUTLBEntryFull, new_size);
+        desc->fulltlb = tlb_fulltlb_alloc(new_size, true);
     }
     return true;
 }
@@ -283,6 +305,7 @@ static bool tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
 static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
 {
     desc->has_global = false;
+    desc->ng_count = 0;
     desc->n_used_entries = 0;
     desc->large_page_addr = -1;
     desc->large_page_mask = -1;
@@ -309,7 +332,7 @@ static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
     desc->n_used_entries = 0;
     fast->mask = (n_entries - 1) << CPU_TLB_ENTRY_BITS;
     fast->table = g_new(CPUTLBEntry, n_entries);
-    desc->fulltlb = g_new(CPUTLBEntryFull, n_entries);
+    desc->fulltlb = tlb_fulltlb_alloc(n_entries, false);
     tlb_mmu_flush_locked(desc, fast);
 }
 
@@ -448,14 +471,30 @@ static void tlb_flush_nonglobal_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
         tlb_mmu_flush_locked(desc, fast);
         return;
     }
-    for (size_t i = 0; i < n; i++) {
-        CPUTLBEntry *te = &fast->table[i];
+    if (tcg_tlb_nglist && desc->ng_count <= CPU_TLB_NG_SLOTS) {
+        /* The slots that got a non-global entry since the last flush. */
+        uint32_t *slots = tlb_ng_slots(desc, fast);
 
-        if (!tlb_entry_is_empty(te) && !desc->fulltlb[i].global) {
-            memset(te, -1, sizeof(*te));
-            desc->n_used_entries--;
+        for (unsigned j = 0; j < desc->ng_count; j++) {
+            size_t i = slots[j];
+            CPUTLBEntry *te = &fast->table[i];
+
+            if (!tlb_entry_is_empty(te) && !desc->fulltlb[i].global) {
+                memset(te, -1, sizeof(*te));
+                desc->n_used_entries--;
+            }
+        }
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            CPUTLBEntry *te = &fast->table[i];
+
+            if (!tlb_entry_is_empty(te) && !desc->fulltlb[i].global) {
+                memset(te, -1, sizeof(*te));
+                desc->n_used_entries--;
+            }
         }
     }
+    desc->ng_count = 0;
     for (int i = 0; i < CPU_VTLB_SIZE; i++) {
         if (!desc->vfulltlb[i].global) {
             memset(&desc->vtable[i], -1, sizeof(desc->vtable[i]));
@@ -970,6 +1009,18 @@ static void tlb_reset_dirty_range_locked(CPUTLBEntryFull *full, CPUTLBEntry *ent
  * Called with tlb_c.lock held.
  * Called only from the vCPU context, i.e. the TLB's owner thread.
  */
+/* tcg_tlb_nglist: tlb slot @index of @desc now holds a non-global entry. */
+static inline void tlb_ng_note(CPUTLBDesc *desc, CPUTLBDescFast *fast,
+                               size_t index, bool global)
+{
+    if (tcg_tlb_nglist && !global && desc->ng_count <= CPU_TLB_NG_SLOTS) {
+        if (desc->ng_count < CPU_TLB_NG_SLOTS) {
+            tlb_ng_slots(desc, fast)[desc->ng_count] = index;
+        }
+        desc->ng_count++;
+    }
+}
+
 static inline void copy_tlb_helper_locked(CPUTLBEntry *d, const CPUTLBEntry *s)
 {
     *d = *s;
@@ -1220,6 +1271,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     if (full->global) {
         desc->has_global = true;
     }
+    tlb_ng_note(desc, cpu_tlb_fast(cpu, mmu_idx), index, full->global);
     full = &desc->fulltlb[index];
     full->xlat_offset = iotlb - addr_page;
     full->section = section;
@@ -1395,6 +1447,8 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
             CPUTLBEntryFull *f2 = &cpu->neg.tlb.d[mmu_idx].vfulltlb[vidx];
             CPUTLBEntryFull tmpf;
             tmpf = *f1; *f1 = *f2; *f2 = tmpf;
+            tlb_ng_note(&cpu->neg.tlb.d[mmu_idx], cpu_tlb_fast(cpu, mmu_idx),
+                        index, f1->global);
             return true;
         }
     }
