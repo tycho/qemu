@@ -156,6 +156,8 @@ static void xtcg_fork_defaults(Object *obj)
     object_property_parse(obj, "x-tlb-nglist", "on", &error_abort);
     /* Code-page protection scans only the TLBs that may map the page. */
     object_property_parse(obj, "x-tlb-dirtyfilter", "on", &error_abort);
+    /* Ordered accesses' slow paths through a thunk per layout chunk. */
+    object_property_parse(obj, "x-slowthunk", "on", &error_abort);
     /* Crossings found by fault: on where the host raises the fault. */
     if (tcg_tso_fault_supported()) {
         object_property_parse(obj, "x-tso-fault", "on", &error_abort);
