@@ -779,7 +779,7 @@ void tb_flush__exclusive_or_serial(void)
            (current_cpu && cpu_in_serial_context(current_cpu)));
 
     CPU_FOREACH(cpu) {
-        tcg_flush_jmp_cache(cpu);
+        tcg_clear_jmp_cache(cpu);
     }
 
     qht_reset_size(&tb_ctx.htable, CODE_GEN_HTABLE_SIZE);

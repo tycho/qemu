@@ -682,7 +682,7 @@ uintptr_t tcg_retstack_fault(CPUState *cpu, uintptr_t addr)
     return ring + TCG_RETSTACK_SIZE / 2;
 }
 
-void tcg_flush_jmp_cache(CPUState *cpu)
+static void tcg_flush_jmp_cache_1(CPUState *cpu, bool clear)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
 
@@ -692,7 +692,7 @@ void tcg_flush_jmp_cache(CPUState *cpu)
     }
     tcg_retstack_reset(cpu);
 
-    if (tcg_jcgen) {
+    if (tcg_jcgen && !clear) {
         uint64_t salt = qatomic_read(&jc->salt) + TB_JMP_SALT_STEP;
 
         /* Once every 65536 flushes the salt comes round: clear for real. */
@@ -700,9 +700,23 @@ void tcg_flush_jmp_cache(CPUState *cpu)
             qatomic_set(&jc->salt, salt);
             return;
         }
-        qatomic_set(&jc->salt, 0);
     }
+    qatomic_set(&jc->salt, 0);
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
         qatomic_set(&jc->array[i].tb, NULL);
     }
+}
+
+void tcg_flush_jmp_cache(CPUState *cpu)
+{
+    tcg_flush_jmp_cache_1(cpu, false);
+}
+
+/*
+ * Clear the entries themselves, not only the salt: the TBs they point to
+ * are being freed (tb_flush), and tb_lookup may read them (x-tblookup).
+ */
+void tcg_clear_jmp_cache(CPUState *cpu)
+{
+    tcg_flush_jmp_cache_1(cpu, true);
 }
