@@ -896,7 +896,7 @@ uintptr_t tcg_retstack_fault(CPUState *cpu, uintptr_t addr)
     return ring + TCG_RETSTACK_SIZE / 2;
 }
 
-void tcg_flush_jmp_cache(CPUState *cpu)
+static void tcg_flush_jmp_cache_1(CPUState *cpu, bool clear)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
 
@@ -907,24 +907,45 @@ void tcg_flush_jmp_cache(CPUState *cpu)
     tcg_retstack_reset(cpu);
 
     if (tcg_jcgen) {
-        uint64_t salt = qatomic_read(&jc->salt) + TB_JMP_SALT_STEP;
-        uint64_t gsalt = qatomic_read(&jc->gsalt) + TB_JMP_SALT_STEP;
+        int shift = cpu->cc->tcg_ops->jmp_cache_salt_shift(cpu);
+        uint64_t step = 1ull << shift;
+        uint64_t salt = qatomic_read(&jc->salt) + step;
+        uint64_t gsalt = qatomic_read(&jc->gsalt) + step;
 
         /*
-         * Once every 32768 flushes a salt comes round (into the other's
-         * half): clear for real.
+         * Once every 2^(63 - shift) flushes a salt comes round (into the
+         * other's half), and in a mode with another shift the old
+         * entries' keys may alias new pcs: clear for real then.
          */
-        if (!(salt & TB_JMP_GSALT_BASE) && (gsalt & TB_JMP_GSALT_BASE)) {
+        if (!clear && step == jc->salt_step &&
+            !(salt & TB_JMP_GSALT_BASE) && (gsalt & TB_JMP_GSALT_BASE)) {
             qatomic_set(&jc->salt, salt);
             qatomic_set(&jc->gsalt, gsalt);
             return;
         }
+        jc->salt_step = step;
+    }
+    if (tcg_jcgen) {
         qatomic_set(&jc->salt, 0);
         qatomic_set(&jc->gsalt, TB_JMP_GSALT_BASE);
     }
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
         qatomic_set(&jc->array[i].tb, NULL);
     }
+}
+
+void tcg_flush_jmp_cache(CPUState *cpu)
+{
+    tcg_flush_jmp_cache_1(cpu, false);
+}
+
+/*
+ * Clear the entries themselves, not only the salt: the TBs they point to
+ * are being freed (tb_flush), and tb_lookup may read them (x-tblookup).
+ */
+void tcg_clear_jmp_cache(CPUState *cpu)
+{
+    tcg_flush_jmp_cache_1(cpu, true);
 }
 
 /*
@@ -934,7 +955,7 @@ void tcg_flush_jmp_cache(CPUState *cpu)
 void tcg_flush_jmp_cache_nonglobal(CPUState *cpu)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
-    uint64_t salt;
+    uint64_t step, salt;
 
     if (unlikely(jc == NULL)) {
         return;
@@ -943,11 +964,13 @@ void tcg_flush_jmp_cache_nonglobal(CPUState *cpu)
         tcg_flush_jmp_cache(cpu);
         return;
     }
-    salt = qatomic_read(&jc->salt) + TB_JMP_SALT_STEP;
-    if (!(salt & TB_JMP_GSALT_BASE)) {
+    step = 1ull << cpu->cc->tcg_ops->jmp_cache_salt_shift(cpu);
+    salt = qatomic_read(&jc->salt) + step;
+    if (step == jc->salt_step && !(salt & TB_JMP_GSALT_BASE)) {
         qatomic_set(&jc->salt, salt);
         return;
     }
+    jc->salt_step = step;
     qatomic_set(&jc->salt, 0);
     qatomic_set(&jc->gsalt, TB_JMP_GSALT_BASE);
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {

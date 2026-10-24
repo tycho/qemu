@@ -230,17 +230,12 @@ void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
 
 void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
 {
+    uint32_t old_cr4 = env->cr[4];
     uint32_t hflags;
 
 #if defined(DEBUG_MMU)
     printf("CR4 update: %08x -> %08x\n", (uint32_t)env->cr[4], new_cr4);
 #endif
-    if ((new_cr4 ^ env->cr[4]) &
-        (CR4_PGE_MASK | CR4_PAE_MASK | CR4_PSE_MASK | CR4_PCIDE_MASK |
-         CR4_SMEP_MASK | CR4_SMAP_MASK | CR4_LA57_MASK)) {
-        tlb_flush(env_cpu(env));
-    }
-
     /* Clear bits we're going to recompute.  */
     hflags = env->hflags & ~(HF_OSFXSR_MASK | HF_SMAP_MASK | HF_UMIP_MASK);
 
@@ -290,6 +285,13 @@ void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
 
     env->cr[4] = new_cr4;
     env->hflags = hflags;
+
+    /* After the update: the jump cache's flush reads CR4.LA57. */
+    if ((new_cr4 ^ old_cr4) &
+        (CR4_PGE_MASK | CR4_PAE_MASK | CR4_PSE_MASK | CR4_PCIDE_MASK |
+         CR4_SMEP_MASK | CR4_SMAP_MASK | CR4_LA57_MASK)) {
+        tlb_flush(env_cpu(env));
+    }
 
     cpu_sync_bndcs_hflags(env);
     cpu_sync_avx_hflag(env);

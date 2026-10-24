@@ -318,7 +318,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
     tcg_fpcheck_runtime = s->i386_runtime;
     tcg_iopl_runtime = s->i386_runtime;
 
-    tcg_jcgen = cc->tcg_ops->jmp_cache_salt;
+    tcg_jcgen = cc->tcg_ops->jmp_cache_salt_shift != NULL;
 #ifndef CONFIG_USER_ONLY
     tcg_jc_global = tcg_jcgen && tcg_ijmp_inline &&
                     tcg_cr3_flush == TCG_CR3_FLUSH_NONGLOBAL;
