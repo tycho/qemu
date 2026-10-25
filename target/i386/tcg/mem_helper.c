@@ -163,14 +163,6 @@ uint32_t helper_rep_fast(CPUX86State *env, uint32_t desc)
             if (!code64) {
                 n = MIN(n, (UINT32_MAX - (uint32_t)src) / size + 1);
             }
-            /*
-             * A destination just above the source repeats what the copy
-             * wrote: copy at most the distance at a time, as x86's
-             * element by element copy does.
-             */
-            if (dst > src && dst - src < n * size) {
-                n = (dst - src) / size;
-            }
         }
         if (n == 0) {
             break;
@@ -182,6 +174,21 @@ uint32_t helper_rep_fast(CPUX86State *env, uint32_t desc)
         }
         if (!hd || (movs && !hs)) {
             break;
+        }
+        /*
+         * A destination just above the source repeats what the copy wrote:
+         * copy at most the distance at a time, as x86's element by element
+         * copy does.  Host addresses, so that two virtual addresses of one
+         * page count too (in system mode; in user mode, two shared
+         * mappings of the same memory don't).
+         */
+        if (movs && (uintptr_t)hd > (uintptr_t)hs &&
+            (uintptr_t)hd - (uintptr_t)hs < bytes) {
+            n = ((uintptr_t)hd - (uintptr_t)hs) / size;
+            if (n == 0) {
+                break;
+            }
+            bytes = n * size;
         }
         set_helper_retaddr(ra);
         if (movs) {
