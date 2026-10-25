@@ -25,6 +25,7 @@
 #include "qemu/int128.h"
 #include "qemu/atomic128.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 #include "helper-tcg.h"
 #include "accel/tcg/probe.h"
 #include "exec/target_page.h"
@@ -74,6 +75,10 @@ void helper_boundl(CPUX86State *env, target_ulong a0, int v)
  * page that isn't, or at REP_FAST_MAX bytes, stop, and the instruction's
  * element loop (or its next run) goes on from there.  Returns whether
  * any element was done; RCX, RDI and RSI are updated to match.
+ *
+ * With the direction flag set (x-repstr-back), each round goes down from
+ * the element at RDI (RSI) to the start of its page; that element must
+ * lie within the page.
  */
 #define REP_FAST_MAX (64 * KiB)
 
@@ -108,6 +113,37 @@ static void *rep_host(CPUX86State *env, vaddr addr, int len,
 #endif
 }
 
+/*
+ * How many elements from the one at @addr (register value @reg) stay
+ * within its page without wrapping the register or a 32-bit address: up
+ * to the end of the page, or (@down) down to its start, the first
+ * element lying within the page.
+ */
+static uint64_t rep_room(vaddr addr, target_ulong reg, uint64_t amask,
+                         int size, bool code64, bool down)
+{
+    uint64_t off = addr & ~TARGET_PAGE_MASK;
+    uint64_t n;
+
+    if (!down) {
+        n = (TARGET_PAGE_SIZE - off) / size;
+        n = MIN(n, (amask - reg) / size + 1);
+        if (!code64) {
+            n = MIN(n, (UINT32_MAX - (uint32_t)addr) / size + 1);
+        }
+        return n;
+    }
+    if (off + size > TARGET_PAGE_SIZE) {
+        return 0;
+    }
+    n = off / size + 1;
+    n = MIN(n, reg / size + 1);
+    if (!code64) {
+        n = MIN(n, (uint32_t)addr / size + 1);
+    }
+    return n;
+}
+
 uint32_t helper_rep_fast(CPUX86State *env, uint32_t desc)
 {
     MemOp ot = extract32(desc, 0, 2);
@@ -126,8 +162,15 @@ uint32_t helper_rep_fast(CPUX86State *env, uint32_t desc)
     uintptr_t ra = GETPC();
     /* Other vCPUs or threads see the stores in order with the rest. */
     bool order = env_cpu(env)->tcg_cflags & CF_PARALLEL;
+    bool down = env->df != 1;
 
-    if (env->df != 1) {
+    /*
+     * Down only with x-repstr-back.  With fast strings disabled, the stores
+     * within one REP STOS or REP MOVS are seen in order: leave them to the
+     * element loop.
+     */
+    if ((down && !tcg_repstr_back) ||
+        !(env->msr_ia32_misc_enable & MSR_IA32_MISC_ENABLE_FASTSTRING)) {
         return 0;
     }
     if (!movs) {
@@ -151,37 +194,51 @@ uint32_t helper_rep_fast(CPUX86State *env, uint32_t desc)
         void *hd, *hs = NULL;
 
         /* Within a page, without wrapping the register or the address. */
-        n = MIN(n, (TARGET_PAGE_SIZE - (dst & ~TARGET_PAGE_MASK)) / size);
-        n = MIN(n, (amask - rdi) / size + 1);
+        n = MIN(n, rep_room(dst, rdi, amask, size, code64, down));
         n = MIN(n, (REP_FAST_MAX - done) / size);
-        if (!code64) {
-            n = MIN(n, (UINT32_MAX - (uint32_t)dst) / size + 1);
-        }
         if (movs) {
-            n = MIN(n, (TARGET_PAGE_SIZE - (src & ~TARGET_PAGE_MASK)) / size);
-            n = MIN(n, (amask - rsi) / size + 1);
-            if (!code64) {
-                n = MIN(n, (UINT32_MAX - (uint32_t)src) / size + 1);
-            }
-            /*
-             * A destination just above the source repeats what the copy
-             * wrote: copy at most the distance at a time, as x86's
-             * element by element copy does.
-             */
-            if (dst > src && dst - src < n * size) {
-                n = (dst - src) / size;
-            }
+            n = MIN(n, rep_room(src, rsi, amask, size, code64, down));
         }
         if (n == 0) {
             break;
         }
         bytes = n * size;
-        hd = rep_host(env, dst, bytes, MMU_DATA_STORE, mmu_idx, ra);
+        /* Down, the round's lowest element comes first in memory. */
+        hd = rep_host(env, down ? dst - (bytes - size) : dst, bytes,
+                      MMU_DATA_STORE, mmu_idx, ra);
         if (movs) {
-            hs = rep_host(env, src, bytes, MMU_DATA_LOAD, mmu_idx, ra);
+            hs = rep_host(env, down ? src - (bytes - size) : src, bytes,
+                          MMU_DATA_LOAD, mmu_idx, ra);
         }
         if (!hd || (movs && !hs)) {
             break;
+        }
+        /*
+         * A destination just past the source in the copy's direction (above
+         * it upward, below it down) repeats what the copy wrote: copy at
+         * most the distance at a time, as x86's element by element copy
+         * does.  Host addresses, so that two virtual addresses of one page
+         * count too (in system mode; in user mode, two shared mappings of
+         * the same memory don't).  Down, the round keeps its top element.
+         */
+        if (movs && (down ? (uintptr_t)hs > (uintptr_t)hd
+                          : (uintptr_t)hd > (uintptr_t)hs)) {
+            uintptr_t dist = down ? (uintptr_t)hs - (uintptr_t)hd
+                                  : (uintptr_t)hd - (uintptr_t)hs;
+
+            if (dist < bytes) {
+                uint64_t keep = dist / size * size;
+
+                if (keep == 0) {
+                    break;
+                }
+                if (down) {
+                    hd += bytes - keep;
+                    hs += bytes - keep;
+                }
+                n = keep / size;
+                bytes = keep;
+            }
         }
         set_helper_retaddr(ra);
         if (movs) {
@@ -197,14 +254,13 @@ uint32_t helper_rep_fast(CPUX86State *env, uint32_t desc)
             memcpy(hd + i, &pat, bytes - i);
         }
         clear_helper_retaddr();
-        env->regs[R_EDI] = (env->regs[R_EDI] & ~amask) |
-                           ((rdi + bytes) & amask);
+        /* Writing a 32-bit address register zero-extends it, as x86 does. */
+        env->regs[R_EDI] = (down ? rdi - bytes : rdi + bytes) & amask;
         if (movs) {
-            env->regs[R_ESI] = (env->regs[R_ESI] & ~amask) |
-                               ((rsi + bytes) & amask);
+            env->regs[R_ESI] = (down ? rsi - bytes : rsi + bytes) & amask;
         }
         count -= n;
-        env->regs[R_ECX] = (env->regs[R_ECX] & ~amask) | count;
+        env->regs[R_ECX] = count;
         done += bytes;
     }
     if (order) {

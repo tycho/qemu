@@ -561,6 +561,11 @@ extern bool tcg_alignfold;
  * string operations do.
  */
 extern bool tcg_repstr;
+/*
+ * x86 guests (accel property x-repstr-back): with x-repstr, REP STOS and
+ * REP MOVS in bulk when the direction flag is set too.
+ */
+extern bool tcg_repstr_back;
 
 /*
  * x86 guests: TCG implements the Hyper-V interface for the enlightenments
