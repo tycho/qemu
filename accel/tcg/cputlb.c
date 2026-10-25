@@ -150,16 +150,42 @@ static void tlb_window_reset(CPUTLBDesc *desc, int64_t ns,
 static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
+    uint64_t salt;
     int i, i0;
 
     if (unlikely(!jc)) {
         return;
     }
 
+    salt = qatomic_read(&jc->salt);
     i0 = tb_jmp_cache_hash_page(page_addr);
     for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
-        qatomic_set(&jc->array[i0 + i].tb, NULL);
+        /*
+         * The group holds other pages' entries too.  With tcg_jcgen the
+         * key gives back the pc under the current salt: drop only this
+         * page's entries.  Those made under older salts stay, but only
+         * the revalidation of a stale entry takes them again, and it
+         * checks the TB's pages as they are mapped now.
+         */
+        if (!tcg_jcgen ||
+            ((jc->array[i0 + i].pc ^ salt) & TARGET_PAGE_MASK) == page_addr) {
+            qatomic_set(&jc->array[i0 + i].tb, NULL);
+        }
     }
+}
+
+/*
+ * Clear the jump cache entries of TBs that may overlap the page at
+ * @addr: those starting on it or on the page before, which for a
+ * 32-bit guest at address 0 is 0xfffff000 (its pcs wrap at 4 GiB).
+ */
+static void tb_jmp_cache_clear_page_and_prev(CPUState *cpu, vaddr addr)
+{
+    tb_jmp_cache_clear_page(cpu, addr - TARGET_PAGE_SIZE);
+    if (addr < TARGET_PAGE_SIZE) {
+        tb_jmp_cache_clear_page(cpu, (uint32_t)(addr - TARGET_PAGE_SIZE));
+    }
+    tb_jmp_cache_clear_page(cpu, addr);
 }
 
 /**
@@ -550,8 +576,7 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
      * Discard jump cache entries for any tb which might potentially
      * overlap the flushed page, which includes the previous.
      */
-    tb_jmp_cache_clear_page(cpu, addr - TARGET_PAGE_SIZE);
-    tb_jmp_cache_clear_page(cpu, addr);
+    tb_jmp_cache_clear_page_and_prev(cpu, addr);
 }
 
 /**
@@ -749,10 +774,10 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
      * Discard jump cache entries for any tb which might potentially
      * overlap the flushed pages, which includes the previous.
      */
-    d.addr -= TARGET_PAGE_SIZE;
-    for (vaddr i = 0, n = d.len / TARGET_PAGE_SIZE + 1; i < n; i++) {
-        tb_jmp_cache_clear_page(cpu, d.addr);
+    tb_jmp_cache_clear_page_and_prev(cpu, d.addr);
+    for (vaddr i = 1, n = d.len / TARGET_PAGE_SIZE; i < n; i++) {
         d.addr += TARGET_PAGE_SIZE;
+        tb_jmp_cache_clear_page(cpu, d.addr);
     }
 }
 
