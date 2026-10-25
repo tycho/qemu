@@ -321,6 +321,9 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 
     jc->array[hash].pc = key;
     qatomic_set(&jc->array[hash].tb, tb);
+#ifndef CONFIG_USER_ONLY
+    set_bit(tb_jmp_cache_filter_bit(s.pc), jc->filter);
+#endif
 
 hit:
     /*
@@ -1117,6 +1120,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 if (!tcg_jc_ctx || tb_jmp_cache_ctx_match(jc, s)) {
                     jc->array[h].pc = s.pc ^ qatomic_read(&jc->salt);
                     qatomic_set(&jc->array[h].tb, tb);
+#ifndef CONFIG_USER_ONLY
+                    set_bit(tb_jmp_cache_filter_bit(s.pc), jc->filter);
+#endif
                 }
             }
 
