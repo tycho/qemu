@@ -159,17 +159,26 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
 
     salt = qatomic_read(&jc->salt);
     i0 = tb_jmp_cache_hash_page(page_addr);
+    /* No entry made for the page since its group was last scanned. */
+    if (!test_bit(tb_jmp_cache_filter_bit(page_addr), jc->filter)) {
+        return;
+    }
+    bitmap_clear(jc->filter, i0, TB_JMP_PAGE_SIZE);
     for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
+        vaddr pc = jc->array[i0 + i].pc ^ salt;
+
         /*
          * The group holds other pages' entries too.  With tcg_jcgen the
          * key gives back the pc under the current salt: drop only this
-         * page's entries.  Those made under older salts stay, but only
-         * the revalidation of a stale entry takes them again, and it
-         * checks the TB's pages as they are mapped now.
+         * page's entries, and set the bits of those that stay.  Those
+         * made under older salts stay too, but only the revalidation of
+         * a stale entry takes them again, and it checks the TB's pages
+         * as they are mapped now.
          */
-        if (!tcg_jcgen ||
-            ((jc->array[i0 + i].pc ^ salt) & TARGET_PAGE_MASK) == page_addr) {
+        if (!tcg_jcgen || (pc & TARGET_PAGE_MASK) == page_addr) {
             qatomic_set(&jc->array[i0 + i].tb, NULL);
+        } else if (qatomic_read(&jc->array[i0 + i].tb)) {
+            set_bit(tb_jmp_cache_filter_bit(pc), jc->filter);
         }
     }
 }
