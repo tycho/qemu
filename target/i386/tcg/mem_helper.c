@@ -197,14 +197,13 @@ uint32_t helper_rep_fast(CPUX86State *env, uint32_t desc)
             memcpy(hd + i, &pat, bytes - i);
         }
         clear_helper_retaddr();
-        env->regs[R_EDI] = (env->regs[R_EDI] & ~amask) |
-                           ((rdi + bytes) & amask);
+        /* Writing a 32-bit address register zero-extends it, as x86 does. */
+        env->regs[R_EDI] = (rdi + bytes) & amask;
         if (movs) {
-            env->regs[R_ESI] = (env->regs[R_ESI] & ~amask) |
-                               ((rsi + bytes) & amask);
+            env->regs[R_ESI] = (rsi + bytes) & amask;
         }
         count -= n;
-        env->regs[R_ECX] = (env->regs[R_ECX] & ~amask) | count;
+        env->regs[R_ECX] = count;
         done += bytes;
     }
     if (order) {
