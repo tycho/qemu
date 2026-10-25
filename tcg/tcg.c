@@ -375,6 +375,7 @@ bool tcg_hyperv;
 bool tcg_hvtimers;
 bool tcg_vexzero;
 bool tcg_crypto;
+bool tcg_repstr_back;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
