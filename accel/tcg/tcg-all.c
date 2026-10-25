@@ -112,6 +112,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-lazyinc", "on" },
         { "x-flags", "dead" },
         { "x-repstr", "on" },
+        { "x-repstr-back", "on" },
         { "x-vexzero", "on" },
         { "x-crypto", "on" },
         { "x-alignfold", "on" },
