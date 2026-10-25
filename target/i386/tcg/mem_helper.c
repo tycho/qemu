@@ -127,7 +127,12 @@ uint32_t helper_rep_fast(CPUX86State *env, uint32_t desc)
     /* Other vCPUs or threads see the stores in order with the rest. */
     bool order = env_cpu(env)->tcg_cflags & CF_PARALLEL;
 
-    if (env->df != 1) {
+    /*
+     * With fast strings disabled, the stores within one REP STOS or REP
+     * MOVS are seen in order: leave them to the element loop.
+     */
+    if (env->df != 1 ||
+        !(env->msr_ia32_misc_enable & MSR_IA32_MISC_ENABLE_FASTSTRING)) {
         return 0;
     }
     if (!movs) {
