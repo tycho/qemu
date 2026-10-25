@@ -727,3 +727,21 @@ void tcg_clear_jmp_cache(CPUState *cpu)
 {
     tcg_flush_jmp_cache_1(cpu, true);
 }
+
+/*
+ * Drop every entry of @cpu's jump cache, from any thread.  Unlike a
+ * flush, leave the salt alone: only @cpu's own thread moves it, since a
+ * racing store could bring back an older salt and the entries made under
+ * it.
+ */
+void tcg_drop_jmp_cache(CPUState *cpu)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+    if (unlikely(jc == NULL)) {
+        return;
+    }
+    for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+        qatomic_set(&jc->array[i].tb, NULL);
+    }
+}

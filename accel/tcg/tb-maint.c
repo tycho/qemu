@@ -906,7 +906,7 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
          */
         if (!tcg_jc_keep_pcrel) {
             CPU_FOREACH(cpu) {
-                tcg_flush_jmp_cache(cpu);
+                tcg_drop_jmp_cache(cpu);
             }
         }
     } else {
