@@ -29,10 +29,10 @@ typedef struct CPUJumpCache {
     struct rcu_head rcu;
     /*
      * tcg_jcgen: entries store pc ^ salt, and a flush moves the salt on
-     * instead of clearing every entry.  The salt lives in bits 48-63,
-     * which a guest pc never needs to tell two addresses apart on x86
-     * (canonical 64-bit addresses, 32-bit ones otherwise).  Zero without
-     * tcg_jcgen.
+     * instead of clearing every entry.  The salt lives in the high bits
+     * that the guest's pcs never need to tell two addresses apart, from
+     * bit TCGCPUOps.jmp_cache_salt_shift up, and moves on by salt_step.
+     * Zero without tcg_jcgen.
      */
     uint64_t salt;
     /*
@@ -52,10 +52,12 @@ typedef struct CPUJumpCache {
      * host code is for the TB state of the cache.
      */
     void *retring;
+    /*
+     * tcg_jcgen: 1 << the salt's lowest bit, for the guest mode at the
+     * last flush; a flush in a mode with another clears the entries.
+     * The key bits below it are the pc's.
+     */
+    uint64_t salt_step;
 } CPUJumpCache;
-
-#define TB_JMP_SALT_STEP (1ull << 48)
-/* The bits of an entry's key that hold the salt. */
-#define TB_JMP_SALT_MASK (~0ull << 48)
 
 #endif /* ACCEL_TCG_TB_JMP_CACHE_H */
