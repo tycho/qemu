@@ -67,6 +67,14 @@ static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
     return tb_jmp_cache_hash_page(pc) | (off & TB_JMP_ADDR_MASK);
 }
 
+/* @pc's page's bit in CPUJumpCache.filter, within its group's bits. */
+static inline unsigned int tb_jmp_cache_filter_bit(vaddr pc)
+{
+    uint64_t h = (uint64_t)(pc >> TARGET_PAGE_BITS) * 0x9e3779b97f4a7c15ull;
+
+    return tb_jmp_cache_hash_page(pc) | (h >> (64 - TB_JMP_PAGE_BITS));
+}
+
 #else
 
 /*

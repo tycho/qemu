@@ -10,6 +10,7 @@
 #define ACCEL_TCG_TB_JMP_CACHE_H
 
 #include "qemu/rcu.h"
+#include "qemu/bitops.h"
 #include "exec/cpu-common.h"
 
 /* log2 of the entries per vCPU; a compile-time constant, overridable. */
@@ -58,6 +59,18 @@ typedef struct CPUJumpCache {
      * The key bits below it are the pc's.
      */
     uint64_t salt_step;
+#ifndef CONFIG_USER_ONLY
+    /*
+     * One bit per slot, in the same groups: a page's bit in its group
+     * (tb_jmp_cache_filter_bit) is set where an entry for a pc on it is
+     * made, and a page clear that scans the group sets the bits again
+     * from the entries it keeps.  A clear of a page whose bit is clear
+     * skips the scan.  Entries under older salts may be left without
+     * their bit; only revalidation, which walks the TB's pages, takes
+     * them again.
+     */
+    unsigned long filter[BITS_TO_LONGS(TB_JMP_CACHE_SIZE)];
+#endif
 } CPUJumpCache;
 
 #endif /* ACCEL_TCG_TB_JMP_CACHE_H */
