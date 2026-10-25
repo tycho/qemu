@@ -160,6 +160,8 @@ static void xtcg_fork_defaults(Object *obj)
     object_property_parse(obj, "x-slowthunk", "on", &error_abort);
     /* Stale jump-cache entries that still match, before the hash table. */
     object_property_parse(obj, "x-jcrevalidate", "on", &error_abort);
+    /* Exit-request checks on cycle edges (needs x-region). */
+    object_property_parse(obj, "x-edgesys", "on", &error_abort);
     /* Crossings found by fault: on where the host raises the fault. */
     if (tcg_tso_fault_supported()) {
         object_property_parse(obj, "x-tso-fault", "on", &error_abort);
