@@ -169,14 +169,20 @@ static vaddr x86_pointer_wrap(CPUState *cs, int mmu_idx,
 }
 #endif
 
+/*
+ * Canonical 64-bit addresses repeat bit 47 from bit 48 up, or bit 56
+ * from bit 57 up with 5-level paging; 32-bit ones are zero there.  A
+ * change of CR4.LA57 flushes the TLB (cpu_x86_update_cr4).
+ */
+static int x86_jmp_cache_salt_shift(CPUState *cs)
+{
+    return cpu_env(cs)->cr[4] & CR4_LA57_MASK ? 57 : 48;
+}
+
 const TCGCPUOps x86_tcg_ops = {
     .mttcg_supported = true,
     .precise_smc = true,
-    /*
-     * Canonical 64-bit addresses, 32-bit ones otherwise; user and kernel
-     * code with the same low 48 bits differ in CPL, part of the flags.
-     */
-    .jmp_cache_salt = true,
+    .jmp_cache_salt_shift = x86_jmp_cache_salt_shift,
     /*
      * The x86 has a strong memory model with some store-after-load re-ordering
      */

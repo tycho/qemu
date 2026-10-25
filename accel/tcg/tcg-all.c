@@ -163,7 +163,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
         as->gdbstub.can_reverse = true;
     }
 
-    tcg_jcgen = cc->tcg_ops->jmp_cache_salt;
+    tcg_jcgen = cc->tcg_ops->jmp_cache_salt_shift != NULL;
 #ifdef CONFIG_USER_ONLY
     tcg_jc_ctx = tcg_jcgen && tcg_ijmp_inline;
 #endif

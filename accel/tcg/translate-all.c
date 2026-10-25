@@ -692,14 +692,21 @@ static void tcg_flush_jmp_cache_1(CPUState *cpu, bool clear)
     }
     tcg_retstack_reset(cpu);
 
-    if (tcg_jcgen && !clear) {
-        uint64_t salt = qatomic_read(&jc->salt) + TB_JMP_SALT_STEP;
+    if (tcg_jcgen) {
+        int shift = cpu->cc->tcg_ops->jmp_cache_salt_shift(cpu);
+        uint64_t step = 1ull << shift;
+        uint64_t salt = qatomic_read(&jc->salt) + step;
 
-        /* Once every 65536 flushes the salt comes round: clear for real. */
-        if (salt != 0) {
+        /*
+         * Once every 2^(64 - shift) flushes the salt comes round, and in
+         * a mode with another shift the old entries' keys may alias new
+         * pcs: clear for real then.
+         */
+        if (!clear && step == jc->salt_step && salt != 0) {
             qatomic_set(&jc->salt, salt);
             return;
         }
+        jc->salt_step = step;
     }
     qatomic_set(&jc->salt, 0);
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
