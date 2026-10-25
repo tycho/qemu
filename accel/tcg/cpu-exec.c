@@ -504,7 +504,9 @@ void tcg_jc_layout_init(void)
     l->entry_tb_ofs = offsetof(CPUJumpCache, array[0].tb);
     l->entry_pc_ofs = offsetof(CPUJumpCache, array[0].pc);
     l->entry_shift = 4;
-    l->hash_shift = TARGET_PAGE_BITS - TB_JMP_PAGE_BITS;
+    l->fold_shift = TB_JMP_FOLD_SHIFT;
+    l->group_shift = TB_JMP_GROUP_SHIFT;
+    l->mix_shift = TB_JMP_MIX_SHIFT;
     l->page_bits = TB_JMP_PAGE_BITS;
     l->cache_bits = TB_JMP_CACHE_BITS;
     l->tb_cs_base_ofs = offsetof(TranslationBlock, cs_base);
