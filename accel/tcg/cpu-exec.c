@@ -310,7 +310,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
      * the hash table's would.
      */
     if (tcg_ijmp_inline && tb && tcg_jcgen &&
-        !((jc->array[hash].pc ^ s.pc) & ~TB_JMP_SALT_MASK)) {
+        !((jc->array[hash].pc ^ s.pc) & (jc->salt_step - 1))) {
         tb = tb_htable_lookup_stale(cpu, s, tb);
     } else {
         tb = tb_htable_lookup(cpu, s);
@@ -1222,6 +1222,10 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
             cpu->tb_jmp_cache->retring = p + page;
             tcg_retstack_reset(cpu);
         }
+    }
+    if (tcg_jcgen) {
+        cpu->tb_jmp_cache->salt_step =
+            1ull << cpu->cc->tcg_ops->jmp_cache_salt_shift(cpu);
     }
     tlb_init(cpu);
 #ifndef CONFIG_USER_ONLY

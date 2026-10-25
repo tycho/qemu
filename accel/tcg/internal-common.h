@@ -43,7 +43,7 @@ void tcg_jc_layout_init(void);
 /*
  * tcg_jcgen: flushing a vCPU's jump cache moves its salt on (O(1))
  * instead of clearing every entry (see CPUJumpCache); set from the
- * target's TCGCPUOps.jmp_cache_salt.
+ * target's TCGCPUOps.jmp_cache_salt_shift.
  */
 extern bool tcg_jcgen;
 
