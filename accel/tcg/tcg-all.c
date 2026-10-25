@@ -1270,6 +1270,16 @@ static void tcg_set_tlbpin(Object *obj, bool value, Error **errp)
     tcg_tlbpin = value;
 }
 
+static bool tcg_get_repstr_back(Object *obj, Error **errp)
+{
+    return tcg_repstr_back;
+}
+
+static void tcg_set_repstr_back(Object *obj, bool value, Error **errp)
+{
+    tcg_repstr_back = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1627,6 +1637,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-tlbpin",
         "Keep the TLB mask and table of a block's main mmu index in host "
         "registers (system mode)");
+
+    object_class_property_add_bool(oc, "x-repstr-back", tcg_get_repstr_back,
+                                   tcg_set_repstr_back);
+    object_class_property_set_description(oc, "x-repstr-back",
+        "with x-repstr, x86 REP STOS and REP MOVS in bulk with the "
+        "direction flag set too (default off)");
 }
 
 static const TypeInfo tcg_accel_type = {
