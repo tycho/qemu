@@ -176,14 +176,20 @@ static void gen_jmp_cache_offset(TCGv_i64 off, TCGv_i64 pc)
 #ifdef CONFIG_SOFTMMU
     TCGv_i64 tmp = tcg_temp_ebb_new_i64();
     TCGv_i64 hi = tcg_temp_ebb_new_i64();
-    const unsigned sh = TARGET_PAGE_BITS - TB_JMP_PAGE_BITS;
+    const unsigned fold = TB_JMP_FOLD_SHIFT;
 
-    tcg_gen_shri_i64(tmp, pc, sh);
-    tcg_gen_xor_i64(tmp, tmp, pc);
-    tcg_gen_shri_i64(hi, tmp, sh + TB_JMP_PAGE_BITS);
+    tcg_gen_shri_i64(hi, pc, TB_JMP_MIX_SHIFT);
+    tcg_gen_xor_i64(hi, hi, pc);
+    tcg_gen_shri_i64(hi, hi, TB_JMP_GROUP_SHIFT);
     tcg_gen_deposit_z_i64(hi, hi, e + TB_JMP_PAGE_BITS,
                           TB_JMP_CACHE_BITS - TB_JMP_PAGE_BITS);
-    tcg_gen_deposit_z_i64(off, tmp, e, TB_JMP_PAGE_BITS);
+    if (fold) {
+        tcg_gen_shri_i64(tmp, pc, fold);
+        tcg_gen_xor_i64(tmp, tmp, pc);
+        tcg_gen_deposit_z_i64(off, tmp, e, TB_JMP_PAGE_BITS);
+    } else {
+        tcg_gen_deposit_z_i64(off, pc, e, TB_JMP_PAGE_BITS);
+    }
     tcg_gen_or_i64(off, off, hi);
     tcg_temp_free_i64(hi);
     tcg_temp_free_i64(tmp);
