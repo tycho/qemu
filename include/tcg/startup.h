@@ -61,5 +61,10 @@ void tcg_prologue_init(void);
  * string operations do.
  */
 extern bool tcg_repstr;
+/*
+ * x86 guests (accel property x-repstr-back): with x-repstr, REP STOS and
+ * REP MOVS in bulk when the direction flag is set too.
+ */
+extern bool tcg_repstr_back;
 
 #endif
