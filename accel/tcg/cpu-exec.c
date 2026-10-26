@@ -1226,7 +1226,9 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
     /* Pick up one-insn-per-tb and -d nochain from the command line. */
     tcg_update_cflags(cpu);
 
-    cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
+    cpu->tb_jmp_cache = qemu_memalign(TB_JMP_CACHE_ALIGN,
+                                      sizeof(CPUJumpCache));
+    memset(cpu->tb_jmp_cache, 0, sizeof(CPUJumpCache));
     if (tcg_retstack && tcg_retsp_off) {
         size_t page = qemu_real_host_page_size();
         char *p = mmap(NULL, TCG_RETSTACK_SIZE + 2 * page, PROT_NONE,
@@ -1278,7 +1280,7 @@ static void tb_jmp_cache_free(CPUJumpCache *jc)
 
         munmap((char *)jc->retring - page, TCG_RETSTACK_SIZE + 2 * page);
     }
-    g_free(jc);
+    qemu_vfree(jc);
 }
 
 void tcg_exec_unrealizefn(CPUState *cpu)
