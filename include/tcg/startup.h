@@ -428,7 +428,7 @@ typedef struct TCGJumpCacheLayout {
     int cflags_ofs;         /* env: CPUState.tcg_cflags */
     int salt_ofs, gsalt_ofs;
     int entry_tb_ofs, entry_pc_ofs, entry_shift;
-    int hash_shift, page_bits, cache_bits;
+    int fold_shift, group_shift, mix_shift, page_bits, cache_bits;
     int tb_cs_base_ofs, tb_flags_ofs, tb_cflags_ofs, tb_ptr_ofs;
 } TCGJumpCacheLayout;
 

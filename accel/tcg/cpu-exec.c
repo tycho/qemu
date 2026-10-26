@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/memalign.h"
 #include "qemu/qemu-print.h"
 #include "qapi/error.h"
 #include "qapi/type-helpers.h"
@@ -356,6 +357,9 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s,
     key = tb_jmp_cache_key(jc, s.pc, tb_jmp_cache_global(cpu, tb, s.pc));
     jc->array[hash].pc = key;
     qatomic_set(&jc->array[hash].tb, tb);
+#ifndef CONFIG_USER_ONLY
+    set_bit(tb_jmp_cache_filter_bit(s.pc), jc->filter);
+#endif
 
 hit:
     /*
@@ -792,7 +796,9 @@ void tcg_jc_layout_init(void)
     l->entry_tb_ofs = offsetof(CPUJumpCache, array[0].tb);
     l->entry_pc_ofs = offsetof(CPUJumpCache, array[0].pc);
     l->entry_shift = 4;
-    l->hash_shift = TARGET_PAGE_BITS - TB_JMP_PAGE_BITS;
+    l->fold_shift = TB_JMP_FOLD_SHIFT;
+    l->group_shift = TB_JMP_GROUP_SHIFT;
+    l->mix_shift = TB_JMP_MIX_SHIFT;
     l->page_bits = TB_JMP_PAGE_BITS;
     l->cache_bits = TB_JMP_CACHE_BITS;
     l->tb_cs_base_ofs = offsetof(TranslationBlock, cs_base);
@@ -1476,6 +1482,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                     jc->array[h].pc = tb_jmp_cache_key(jc, s.pc,
                                         tb_jmp_cache_global(cpu, tb, s.pc));
                     qatomic_set(&jc->array[h].tb, tb);
+#ifndef CONFIG_USER_ONLY
+                    set_bit(tb_jmp_cache_filter_bit(s.pc), jc->filter);
+#endif
                 }
             }
 
@@ -1597,7 +1606,9 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
     /* Pick up one-insn-per-tb and -d nochain from the command line. */
     tcg_update_cflags(cpu);
 
-    cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
+    cpu->tb_jmp_cache = qemu_memalign(TB_JMP_CACHE_ALIGN,
+                                      sizeof(CPUJumpCache));
+    memset(cpu->tb_jmp_cache, 0, sizeof(CPUJumpCache));
     cpu->tb_jmp_cache->gsalt = TB_JMP_GSALT_BASE;
     if (tcg_retstack && tcg_retsp_off) {
         size_t page = qemu_real_host_page_size();
@@ -1624,6 +1635,11 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
 }
 
 /* undo the initializations in reverse order */
+static void tb_jmp_cache_free(CPUJumpCache *jc)
+{
+    qemu_vfree(jc);
+}
+
 void tcg_exec_unrealizefn(CPUState *cpu)
 {
 #ifndef CONFIG_USER_ONLY
@@ -1631,5 +1647,5 @@ void tcg_exec_unrealizefn(CPUState *cpu)
 #endif /* !CONFIG_USER_ONLY */
 
     tlb_destroy(cpu);
-    g_free_rcu(cpu->tb_jmp_cache, rcu);
+    call_rcu(cpu->tb_jmp_cache, tb_jmp_cache_free, rcu);
 }

@@ -36,5 +36,6 @@ void queue_tb_flush(CPUState *cs);
 void tcg_flush_jmp_cache(CPUState *cs);
 void tcg_clear_jmp_cache(CPUState *cs);
 void tcg_flush_jmp_cache_nonglobal(CPUState *cs);
+void tcg_drop_jmp_cache(CPUState *cs);
 
 #endif /* _TB_FLUSH_H_ */

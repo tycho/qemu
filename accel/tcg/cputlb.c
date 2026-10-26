@@ -162,23 +162,51 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
     salt = qatomic_read(&jc->salt);
     gsalt = qatomic_read(&jc->gsalt);
     i0 = tb_jmp_cache_hash_page(page_addr);
+    /* No entry made for the page since its group was last scanned. */
+    if (!test_bit(tb_jmp_cache_filter_bit(page_addr), jc->filter)) {
+        return;
+    }
+    bitmap_clear(jc->filter, i0, TB_JMP_PAGE_SIZE);
     for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
-        vaddr key = jc->array[i0 + i].pc;
+        vaddr pc = jc->array[i0 + i].pc ^ salt;
+        vaddr gpc = jc->array[i0 + i].pc ^ gsalt;
 
         /*
-         * The group holds other pages' entries too: with tcg_jc_global,
-         * drop only this page's, under either salt (entries under older
-         * salts never match again).
+         * The group holds other pages' entries too.  With tcg_jcgen the
+         * key gives back the pc under the current salt, or with
+         * tcg_jc_global under gsalt: drop only this page's entries, and
+         * set the bits of those that stay (under both, since the key
+         * doesn't say which).  Those made under older salts stay too,
+         * but only the revalidation of a stale entry takes them again,
+         * and it checks the TB's pages as they are mapped now.
          */
         if (!qatomic_read(&jc->array[i0 + i].tb)) {
             continue;
         }
-        if (!tcg_jc_global ||
-            ((key ^ salt) & TARGET_PAGE_MASK) == page_addr ||
-            ((key ^ gsalt) & TARGET_PAGE_MASK) == page_addr) {
+        if (!tcg_jcgen || (pc & TARGET_PAGE_MASK) == page_addr ||
+            (tcg_jc_global && (gpc & TARGET_PAGE_MASK) == page_addr)) {
             qatomic_set(&jc->array[i0 + i].tb, NULL);
+        } else {
+            set_bit(tb_jmp_cache_filter_bit(pc), jc->filter);
+            if (tcg_jc_global) {
+                set_bit(tb_jmp_cache_filter_bit(gpc), jc->filter);
+            }
         }
     }
+}
+
+/*
+ * Clear the jump cache entries of TBs that may overlap the page at
+ * @addr: those starting on it or on the page before, which for a
+ * 32-bit guest at address 0 is 0xfffff000 (its pcs wrap at 4 GiB).
+ */
+static void tb_jmp_cache_clear_page_and_prev(CPUState *cpu, vaddr addr)
+{
+    tb_jmp_cache_clear_page(cpu, addr - TARGET_PAGE_SIZE);
+    if (addr < TARGET_PAGE_SIZE) {
+        tb_jmp_cache_clear_page(cpu, (uint32_t)(addr - TARGET_PAGE_SIZE));
+    }
+    tb_jmp_cache_clear_page(cpu, addr);
 }
 
 /*
@@ -722,8 +750,7 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
      * Discard jump cache entries for any tb which might potentially
      * overlap the flushed page, which includes the previous.
      */
-    tb_jmp_cache_clear_page(cpu, addr - TARGET_PAGE_SIZE);
-    tb_jmp_cache_clear_page(cpu, addr);
+    tb_jmp_cache_clear_page_and_prev(cpu, addr);
 }
 
 /**
@@ -921,10 +948,10 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
      * Discard jump cache entries for any tb which might potentially
      * overlap the flushed pages, which includes the previous.
      */
-    d.addr -= TARGET_PAGE_SIZE;
-    for (vaddr i = 0, n = d.len / TARGET_PAGE_SIZE + 1; i < n; i++) {
-        tb_jmp_cache_clear_page(cpu, d.addr);
+    tb_jmp_cache_clear_page_and_prev(cpu, d.addr);
+    for (vaddr i = 1, n = d.len / TARGET_PAGE_SIZE; i < n; i++) {
         d.addr += TARGET_PAGE_SIZE;
+        tb_jmp_cache_clear_page(cpu, d.addr);
     }
 }
 
