@@ -6251,7 +6251,8 @@ static void tcg_out_xpage_stub(TCGContext *s)
 {
     const TCGJumpCacheLayout *l = &tcg_jc_layout;
     ptrdiff_t miss[8];
-    int nmiss = 0, hs = l->hash_shift, pb = l->page_bits;
+    int nmiss = 0, fs = l->fold_shift, gs = l->group_shift;
+    int ms = l->mix_shift, pb = l->page_bits;
     int cb = l->cache_bits, es = l->entry_shift;
     ptrdiff_t key_ok = -1;
 
@@ -6260,15 +6261,25 @@ static void tcg_out_xpage_stub(TCGContext *s)
 
     /* X4 = the jump cache; X6 = the entry's offset (tb_jmp_cache_hash_func) */
     tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_X4, TCG_REG_X0, l->jc_ofs);
-    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X5, TCG_REG_X1, hs, 63);
+    /* X7 = the group: (pc ^ pc >> mix) >> group shift, in place */
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X5, TCG_REG_X1, ms, 63);
     tcg_out_insn(s, logic_shift, EOR, TCG_TYPE_I64, TCG_REG_X5, TCG_REG_X5,
                  TCG_REG_X1);
-    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X6, TCG_REG_X5, (64 - es) & 63,
-                 pb - 1);
-    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X7, TCG_REG_X5, hs + pb,
-                 hs + cb - 1);
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X7, TCG_REG_X5, gs,
+                 gs + cb - pb - 1);
     tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X7, TCG_REG_X7,
                  (64 - (pb + es)) & 63, cb - pb - 1);
+    /* X6 = the slot: the pc's low bits, folded where a page is larger */
+    if (fs) {
+        tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X6, TCG_REG_X1, fs, 63);
+        tcg_out_insn(s, logic_shift, EOR, TCG_TYPE_I64, TCG_REG_X6,
+                     TCG_REG_X6, TCG_REG_X1);
+        tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X6, TCG_REG_X6,
+                     (64 - es) & 63, pb - 1);
+    } else {
+        tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X6, TCG_REG_X1,
+                     (64 - es) & 63, pb - 1);
+    }
     tcg_out_insn(s, logic_shift, ORR, TCG_TYPE_I64, TCG_REG_X6, TCG_REG_X6,
                  TCG_REG_X7);
     tcg_out_insn(s, addsub_shift, ADD, TCG_TYPE_I64, TCG_REG_X8, TCG_REG_X4,
