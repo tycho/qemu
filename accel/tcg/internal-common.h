@@ -21,8 +21,8 @@ extern bool one_insn_per_tb;
 
 /*
  * x-tlb-grow: grow a softmmu TLB between flushes once it has had this
- * many times its size in fills within 100 ms while over 70% used (0: only
- * resize at flushes).
+ * many times its size in fills within 100 ms while over 35% used, and
+ * size it for 15-35% use at flushes (0: QEMU's sizing, only at flushes).
  */
 extern unsigned tcg_tlb_grow;
 
