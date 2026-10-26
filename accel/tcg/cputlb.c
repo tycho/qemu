@@ -200,8 +200,20 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
  * since in that range performance is likely near-optimal. Recall that the TLB
  * is direct mapped, so we want the use rate to be low (or at least not too
  * high), since otherwise we are likely to have a significant amount of
- * conflict misses.
+ * conflict misses.  With tcg_tlb_grow, keep it in the 15-35% range: at
+ * 30-70% a Windows XP guest's TLBs still have twice as many victim-TLB
+ * hits as fills.
  */
+static inline size_t tlb_grow_rate(void)
+{
+    return tcg_tlb_grow ? 35 : 70;
+}
+
+static inline size_t tlb_shrink_rate(void)
+{
+    return tcg_tlb_grow ? 15 : 30;
+}
+
 static void tlb_mmu_realloc_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
                                    size_t new_size, int64_t now);
 
@@ -220,9 +232,9 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
     }
     rate = desc->window_max_entries * 100 / old_size;
 
-    if (rate > 70) {
+    if (rate > tlb_grow_rate()) {
         new_size = MIN(old_size << 1, 1 << CPU_TLB_DYN_MAX_BITS);
-    } else if (rate < 30 && window_expired) {
+    } else if (rate < tlb_shrink_rate() && window_expired) {
         size_t ceil = pow2ceil(desc->window_max_entries);
         size_t expected_rate = desc->window_max_entries * 100 / ceil;
 
@@ -237,6 +249,9 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
          * we consider that the size is appropriate.)
          */
         if (expected_rate > 70) {
+            ceil *= 2;
+        }
+        if (tcg_tlb_grow) {
             ceil *= 2;
         }
         new_size = MAX(ceil, 1 << CPU_TLB_DYN_MIN_BITS);
@@ -1070,9 +1085,10 @@ static void tlb_grow_async_work(CPUState *cpu, run_on_cpu_data data)
 
 /*
  * Count a fill; true if the TLB should grow: it has had tcg_tlb_grow times
- * its size in fills within 100 ms (the resize window) and is over 70% used,
- * the rate at which a flush would grow it.  The clock is only read each
- * time that many fills have happened.  Called with tlb_lock_held.
+ * its size in fills within 100 ms (the resize window) and is used over
+ * tlb_grow_rate(), the rate at which a flush would grow it.  The clock is
+ * only read each time that many fills have happened.  Called with
+ * tlb_lock_held.
  */
 static bool tlb_note_fill_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
 {
@@ -1086,7 +1102,7 @@ static bool tlb_note_fill_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
     now = get_clock_realtime();
     grow = !desc->grow_pending
            && now - desc->fill_window_ns < 100 * SCALE_MS
-           && desc->n_used_entries * 100 > size * 70
+           && desc->n_used_entries * 100 > size * tlb_grow_rate()
            && size < (1 << CPU_TLB_DYN_MAX_BITS);
     desc->grow_pending |= grow;
     desc->n_fills = 0;
