@@ -314,8 +314,9 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                               NULL, NULL);
     object_class_property_set_description(oc, "x-tlb-grow",
         "Grow a softmmu TLB between flushes once it has had this many "
-        "times its size in fills within 100 ms while over 70% used "
-        "(0: resize only at flushes, the default)");
+        "times its size in fills within 100 ms while over 35% used, and "
+        "size it for 15-35% use instead of 30-70% (0: QEMU's sizing, "
+        "only at flushes, the default)");
 }
 
 static const TypeInfo tcg_accel_type = {
