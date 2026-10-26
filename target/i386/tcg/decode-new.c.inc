@@ -3842,8 +3842,9 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
              * use and can be computed in 32-bit form.
              */
             if (tcg_lean_narrow32() && dst == s->T0 && reg32 >= 0 &&
-                decode.cc_op >= CC_OP_FIRST_BWLQ &&
-                decode.cc_op <= CC_OP_LAST_BWLQ &&
+                ((decode.cc_op >= CC_OP_FIRST_BWLQ &&
+                  decode.cc_op <= CC_OP_LAST_BWLQ) ||
+                 cc_op_lazy(decode.cc_op)) &&
                 (decode.cc_op & 3) == MO_32) {
                 dst = cpu_regs[reg32];
             }
