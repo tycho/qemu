@@ -10629,7 +10629,8 @@ static void pinned_fold_pass(TCGContext *s)
     }
 }
 
-#if defined(TCG_TARGET_HAS_LDST_X) || defined(TCG_TARGET_HAS_SHLADD)
+#if defined(TCG_TARGET_HAS_LDST_X) || defined(TCG_TARGET_HAS_SHLADD) || \
+    defined(TCG_TARGET_I32_OPS_ZEXT)
 /* Whether @op names @t among its arguments (inputs or outputs). */
 static bool op_uses_temp(const TCGOp *op, const TCGTemp *t)
 {
@@ -11157,6 +11158,36 @@ static bool narrow32_consts(const TCGOp *x)
     return true;
 }
 
+/*
+ * The op before @op that defines @t, if no op between them names @t or
+ * @dst, faults, leaves the block or starts another guest insn: the def
+ * may then write @dst itself.
+ */
+static TCGOp *narrow32_def(TCGOp *op, TCGTemp *t, TCGTemp *dst)
+{
+    TCGOp *prev = op;
+
+    for (int n = 0; n < 16; n++) {
+        const TCGOpDef *def;
+
+        prev = QTAILQ_PREV(prev, link);
+        if (!prev) {
+            return NULL;
+        }
+        def = &tcg_op_defs[prev->opc];
+        if (def->nb_oargs == 1 && arg_temp(prev->args[0]) == t) {
+            return prev;
+        }
+        if (prev->opc == INDEX_op_insn_start || prev->opc == INDEX_op_call ||
+            (def->flags & (TCG_OPF_BB_END | TCG_OPF_SIDE_EFFECTS |
+                           TCG_OPF_CALL_CLOBBER)) ||
+            op_uses_temp(prev, t) || op_uses_temp(prev, dst)) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
 static void narrow32_pass(TCGContext *s)
 {
     TCGOp *op, *next;
@@ -11183,6 +11214,12 @@ static void narrow32_pass(TCGContext *s)
             t = arg_temp(mov->args[1]);
             x = QTAILQ_PREV(mov, link);
             if (!x || (t->kind != TEMP_EBB && t->kind != TEMP_TB)) {
+                continue;
+            }
+        } else if (arg_temp(x->args[0]) != t) {
+            /* Earlier, past ops that don't touch t or the destination. */
+            x = narrow32_def(op, t, arg_temp(op->args[0]));
+            if (!x) {
                 continue;
             }
         }
