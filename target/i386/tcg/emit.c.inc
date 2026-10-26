@@ -439,10 +439,14 @@ static void prepare_update_cc_incdec_lazy(X86DecodedInsn *decode,
         tcg_gen_movcond_tl(TCG_COND_LTU, decode->cc_dst2, low_tl,
                            tcg_constant_tl(CC_OP_DECLQ - CC_OP_INCLB + 1),
                            cpu_cc_dst2, cpu_cc_dst);
+        tcg_gen_ori_i32(cc_op, cc_op, lazy);
+    } else if (s->cc_op == lazy) {
+        /* The state the last INC/DEC left: CC_OP stays as it is. */
+        cc_op = cpu_cc_op;
     } else {
         tcg_gen_andi_i32(cc_op, cpu_cc_op, ~0xff);
+        tcg_gen_ori_i32(cc_op, cc_op, lazy);
     }
-    tcg_gen_ori_i32(cc_op, cc_op, lazy);
 
     decode->cc_dst = s->T0;
     decode->cc_src = cpu_cc_src;
