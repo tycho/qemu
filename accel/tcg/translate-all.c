@@ -981,6 +981,37 @@ void tcg_clear_jmp_cache(CPUState *cpu)
 }
 
 /*
+ * Forget the entries for code on non-global pages: with tcg_jcgen, move
+ * only the salt on, keeping the entries made under gsalt.
+ */
+void tcg_flush_jmp_cache_nonglobal(CPUState *cpu)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    uint64_t step, salt;
+
+    if (unlikely(jc == NULL)) {
+        return;
+    }
+    if (!tcg_jc_global) {
+        tcg_flush_jmp_cache(cpu);
+        return;
+    }
+    tcg_retstack_bump(cpu);
+    step = 1ull << cpu->cc->tcg_ops->jmp_cache_salt_shift(cpu);
+    salt = qatomic_read(&jc->salt) + step;
+    if (step == jc->salt_step && !(salt & TB_JMP_GSALT_BASE)) {
+        qatomic_set(&jc->salt, salt);
+        return;
+    }
+    jc->salt_step = step;
+    qatomic_set(&jc->salt, 0);
+    qatomic_set(&jc->gsalt, TB_JMP_GSALT_BASE);
+    for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+        qatomic_set(&jc->array[i].tb, NULL);
+    }
+}
+
+/*
  * Drop every entry of @cpu's jump cache, from any thread.  Unlike a
  * flush, leave the salt alone: only @cpu's own thread moves it, since a
  * racing store could bring back an older salt and the entries made under
