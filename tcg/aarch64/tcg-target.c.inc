@@ -2183,7 +2183,8 @@ static void tcg_out_goto_tb(TCGContext *s, int which)
  */
 #define TCG_TARGET_HAS_RETSTACK
 
-static void tcg_out_push_ret(TCGContext *s, TCGReg key, TCGLabel *ret)
+static void tcg_out_push_ret(TCGContext *s, TCGReg key, TCGLabel *ret,
+                             unsigned tag)
 {
     tcg_out_reloc(s, s->code_ptr, R_AARCH64_ADR_PREL_LO21, ret, 0);
     tcg_out_insn(s, pcrel, ADR, TCG_REG_TMP1, 0);
@@ -2215,7 +2216,7 @@ static void tcg_out_call_ptr(TCGContext *s, TCGReg a0)
     tcg_out_insn(s, branch, BL, -1);
 }
 
-static void tcg_out_ret_tb(TCGContext *s, TCGReg key)
+static void tcg_out_ret_tb(TCGContext *s, TCGReg key, unsigned tag)
 {
     tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP1, TCG_REG_LR,
                  tcg_retstack_reg, 16, 0, 1);
