@@ -2121,7 +2121,8 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
 
     if (s->jmp_opt) {
         bool backward;
-        TCGLabel *l = translator_region_target(&s->base, new_pc, &backward);
+        TCGLabel *l = translator_region_target(&s->base, new_pc, &backward,
+                                               -1);
 
         if (l) {
             /*

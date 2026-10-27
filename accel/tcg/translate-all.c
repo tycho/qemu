@@ -270,6 +270,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 
     assert_memory_lock();
     qemu_thread_jit_write();
+    translator_region_start();
 
     phys_pc = get_page_addr_code_hostp(env, s.pc, &host_pc);
 
