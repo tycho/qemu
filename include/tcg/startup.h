@@ -99,6 +99,8 @@ extern intptr_t tcg_retsp_off;
 extern int tcg_retstack_reg;
 extern bool tcg_retstack_addr64;
 #define TCG_RETSTACK_SIZE (16 * 1024)
+/* The tags of tcg_gen_push_ret() are below this. */
+#define TCG_RETSTACK_TAGS 128
 void tcg_retstack_reset(CPUState *cpu);
 /*
  * Whether the insn at @pc in the code buffer is a return stack push or
