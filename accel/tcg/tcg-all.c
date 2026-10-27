@@ -124,6 +124,7 @@ static void xtcg_fork_defaults(Object *obj)
 #endif
         { "x-regionflags", "on" },
         { "x-tblookup", "on" },
+        { "x-sysret", "on" },
         { "x-xpage", "stub" },
         { "x-tblayout", "split" },
         { "x-i386-runtime", "on" },
