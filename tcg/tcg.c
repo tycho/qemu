@@ -6026,13 +6026,14 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
 
 #ifdef TCG_TARGET_HAS_RETSTACK
     case INDEX_op_push_ret:
-        tcg_out_push_ret(s, new_args[0], arg_label(new_args[1]));
+        tcg_out_push_ret(s, new_args[0], arg_label(new_args[1]),
+                         new_args[2]);
         break;
     case INDEX_op_call_ptr:
         tcg_out_call_ptr(s, new_args[0]);
         break;
     case INDEX_op_ret_tb:
-        tcg_out_ret_tb(s, new_args[0]);
+        tcg_out_ret_tb(s, new_args[0], new_args[1]);
         break;
 #endif
 

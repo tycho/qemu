@@ -79,7 +79,7 @@ void tcg_gen_goto_tb(unsigned idx);
  * guest return address (@key) and the host code that continues there,
  * whose top the backend keeps in a register.
  *
- * tcg_gen_push_ret() - push @key with the host address of label @ret,
+ * tcg_gen_push_ret() - push @key and @tag with the host address of label @ret,
  *   which the caller sets where execution continues after the call
  *   returns (with the guest state of that return, as at a TB entry).
  *   With @call, the goto_ptr ops until tcg_gen_push_ret_done() leave by
@@ -88,13 +88,16 @@ void tcg_gen_goto_tb(unsigned idx);
  *   call, so that the host predicts the return to the next op; @reset is
  *   where the slot leads while unlinked (the code that leaves to the main
  *   loop), set by the caller after the code at the return.
- * tcg_gen_ret_tb() - pop the top pair; if its key is @key, return to its
- *   host code, else continue.
+ * tcg_gen_ret_tb() - pop the top entry; if its key is @key and its tag
+ *   @tag, return to its host code, else continue.  A tag is a front-end
+ *   constant below TCG_RETSTACK_TAGS (an id of the TB's state, say);
+ *   front ends that don't distinguish entries by state pass 0.
  */
-void tcg_gen_push_ret(TCGv_i64 key, TCGLabel *ret, TCGLabel *call);
+void tcg_gen_push_ret(TCGv_i64 key, TCGLabel *ret, TCGLabel *call,
+                      unsigned tag);
 void tcg_gen_push_ret_done(void);
 void tcg_gen_call_tb(unsigned idx, TCGLabel *reset);
-void tcg_gen_ret_tb(TCGv_i64 key);
+void tcg_gen_ret_tb(TCGv_i64 key, unsigned tag);
 
 /**
  * tcg_gen_lookup_and_goto_ptr() - look up the current TB, jump to it if valid

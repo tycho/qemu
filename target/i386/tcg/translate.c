@@ -2177,7 +2177,7 @@ gen_eob(DisasContext *s, int mode)
 
             tcg_gen_extu_tl_i64(key, cpu_eip);
             if (tb_cflags(s->base.tb) & CF_PCREL) {
-                tcg_gen_ret_tb(key);
+                tcg_gen_ret_tb(key, 0);
             } else {
                 /*
                  * A hit returns to the code after the CALL, which sets
@@ -2185,14 +2185,14 @@ gen_eob(DisasContext *s, int mode)
                  * the miss path only.
                  */
                 tcg_gen_discard_tl(cpu_eip);
-                tcg_gen_ret_tb(key);
+                tcg_gen_ret_tb(key, 0);
                 tcg_gen_trunc_i64_tl(cpu_eip, key);
             }
         } else if (mode == DISAS_JUMP && s->rs_call && use_retstack(s)) {
             /* The lookup leaves by a host call; land comes after it. */
             land = gen_new_label();
             tcg_gen_push_ret(tcg_constant_i64(s->rs_next), gen_new_label(),
-                             land);
+                             land, 0);
         }
         gen_lookup_and_goto_ptr(s, mode);
         tcg_gen_push_ret_done();
@@ -2256,7 +2256,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
         TCGLabel *reset = gen_new_label();
 
         s->rs_call = false;
-        tcg_gen_push_ret(tcg_constant_i64(s->rs_next), land, NULL);
+        tcg_gen_push_ret(tcg_constant_i64(s->rs_next), land, NULL, 0);
         tcg_gen_call_tb(tb_num, reset);
         gen_ret_landing(s, land, ret_landing_slot(s, tb_num));
         gen_set_label(reset);
