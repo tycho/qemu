@@ -270,6 +270,12 @@ extern unsigned tcg_superblock;
  */
 extern unsigned tcg_units;
 
+/*
+ * In a multi-block region, a block whose every jump in leaves the same
+ * front-end state (translator_region_target) is translated for that state.
+ */
+extern bool tcg_region_entry;
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size

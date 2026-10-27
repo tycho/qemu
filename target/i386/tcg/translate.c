@@ -2663,6 +2663,24 @@ gen_eob(DisasContext *s, int mode)
     s->base.is_jmp = DISAS_NORETURN;
 }
 
+/*
+ * The CC operation a jump within a multi-block region leaves for the
+ * block it enters (translator_region_target): a static one whose CF is
+ * computed inline, or -1: after ADC and SBB, whose CF needs the helper, a
+ * dynamic entry state costs no more.
+ */
+static int region_entry_cc_op(DisasContext *s)
+{
+    switch (s->cc_op) {
+    case CC_OP_DYNAMIC:
+    case CC_OP_ADCB ... CC_OP_ADCQ:
+    case CC_OP_SBBB ... CC_OP_SBBQ:
+        return -1;
+    default:
+        return s->cc_op;
+    }
+}
+
 /* Jump to eip+diff, truncating the result to OT. */
 static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
 {
@@ -2738,7 +2756,8 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
 
     if (s->jmp_opt) {
         bool backward;
-        TCGLabel *l = translator_region_target(&s->base, new_pc, &backward);
+        TCGLabel *l = translator_region_target(&s->base, new_pc, &backward,
+                                               region_entry_cc_op(s));
 
         if (l) {
             /*
@@ -4779,16 +4798,25 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
 /*
  * Another block of a multi-block region: every jump into it leaves cc_op
  * in env (gen_jmp_rel runs with cc_op clean) and, with CF_PCREL, cpu_eip
- * at the block's pc.
+ * at the block's pc.  If every jump leaves the same CC operation
+ * (translator_region_entry), the block starts with it, as straight-line
+ * code after the jump would: the flags globals hold its operands.  A SUB's
+ * first operand, a temp, is rebuilt: CC_DST + CC_SRC, exact in the
+ * operation's width, which is all its consumers read.
  */
 static void i386_tr_block_start(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
+    int entry = translator_region_entry(dcbase);
 
-    dc->cc_op = CC_OP_DYNAMIC;
+    dc->cc_op = entry < 0 ? CC_OP_DYNAMIC : entry;
     dc->cc_op_dirty = false;
     assert(!dc->ymmh_pending);
     dc->cc_srcT = NULL;
+    if (cc_op_live(dc->cc_op) & USES_CC_SRCT) {
+        dc->cc_srcT = tcg_temp_new();
+        tcg_gen_add_tl(dc->cc_srcT, cpu_cc_dst, cpu_cc_src);
+    }
     dc->pc = dc->base.pc_next;
     dc->pc_save = dc->base.pc_next;
 }

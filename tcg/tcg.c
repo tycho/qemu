@@ -346,6 +346,7 @@ bool tcg_vregs_all;
 bool tcg_region;
 unsigned tcg_superblock;
 unsigned tcg_units;
+bool tcg_region_entry;
 bool tcg_tbpack;
 bool tcg_tblayout;
 bool tcg_slowthunk;
