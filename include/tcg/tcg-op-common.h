@@ -90,8 +90,8 @@ void tcg_gen_goto_tb(unsigned idx);
  *   loop), set by the caller after the code at the return.
  * tcg_gen_ret_tb() - pop the top entry; if its key is @key and its tag
  *   @tag, return to its host code, else continue.  A tag is a front-end
- *   constant below TCG_RETSTACK_TAGS (an id of the TB's state, say);
- *   front ends that don't distinguish entries by state pass 0.
+ *   constant below TCG_RETSTACK_TAGS (an id of the TB's state, say),
+ *   which only tcg_retstack_env backends keep: elsewhere it must be 0.
  */
 void tcg_gen_push_ret(TCGv_i64 key, TCGLabel *ret, TCGLabel *call,
                       unsigned tag);

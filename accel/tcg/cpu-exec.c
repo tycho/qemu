@@ -1214,6 +1214,11 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
         assert(tcg_ops->get_tb_cpu_state);
         assert(tcg_ops->mmu_index);
         tcg_ops->initialize();
+#ifndef CONFIG_USER_ONLY
+        /* Once the front end has said where the return stack lives. */
+        tcg_retstack_env = tcg_sysret && tcg_retstack && tcg_retsp_off &&
+                           tcg_retep_off && tcg_jc_layout.valid;
+#endif
         tcg_target_initialized = true;
     }
 
@@ -1223,7 +1228,12 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
     cpu->tb_jmp_cache = qemu_memalign(TB_JMP_CACHE_ALIGN,
                                       sizeof(CPUJumpCache));
     memset(cpu->tb_jmp_cache, 0, sizeof(CPUJumpCache));
-    if (tcg_retstack && tcg_retsp_off) {
+    if (tcg_retstack_env) {
+        /* A ring aligned to its size, which wraps (tcg_out_push_ret). */
+        cpu->tb_jmp_cache->retring = qemu_memalign(TCG_RETSTACK_SIZE,
+                                                   TCG_RETSTACK_SIZE);
+        tcg_retstack_reset(cpu);
+    } else if (tcg_retstack && tcg_retsp_off) {
         size_t page = qemu_real_host_page_size();
         char *p = mmap(NULL, TCG_RETSTACK_SIZE + 2 * page, PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1250,6 +1260,9 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
 /* undo the initializations in reverse order */
 static void tb_jmp_cache_free(CPUJumpCache *jc)
 {
+    if (tcg_retstack_env) {
+        qemu_vfree(jc->retring);
+    }
     qemu_vfree(jc);
 }
 

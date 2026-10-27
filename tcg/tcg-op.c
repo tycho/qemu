@@ -2722,6 +2722,7 @@ void tcg_gen_push_ret(TCGv_i64 key, TCGLabel *ret, TCGLabel *call,
     TCGOp *op;
 
     tcg_debug_assert(tag < TCG_RETSTACK_TAGS);
+    tcg_debug_assert(tag == 0 || tcg_retstack_env);
     op = tcg_gen_op3(INDEX_op_push_ret, TCG_TYPE_I64, tcgv_i64_arg(key),
                      label_arg(ret), tag);
 
@@ -2757,6 +2758,7 @@ void tcg_gen_call_tb(unsigned idx, TCGLabel *reset)
 void tcg_gen_ret_tb(TCGv_i64 key, unsigned tag)
 {
     tcg_debug_assert(tag < TCG_RETSTACK_TAGS);
+    tcg_debug_assert(tag == 0 || tcg_retstack_env);
     plugin_gen_disable_mem_helpers();
     tcg_gen_op2(INDEX_op_ret_tb, TCG_TYPE_I64, tcgv_i64_arg(key), tag);
 }
