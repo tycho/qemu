@@ -1572,6 +1572,7 @@ static void gen_BZHI(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_CALL(DisasContext *s, X86DecodedInsn *decode)
 {
+    rs_call_key(s);
     gen_push_v(s, eip_next_tl(s));
     s->rs_call = true;
     s->rs_next = CODE64(s) ? s->pc : (uint32_t)(s->pc - s->cs_base);
@@ -1580,6 +1581,7 @@ static void gen_CALL(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_CALL_m(DisasContext *s, X86DecodedInsn *decode)
 {
+    rs_call_key(s);
     gen_push_v(s, eip_next_tl(s));
     s->rs_call = true;
     s->rs_next = CODE64(s) ? s->pc : (uint32_t)(s->pc - s->cs_base);
