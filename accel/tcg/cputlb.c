@@ -38,6 +38,7 @@
 #include "exec/tlb-common.h"
 #include "exec/vaddr.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 #include "qemu/error-report.h"
 #include "exec/log.h"
 #include "exec/helper-proto-common.h"
@@ -158,6 +159,8 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
     if (unlikely(!jc)) {
         return;
     }
+    /* Before the filter: the return stack's entries don't set its bits. */
+    tcg_retstack_bump(cpu);
 
     salt = qatomic_read(&jc->salt);
     gsalt = qatomic_read(&jc->gsalt);
