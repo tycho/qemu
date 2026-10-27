@@ -240,6 +240,7 @@ TCGContext tcg_init_ctx;
 bool tcg_region;
 unsigned tcg_superblock;
 unsigned tcg_units;
+bool tcg_region_entry;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;

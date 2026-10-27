@@ -267,6 +267,16 @@ static void tcg_set_region(Object *obj, bool value, Error **errp)
     tcg_region = value;
 }
 
+static bool tcg_get_region_entry(Object *obj, Error **errp)
+{
+    return tcg_region_entry;
+}
+
+static void tcg_set_region_entry(Object *obj, bool value, Error **errp)
+{
+    tcg_region_entry = value;
+}
+
 /* Units of up to this many blocks with x-superblock=units. */
 #define TCG_UNIT_BLOCKS 3
 
@@ -351,6 +361,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "mode every other translation block holds the blocks it reaches by "
         "direct jumps, up to 3; 'units-only': those units, and no sampled "
         "loops");
+
+    object_class_property_add_bool(oc, "x-regionflags",
+                                   tcg_get_region_entry,
+                                   tcg_set_region_entry);
+    object_class_property_set_description(oc, "x-regionflags",
+        "In a multi-block region (x-superblock), translate a block that "
+        "every jump in enters with the same guest condition-code state "
+        "for that state");
 }
 
 static const TypeInfo tcg_accel_type = {

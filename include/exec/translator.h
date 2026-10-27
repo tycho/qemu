@@ -239,14 +239,28 @@ void translator_exit_check(DisasContextBase *db, struct TCGLabel *exit);
  * @dest: the destination of a direct jump
  * @backward: set if the jump goes back to a block already translated
  *
+ * @state: the state the jump leaves that the front end may rely on in
+ *         @dest's block (tcg_region_entry), or -1
+ *
  * In a multi-block region, the label of @dest's block, adding the block if
  * it may join the region; NULL if @dest is outside (the jump leaves the TB
  * as usual).  The caller has brought the guest state up to date as for a
  * jump between TBs.  A backward jump must check the exit request first
- * (translator_exit_check).
+ * (translator_exit_check).  If @dest's block was started for another
+ * @state, the region is translated again with that block's state unknown.
  */
 struct TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
-                                          bool *backward);
+                                          bool *backward, int state);
+
+/**
+ * translator_region_entry:
+ * @db: Disassembly context
+ *
+ * In the block_start hook: the @state every jump into the block leaves
+ * (translator_region_target), or -1 if they differ, if the block is the
+ * region's head, or without tcg_region_entry.
+ */
+int translator_region_entry(const DisasContextBase *db);
 
 /**
  * translator_region_backward:
