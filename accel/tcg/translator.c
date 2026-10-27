@@ -214,6 +214,13 @@ typedef struct TranslatorRegion {
     vaddr pc[REGION_MAX_BLOCKS];
     TCGLabel *label[REGION_MAX_BLOCKS];
     vaddr bend[REGION_MAX_BLOCKS];      /* the end of each block translated */
+    /*
+     * tcg_region_entry: the entry state of the jumps found so far into
+     * each block not yet started, or -1 once two differ; and the state
+     * each block started was translated for, or -1.
+     */
+    int meet[REGION_MAX_BLOCKS];
+    int assumed[REGION_MAX_BLOCKS];
 } TranslatorRegion;
 
 /*
@@ -235,6 +242,42 @@ static bool region_is_split(vaddr pc)
         }
     }
     return false;
+}
+
+/*
+ * tcg_region_entry: blocks of the region being translated whose entry
+ * state is unknown, because a jump found after the block was started left
+ * another state than the one it was translated for.  They and the retry
+ * count belong to one translation (translator_region_start) and survive
+ * its retries; after REGION_ENTRY_RETRIES, one last try takes every entry
+ * state as unknown.
+ */
+#define REGION_ENTRY_RETRIES 8
+static __thread vaddr region_entry_dyn[REGION_MAX_BLOCKS];
+static __thread int region_n_entry_dyn;
+static __thread int region_entry_retries;
+static __thread bool region_entry_alldyn;
+static __thread bool region_reentry;    /* retry with region_entry_dyn */
+
+static bool region_entry_is_dyn(vaddr pc)
+{
+    if (region_entry_alldyn) {
+        return true;
+    }
+    for (int i = 0; i < region_n_entry_dyn; i++) {
+        if (region_entry_dyn[i] == pc) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void region_entry_clear(void)
+{
+    region_n_entry_dyn = 0;
+    region_entry_retries = 0;
+    region_entry_alldyn = false;
+    region_reentry = false;
 }
 
 static GMutex region_lock;              /* static: needs no init */
@@ -411,6 +454,11 @@ int translator_region_judge(TranslatorRegionVerdict *v, int max)
 
 bool translator_region_overflow(void)
 {
+    if (region_reentry) {
+        /* Another entry state to give up: the region keeps its size. */
+        region_reentry = false;
+        return true;
+    }
     if (region_resplit) {
         region_resplit = false;
         return true;
@@ -438,6 +486,11 @@ bool translator_region_overflow(void)
     return false;
 }
 
+void translator_region_start(void)
+{
+    region_entry_clear();
+}
+
 void translator_region_reset(void)
 {
     if (region_cur_trial) {
@@ -455,6 +508,7 @@ void translator_region_reset(void)
     region_reject = false;
     region_resplit = false;
     region_n_split = 0;
+    region_entry_clear();
 }
 
 /*
@@ -511,7 +565,7 @@ static bool region_page_ok(const DisasContextBase *db, vaddr pc)
 }
 
 TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
-                                   bool *backward)
+                                   bool *backward, int state)
 {
     TranslatorRegion *r = db->region;
     int at;
@@ -520,11 +574,31 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
     if (!r || r->stubbing) {
         return NULL;
     }
+    if (!tcg_region_entry) {
+        state = -1;
+    }
     for (int i = 0; i < r->n; i++) {
         if (r->pc[i] == dest) {
             if (i == r->next - 1 && db->num_insns == r->block_insns) {
                 /* The current block, still empty: don't spin on it. */
                 return NULL;
+            }
+            if (i >= r->next) {
+                /* Not started: meet this jump's state. */
+                r->meet[i] = r->meet[i] == state ? state : -1;
+            } else if (r->assumed[i] >= 0 && r->assumed[i] != state) {
+                /*
+                 * Started (or being translated) for another state than
+                 * this jump leaves: translate the region again with the
+                 * block's entry state unknown.
+                 */
+                assert(region_n_entry_dyn < REGION_MAX_BLOCKS);
+                region_entry_dyn[region_n_entry_dyn++] = dest;
+                if (++region_entry_retries >= REGION_ENTRY_RETRIES) {
+                    region_entry_alldyn = true;
+                }
+                region_reentry = true;
+                siglongjmp(tcg_ctx->jmp_trans, -2);
             }
             /* Already translated (or being translated): a cycle closes. */
             *backward = i < r->next;
@@ -574,7 +648,10 @@ TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
     memmove(&r->pc[at + 1], &r->pc[at], (r->n - at) * sizeof(r->pc[0]));
     memmove(&r->label[at + 1], &r->label[at],
             (r->n - at) * sizeof(r->label[0]));
+    memmove(&r->meet[at + 1], &r->meet[at],
+            (r->n - at) * sizeof(r->meet[0]));
     r->pc[at] = dest;
+    r->meet[at] = state;
     r->label[at] = gen_new_label();
     r->label[at]->region = true;
     r->n++;
@@ -595,6 +672,13 @@ bool translator_region_backward(DisasContextBase *db, vaddr dest)
         }
     }
     return false;
+}
+
+int translator_region_entry(const DisasContextBase *db)
+{
+    const TranslatorRegion *r = db->region;
+
+    return r ? r->assumed[r->next - 1] : -1;
 }
 
 bool translator_goto_tb_slot(DisasContextBase *db, int *slot)
@@ -1016,6 +1100,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         r->end = pc;
         r->pc[0] = pc;
         r->label[0] = db->loop_label;
+        /* The head is entered from outside the region. */
+        r->meet[0] = r->assumed[0] = -1;
         db->loop_label->loop = false;
         db->loop_label->region = true;
         db->region = r;
@@ -1120,7 +1206,10 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
                 set_can_do_io(db, false);
             }
 #endif
-            db->pc_next = r->pc[r->next++];
+            db->pc_next = r->pc[r->next];
+            r->assumed[r->next] = region_entry_is_dyn(db->pc_next)
+                                  ? -1 : r->meet[r->next];
+            r->next++;
             db->is_jmp = r->stubbing ? DISAS_TOO_MANY : DISAS_NEXT;
             r->block_insns = db->num_insns;
             ops->block_start(db, cpu);

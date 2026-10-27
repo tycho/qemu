@@ -274,6 +274,8 @@ void translator_region_forget(tb_page_addr_t start, tb_page_addr_t last);
  * fewer of its blocks (or a plain TB at its head) instead of fewer insns.
  */
 bool translator_region_overflow(void);
+/* Before a TB is generated, with its retries: forget the last one's. */
+void translator_region_start(void);
 /* After a TB is generated: regions take their full size again. */
 void translator_region_reset(void);
 /* Whether a TB like @tb exists at @pc: its block has run. */
