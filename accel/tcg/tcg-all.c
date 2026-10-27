@@ -101,11 +101,16 @@ static void tcg_vm_change_state(void *opaque, bool running, RunState state)
 }
 #endif
 
+/* Settings that translated code depends on are fixed from here on. */
+static bool tcg_machine_inited;
+
 static int tcg_init_machine(AccelState *as, MachineState *ms)
 {
     TCGState *s = TCG_STATE(as);
     CPUClass *cc = CPU_CLASS(object_class_by_name(target_cpu_type()));
     unsigned max_threads = 1;
+
+    tcg_machine_inited = true;
 
 #ifndef CONFIG_USER_ONLY
     bool mttcg_supported = cc->tcg_ops->mttcg_supported;
@@ -303,6 +308,25 @@ static void tcg_set_tblookup(Object *obj, bool value, Error **errp)
     tcg_goto_tb_cold = value;
 }
 
+static bool tcg_get_sysret(Object *obj, Error **errp)
+{
+    return tcg_sysret;
+}
+
+static void tcg_set_sysret(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_sysret_supported()) {
+        error_setg(errp, "x-sysret: not supported by this TCG backend");
+        return;
+    }
+    /* The vCPUs decide where the return stack's top lives at realize. */
+    if (tcg_machine_inited && value != tcg_sysret) {
+        error_setg(errp, "x-sysret: cannot be changed at run time");
+        return;
+    }
+    tcg_sysret = value;
+}
+
 static char *tcg_get_tblayout(Object *obj, Error **errp)
 {
     return g_strdup(tcg_tblayout ? "split" : "packed");
@@ -372,6 +396,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "indirect jumps (in a short helper call at direct jumps to "
         "another page), and pack TB structs next to their code (x86 "
         "guests)");
+
+    object_class_property_add_bool(oc, "x-sysret", tcg_get_sysret,
+                                   tcg_set_sysret);
+    object_class_property_set_description(oc, "x-sysret",
+        "With x-tblookup, in system mode: near calls and returns through a "
+        "return stack in host code, as in user mode");
 
     object_class_property_add_str(oc, "x-xpage", tcg_get_xpage,
                                   tcg_set_xpage);

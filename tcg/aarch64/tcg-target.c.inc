@@ -2183,9 +2183,81 @@ static void tcg_out_goto_tb(TCGContext *s, int which)
  */
 #define TCG_TARGET_HAS_RETSTACK
 
+/*
+ * tcg_retstack_env (system mode): the top in env at tcg_retsp_off, 32-byte
+ * entries {key, epoch + tag, landing} in a ring aligned to its size, which
+ * wraps (BFXIL keeps the ring's base bits).  An entry is good only under
+ * the epoch it was pushed in (tcg_retep_off, in steps of
+ * TCG_RETSTACK_TAGS) with the same tag, and while the vCPU has no
+ * breakpoints (as the jump-cache probes require).
+ */
+#define TCG_TARGET_HAS_RETSTACK_ENV
+#define RETSTACK_ENV_BITS 14
+QEMU_BUILD_BUG_ON(TCG_RETSTACK_SIZE != 1 << RETSTACK_ENV_BITS);
+
+static void tcg_out_push_ret_env(TCGContext *s, TCGReg key, TCGLabel *ret,
+                                 unsigned tag)
+{
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_AREG0, tcg_retsp_off);
+    tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_TMP1,
+                 TCG_REG_TMP0, 32);
+    tcg_out_bfm(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_REG_TMP1, 0,
+                RETSTACK_ENV_BITS - 1);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_TMP1, TCG_AREG0, tcg_retep_off);
+    if (tag) {
+        tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_TMP1,
+                     TCG_REG_TMP1, tag);
+    }
+    tcg_out_insn(s, ldstpair, STP, key, TCG_REG_TMP1, TCG_REG_TMP0, 0, 1, 0);
+    tcg_out_reloc(s, s->code_ptr, R_AARCH64_ADR_PREL_LO21, ret, 0);
+    tcg_out_insn(s, pcrel, ADR, TCG_REG_TMP1, 0);
+    tcg_out_st(s, TCG_TYPE_I64, TCG_REG_TMP1, TCG_REG_TMP0, 16);
+    tcg_out_st(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_AREG0, tcg_retsp_off);
+    s->gen_tb->jmp_call |= TB_JMP_RET_LANDING;
+}
+
+static void tcg_out_ccmp_eq(TCGContext *s, TCGReg rn, TCGReg rm)
+{
+    /* CCMP Rn, Rm, #0, EQ: NE unless EQ before and Rn == Rm. */
+    tcg_out32(s, 0x7a400000 | TCG_TYPE_I64 << 31 | rm << 16
+              | tcg_cond_to_aarch64[TCG_COND_EQ] << 12 | rn << 5);
+}
+
+static void tcg_out_ret_tb_env(TCGContext *s, TCGReg key, unsigned tag)
+{
+    /*
+     * No breakpoints first: their offset may need TMP0 to load, which
+     * then holds the top.
+     */
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_TMP1, TCG_AREG0, tcg_jc_layout.bp_ofs);
+    tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_EQ, TCG_REG_TMP1, 0, true);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_AREG0, tcg_retsp_off);
+    tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP1, TCG_REG_LR, TCG_REG_TMP0,
+                 0, 1, 0);
+    tcg_out_ccmp_eq(s, TCG_REG_TMP1, key);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_TMP1, TCG_AREG0, tcg_retep_off);
+    if (tag) {
+        tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_TMP1,
+                     TCG_REG_TMP1, tag);
+    }
+    tcg_out_ccmp_eq(s, TCG_REG_LR, TCG_REG_TMP1);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_LR, TCG_REG_TMP0, 16);
+    tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64, TCG_REG_TMP1,
+                 TCG_REG_TMP0, 32);
+    tcg_out_bfm(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_REG_TMP1, 0,
+                RETSTACK_ENV_BITS - 1);
+    tcg_out_st(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_AREG0, tcg_retsp_off);
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 2);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+}
+
 static void tcg_out_push_ret(TCGContext *s, TCGReg key, TCGLabel *ret,
                              unsigned tag)
 {
+    if (tcg_retstack_reg < 0) {
+        tcg_out_push_ret_env(s, key, ret, tag);
+        return;
+    }
     tcg_out_reloc(s, s->code_ptr, R_AARCH64_ADR_PREL_LO21, ret, 0);
     tcg_out_insn(s, pcrel, ADR, TCG_REG_TMP1, 0);
     tcg_out_insn(s, ldstpair, STP, key, TCG_REG_TMP1, tcg_retstack_reg,
@@ -2218,6 +2290,10 @@ static void tcg_out_call_ptr(TCGContext *s, TCGReg a0)
 
 static void tcg_out_ret_tb(TCGContext *s, TCGReg key, unsigned tag)
 {
+    if (tcg_retstack_reg < 0) {
+        tcg_out_ret_tb_env(s, key, tag);
+        return;
+    }
     tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP1, TCG_REG_LR,
                  tcg_retstack_reg, 16, 0, 1);
     tcg_out_insn(s, addsub_shift, SUBS, TCG_TYPE_I64,

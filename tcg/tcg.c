@@ -247,6 +247,9 @@ bool tcg_retstack;
 intptr_t tcg_retsp_off;
 int tcg_retstack_reg = -1;
 bool tcg_retstack_addr64;
+bool tcg_sysret;
+bool tcg_retstack_env;
+intptr_t tcg_retep_off;
 bool tcg_tb_flags_canon;
 TCGJumpCacheLayout tcg_jc_layout;
 const void *tcg_xpage_stub;
@@ -1160,7 +1163,18 @@ static const TCGOutOp outop_goto_ptr = {
 static const TCGOutOp outop_retstack = {
     .static_constraint = C_O0_I1(r),
 };
+#endif
+
+bool tcg_sysret_supported(void)
+{
+#ifdef TCG_TARGET_HAS_RETSTACK_ENV
+    return true;
 #else
+    return false;
+#endif
+}
+
+#ifndef TCG_TARGET_HAS_RETSTACK
 static const TCGOutOp outop_retstack = {
     .static_constraint = C_NotImplemented,
 };
