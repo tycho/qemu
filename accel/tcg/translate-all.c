@@ -386,6 +386,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     xtcg_stat_inc(XS_TB_GEN);
     qemu_thread_jit_write();
     TCG_HOST_FP_SUSPEND_GUARD(cpu);
+    translator_region_start();
 
     phys_pc = get_page_addr_code_hostp(env, s.pc, &host_pc);
 
