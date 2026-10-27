@@ -2769,8 +2769,8 @@ gen_eob(DisasContext *s, int mode)
 /*
  * The CC operation a jump within a multi-block region leaves for the
  * block it enters (translator_region_target): a static one whose CF is
- * computed inline, or -1: after ADC and SBB, whose CF needs the helper, a
- * dynamic entry state costs no more.
+ * computed inline, or -1.  With ADC and SBB, whose CF needs the helper, a
+ * dynamic entry state lets INC and DEC defer CF instead (x-lazyinc).
  */
 static int region_entry_cc_op(DisasContext *s)
 {
@@ -2780,7 +2780,7 @@ static int region_entry_cc_op(DisasContext *s)
     case CC_OP_SBBB ... CC_OP_SBBQ:
         return -1;
     default:
-        return s->cc_op;
+        return cc_op_lazy(s->cc_op) ? -1 : s->cc_op;
     }
 }
 
