@@ -122,6 +122,7 @@ static void xtcg_fork_defaults(Object *obj)
 #else
         { "x-superblock", "units" },
 #endif
+        { "x-regionflags", "on" },
         { "x-tblookup", "on" },
         { "x-xpage", "stub" },
         { "x-tblayout", "split" },
