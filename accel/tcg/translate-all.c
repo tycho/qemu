@@ -996,6 +996,7 @@ void tcg_flush_jmp_cache_nonglobal(CPUState *cpu)
         tcg_flush_jmp_cache(cpu);
         return;
     }
+    tcg_retstack_bump(cpu);
     step = 1ull << cpu->cc->tcg_ops->jmp_cache_salt_shift(cpu);
     salt = qatomic_read(&jc->salt) + step;
     if (step == jc->salt_step && !(salt & TB_JMP_GSALT_BASE)) {
