@@ -355,6 +355,9 @@ bool tcg_retstack;
 intptr_t tcg_retsp_off;
 int tcg_retstack_reg = -1;
 bool tcg_retstack_addr64;
+bool tcg_sysret;
+bool tcg_retstack_env;
+intptr_t tcg_retep_off;
 bool tcg_tb_flags_canon;
 bool tcg_addr32;
 bool tcg_tsc_counter;
@@ -1638,7 +1641,18 @@ static const TCGOutOp outop_goto_ptr = {
 static const TCGOutOp outop_retstack = {
     .static_constraint = C_O0_I1(r),
 };
+#endif
+
+bool tcg_sysret_supported(void)
+{
+#ifdef TCG_TARGET_HAS_RETSTACK_ENV
+    return true;
 #else
+    return false;
+#endif
+}
+
+#ifndef TCG_TARGET_HAS_RETSTACK
 static const TCGOutOp outop_retstack = {
     .static_constraint = C_NotImplemented,
 };
@@ -9437,13 +9451,14 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
 
 #ifdef TCG_TARGET_HAS_RETSTACK
     case INDEX_op_push_ret:
-        tcg_out_push_ret(s, new_args[0], arg_label(new_args[1]));
+        tcg_out_push_ret(s, new_args[0], arg_label(new_args[1]),
+                         new_args[2]);
         break;
     case INDEX_op_call_ptr:
         tcg_out_call_ptr(s, new_args[0]);
         break;
     case INDEX_op_ret_tb:
-        tcg_out_ret_tb(s, new_args[0]);
+        tcg_out_ret_tb(s, new_args[0], new_args[1]);
         break;
 #endif
 

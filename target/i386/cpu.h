@@ -2400,6 +2400,8 @@ typedef struct CPUArchState {
 
     /* The top of the return stack (tcg_gen_push_ret). */
     uintptr_t retsp;
+    /* tcg_retstack_env: the return stack's epoch (tcg_retstack_bump). */
+    uint64_t retep;
 } CPUX86State;
 
 /**

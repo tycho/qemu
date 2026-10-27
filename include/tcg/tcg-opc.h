@@ -126,12 +126,12 @@ DEF(exit_tb, 0, 0, 1, TCG_OPF_BB_EXIT | TCG_OPF_BB_END | TCG_OPF_NOT_PRESENT)
 DEF(goto_tb, 0, 0, 1, TCG_OPF_BB_EXIT | TCG_OPF_BB_END | TCG_OPF_NOT_PRESENT)
 DEF(goto_tb_dead, 0, 0, 2, TCG_OPF_BB_END | TCG_OPF_NOT_PRESENT)
 DEF(goto_ptr, 0, 1, 0, TCG_OPF_BB_EXIT | TCG_OPF_BB_END)
-DEF(push_ret, 0, 1, 1, TCG_OPF_SIDE_EFFECTS | TCG_OPF_INT)
+DEF(push_ret, 0, 1, 2, TCG_OPF_SIDE_EFFECTS | TCG_OPF_INT)
 DEF(call_ptr, 0, 1, 0, TCG_OPF_BB_EXIT | TCG_OPF_BB_END)
 DEF(call_tb, 0, 0, 2, TCG_OPF_BB_EXIT | TCG_OPF_BB_END | TCG_OPF_NOT_PRESENT)
 DEF(goto_tb_cold, 0, 0, 2,
     TCG_OPF_BB_EXIT | TCG_OPF_BB_END | TCG_OPF_NOT_PRESENT)
-DEF(ret_tb, 0, 1, 0, TCG_OPF_BB_END | TCG_OPF_COND_BRANCH | TCG_OPF_INT)
+DEF(ret_tb, 0, 1, 1, TCG_OPF_BB_END | TCG_OPF_COND_BRANCH | TCG_OPF_INT)
 /* A TB's start, or a return into it: the boundary globals arrive. */
 DEF(boundary_in, 2, 0, 0, TCG_OPF_NOT_PRESENT)
 

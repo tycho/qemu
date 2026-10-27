@@ -404,7 +404,25 @@ extern bool tcg_goto_tb_cold;
 extern intptr_t tcg_retsp_off;
 extern int tcg_retstack_reg;
 extern bool tcg_retstack_addr64;
+/*
+ * tcg_sysret: the return stack in system mode too, where the backend
+ * implements it (tcg_sysret_supported), with its top in env
+ * (tcg_retstack_env, set when the front end has set tcg_retep_off): an
+ * entry is good only under the vCPU's epoch at tcg_retep_off in env,
+ * which tcg_retstack_bump() moves on wherever the jump cache is
+ * invalidated.
+ */
+extern bool tcg_sysret;
+extern bool tcg_retstack_env;
+extern intptr_t tcg_retep_off;
+bool tcg_sysret_supported(void);
+void tcg_retstack_bump(CPUState *cpu);
 #define TCG_RETSTACK_SIZE (16 * 1024)
+/*
+ * The tags of tcg_gen_push_ret() are below this; the epoch at
+ * tcg_retep_off counts in steps of it.
+ */
+#define TCG_RETSTACK_TAGS 128
 void tcg_retstack_reset(CPUState *cpu);
 /*
  * A fault at @addr in generated code: if it is on a guard page of @cpu's

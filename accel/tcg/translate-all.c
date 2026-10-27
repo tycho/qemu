@@ -901,6 +901,16 @@ void tcg_retstack_reset(CPUState *cpu)
     }
 }
 
+/* tcg_retstack_env: entries pushed before now are no longer good. */
+void tcg_retstack_bump(CPUState *cpu)
+{
+    if (tcg_retstack_env) {
+        uint64_t *ep = (uint64_t *)((char *)cpu_env(cpu) + tcg_retep_off);
+
+        qatomic_set(ep, *ep + TCG_RETSTACK_TAGS);
+    }
+}
+
 uintptr_t tcg_retstack_fault(CPUState *cpu, uintptr_t addr)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
@@ -926,6 +936,7 @@ static void tcg_flush_jmp_cache_1(CPUState *cpu, bool clear)
         return;
     }
     tcg_retstack_reset(cpu);
+    tcg_retstack_bump(cpu);
 
     if (tcg_jcgen) {
         int shift = cpu->cc->tcg_ops->jmp_cache_salt_shift(cpu);
