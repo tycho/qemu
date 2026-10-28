@@ -3884,7 +3884,12 @@ reachable_code_pass(TCGContext *s)
         case INDEX_op_br:
         case INDEX_op_exit_tb:
         case INDEX_op_goto_ptr:
-            /* Unconditional branches; everything following is dead.  */
+        case INDEX_op_goto_tb_cold:
+            /*
+             * Unconditional branches; everything following is dead.
+             * goto_tb_cold branches to its target or, unlinked, to its
+             * label: unlike goto_tb, it never falls through.
+             */
             dead = true;
             break;
 
