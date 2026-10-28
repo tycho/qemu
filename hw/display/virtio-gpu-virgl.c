@@ -602,7 +602,7 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
             .handle = ext.d3d_tex2d,
         };
     }
-#ifdef VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION
+#if VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION >= 1
     /* the renderer's own texture, when it shares textures natively */
     if (ext.version >= 1) {
         switch (ext.native_type) {
