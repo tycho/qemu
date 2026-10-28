@@ -831,6 +831,9 @@ socket = []
 version_res = []
 coref = []
 iokit = []
+iosurface = not_found
+metal = not_found
+quartzcore = not_found
 pvg = not_found
 emulator_link_args = []
 midl = not_found
@@ -856,9 +859,13 @@ if host_os == 'windows'
 elif host_os == 'darwin'
   coref = dependency('appleframeworks', modules: 'CoreFoundation')
   iokit = dependency('appleframeworks', modules: 'IOKit', required: false)
+  iosurface = dependency('appleframeworks', modules: 'IOSurface', required: false)
   host_dsosuf = '.dylib'
   pvg = dependency('appleframeworks', modules: ['ParavirtualizedGraphics', 'Metal'],
                    required: get_option('pvg'))
+  metal = dependency('appleframeworks', modules: 'Metal', required: false)
+  quartzcore = dependency('appleframeworks', modules: ['OpenGL', 'QuartzCore'],
+                          required: false)
 elif host_os == 'sunos'
   socket = [cc.find_library('socket'),
             cc.find_library('nsl'),
@@ -1783,6 +1790,8 @@ if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
     error('epoxy/egl.h not found')
   endif
 endif
+# EGL comes with OpenGL: epoxy/egl.h is required above
+egl = opengl
 gbm = not_found
 if (have_system or have_tools) and (virgl.found() or opengl.found())
   gbm = dependency('gbm', method: 'pkg-config', required: false)
@@ -2454,6 +2463,9 @@ endif
 config_host_data.set('CONFIG_CURL', curl.found())
 config_host_data.set('CONFIG_CURSES', curses.found())
 config_host_data.set('CONFIG_GBM', gbm.found())
+config_host_data.set('CONFIG_EGL', egl.found())
+config_host_data.set('CONFIG_IOSURFACE', iosurface.found())
+config_host_data.set('CONFIG_METAL', metal.found())
 config_host_data.set('CONFIG_GIO', gio.found())
 config_host_data.set('CONFIG_GTK', gtk.found())
 config_host_data.set('CONFIG_VTE', vte.found())
@@ -2517,6 +2529,15 @@ config_host_data.set('CONFIG_VNC', vnc.found())
 config_host_data.set('CONFIG_VNC_JPEG', jpeg.found())
 config_host_data.set('CONFIG_VNC_SASL', sasl.found())
 if virgl.found()
+  config_host_data.set('HAVE_VIRGL_RENDERER_NATIVE_SCANOUT',
+                       cc.has_function('virgl_renderer_create_handle_for_scanout',
+                                       args: '-DVIRGL_RENDERER_UNSTABLE_APIS',
+                                       prefix: '#include <virglrenderer.h>',
+                                       dependencies: virgl))
+  config_host_data.set('HAVE_VIRGL_RENDERER_NEPTUNE',
+                       cc.has_header_symbol('virglrenderer.h',
+                                            'VIRGL_RENDERER_NEPTUNE',
+                                            dependencies: virgl))
   config_host_data.set('VIRGL_VERSION_MAJOR', virgl.version().split('.')[0])
   config_host_data.set('VIRGL_VERSION_MINOR', virgl.version().split('.')[1])
   config_host_data.set('VIRGL_VERSION_MICRO', virgl.version().split('.')[2])
