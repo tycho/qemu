@@ -956,7 +956,7 @@ int main(int argc, char **argv)
         int stderr_fd[2];
         pid_t pid;
 
-        if (!g_unix_open_pipe(stderr_fd, FD_CLOEXEC, &err)) {
+        if (!g_unix_open_pipe(stderr_fd, QEMU_G_UNIX_PIPE_CLOEXEC, &err)) {
             error_report("Error setting up communication pipe: %s",
                          err->message);
             exit(EXIT_FAILURE);

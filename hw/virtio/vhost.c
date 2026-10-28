@@ -2463,7 +2463,7 @@ int vhost_save_backend_state(struct vhost_dev *dev, QEMUFile *f, Error **errp)
     int ret;
 
     /* [0] for reading (our end), [1] for writing (back-end's end) */
-    if (!g_unix_open_pipe(pipe_fds, FD_CLOEXEC, &g_err)) {
+    if (!g_unix_open_pipe(pipe_fds, QEMU_G_UNIX_PIPE_CLOEXEC, &g_err)) {
         error_setg(errp, "Failed to set up state transfer pipe: %s",
                    g_err->message);
         ret = -EINVAL;
@@ -2555,7 +2555,7 @@ int vhost_load_backend_state(struct vhost_dev *dev, QEMUFile *f, Error **errp)
     int ret;
 
     /* [0] for reading (back-end's end), [1] for writing (our end) */
-    if (!g_unix_open_pipe(pipe_fds, FD_CLOEXEC, &g_err)) {
+    if (!g_unix_open_pipe(pipe_fds, QEMU_G_UNIX_PIPE_CLOEXEC, &g_err)) {
         error_setg(errp, "Failed to set up state transfer pipe: %s",
                    g_err->message);
         ret = -EINVAL;

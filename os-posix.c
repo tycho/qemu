@@ -215,7 +215,7 @@ void os_daemonize(void)
         pid_t pid;
         int fds[2];
 
-        if (!g_unix_open_pipe(fds, FD_CLOEXEC, NULL)) {
+        if (!g_unix_open_pipe(fds, QEMU_G_UNIX_PIPE_CLOEXEC, NULL)) {
             exit(1);
         }
 
