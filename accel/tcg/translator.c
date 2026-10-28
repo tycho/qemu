@@ -674,6 +674,13 @@ bool translator_region_backward(DisasContextBase *db, vaddr dest)
     return false;
 }
 
+bool translator_region_more(const DisasContextBase *db)
+{
+    const TranslatorRegion *r = db->region;
+
+    return r && r->next < r->n;
+}
+
 int translator_region_entry(const DisasContextBase *db)
 {
     const TranslatorRegion *r = db->region;
