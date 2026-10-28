@@ -43,6 +43,7 @@ struct HVFState {
 };
 extern HVFState *hvf_state;
 extern bool hvf_tso_mode;
+extern uint32_t hvf_ipa_granule_size;
 
 struct AccelCPUState {
     hvf_vcpuid fd;
@@ -59,7 +60,8 @@ void assert_hvf_ok_impl(hv_return_t ret, const char *file, unsigned int line,
 #define assert_hvf_ok(EX) assert_hvf_ok_impl((EX), __FILE__, __LINE__, #EX)
 const char *hvf_return_string(hv_return_t ret);
 int hvf_arch_init(void);
-hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range);
+hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range,
+                               uint32_t ipa_granule_size);
 uint32_t hvf_arch_get_default_ipa_bit_size(void);
 uint32_t hvf_arch_get_max_ipa_bit_size(void);
 void hvf_kick_vcpu_thread(CPUState *cpu);
