@@ -2527,7 +2527,14 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         break;
     case EC_AA64_SMC:
         cpu_synchronize_state(cpu);
-        if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_SMC) {
+        /*
+         * Windows for Arm makes an OEM SMCCC call through SMC whatever the
+         * PSCI conduit, and crashes on the UNDEF an inactive conduit gets:
+         * answer SMC calls as SMCCC calls in either case (an unknown one
+         * returns -1).
+         */
+        if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_SMC ||
+            arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_HVC) {
             /* Secure Monitor Call exception, we need to advance $pc */
             advance_pc = true;
 
