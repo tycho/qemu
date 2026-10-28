@@ -193,6 +193,7 @@ extern bool spice_remote_client;
 /* whether -spice gl=... enables GL; @core for gl=core */
 bool qemu_spice_display_gl_option(QemuOpts *opts, bool *core);
 extern int spice_max_refresh_rate;
+extern int spice_display_refresh_rate;
 
 int qemu_spice_rect_is_empty(const QXLRect* r);
 void qemu_spice_rect_union(QXLRect *dest, const QXLRect *r);

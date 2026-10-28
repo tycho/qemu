@@ -2549,6 +2549,9 @@ SRST
     ``max-refresh-rate=rate``
         Provide the maximum refresh rate (or FPS) at which the encoding
         requests should be sent to the Spice server. Default would be 30.
+        When given, it is also taken as the client display's refresh
+        rate: the display is redrawn at that rate, and the guest's display
+        reports it (EDID).
 
     ``gl=on|off|core|es``
         Enable/disable OpenGL context. Default is off. On macOS, frames go

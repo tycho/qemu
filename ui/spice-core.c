@@ -817,6 +817,9 @@ static void qemu_spice_init(void)
         error_report("max refresh rate/fps is invalid");
         exit(1);
     }
+    if (qemu_opt_get(opts, "max-refresh-rate")) {
+        spice_display_refresh_rate = spice_max_refresh_rate;
+    }
 
     spice_server_set_agent_mouse
         (spice_server, qemu_opt_get_bool(opts, "agent-mouse", 1));
