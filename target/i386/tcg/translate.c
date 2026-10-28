@@ -4898,20 +4898,27 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     }
 
 #ifndef CONFIG_USER_ONLY
-    if (dc->fp_entry_label && !dc->fp_entry_mask) {
-        /* No insn checks CR0: drop the entry check and its fallback. */
-        TCGOp *ld = QTAILQ_PREV(dc->fp_entry_and, link);
-        TCGOp *br = QTAILQ_NEXT(dc->fp_entry_and, link);
+    /*
+     * The entry check covers the whole TB: in a multi-block region, finish
+     * it after the last block, once every block has added to its mask.
+     */
+    if (dc->fp_entry_label && !translator_region_more(dcbase)) {
+        if (!dc->fp_entry_mask) {
+            /* No insn checks CR0: drop the entry check and its fallback. */
+            TCGOp *ld = QTAILQ_PREV(dc->fp_entry_and, link);
+            TCGOp *br = QTAILQ_NEXT(dc->fp_entry_and, link);
 
-        tcg_debug_assert(ld->opc == INDEX_op_ld && br->opc == INDEX_op_brcond);
-        tcg_op_remove(tcg_ctx, br);
-        tcg_op_remove(tcg_ctx, dc->fp_entry_and);
-        tcg_op_remove(tcg_ctx, ld);
-    } else if (dc->fp_entry_label) {
-        dc->fp_entry_and->args[2] =
-            tcgv_i32_arg(tcg_constant_i32(dc->fp_entry_mask));
-        gen_set_label(dc->fp_entry_label);
-        gen_helper_cr0_fallback(tcg_env);
+            tcg_debug_assert(ld->opc == INDEX_op_ld &&
+                             br->opc == INDEX_op_brcond);
+            tcg_op_remove(tcg_ctx, br);
+            tcg_op_remove(tcg_ctx, dc->fp_entry_and);
+            tcg_op_remove(tcg_ctx, ld);
+        } else {
+            dc->fp_entry_and->args[2] =
+                tcgv_i32_arg(tcg_constant_i32(dc->fp_entry_mask));
+            gen_set_label(dc->fp_entry_label);
+            gen_helper_cr0_fallback(tcg_env);
+        }
     }
 #endif
 }
