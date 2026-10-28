@@ -25,6 +25,7 @@
 bool hvf_allowed;
 bool hvf_kernel_irqchip;
 bool hvf_nested_virt;
+bool hvf_tso_mode;
 static bool hvf_kernel_irqchip_override;
 
 void hvf_nested_virt_enable(bool nested_virt)
@@ -269,6 +270,23 @@ static void hvf_set_kernel_irqchip(Object *obj, Visitor *v,
     }
 }
 
+#ifdef HOST_AARCH64
+static bool hvf_get_tso(Object *obj, Error **errp)
+{
+    return hvf_tso_mode;
+}
+
+static void hvf_set_tso(Object *obj, bool value, Error **errp)
+{
+    /* ACTLR_EL1, which holds the TSO bit, is accessible from macOS 15 */
+    if (value && !__builtin_available(macOS 15, *)) {
+        error_setg(errp, "HVF: tso=on needs macOS 15 or later");
+        return;
+    }
+    hvf_tso_mode = value;
+}
+#endif
+
 static void hvf_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -282,6 +300,11 @@ static void hvf_accel_class_init(ObjectClass *oc, const void *data)
         NULL, NULL);
     object_class_property_set_description(oc, "kernel-irqchip",
         "Configure HVF irqchip");
+#ifdef HOST_AARCH64
+    object_class_property_add_bool(oc, "tso", hvf_get_tso, hvf_set_tso);
+    object_class_property_set_description(oc, "tso",
+        "Set on/off to enable/disable total store ordering mode");
+#endif
 }
 
 static const TypeInfo hvf_accel_type = {
