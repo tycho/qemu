@@ -1498,6 +1498,21 @@ int hvf_arch_init_vcpu(CPUState *cpu)
                                              hvf_wfi_timer_cb, cpu);
     }
 
+    if (hvf_tso_mode) {
+        /* the ACTLR_EL1 bit that makes the vCPU's memory model TSO */
+        const uint64_t actlr_el1_tso = 1 << 1;
+        uint64_t actlr;
+
+        if (__builtin_available(macOS 15, *)) {
+            ret = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_ACTLR_EL1,
+                                      &actlr);
+            assert_hvf_ok(ret);
+            ret = hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_ACTLR_EL1,
+                                      actlr | actlr_el1_tso);
+            assert_hvf_ok(ret);
+        }
+    }
+
     aarch64_add_sme_properties(OBJECT(cpu));
     return 0;
 }
