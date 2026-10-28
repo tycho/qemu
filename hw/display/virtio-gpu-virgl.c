@@ -42,8 +42,14 @@
      VIRGL_VERSION_MICRO >= (micro))
 #endif
 
+/*
+ * On macOS a blob is a Metal or render-server allocation that the renderer
+ * cannot map at a fixed address (it fails with EINVAL); map it as a
+ * subregion instead.
+ */
 #define VIRGL_HAS_MAP_FIXED \
-    (VIRGL_CHECK_VERSION(1, 3, 0) && !IS_ENABLED(CONFIG_WIN32))
+    (VIRGL_CHECK_VERSION(1, 3, 0) && !IS_ENABLED(CONFIG_WIN32) && \
+     !IS_ENABLED(CONFIG_DARWIN))
 
 struct virtio_gpu_virgl_resource {
     struct virtio_gpu_simple_resource base;
