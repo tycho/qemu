@@ -1207,6 +1207,7 @@ static void qemu_spice_gl_block(SimpleSpiceDisplay *ssd, bool block)
 {
     uint64_t timeout;
 
+    trace_qemu_spice_gl_block(ssd->qxl.id, block);
     if (block) {
         timeout = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
         timeout += 1000; /* one sec */
