@@ -2003,6 +2003,13 @@ static void qemu_spice_display_init_one(QemuConsole *con)
         qemu_console_listener_set_refresh(&ssd->dcl,
                                           MAX(1000 / spice_display_refresh_rate,
                                               1));
+        /*
+         * With an agent in the guest, the client's monitor configs go to
+         * the agent rather than to interface_client_monitors_config():
+         * give the guest's display (its EDID) the rate now.
+         */
+        qemu_console_set_ui_refresh_rate(con,
+                                         spice_display_refresh_rate * 1000);
     }
     g_ptr_array_add(spice_displays, ssd);
 }
