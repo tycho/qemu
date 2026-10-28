@@ -76,9 +76,7 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
 
     cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     while (cmd) {
-        cmd->vq = vq;
-        cmd->error = 0;
-        cmd->finished = false;
+        virtio_gpu_ctrl_cmd_init(cmd, vq);
         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     }
@@ -170,6 +168,8 @@ static const Property virtio_gpu_gl_properties[] = {
                     VIRTIO_GPU_FLAG_VENUS_ENABLED, false),
     DEFINE_PROP_BIT("drm_native_context", VirtIOGPU, parent_obj.conf.flags,
                     VIRTIO_GPU_FLAG_DRM_ENABLED, false),
+    DEFINE_PROP_BIT("neptune", VirtIOGPU, parent_obj.conf.flags,
+                    VIRTIO_GPU_FLAG_NEPTUNE_ENABLED, false),
 };
 
 static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)

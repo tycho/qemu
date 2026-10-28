@@ -12,6 +12,7 @@
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "qapi/qapi-visit-common.h"
+#include "qapi/visitor.h"
 #include "accel/accel-ops.h"
 #include "exec/cpu-common.h"
 #include "system/address-spaces.h"
@@ -26,6 +27,7 @@ bool hvf_allowed;
 bool hvf_kernel_irqchip;
 bool hvf_nested_virt;
 bool hvf_tso_mode;
+uint32_t hvf_ipa_granule_size;
 static bool hvf_kernel_irqchip_override;
 
 void hvf_nested_virt_enable(bool nested_virt)
@@ -94,7 +96,7 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
     MemoryRegion *area = section->mr;
     bool writable = !area->readonly && !area->rom_device;
     hv_memory_flags_t flags;
-    uint64_t page_size = qemu_real_host_page_size();
+    uint64_t page_size = hvf_ipa_granule_size ?: qemu_real_host_page_size();
     uint64_t gpa = section->offset_within_address_space;
     uint64_t size = int128_get64(section->size);
     hv_return_t ret;
@@ -114,6 +116,11 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
 
     if (!QEMU_IS_ALIGNED(size, page_size) ||
         !QEMU_IS_ALIGNED(gpa, page_size)) {
+        if (add) {
+            warn_report("HVF: cannot map 0x%" PRIx64 "+0x%" PRIx64
+                        ": not aligned to the 0x%" PRIx64 " IPA granule",
+                        gpa, size, page_size);
+        }
         /* Not page aligned, so we can not map as RAM */
         add = false;
     }
@@ -213,7 +220,7 @@ static int hvf_accel_init(AccelState *as, MachineState *ms)
         }
     }
 
-    ret = hvf_arch_vm_create(ms, (uint32_t)pa_range);
+    ret = hvf_arch_vm_create(ms, (uint32_t)pa_range, hvf_ipa_granule_size);
     if (ret == HV_DENIED) {
         error_report("Could not access HVF. Is the executable signed"
                      " with com.apple.security.hypervisor entitlement?");
@@ -279,13 +286,42 @@ static bool hvf_get_tso(Object *obj, Error **errp)
 static void hvf_set_tso(Object *obj, bool value, Error **errp)
 {
     /* ACTLR_EL1, which holds the TSO bit, is accessible from macOS 15 */
-    if (value && !__builtin_available(macOS 15, *)) {
-        error_setg(errp, "HVF: tso=on needs macOS 15 or later");
-        return;
+    if (value) {
+        if (__builtin_available(macOS 15, *)) {
+            /* supported */
+        } else {
+            error_setg(errp, "HVF: tso=on needs macOS 15 or later");
+            return;
+        }
     }
     hvf_tso_mode = value;
 }
 #endif
+
+static void hvf_get_ipa_granule_size(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp)
+{
+    uint32_t value = hvf_ipa_granule_size;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void hvf_set_ipa_granule_size(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp)
+{
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value & (value - 1)) {
+        error_setg(errp, "HVF: ipa-granule-size must be a power of two");
+        return;
+    }
+    hvf_ipa_granule_size = value;
+}
 
 static void hvf_accel_class_init(ObjectClass *oc, const void *data)
 {
@@ -305,6 +341,11 @@ static void hvf_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "tso",
         "Set on/off to enable/disable total store ordering mode");
 #endif
+    object_class_property_add(oc, "ipa-granule-size", "uint32",
+        hvf_get_ipa_granule_size, hvf_set_ipa_granule_size,
+        NULL, NULL);
+    object_class_property_set_description(oc, "ipa-granule-size",
+        "Smallest guest physical mapping in bytes (default: host page size)");
 }
 
 static const TypeInfo hvf_accel_type = {
