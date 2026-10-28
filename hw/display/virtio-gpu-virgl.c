@@ -48,6 +48,16 @@ struct virtio_gpu_virgl_resource {
     struct virtio_gpu_simple_resource base;
     MemoryRegion *mr;
     void *map_fixed;
+    /*
+     * A RESOURCE_UNREF that arrived while the blob mapping was still being
+     * torn down; completed (virgl unref and response) once the MR finalizes.
+     */
+    struct virtio_gpu_ctrl_command *unref_cmd;
+    /*
+     * A command for this resource is suspended at the cmdq head, holding
+     * renderer_blocked, until its in-flight unmap finalizes.
+     */
+    bool map_blocked;
 };
 
 static struct virtio_gpu_virgl_resource *
@@ -82,7 +92,10 @@ struct virtio_gpu_virgl_hostmem_region {
     Object parent_obj;
     MemoryRegion mr;
     struct VirtIOGPU *g;
+    struct virtio_gpu_virgl_resource *res;
     enum virtio_gpu_virgl_hostmem_region_mapping_state mapping_state;
+    /* On VirtIOGPUGL.unmap_done_list while in VIRTIO_GPU_MR_UNMAP_COMPLETED */
+    QTAILQ_ENTRY(virtio_gpu_virgl_hostmem_region) done_next;
 };
 
 #define TYPE_VIRTIO_GPU_VIRGL_HOSTMEM_REGION "virtio-gpu-virgl-hostmem-region"
@@ -96,12 +109,21 @@ to_hostmem_region(MemoryRegion *mr)
     return container_of(mr, struct virtio_gpu_virgl_hostmem_region, mr);
 }
 
+static void virtio_gpu_virgl_finish_unmap(VirtIOGPU *g,
+                                          struct virtio_gpu_virgl_resource *res);
+
 static void virtio_gpu_virgl_resume_cmdq_bh(void *opaque)
 {
     VirtIOGPU *g = opaque;
+    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+    struct virtio_gpu_virgl_hostmem_region *vmr;
 
     if (!virtio_gpu_virgl_update_render_state(g)) {
         return;
+    }
+
+    while ((vmr = QTAILQ_FIRST(&gl->unmap_done_list)) != NULL) {
+        virtio_gpu_virgl_finish_unmap(g, vmr->res);
     }
 
     virtio_gpu_process_cmdq(g);
@@ -109,14 +131,20 @@ static void virtio_gpu_virgl_resume_cmdq_bh(void *opaque)
 
 /*
  * MR could outlive the resource if MR's reference is held outside of
- * virtio-gpu. In order to prevent unmapping resource while MR is alive,
- * and thus, making the data pointer invalid, we will block virtio-gpu
- * command processing until MR is fully unreferenced and freed.
+ * virtio-gpu (a flat view still under an RCU reader), so the virgl mapping
+ * stays alive until the MR is fully unreferenced and freed; only then is
+ * the resource unmapped.  That grace period is on the order of 100 ms, and
+ * blocking the whole control queue for it turns a burst of unmaps into
+ * multi-second round trips for every other command, past a WDDM guest's
+ * GPU-scheduler timeout.  The queue therefore keeps flowing: UNMAP_BLOB is
+ * answered once the subregion is gone (the guest cannot reach the pages
+ * any more), and only work that needs the virgl unmap to have happened
+ * (an UNREF of the resource, a re-MAP, a create reusing its id) waits for
+ * it.
  */
 static void virtio_gpu_virgl_hostmem_region_finalize(Object *obj)
 {
     struct virtio_gpu_virgl_hostmem_region *vmr = VIRTIO_GPU_VIRGL_HOSTMEM_REGION(obj);
-    VirtIOGPUBase *b;
     VirtIOGPUGL *gl;
 
     if (!vmr->g) {
@@ -125,15 +153,13 @@ static void virtio_gpu_virgl_hostmem_region_finalize(Object *obj)
 
     vmr->mapping_state = VIRTIO_GPU_MR_UNMAP_COMPLETED;
 
-    b = VIRTIO_GPU_BASE(vmr->g);
-    b->renderer_blocked--;
-
     /*
      * memory_region_unref() is executed from RCU thread context, while
      * virglrenderer works only on the main-loop thread that's holding GL
      * context.
      */
     gl = VIRTIO_GPU_GL(vmr->g);
+    QTAILQ_INSERT_TAIL(&gl->unmap_done_list, vmr, done_next);
     qemu_bh_schedule(gl->cmdq_resume_bh);
 }
 
@@ -219,6 +245,7 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
     object_initialize_child(OBJECT(g), name, vmr,
                             TYPE_VIRTIO_GPU_VIRGL_HOSTMEM_REGION);
     vmr->g = g;
+    vmr->res = res;
     vmr->mapping_state = VIRTIO_GPU_MR_MAPPED;
 
     mr = &vmr->mr;
@@ -232,17 +259,58 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
     return 0;
 }
 
+/*
+ * Drop the virgl mapping of a blob whose MemoryRegion has finalized, and
+ * release a command blocked on that.
+ */
+static int
+virtio_gpu_virgl_unmap_completed(VirtIOGPU *g,
+                                 struct virtio_gpu_virgl_resource *res)
+{
+    struct virtio_gpu_virgl_hostmem_region *vmr = to_hostmem_region(res->mr);
+    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+    int ret;
+
+    QTAILQ_REMOVE(&gl->unmap_done_list, vmr, done_next);
+    res->mr = NULL;
+    g_free(vmr);
+
+    if (res->map_blocked) {
+        res->map_blocked = false;
+        VIRTIO_GPU_BASE(g)->renderer_blocked--;
+    }
+
+    ret = virgl_renderer_resource_unmap(res->base.resource_id);
+    if (ret) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: failed to unmap virgl resource: %s\n",
+                      __func__, strerror(-ret));
+    }
+    return ret;
+}
+
+/*
+ * Unmap a blob in 2 steps:
+ *
+ * 1. Detach the subregion: the guest loses access immediately, and the
+ *    MR goes away asynchronously once its last (RCU) reference drops.
+ * 2. virtio_gpu_virgl_hostmem_region_finalize() queues the region for the
+ *    main loop, which drops the virgl mapping and completes any UNREF
+ *    deferred behind it (virtio_gpu_virgl_finish_unmap()).
+ *
+ * Sets *in_flight while step 2 is pending (res->mr stays set until then).
+ */
 static int
 virtio_gpu_virgl_unmap_resource_blob(VirtIOGPU *g,
                                      struct virtio_gpu_virgl_resource *res,
-                                     bool *cmd_suspended)
+                                     bool *in_flight)
 {
     struct virtio_gpu_virgl_hostmem_region *vmr;
     VirtIOGPUBase *b = VIRTIO_GPU_BASE(g);
     MemoryRegion *mr = res->mr;
+#if VIRGL_HAS_MAP_FIXED
     int ret;
 
-#if VIRGL_HAS_MAP_FIXED
     if (res->map_fixed) {
         if (mmap(res->map_fixed, res->base.blob_size, PROT_READ | PROT_WRITE,
                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
@@ -266,33 +334,12 @@ virtio_gpu_virgl_unmap_resource_blob(VirtIOGPU *g,
     trace_virtio_gpu_cmd_res_unmap_blob(res->base.resource_id, mr,
                                         vmr->mapping_state);
 
-    /*
-     * Perform async unmapping in 3 steps:
-     *
-     * 1. Begin async unmapping with memory_region_del_subregion()
-     *    and suspend/block cmd processing.
-     * 2. Wait for res->mr to be freed and cmd processing resumed
-     *    asynchronously by virtio_gpu_virgl_hostmem_region_finalize().
-     * 3. Finish the unmapping with final virgl_renderer_resource_unmap().
-     */
     switch (vmr->mapping_state) {
     case VIRTIO_GPU_MR_UNMAP_COMPLETED:
-        res->mr = NULL;
-        g_free(vmr);
-
-        ret = virgl_renderer_resource_unmap(res->base.resource_id);
-        if (ret) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "%s: failed to unmap virgl resource: %s\n",
-                          __func__, strerror(-ret));
-            return ret;
-        }
-        break;
+        /* Finalized, but the resume BH has not run yet: finish here. */
+        return virtio_gpu_virgl_unmap_completed(g, res);
 
     case VIRTIO_GPU_MR_MAPPED:
-        /* render will be unblocked once MR is freed */
-        b->renderer_blocked++;
-
         vmr->mapping_state = VIRTIO_GPU_MR_UNMAP_STARTED;
 
         /* memory region owns self res->mr object and frees it by itself */
@@ -301,11 +348,28 @@ virtio_gpu_virgl_unmap_resource_blob(VirtIOGPU *g,
 
         /* Fallthrough */
     case VIRTIO_GPU_MR_UNMAP_STARTED:
-        *cmd_suspended = true;
+        *in_flight = true;
         break;
     }
 
     return 0;
+}
+
+/*
+ * Park a command at the cmdq head until the in-flight unmap of @res
+ * finalizes: a re-MAP, whose virgl map must follow the virgl unmap, or a
+ * create reusing the id of a resource whose UNREF waits for its unmap.
+ */
+static void
+virtio_gpu_virgl_wait_for_unmap(VirtIOGPU *g,
+                                struct virtio_gpu_virgl_resource *res,
+                                bool *cmd_suspended)
+{
+    if (!res->map_blocked) {
+        res->map_blocked = true;
+        VIRTIO_GPU_BASE(g)->renderer_blocked++;
+    }
+    *cmd_suspended = true;
 }
 #endif
 
@@ -426,21 +490,25 @@ static void virgl_cmd_create_resource_3d(VirtIOGPU *g,
     virgl_renderer_resource_create(&args, NULL, 0);
 }
 
+/*
+ * Unref @res, unless its blob mapping is still being torn down: then
+ * *in_flight is set and the unref has to be repeated once it is gone.
+ */
 static int
 virtio_gpu_virgl_resource_unref(VirtIOGPU *g,
                                 struct virtio_gpu_virgl_resource *res,
-                                bool *suspended)
+                                bool *in_flight)
 {
     struct iovec *res_iovs = NULL;
     int num_iovs = 0;
 #if VIRGL_VERSION_MAJOR >= 1
     int ret;
 
-    ret = virtio_gpu_virgl_unmap_resource_blob(g, res, suspended);
+    ret = virtio_gpu_virgl_unmap_resource_blob(g, res, in_flight);
     if (ret) {
         return ret;
     }
-    if (*suspended) {
+    if (*in_flight) {
         return 0;
     }
 #endif
@@ -464,11 +532,11 @@ virtio_gpu_virgl_resource_unref(VirtIOGPU *g,
 }
 
 static void virgl_cmd_resource_unref(VirtIOGPU *g,
-                                     struct virtio_gpu_ctrl_command *cmd,
-                                     bool *cmd_suspended)
+                                     struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_resource_unref unref;
     struct virtio_gpu_virgl_resource *res;
+    bool in_flight = false;
 
     VIRTIO_GPU_FILL_CMD(unref);
     trace_virtio_gpu_cmd_res_unref(unref.resource_id);
@@ -481,19 +549,77 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
         return;
     }
 
-    virtio_gpu_virgl_resource_unref(g, res, cmd_suspended);
+    if (res->unref_cmd) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: resource %d already being unref'd\n",
+                      __func__, unref.resource_id);
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+        return;
+    }
+
+    if (virtio_gpu_virgl_resource_unref(g, res, &in_flight)) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+        return;
+    }
+    if (in_flight) {
+        /*
+         * The mapping is still being torn down: the virgl unref must wait
+         * for it, and so must this command's completion, but not the
+         * commands behind it.  virtio_gpu_virgl_finish_unmap() completes
+         * the unref and answers the command.
+         */
+        res->unref_cmd = cmd;
+        cmd->deferred = true;
+    }
 }
+
+#if VIRGL_VERSION_MAJOR >= 1
+/*
+ * Finish the unmap of a blob whose MemoryRegion has finalized, and complete
+ * a RESOURCE_UNREF deferred behind it.  Main-loop only (virglrenderer runs
+ * on the thread holding the GL context).
+ */
+static void virtio_gpu_virgl_finish_unmap(VirtIOGPU *g,
+                                          struct virtio_gpu_virgl_resource *res)
+{
+    struct virtio_gpu_ctrl_command *cmd = res->unref_cmd;
+    bool in_flight = false;
+
+    virtio_gpu_virgl_unmap_completed(g, res);
+    if (!cmd) {
+        return;
+    }
+
+    res->unref_cmd = NULL;
+    if (virtio_gpu_virgl_resource_unref(g, res, &in_flight)) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+    }
+    virtio_gpu_ctrl_response_nodata(g, cmd, cmd->error ? cmd->error :
+                                    VIRTIO_GPU_RESP_OK_NODATA);
+    g_free(cmd);
+}
+#endif
 
 void virtio_gpu_virgl_resource_destroy(VirtIOGPU *g,
                                        struct virtio_gpu_simple_resource *base,
                                        Error **errp)
 {
     struct virtio_gpu_virgl_resource *res;
-    bool suspended = false;
+    bool in_flight = false;
 
     res = container_of(base, struct virtio_gpu_virgl_resource, base);
 
-    if (virtio_gpu_virgl_resource_unref(g, res, &suspended)) {
+    /*
+     * Reset drops queued commands without a response (see the cmdq flush
+     * in virtio_gpu_reset()); a deferred UNREF is no different.
+     */
+    g_clear_pointer(&res->unref_cmd, g_free);
+    if (res->map_blocked) {
+        res->map_blocked = false;
+        VIRTIO_GPU_BASE(g)->renderer_blocked--;
+    }
+
+    if (virtio_gpu_virgl_resource_unref(g, res, &in_flight)) {
         error_setg(errp, "failed to destroy virgl resource");
     }
 }
@@ -951,7 +1077,8 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
 }
 
 static void virgl_cmd_resource_map_blob(VirtIOGPU *g,
-                                        struct virtio_gpu_ctrl_command *cmd)
+                                        struct virtio_gpu_ctrl_command *cmd,
+                                        bool *cmd_suspended)
 {
     struct virtio_gpu_resource_map_blob mblob;
     struct virtio_gpu_virgl_resource *res;
@@ -979,6 +1106,31 @@ static void virgl_cmd_resource_map_blob(VirtIOGPU *g,
         return;
     }
 
+    if (res->unref_cmd) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource %d is being unref'd\n",
+                      __func__, mblob.resource_id);
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+        return;
+    }
+
+    if (res->mr &&
+        to_hostmem_region(res->mr)->mapping_state != VIRTIO_GPU_MR_MAPPED) {
+        bool in_flight = false;
+
+        /*
+         * Re-mapping a blob whose previous mapping is still being torn
+         * down: the virgl map must follow the virgl unmap.
+         */
+        if (virtio_gpu_virgl_unmap_resource_blob(g, res, &in_flight)) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            return;
+        }
+        if (in_flight) {
+            virtio_gpu_virgl_wait_for_unmap(g, res, cmd_suspended);
+            return;
+        }
+    }
+
     ret = virtio_gpu_virgl_map_resource_blob(g, res, mblob.offset);
     if (ret) {
         cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
@@ -992,12 +1144,11 @@ static void virgl_cmd_resource_map_blob(VirtIOGPU *g,
 }
 
 static void virgl_cmd_resource_unmap_blob(VirtIOGPU *g,
-                                          struct virtio_gpu_ctrl_command *cmd,
-                                          bool *cmd_suspended)
+                                          struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_resource_unmap_blob ublob;
     struct virtio_gpu_virgl_resource *res;
-    int ret;
+    bool in_flight = false;
 
     VIRTIO_GPU_FILL_CMD(ublob);
     virtio_gpu_unmap_blob_bswap(&ublob);
@@ -1010,10 +1161,21 @@ static void virgl_cmd_resource_unmap_blob(VirtIOGPU *g,
         return;
     }
 
-    ret = virtio_gpu_virgl_unmap_resource_blob(g, res, cmd_suspended);
-    if (ret) {
-        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+    if (res->unref_cmd) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource %d is being unref'd\n",
+                      __func__, ublob.resource_id);
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
         return;
+    }
+
+    /*
+     * The subregion is gone before this returns, so the guest cannot reach
+     * the pages any more: answer now.  Dropping the virgl mapping waits for
+     * the MR to finalize, but nothing the guest can do depends on it except
+     * an UNREF or a re-MAP of this resource, which each wait on their own.
+     */
+    if (virtio_gpu_virgl_unmap_resource_blob(g, res, &in_flight)) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
     }
 }
 
@@ -1129,7 +1291,7 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
         virgl_renderer_force_ctx_0();
         break;
     case VIRTIO_GPU_CMD_RESOURCE_UNREF:
-        virgl_cmd_resource_unref(g, cmd, &cmd_suspended);
+        virgl_cmd_resource_unref(g, cmd);
         break;
     case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:
         /* TODO add security */
@@ -1156,10 +1318,10 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
         virgl_cmd_resource_create_blob(g, cmd);
         break;
     case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
-        virgl_cmd_resource_map_blob(g, cmd);
+        virgl_cmd_resource_map_blob(g, cmd, &cmd_suspended);
         break;
     case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB:
-        virgl_cmd_resource_unmap_blob(g, cmd, &cmd_suspended);
+        virgl_cmd_resource_unmap_blob(g, cmd);
         break;
     case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
         virgl_cmd_set_scanout_blob(g, cmd);
@@ -1173,7 +1335,7 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
 
     cmd->suspended = cmd_suspended;
 
-    if (cmd_suspended || cmd->finished) {
+    if (cmd_suspended || cmd->finished || cmd->deferred) {
         return;
     }
     if (cmd->error) {
@@ -1622,6 +1784,7 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
     }
 
 #if VIRGL_VERSION_MAJOR >= 1
+    QTAILQ_INIT(&gl->unmap_done_list);
     gl->cmdq_resume_bh = virtio_bh_io_new_guarded(DEVICE(g),
                                                   virtio_gpu_virgl_resume_cmdq_bh,
                                                   g);
