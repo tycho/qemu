@@ -727,6 +727,28 @@ int qemu_console_set_ui_info(QemuConsole *con, QemuUIInfo *info, bool delay)
     return 0;
 }
 
+/*
+ * The display's refresh rate in mHz, for a UI that knows it but not (yet)
+ * the size: the device sees it with the next size, or in its EDID.
+ * Without a size the device is not told, since a zero size disables the
+ * output.
+ */
+void qemu_console_set_ui_refresh_rate(QemuConsole *con, uint32_t refresh_rate)
+{
+    QemuUIInfo info;
+
+    if (!qemu_console_ui_info_supported(con)) {
+        return;
+    }
+    if (con->ui_info.width && con->ui_info.height) {
+        info = con->ui_info;
+        info.refresh_rate = refresh_rate;
+        qemu_console_set_ui_info(con, &info, false);
+    } else {
+        con->ui_info.refresh_rate = refresh_rate;
+    }
+}
+
 void qemu_console_update(QemuConsole *con, int x, int y, int w, int h)
 {
     DisplayState *s = con->ds;
