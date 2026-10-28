@@ -1346,11 +1346,7 @@ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
 
     cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     while (cmd) {
-        cmd->vq = vq;
-        cmd->error = 0;
-        cmd->finished = false;
-        cmd->suspended = false;
-        cmd->deferred = false;
+        virtio_gpu_ctrl_cmd_init(cmd, vq);
         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     }
