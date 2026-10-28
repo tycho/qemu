@@ -22,6 +22,8 @@
 #include "cpu-sysregs.h"
 
 #include <mach/mach_time.h>
+#include <dlfcn.h>
+#include <AvailabilityMacros.h>
 
 #include "system/address-spaces.h"
 #include "system/memory.h"
@@ -1321,7 +1323,46 @@ static bool hvf_arm_el2_supported(void)
 }
 
 
-hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
+/*
+ * The IPA granule is the smallest mapping hv_vm_map() accepts.  macOS 26
+ * sets it through a public API; older releases only have a private one.
+ */
+static hv_return_t hvf_set_ipa_granule(hv_vm_config_t config,
+                                       uint32_t ipa_granule_size)
+{
+    static hv_return_t (*set_ipa_granule)(hv_vm_config_t, uint32_t);
+
+#if defined(__MAC_26_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_26_0
+    if (__builtin_available(macOS 26, *)) {
+        hv_ipa_granule_t granule;
+
+        if (ipa_granule_size == 4096) {
+            granule = HV_IPA_GRANULE_4KB;
+        } else if (ipa_granule_size == 16384) {
+            granule = HV_IPA_GRANULE_16KB;
+        } else {
+            error_report("HVF: unsupported IPA granule 0x%x", ipa_granule_size);
+            return HV_UNSUPPORTED;
+        }
+        return hv_vm_config_set_ipa_granule(config, granule);
+    }
+#endif
+
+    if (!set_ipa_granule) {
+        set_ipa_granule = dlsym(RTLD_NEXT, "_hv_vm_config_set_ipa_granule");
+    }
+    if (set_ipa_granule) {
+        return set_ipa_granule(config, ipa_granule_size);
+    }
+    if (ipa_granule_size != qemu_real_host_page_size()) {
+        error_report("HVF: this macOS cannot set the IPA granule");
+        return HV_UNSUPPORTED;
+    }
+    return HV_SUCCESS;
+}
+
+hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range,
+                               uint32_t ipa_granule_size)
 {
     hv_return_t ret;
     hv_vm_config_t config = hv_vm_config_create();
@@ -1331,6 +1372,13 @@ hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
         goto cleanup;
     }
     chosen_ipa_bit_size = pa_range;
+
+    if (ipa_granule_size) {
+        ret = hvf_set_ipa_granule(config, ipa_granule_size);
+        if (ret != HV_SUCCESS) {
+            goto cleanup;
+        }
+    }
 
     if (__builtin_available(macOS 15.0, *)) {
         if (hvf_nested_virt_enabled()) {
