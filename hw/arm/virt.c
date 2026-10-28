@@ -3921,6 +3921,12 @@ static void virt_machine_device_plug_cb(const HotplugHandler *hotplug_dev,
             platform_bus_link_device(PLATFORM_BUS_DEVICE(vms->platform_bus_dev),
                                      SYS_BUS_DEVICE(dev));
         }
+#ifdef CONFIG_TPM
+        if (object_dynamic_cast(OBJECT(dev), TYPE_TPM_IF)) {
+            tpm_sysbus_plug(TPM_IF(dev), OBJECT(vms->platform_bus_dev),
+                            vms->memmap[VIRT_PLATFORM_BUS].base);
+        }
+#endif
     }
 
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
@@ -4172,6 +4178,7 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_WDT_SBSA);
 #ifdef CONFIG_TPM
     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_TPM_TIS_SYSBUS);
+    machine_class_allow_dynamic_sysbus_dev(mc, TYPE_TPM_CRB_SYSBUS);
 #endif
     mc->block_default_type = IF_VIRTIO;
     mc->no_cdrom = 1;
