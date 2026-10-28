@@ -277,7 +277,7 @@ void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
                             0, 0,
                             qemu_dmabuf_get_width(dmabuf),
                             qemu_dmabuf_get_height(dmabuf),
-                            NULL);
+                            NO_NATIVE_TEXTURE);
 
     if (qemu_dmabuf_get_allow_fences(dmabuf)) {
         scon->guest_fb.dmabuf = dmabuf;
