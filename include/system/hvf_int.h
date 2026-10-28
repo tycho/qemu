@@ -42,6 +42,7 @@ struct HVFState {
     QTAILQ_HEAD(, hvf_sw_breakpoint) hvf_sw_breakpoints;
 };
 extern HVFState *hvf_state;
+extern bool hvf_tso_mode;
 
 struct AccelCPUState {
     hvf_vcpuid fd;
