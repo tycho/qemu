@@ -329,9 +329,14 @@ struct TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
 int translator_region_entry(const DisasContextBase *db);
 
 /**
+ * translator_region_more:
  * @db: Disassembly context
  *
+ * In the tb_stop hook: whether another block of the region follows.  Work
+ * for the whole TB, such as finishing a check emitted on entry, waits for
+ * the last block's tb_stop.
  */
+bool translator_region_more(const DisasContextBase *db);
 
 /**
  * translator_region_backward:
