@@ -286,9 +286,13 @@ static bool hvf_get_tso(Object *obj, Error **errp)
 static void hvf_set_tso(Object *obj, bool value, Error **errp)
 {
     /* ACTLR_EL1, which holds the TSO bit, is accessible from macOS 15 */
-    if (value && !__builtin_available(macOS 15, *)) {
-        error_setg(errp, "HVF: tso=on needs macOS 15 or later");
-        return;
+    if (value) {
+        if (__builtin_available(macOS 15, *)) {
+            /* supported */
+        } else {
+            error_setg(errp, "HVF: tso=on needs macOS 15 or later");
+            return;
+        }
     }
     hvf_tso_mode = value;
 }
