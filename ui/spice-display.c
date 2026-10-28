@@ -42,6 +42,8 @@
 
 bool spice_remote_client;
 int spice_max_refresh_rate;
+/* max-refresh-rate when given: the client display's rate, in Hz */
+int spice_display_refresh_rate;
 static DisplayGLMode spice_opengl;
 QEMUGLContext spice_gl_ctx;
 
@@ -700,6 +702,10 @@ static int interface_client_monitors_config(QXLInstance *sin,
             info.width_mm = mm[head].width;
             info.height_mm = mm[head].height;
         }
+    }
+    if (spice_display_refresh_rate) {
+        /* mHz; the guest's display then offers the client's rate */
+        info.refresh_rate = spice_display_refresh_rate * 1000;
     }
 
     trace_qemu_spice_ui_info(ssd->qxl.id, info.width, info.height);
@@ -1987,6 +1993,16 @@ static void qemu_spice_display_init_one(QemuConsole *con)
         qemu_console_set_display_gl_ctx(con, &ssd->dgc);
     }
     qemu_console_register_listener(con, &ssd->dcl, ops);
+    if (spice_display_refresh_rate) {
+        /*
+         * Framebuffers and 2D updates reach the client only when the
+         * console refreshes: refresh at the client display's rate rather
+         * than every GUI_REFRESH_INTERVAL_DEFAULT ms.
+         */
+        qemu_console_listener_set_refresh(&ssd->dcl,
+                                          MAX(1000 / spice_display_refresh_rate,
+                                              1));
+    }
     g_ptr_array_add(spice_displays, ssd);
 }
 
