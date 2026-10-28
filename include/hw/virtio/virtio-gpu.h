@@ -166,6 +166,20 @@ struct virtio_gpu_ctrl_command {
     QTAILQ_ENTRY(virtio_gpu_ctrl_command) next;
 };
 
+/*
+ * virtqueue_pop() does not zero the element, so every popper must reset
+ * the per-command state that virtio_gpu_process_cmdq() reads.
+ */
+static inline void virtio_gpu_ctrl_cmd_init(struct virtio_gpu_ctrl_command *cmd,
+                                            VirtQueue *vq)
+{
+    cmd->vq = vq;
+    cmd->error = 0;
+    cmd->finished = false;
+    cmd->suspended = false;
+    cmd->deferred = false;
+}
+
 struct VirtIOGPUBase {
     VirtIODevice parent_obj;
 
