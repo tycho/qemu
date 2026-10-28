@@ -239,8 +239,14 @@ uint32_t hvf_arch_get_max_ipa_bit_size(void)
     g_assert_not_reached();
 }
 
-hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
+hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range,
+                               uint32_t ipa_granule_size)
 {
+    if (ipa_granule_size && ipa_granule_size != qemu_real_host_page_size()) {
+        error_report("HVF: the only IPA granule is the host page size, 0x%"
+                     PRIx64, (uint64_t)qemu_real_host_page_size());
+        return HV_UNSUPPORTED;
+    }
     return hv_vm_create(HV_VM_DEFAULT);
 }
 
