@@ -571,7 +571,7 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
 {
     struct virtio_gpu_set_scanout ss;
     struct virgl_renderer_resource_info info;
-    void *d3d_tex2d = NULL;
+    ScanoutTextureNative native = NO_NATIVE_TEXTURE;
     int ret;
 
     VIRTIO_GPU_FILL_CMD(ss);
@@ -596,7 +596,29 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
     memset(&ext, 0, sizeof(ext));
     ret = virgl_renderer_resource_get_info_ext(ss.resource_id, &ext);
     info = ext.base;
-    d3d_tex2d = ext.d3d_tex2d;
+    if (ext.d3d_tex2d) {
+        native = (ScanoutTextureNative) {
+            .type = SCANOUT_TEXTURE_NATIVE_TYPE_D3D,
+            .handle = ext.d3d_tex2d,
+        };
+    }
+#ifdef VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION
+    /* the renderer's own texture, when it shares textures natively */
+    if (ext.version >= 1) {
+        switch (ext.native_type) {
+#ifdef CONFIG_METAL
+        case VIRGL_NATIVE_HANDLE_METAL_TEXTURE:
+            native = (ScanoutTextureNative) {
+                .type = SCANOUT_TEXTURE_NATIVE_TYPE_METAL,
+                .handle = ext.native_handle,
+            };
+            break;
+#endif
+        default:
+            break;
+        }
+    }
+#endif
 #else
     memset(&info, 0, sizeof(info));
     ret = virgl_renderer_resource_get_info(ss.resource_id, &info);
@@ -625,7 +647,7 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
         info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
         info.width, info.height,
         ss.r.x, ss.r.y, ss.r.width, ss.r.height,
-        d3d_tex2d);
+        native, NULL);
     g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
 }
 
@@ -1486,7 +1508,12 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
 #endif
     }
 #endif
-#ifdef VIRGL_RENDERER_D3D11_SHARE_TEXTURE
+#if defined(VIRGL_RENDERER_NATIVE_SHARE_TEXTURE)
+    /* ANGLE's D3D11 or Metal device: share the renderer's textures */
+    if (qemu_egl_angle_native_device) {
+        flags |= VIRGL_RENDERER_NATIVE_SHARE_TEXTURE;
+    }
+#elif defined(VIRGL_RENDERER_D3D11_SHARE_TEXTURE)
     if (qemu_egl_angle_d3d) {
         flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
     }

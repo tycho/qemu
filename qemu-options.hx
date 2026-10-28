@@ -2451,7 +2451,7 @@ DEF("spice", HAS_ARG, QEMU_OPTION_spice,
     "       [,playback-compression=on|off][,seamless-migration=on|off]\n"
     "       [,video-codec=<codec>\n"
     "       [,max-refresh-rate=rate\n"
-    "       [,gl=on|off][,rendernode=<file>]\n"
+    "       [,gl=on|off|core|es][,rendernode=<file>]\n"
     "                enable spice\n"
     "                at least one of {port, tls-port} is mandatory\n",
     QEMU_ARCH_ALL)
@@ -2550,8 +2550,10 @@ SRST
         Provide the maximum refresh rate (or FPS) at which the encoding
         requests should be sent to the Spice server. Default would be 30.
 
-    ``gl=on|off``
-        Enable/disable OpenGL context. Default is off.
+    ``gl=on|off|core|es``
+        Enable/disable OpenGL context. Default is off. On macOS, frames go
+        to the local client as an IOSurface: ``core`` renders with a CGL
+        core profile context, ``es`` (and ``on``) with ANGLE's OpenGL ES.
 
     ``rendernode=<file>``
         DRM render node for OpenGL rendering. If not specified, it will

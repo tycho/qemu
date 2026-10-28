@@ -514,7 +514,7 @@ static QemuOptsList qemu_spice_opts = {
 #ifdef HAVE_SPICE_GL
         },{
             .name = "gl",
-            .type = QEMU_OPT_BOOL,
+            .type = QEMU_OPT_STRING,
         },{
             .name = "rendernode",
             .type = QEMU_OPT_STRING,
@@ -851,8 +851,11 @@ static void qemu_spice_init(void)
     g_free(password);
 
 #ifdef HAVE_SPICE_GL
-    if (qemu_opt_get_bool(opts, "gl", 0)) {
-        if ((port != 0) || (tls_port != 0)) {
+    {
+        bool gl_core;
+
+        if (qemu_spice_display_gl_option(opts, &gl_core) &&
+            (port != 0 || tls_port != 0)) {
 #if SPICE_SERVER_VERSION >= 0x000f03 /* release 0.15.3 */
             const char *video_codec = NULL;
             g_autofree char *enc_codec = NULL;
@@ -874,10 +877,9 @@ static void qemu_spice_init(void)
             exit(1);
 #endif
         }
-        egl_init(qemu_opt_get(opts, "rendernode"), DISPLAY_GL_MODE_ON, &error_fatal);
-        spice_opengl = 1;
     }
 #endif
+    qemu_spice_display_early_init();
 }
 
 static int qemu_spice_add_interface(SpiceBaseInstance *sin)

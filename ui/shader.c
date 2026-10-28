@@ -153,11 +153,21 @@ end:
 QemuGLShader *qemu_gl_init_shader(void)
 {
     QemuGLShader *gls = g_new0(QemuGLShader, 1);
+    /* desktop GL (a core profile context) or GL ES */
+    const char *header = epoxy_is_desktop_gl() ? "#version 140\n"
+                                               : "#version 300 es\n";
+    g_autofree char *vert_src = g_strconcat(header, texture_blit_vert_src,
+                                            NULL);
+    g_autofree char *flip_vert_src = g_strconcat(header,
+                                                 texture_blit_flip_vert_src,
+                                                 NULL);
+    g_autofree char *frag_src = g_strconcat(header, texture_blit_frag_src,
+                                            NULL);
 
     gls->texture_blit_prog = qemu_gl_create_compile_link_program
-        (texture_blit_vert_src, texture_blit_frag_src);
+        (vert_src, frag_src);
     gls->texture_blit_flip_prog = qemu_gl_create_compile_link_program
-        (texture_blit_flip_vert_src, texture_blit_frag_src);
+        (flip_vert_src, frag_src);
     if (!gls->texture_blit_prog || !gls->texture_blit_flip_prog) {
         exit(1);
     }
