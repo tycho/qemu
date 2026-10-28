@@ -4753,8 +4753,8 @@ static void i386_tr_tb_start(DisasContextBase *db, CPUState *cpu)
 
     /*
      * The CR0 check on entry (gen_check_cr0_fp), its mask filled in by
-     * i386_tr_tb_stop; with no FPU or SIMD insn it stays 0 and the
-     * optimizer removes the check.
+     * i386_tr_tb_stop; with no FPU or SIMD insn it stays 0 and
+     * i386_tr_tb_stop removes the check.
      */
     if (dc->fp_runtime && db->max_insns > 1) {
         TCGv_i32 t = tcg_temp_new_i32();
@@ -4898,7 +4898,16 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     }
 
 #ifndef CONFIG_USER_ONLY
-    if (dc->fp_entry_label) {
+    if (dc->fp_entry_label && !dc->fp_entry_mask) {
+        /* No insn checks CR0: drop the entry check and its fallback. */
+        TCGOp *ld = QTAILQ_PREV(dc->fp_entry_and, link);
+        TCGOp *br = QTAILQ_NEXT(dc->fp_entry_and, link);
+
+        tcg_debug_assert(ld->opc == INDEX_op_ld && br->opc == INDEX_op_brcond);
+        tcg_op_remove(tcg_ctx, br);
+        tcg_op_remove(tcg_ctx, dc->fp_entry_and);
+        tcg_op_remove(tcg_ctx, ld);
+    } else if (dc->fp_entry_label) {
         dc->fp_entry_and->args[2] =
             tcgv_i32_arg(tcg_constant_i32(dc->fp_entry_mask));
         gen_set_label(dc->fp_entry_label);
