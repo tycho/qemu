@@ -79,6 +79,8 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= (hwcap & HWCAP_AES ? CPUINFO_AES : 0);
     info |= (hwcap & HWCAP_PMULL ? CPUINFO_PMULL : 0);
     info |= (hwcap & HWCAP_SHA1 ? CPUINFO_SHA1 : 0);
+    info |= (hwcap & HWCAP_SHA2 ? CPUINFO_SHA2 : 0);
+    info |= (hwcap & HWCAP_CRC32 ? CPUINFO_CRC32 : 0);
     info |= (hwcap & HWCAP_ASIMDDP ? CPUINFO_DOTPROD : 0);
 
     unsigned long hwcap2 = qemu_getauxval(AT_HWCAP2);
@@ -92,6 +94,8 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= sysctl_for_bool("hw.optional.arm.FEAT_AES") * CPUINFO_AES;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_PMULL") * CPUINFO_PMULL;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_SHA1") * CPUINFO_SHA1;
+    info |= sysctl_for_bool("hw.optional.arm.FEAT_SHA256") * CPUINFO_SHA2;
+    info |= sysctl_for_bool("hw.optional.arm.FEAT_CRC32") * CPUINFO_CRC32;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_DotProd") * CPUINFO_DOTPROD;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_I8MM") * CPUINFO_I8MM;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_BTI") * CPUINFO_BTI;
