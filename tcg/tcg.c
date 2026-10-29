@@ -6978,7 +6978,6 @@ static void ldst_fold_pass(TCGContext *s)
         MemOp mop;
         unsigned shift = 0;
         int ofs = 0;
-        TCGOp *x;
 
         if ((op->opc != INDEX_op_qemu_ld && op->opc != INDEX_op_qemu_st) ||
             TCGOP_TYPE(op) > TCG_TYPE_REG) {
@@ -6993,7 +6992,8 @@ static void ldst_fold_pass(TCGContext *s)
             continue;
         }
         add = ldst_fold_def(s, op, t, INDEX_op_add);
-        if (!add) {
+        /* A TB temp's address may have to reach memory too (SYNC_ARG). */
+        if (!add || (add->life & SYNC_ARG)) {
             continue;
         }
         base = arg_temp(add->args[1]);
@@ -7020,7 +7020,8 @@ static void ldst_fold_pass(TCGContext *s)
             if (base == t) {
                 /* add t, t, b with t = shl i, k right before. */
                 shl = ldst_fold_def(s, add, t, INDEX_op_shl);
-                if (!shl || arg_temp(shl->args[2])->kind != TEMP_CONST) {
+                if (!shl || (shl->life & SYNC_ARG) ||
+                    arg_temp(shl->args[2])->kind != TEMP_CONST) {
                     continue;
                 }
                 shift = arg_temp(shl->args[2])->val;
@@ -7036,31 +7037,28 @@ static void ldst_fold_pass(TCGContext *s)
             }
         }
 
-        x = tcg_op_insert_before(s, op, is_ld ? INDEX_op_qemu_ld_x
-                                              : INDEX_op_qemu_st_x,
-                                 TCGOP_TYPE(op), 4);
-        x->args[0] = op->args[0];
-        x->args[1] = temp_arg(base);
-        x->args[2] = temp_arg(index->kind == TEMP_CONST
-                              ? tcg_constant_internal(TCG_TYPE_I64, 0)
-                              : index);
-        x->args[3] = tcg_ldst_x_arg(oi, shift, ofs);
-        x->life = op->life & (is_ld ? (DEAD_ARG | SYNC_ARG) : DEAD_ARG);
-        x->output_pref[0] = op->output_pref[0];
+        /*
+         * The access becomes qemu_ld_x or qemu_st_x in place, so that
+         * anything that holds the op keeps it.  Its inputs' liveness is
+         * the address computation's.
+         */
+        tcg_debug_assert(op->nargs >= 4);
+        op->life &= is_ld ? DEAD_ARG | SYNC_ARG : DEAD_ARG;
+        op->opc = is_ld ? INDEX_op_qemu_ld_x : INDEX_op_qemu_st_x;
+        op->args[1] = temp_arg(base);
+        op->args[2] = temp_arg(index->kind == TEMP_CONST
+                               ? tcg_constant_internal(TCG_TYPE_I64, 0)
+                               : index);
+        op->args[3] = tcg_ldst_x_arg(oi, shift, ofs);
         if (shl) {
-            ldst_fold_life(x, 1, add, 2);
-            ldst_fold_life(x, 2, shl, 1);
+            ldst_fold_life(op, 1, add, 2);
+            ldst_fold_life(op, 2, shl, 1);
         } else {
-            ldst_fold_life(x, 1, add, 1);
+            ldst_fold_life(op, 1, add, 1);
             if (index->kind != TEMP_CONST) {
-                ldst_fold_life(x, 2, add, 2);
+                ldst_fold_life(op, 2, add, 2);
             }
         }
-        if (!is_ld) {
-            /* The stored value is arg 0 of a store. */
-            ldst_fold_life(x, 0, op, 0);
-        }
-        tcg_op_remove(s, op);
         tcg_op_remove(s, add);
         if (shl) {
             tcg_op_remove(s, shl);
