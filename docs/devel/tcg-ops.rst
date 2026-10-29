@@ -825,6 +825,32 @@ specifies the length of the element (if applicable) in log2 8-bit units.
      - | Extract: bytes *n* to *n* + 15 of the concatenation *v1*:*v2*,
          whose bytes 0 to 15 are *v1*'s (128-bit vectors, 0 <= *n* <= 15).
 
+   * - clmul64_vec *v0*, *v1*, *v2*, *sel*
+
+     - | Carry-less multiply: *v0* is the 128-bit carry-less product of
+         64-bit element *sel* & 1 of *v1* and element *sel* >> 1 of *v2*
+         (128-bit vectors, 0 <= *sel* <= 3).  Optional.
+
+   * - sha256h_vec *v0*, *v1*, *v2*, *v3*
+
+       sha256h2_vec *v0*, *v1*, *v2*, *v3*
+
+     - | Four SHA-256 rounds, as Arm's SHA256H and SHA256H2: the state is
+         a, b, c, d in elements 0 to 3 of *v1* and e, f, g, h in those of
+         *v2* (for sha256h2, the other way around), *v3* the message words
+         plus round constants, in order.  *v0* is the new a, b, c, d (for
+         sha256h2, e, f, g, h).  Optional.
+
+   * - sha256su0_vec *v0*, *v1*, *v2*
+
+       sha256su1_vec *v0*, *v1*, *v2*, *v3*
+
+     - | The SHA-256 message schedule, as Arm's SHA256SU0 and SHA256SU1:
+         sha256su0 gives *v1*\[i] + sigma0(t[i]), t = *v1*\[1], *v1*\[2],
+         *v1*\[3], *v2*\[0]; sha256su1 gives *v1*\[i] + t0[i] +
+         sigma1(x[i]), t0 = *v2*\[1], *v2*\[2], *v2*\[3], *v3*\[0], x =
+         *v3*\[2], *v3*\[3], *v0*\[0], *v0*\[1].  Optional.
+
    * - widen_vec *v0*, *v1*, *k*
 
      - | Widen: the elements of the low half of *v1* (the high half if

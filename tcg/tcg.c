@@ -2497,6 +2497,13 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_aesmc_vec:
     case INDEX_op_aesimc_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_aes_vec;
+    case INDEX_op_sha256h_vec:
+    case INDEX_op_sha256h2_vec:
+    case INDEX_op_sha256su0_vec:
+    case INDEX_op_sha256su1_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_sha256_vec;
+    case INDEX_op_clmul64_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_clmul64_vec;
     case INDEX_op_narrow_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_narrow_vec;
     case INDEX_op_abd_vec:
