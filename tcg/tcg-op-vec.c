@@ -429,6 +429,43 @@ void tcg_gen_aesimc_vec(TCGv_vec r, TCGv_vec a)
     do_crypto(INDEX_op_aesimc_vec, MO_8, 1, r, a, NULL, NULL);
 }
 
+void tcg_gen_sha256h_vec(TCGv_vec r, TCGv_vec abcd, TCGv_vec efgh,
+                         TCGv_vec wk)
+{
+    do_crypto(INDEX_op_sha256h_vec, MO_32, 3, r, abcd, efgh, wk);
+}
+
+void tcg_gen_sha256h2_vec(TCGv_vec r, TCGv_vec efgh, TCGv_vec abcd,
+                          TCGv_vec wk)
+{
+    do_crypto(INDEX_op_sha256h2_vec, MO_32, 3, r, efgh, abcd, wk);
+}
+
+void tcg_gen_sha256su0_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_crypto(INDEX_op_sha256su0_vec, MO_32, 2, r, a, b, NULL);
+}
+
+void tcg_gen_sha256su1_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c)
+{
+    do_crypto(INDEX_op_sha256su1_vec, MO_32, 3, r, a, b, c);
+}
+
+void tcg_gen_clmul64_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, unsigned sel)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(tcgv_vec_temp(a)->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(tcgv_vec_temp(b)->base_type == TCG_TYPE_V128);
+    tcg_debug_assert(sel <= 3);
+    tcg_assert_listed_vecop(INDEX_op_clmul64_vec);
+    tcg_debug_assert(tcg_can_emit_vec_op(INDEX_op_clmul64_vec,
+                                         TCG_TYPE_V128, MO_64) > 0);
+    vec_gen_4(INDEX_op_clmul64_vec, TCG_TYPE_V128, MO_64, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b), sel);
+}
+
 void tcg_gen_narrow_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
                         TCGNarrow kind, unsigned shift, bool round)
 {

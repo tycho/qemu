@@ -69,6 +69,12 @@
 #ifndef TCG_TARGET_HAS_aes_vec
 #define TCG_TARGET_HAS_aes_vec          0
 #endif
+#ifndef TCG_TARGET_HAS_sha256_vec
+#define TCG_TARGET_HAS_sha256_vec       0
+#endif
+#ifndef TCG_TARGET_HAS_clmul64_vec
+#define TCG_TARGET_HAS_clmul64_vec      0
+#endif
 #ifndef TCG_TARGET_HAS_addp_vec
 #define TCG_TARGET_HAS_addp_vec         0
 #endif
