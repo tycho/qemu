@@ -385,6 +385,16 @@ Logical
        | The name *ctpop* is short for "count population", and matches
          the function name used in ``include/qemu/host-utils.h``.
 
+   * - crc32c *t0*, *t1*, *t2*, *size*
+
+     - | *t0* = the CRC-32C (Castagnoli polynomial) of the low 8 << *size*
+         bits of *t2*, continuing from the low 32 bits of *t1*: reflected,
+         with no inversion of the input or the result, zero-extended.
+         *size* is ``MO_8`` to ``MO_32``, or to ``MO_64`` for 64-bit
+         operations.
+       |
+       | Optional: check ``tcg_op_supported()`` first.
+
 
 Shifts/Rotates
 --------------
