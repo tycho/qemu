@@ -347,9 +347,10 @@ extern bool tcg_vint;
 extern bool tcg_vexzero;
 
 /*
- * tcg_crypto: guest SHA-1 and AES round insns as TCG's SHA-1 and AES
- * vector ops (sha1c_vec, aese_vec, ...) where the backend has them, instead
- * of helper calls.
+ * tcg_crypto: guest SHA-1, SHA-256, AES round, carry-less multiply and
+ * CRC-32C insns as TCG's ops for them (sha1c_vec, sha256h_vec, aese_vec,
+ * clmul64_vec, crc32c, ...) where the backend has them, instead of helper
+ * calls.
  */
 extern bool tcg_crypto;
 

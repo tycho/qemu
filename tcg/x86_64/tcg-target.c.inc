@@ -2651,6 +2651,10 @@ static const TCGOutOpBinary outop_ctz = {
     .out_rri = tgen_ctzi,
 };
 
+static const TCGOutOpCrc32c outop_crc32c = {
+    .base.static_constraint = C_NotImplemented,
+};
+
 static const TCGOutOpBinary outop_divs = {
     .base.static_constraint = C_NotImplemented,
 };
