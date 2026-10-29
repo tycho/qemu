@@ -1345,8 +1345,9 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "x-crypto", tcg_get_crypto,
                                    tcg_set_crypto);
     object_class_property_set_description(oc, "x-crypto",
-        "SHA-1 and AES round insns as host cryptographic insns inline, "
-        "where the host has them, instead of helper calls");
+        "SHA-1, SHA-256, AES round, carry-less multiply and CRC-32C "
+        "insns as host insns inline, where the host has them, instead "
+        "of helper calls");
 
     object_class_property_add_bool(oc, "x-vexzero", tcg_get_vexzero,
                                    tcg_set_vexzero);

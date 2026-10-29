@@ -1194,6 +1194,12 @@ typedef struct TCGOutOpBswap {
                    TCGReg a0, TCGReg a1, unsigned flags);
 } TCGOutOpBswap;
 
+typedef struct TCGOutOpCrc32c {
+    TCGOutOp base;
+    void (*out_rrr)(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                    TCGReg a2, MemOp size);
+} TCGOutOpCrc32c;
+
 typedef struct TCGOutOpDeposit {
     TCGOutOp base;
     void (*out_rrr)(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
@@ -1685,6 +1691,7 @@ static const TCGOutOp * const all_outop[NB_OPS] = {
     OUTOP(INDEX_op_bswap32, TCGOutOpBswap, outop_bswap32),
     OUTOP(INDEX_op_bswap64, TCGOutOpUnary, outop_bswap64),
     OUTOP(INDEX_op_clz, TCGOutOpBinary, outop_clz),
+    OUTOP(INDEX_op_crc32c, TCGOutOpCrc32c, outop_crc32c),
     OUTOP(INDEX_op_ctpop, TCGOutOpUnary, outop_ctpop),
     OUTOP(INDEX_op_host_counter, TCGOutOpHostCounter, outop_host_counter),
     OUTOP(INDEX_op_ctz, TCGOutOpBinary, outop_ctz),
@@ -3338,6 +3345,13 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_aesmc_vec:
     case INDEX_op_aesimc_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_aes_vec;
+    case INDEX_op_sha256h_vec:
+    case INDEX_op_sha256h2_vec:
+    case INDEX_op_sha256su0_vec:
+    case INDEX_op_sha256su1_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_sha256_vec;
+    case INDEX_op_clmul64_vec:
+        return type == TCG_TYPE_V128 && TCG_TARGET_HAS_clmul64_vec;
     case INDEX_op_narrow_vec:
         return type == TCG_TYPE_V128 && TCG_TARGET_HAS_narrow_vec;
     case INDEX_op_abd_vec:
@@ -9279,6 +9293,16 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             tcg_debug_assert(new_args[1] == new_args[3]);
             tcg_debug_assert(!const_args[4]);
             out->out_rr01r(s, type, new_args[0], new_args[1], new_args[4]);
+        }
+        break;
+
+    case INDEX_op_crc32c:
+        {
+            const TCGOutOpCrc32c *out = &outop_crc32c;
+
+            tcg_debug_assert(!const_args[1] && !const_args[2]);
+            out->out_rrr(s, type, new_args[0], new_args[1],
+                         new_args[2], new_args[3]);
         }
         break;
 

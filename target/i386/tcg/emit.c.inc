@@ -1821,7 +1821,7 @@ static void gen_VDPPD(DisasContext *s, X86DecodedInsn *decode)
     gen_binary_imm_sse(s, decode, gen_helper_dppd_xmm, gen_helper_dppd_ymm);
 }
 BINARY_IMM_SSE(VMPSADBW,   mpsadbw)
-BINARY_IMM_SSE(PCLMULQDQ,  pclmulqdq)
+BINARY_IMM_SSE(PCLMULQDQ_helper, pclmulqdq)
 
 
 #define UNARY_INT_GVEC(uname, func, ...)                                           \
@@ -2322,6 +2322,29 @@ static void gen_VAESENCLAST(DisasContext *s, X86DecodedInsn *decode)
 {
     if (!gen_aes_round(s, decode, false, false)) {
         gen_VAESENCLAST_helper(s, decode);
+    }
+}
+
+/*
+ * x-crypto: PCLMULQDQ per 128-bit lane with TCG's carry-less multiply,
+ * imm[0] choosing the first source's quadword and imm[4] the second's.
+ */
+static void gen_PCLMULQDQ(DisasContext *s, X86DecodedInsn *decode)
+{
+    unsigned sel = (decode->immediate & 1) | ((decode->immediate >> 3) & 2);
+
+    if (!crypto_can(INDEX_op_clmul64_vec, MO_64)) {
+        gen_PCLMULQDQ_helper(s, decode);
+        return;
+    }
+    for (int lane = 0; lane <= s->vex_l; lane++) {
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(a, tcg_env, decode->op[1].offset + lane * 16);
+        tcg_gen_ld_vec(b, tcg_env, decode->op[2].offset + lane * 16);
+        tcg_gen_clmul64_vec(a, a, b, sel);
+        tcg_gen_st_vec(a, tcg_env, decode->op[0].offset + lane * 16);
     }
 }
 
@@ -4016,8 +4039,17 @@ static void gen_CPUID(DisasContext *s, X86DecodedInsn *decode)
 static void gen_CRC32(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[2].ot;
-    TCGv_i32 tmp = tcg_temp_new_i32();
+    TCGv_i32 tmp;
 
+    /*
+     * x-crypto: CRC32 is the CRC-32C of the source's size, the operand
+     * already loaded (and a high-byte register extracted) into T1.
+     */
+    if (tcg_crypto && tcg_op_supported(INDEX_op_crc32c, TCG_TYPE_TL, 0)) {
+        tcg_gen_crc32c_tl(s->T0, s->T0, s->T1, ot);
+        return;
+    }
+    tmp = tcg_temp_new_i32();
     tcg_gen_trunc_tl_i32(tmp, s->T0);
     gen_helper_crc32(s->T0, tmp, s->T1, tcg_constant_i32(8 << ot));
 }
@@ -6457,20 +6489,107 @@ static void gen_SHA1RNDS4(DisasContext *s, X86DecodedInsn *decode)
     }
 }
 
+/*
+ * x-crypto: SHA256MSG1 is TCG's sha256su0 as it is: both keep W0 to W3 in
+ * elements 0 to 3 and take W4 from element 0 of the second source.
+ */
 static void gen_SHA256MSG1(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (crypto_can(INDEX_op_sha256su0_vec, MO_32)) {
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(a, tcg_env, decode->op[1].offset);
+        tcg_gen_ld_vec(b, tcg_env, decode->op[2].offset);
+        tcg_gen_sha256su0_vec(a, a, b);
+        tcg_gen_st_vec(a, tcg_env, decode->op[0].offset);
+        return;
+    }
     gen_helper_sha256msg1(OP_PTR0, OP_PTR1, OP_PTR2);
 }
 
+/*
+ * x-crypto: SHA256MSG2 gives W16 to W19 as the first source plus sigma1 of
+ * W14, W15, W16, W17, with W14 and W15 in elements 2 and 3 of the second
+ * source.  TCG's sha256su1 adds to its first input b[1], b[2], b[3], c[0]
+ * and sigma1 of c[2], c[3] and its own first two results: with b zero and
+ * c = 0, 0, W14, W15 it is the same.
+ */
 static void gen_SHA256MSG2(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (crypto_can(INDEX_op_sha256su1_vec, MO_32) &&
+        tcg_can_emit_vec_op(INDEX_op_zip_vec, TCG_TYPE_V128, MO_64) > 0) {
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec c = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec zero = tcg_constant_vec(TCG_TYPE_V128, MO_32, 0);
+
+        tcg_gen_ld_vec(a, tcg_env, decode->op[1].offset);
+        tcg_gen_ld_vec(c, tcg_env, decode->op[2].offset);
+        tcg_gen_zip_vec(MO_64, c, zero, c, true);
+        tcg_gen_sha256su1_vec(a, a, zero, c);
+        tcg_gen_st_vec(a, tcg_env, decode->op[0].offset);
+        return;
+    }
     gen_helper_sha256msg2(OP_PTR0, OP_PTR1, OP_PTR2);
+}
+
+/*
+ * x-crypto: SHA256RNDS2 with TCG's four-round sha256h and sha256h2.  x86
+ * keeps A, B, E, F in elements 3 to 0 of the second source and C, D, G, H
+ * in those of the first; the ops take a, b, c, d and e, f, g, h in elements
+ * 0 to 3, and four message words from XMM0, whose first two are WK0 and
+ * WK1.  Each round makes a new a and e and shifts the others down, so after
+ * four rounds the ops hold a4, a3, a2, a1 and e4, e3, e2, e1; rounds 3 and
+ * 4, whatever their message words, can't have changed a2, a1, e2 or e1.
+ * x86's result after two rounds, A, B, E, F, is a2, a1, e2, e1.
+ */
+/* perm_vec's pattern for elements 1, 0, 3, 2: each 64-bit half reversed. */
+#define SHA256_REV64 0x2301
+
+static bool gen_sha256rnds2_inline(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv_vec s1, s2, wk, abcd, efgh, h;
+
+    if (!crypto_can(INDEX_op_sha256h_vec, MO_32) ||
+        !crypto_can(INDEX_op_sha256h2_vec, MO_32) ||
+        tcg_can_emit_vec_op(INDEX_op_zip_vec, TCG_TYPE_V128, MO_64) <= 0 ||
+        tcg_can_emit_vec_op(INDEX_op_perm_vec, TCG_TYPE_V128, MO_32) <= 0) {
+        return false;
+    }
+    s1 = tcg_temp_new_vec(TCG_TYPE_V128);
+    s2 = tcg_temp_new_vec(TCG_TYPE_V128);
+    wk = tcg_temp_new_vec(TCG_TYPE_V128);
+    abcd = tcg_temp_new_vec(TCG_TYPE_V128);
+    efgh = tcg_temp_new_vec(TCG_TYPE_V128);
+    h = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    tcg_gen_ld_vec(s1, tcg_env, decode->op[1].offset);
+    tcg_gen_ld_vec(s2, tcg_env, decode->op[2].offset);
+    tcg_gen_ld_vec(wk, tcg_env, ZMM_OFFSET(0));
+    /* A, B, C, D and E, F, G, H: the halves paired, each half reversed. */
+    tcg_gen_zip_vec(MO_64, abcd, s2, s1, true);
+    tcg_gen_perm_vec(MO_32, abcd, abcd, abcd, SHA256_REV64);
+    tcg_gen_zip_vec(MO_64, efgh, s2, s1, false);
+    tcg_gen_perm_vec(MO_32, efgh, efgh, efgh, SHA256_REV64);
+    tcg_gen_sha256h_vec(h, abcd, efgh, wk);
+    tcg_gen_sha256h2_vec(efgh, efgh, abcd, wk);
+    /* e1, e2, a1, a2 in elements 0 to 3: the upper halves, reversed. */
+    tcg_gen_zip_vec(MO_64, h, efgh, h, true);
+    tcg_gen_perm_vec(MO_32, h, h, h, SHA256_REV64);
+    tcg_gen_st_vec(h, tcg_env, decode->op[0].offset);
+    return true;
 }
 
 static void gen_SHA256RNDS2(DisasContext *s, X86DecodedInsn *decode)
 {
-    TCGv_i32 wk0 = tcg_temp_new_i32();
-    TCGv_i32 wk1 = tcg_temp_new_i32();
+    TCGv_i32 wk0;
+    TCGv_i32 wk1;
+
+    if (gen_sha256rnds2_inline(s, decode)) {
+        return;
+    }
+    wk0 = tcg_temp_new_i32();
+    wk1 = tcg_temp_new_i32();
 
     tcg_gen_ld_i32(wk0, tcg_env, ZMM_OFFSET(0) + offsetof(ZMMReg, ZMM_L(0)));
     tcg_gen_ld_i32(wk1, tcg_env, ZMM_OFFSET(0) + offsetof(ZMMReg, ZMM_L(1)));
