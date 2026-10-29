@@ -205,6 +205,13 @@ void tcg_gen_clzi_i32(TCGv_i32 ret, TCGv_i32 arg1, uint32_t arg2);
 void tcg_gen_ctzi_i32(TCGv_i32 ret, TCGv_i32 arg1, uint32_t arg2);
 void tcg_gen_clrsb_i32(TCGv_i32 ret, TCGv_i32 arg);
 void tcg_gen_ctpop_i32(TCGv_i32 a1, TCGv_i32 a2);
+/*
+ * The CRC-32C of the low 8 << size bits of val, continuing from the low
+ * 32 bits of acc (reflected, no inversion in or out), zero-extended; size
+ * is MO_8 to MO_32.  No fallback: check tcg_op_supported() first.
+ */
+void tcg_gen_crc32c_i32(TCGv_i32 ret, TCGv_i32 acc, TCGv_i32 val,
+                        MemOp size);
 void tcg_gen_rotl_i32(TCGv_i32 ret, TCGv_i32 arg1, TCGv_i32 arg2);
 void tcg_gen_rotli_i32(TCGv_i32 ret, TCGv_i32 arg1, int32_t arg2);
 void tcg_gen_rotr_i32(TCGv_i32 ret, TCGv_i32 arg1, TCGv_i32 arg2);
@@ -313,6 +320,9 @@ void tcg_gen_clzi_i64(TCGv_i64 ret, TCGv_i64 arg1, uint64_t arg2);
 void tcg_gen_ctzi_i64(TCGv_i64 ret, TCGv_i64 arg1, uint64_t arg2);
 void tcg_gen_clrsb_i64(TCGv_i64 ret, TCGv_i64 arg);
 void tcg_gen_ctpop_i64(TCGv_i64 a1, TCGv_i64 a2);
+/* As tcg_gen_crc32c_i32, with size MO_8 to MO_64. */
+void tcg_gen_crc32c_i64(TCGv_i64 ret, TCGv_i64 acc, TCGv_i64 val,
+                        MemOp size);
 void tcg_gen_rotl_i64(TCGv_i64 ret, TCGv_i64 arg1, TCGv_i64 arg2);
 void tcg_gen_rotli_i64(TCGv_i64 ret, TCGv_i64 arg1, int64_t arg2);
 void tcg_gen_rotr_i64(TCGv_i64 ret, TCGv_i64 arg1, TCGv_i64 arg2);
@@ -647,6 +657,33 @@ void tcg_gen_aese_vec(TCGv_vec r, TCGv_vec a, TCGv_vec k);
 void tcg_gen_aesd_vec(TCGv_vec r, TCGv_vec a, TCGv_vec k);
 void tcg_gen_aesmc_vec(TCGv_vec r, TCGv_vec a);
 void tcg_gen_aesimc_vec(TCGv_vec r, TCGv_vec a);
+/*
+ * SHA-256 building blocks on 128-bit vectors, as Arm's cryptographic
+ * extension defines them (SHA256H, SHA256H2, SHA256SU0, SHA256SU1), with
+ * the state in elements 0 to 3 (a, b, c, d and e, f, g, h).
+ *
+ * sha256h: four rounds; abcd and efgh are the state, wk the message words
+ * plus round constants for the four rounds, in order; r is the new a, b,
+ * c, d.  sha256h2: the same rounds, r the new e, f, g, h.
+ *
+ * sha256su0: r[i] = a[i] + sigma0(t[i]), t = a[1], a[2], a[3], b[0].
+ * sha256su1: r[i] = a[i] + t0[i] + sigma1(x[i]), t0 = b[1], b[2], b[3],
+ * c[0], and x = c[2], c[3], r[0], r[1].
+ *
+ * Only where the backend has them: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_sha256h_vec(TCGv_vec r, TCGv_vec abcd, TCGv_vec efgh,
+                         TCGv_vec wk);
+void tcg_gen_sha256h2_vec(TCGv_vec r, TCGv_vec efgh, TCGv_vec abcd,
+                          TCGv_vec wk);
+void tcg_gen_sha256su0_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_sha256su1_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c);
+/*
+ * The 128-bit carry-less product of a 64-bit element of a and one of b:
+ * a[sel & 1] and b[sel >> 1] (0 <= sel <= 3).  No fallback: check
+ * tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_clmul64_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, unsigned sel);
 /*
  * How narrow_vec fits a wide element into a narrow one: keep its low bits,
  * or saturate signed to signed, signed to unsigned, or unsigned to

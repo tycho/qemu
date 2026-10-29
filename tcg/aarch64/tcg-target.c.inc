@@ -589,6 +589,10 @@ typedef enum {
     Irrr_LSRV          = 0x1ac02400,
     Irrr_ASRV          = 0x1ac02800,
     Irrr_RORV          = 0x1ac02c00,
+    Irrr_CRC32CB       = 0x1ac05000,  /* FEAT_CRC32 */
+    Irrr_CRC32CH       = 0x1ac05400,
+    Irrr_CRC32CW       = 0x1ac05800,
+    Irrr_CRC32CX       = 0x1ac05c00,  /* with sf */
     Irrr_SMULH         = 0x9b407c00,
     Irrr_UMULH         = 0x9bc07c00,
     Irrr_UDIV          = 0x1ac00800,
@@ -699,6 +703,11 @@ typedef enum {
     Iqrrr_e_SHA1C     = 0x5e000000,  /* FEAT_SHA1 */
     Iqrrr_e_SHA1P     = 0x5e001000,  /* FEAT_SHA1 */
     Iqrrr_e_SHA1M     = 0x5e002000,  /* FEAT_SHA1 */
+    Iqrrr_e_SHA256H   = 0x5e004000,  /* FEAT_SHA256 */
+    Iqrrr_e_SHA256H2  = 0x5e005000,  /* FEAT_SHA256 */
+    Iqrrr_e_SHA256SU1 = 0x5e006000,  /* FEAT_SHA256 */
+    /* PMULL, PMULL2 (Q); the 64-bit form with size 3 is FEAT_PMULL. */
+    Iqrrr_e_PMULL     = 0x0e20e000,
     Iqrrr_e_SABD      = 0x0e207400,
     Iqrrr_e_UABD      = 0x2e207400,
     Iqrrr_e_URHADD    = 0x2e201400,
@@ -755,6 +764,8 @@ typedef enum {
     Iqrr_e_AESD       = 0x4e285800,  /* FEAT_AES */
     Iqrr_e_AESMC      = 0x4e286800,  /* FEAT_AES */
     Iqrr_e_AESIMC     = 0x4e287800,  /* FEAT_AES */
+    /* Cryptographic two-register SHA (Q bit and size are fixed). */
+    Iqrr_e_SHA256SU0  = 0x5e282800,  /* FEAT_SHA256 */
 
     /* AdvSIMD two-reg misc.  */
     Iqrr_e_REV64      = 0x0e200800,
@@ -4048,6 +4059,28 @@ static const TCGOutOpBinary outop_ctz = {
     .out_rri = tgen_ctzi,
 };
 
+static TCGConstraintSetIndex cset_crc32c(TCGType type, unsigned flags)
+{
+    return cpuinfo & CPUINFO_CRC32 ? C_O1_I2(r, r, r) : C_NotImplemented;
+}
+
+static void tgen_crc32c(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                        TCGReg a2, MemOp size)
+{
+    static const AArch64Insn insn[4] = {
+        Irrr_CRC32CB, Irrr_CRC32CH, Irrr_CRC32CW, Irrr_CRC32CX
+    };
+
+    /* Each writes a W register: the result is zero-extended. */
+    tcg_out_insn_rrr(s, insn[size], size == MO_64, a0, a1, a2);
+}
+
+static const TCGOutOpCrc32c outop_crc32c = {
+    .base.static_constraint = C_Dynamic,
+    .base.dynamic_constraint = cset_crc32c,
+    .out_rrr = tgen_crc32c,
+};
+
 static void tgen_divs(TCGContext *s, TCGType type,
                       TCGReg a0, TCGReg a1, TCGReg a2)
 {
@@ -5356,6 +5389,45 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_aesimc_vec:
         tcg_out_insn_qrr_e(s, Iqrr_e_AESIMC, 0, 0, a0, a1);
         break;
+    case INDEX_op_sha256h_vec:
+        /* The state is both the first input and the output. */
+        tcg_out_insn_qrrr_e(s, Iqrrr_e_SHA256H, 0, 0, a0, a2, args[3]);
+        break;
+    case INDEX_op_sha256h2_vec:
+        tcg_out_insn_qrrr_e(s, Iqrrr_e_SHA256H2, 0, 0, a0, a2, args[3]);
+        break;
+    case INDEX_op_sha256su0_vec:
+        tcg_out_insn_qrr_e(s, Iqrr_e_SHA256SU0, 0, 0, a0, a2);
+        break;
+    case INDEX_op_sha256su1_vec:
+        tcg_out_insn_qrrr_e(s, Iqrrr_e_SHA256SU1, 0, 0, a0, a2, args[3]);
+        break;
+    case INDEX_op_clmul64_vec:
+        /*
+         * PMULL multiplies the low elements, PMULL2 the high ones; for a
+         * high element with a low one, copy the high one down first.
+         */
+        switch (args[3]) {
+        case 0:
+            tcg_out_insn_qrrr_e(s, Iqrrr_e_PMULL, 0, MO_64, a0, a1, a2);
+            break;
+        case 3:
+            tcg_out_insn_qrrr_e(s, Iqrrr_e_PMULL, 1, MO_64, a0, a1, a2);
+            break;
+        case 1:
+            tcg_out_insn(s, simd_copy, DUP, 1, TCG_VEC_TMP0, a1,
+                         (1 << 4) | (1 << 3), 0);
+            tcg_out_insn_qrrr_e(s, Iqrrr_e_PMULL, 0, MO_64, a0,
+                                TCG_VEC_TMP0, a2);
+            break;
+        default:
+            tcg_out_insn(s, simd_copy, DUP, 1, TCG_VEC_TMP0, a2,
+                         (1 << 4) | (1 << 3), 0);
+            tcg_out_insn_qrrr_e(s, Iqrrr_e_PMULL, 0, MO_64, a0, a1,
+                                TCG_VEC_TMP0);
+            break;
+        }
+        break;
     case INDEX_op_narrow_vec:
         tcg_out_narrow_vec(s, vece, a0, a1, a2, args[3]);
         break;
@@ -5973,6 +6045,15 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_aesmc_vec:
     case INDEX_op_aesimc_vec:
         return type == TCG_TYPE_V128 && (cpuinfo & CPUINFO_AES);
+    case INDEX_op_sha256h_vec:
+    case INDEX_op_sha256h2_vec:
+    case INDEX_op_sha256su0_vec:
+    case INDEX_op_sha256su1_vec:
+        return type == TCG_TYPE_V128 && vece == MO_32 &&
+               (cpuinfo & CPUINFO_SHA2);
+    case INDEX_op_clmul64_vec:
+        return type == TCG_TYPE_V128 && vece == MO_64 &&
+               (cpuinfo & CPUINFO_PMULL);
 
     case INDEX_op_fadd_vec:
     case INDEX_op_fsub_vec:
@@ -6211,10 +6292,16 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_sha1c_vec:
     case INDEX_op_sha1p_vec:
     case INDEX_op_sha1m_vec:
+    case INDEX_op_sha256h_vec:
+    case INDEX_op_sha256h2_vec:
+    case INDEX_op_sha256su1_vec:
         return C_O1_I3(w, 0, w, w);
     case INDEX_op_aese_vec:
     case INDEX_op_aesd_vec:
+    case INDEX_op_sha256su0_vec:
         return C_O1_I2(w, 0, w);
+    case INDEX_op_clmul64_vec:
+        return C_O1_I2(w, w, w);
     case INDEX_op_aesmc_vec:
     case INDEX_op_aesimc_vec:
         return C_O1_I1(w, w);

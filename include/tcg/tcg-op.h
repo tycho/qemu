@@ -132,6 +132,7 @@ typedef TCGv_i64 TCGv;
 #define tcg_gen_ctzi_tl tcg_gen_ctzi_i64
 #define tcg_gen_clrsb_tl tcg_gen_clrsb_i64
 #define tcg_gen_ctpop_tl tcg_gen_ctpop_i64
+#define tcg_gen_crc32c_tl tcg_gen_crc32c_i64
 #define tcg_gen_rotl_tl tcg_gen_rotl_i64
 #define tcg_gen_rotli_tl tcg_gen_rotli_i64
 #define tcg_gen_rotr_tl tcg_gen_rotr_i64
@@ -255,6 +256,7 @@ typedef TCGv_i64 TCGv;
 #define tcg_gen_ctzi_tl tcg_gen_ctzi_i32
 #define tcg_gen_clrsb_tl tcg_gen_clrsb_i32
 #define tcg_gen_ctpop_tl tcg_gen_ctpop_i32
+#define tcg_gen_crc32c_tl tcg_gen_crc32c_i32
 #define tcg_gen_rotl_tl tcg_gen_rotl_i32
 #define tcg_gen_rotli_tl tcg_gen_rotli_i32
 #define tcg_gen_rotr_tl tcg_gen_rotr_i32
