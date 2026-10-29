@@ -3314,8 +3314,17 @@ static void gen_CPUID(DisasContext *s, X86DecodedInsn *decode)
 static void gen_CRC32(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[2].ot;
-    TCGv_i32 tmp = tcg_temp_new_i32();
+    TCGv_i32 tmp;
 
+    /*
+     * x-crypto: CRC32 is the CRC-32C of the source's size, the operand
+     * already loaded (and a high-byte register extracted) into T1.
+     */
+    if (tcg_crypto && tcg_op_supported(INDEX_op_crc32c, TCG_TYPE_TL, 0)) {
+        tcg_gen_crc32c_tl(s->T0, s->T0, s->T1, ot);
+        return;
+    }
+    tmp = tcg_temp_new_i32();
     tcg_gen_trunc_tl_i32(tmp, s->T0);
     gen_helper_crc32(s->T0, tmp, s->T1, tcg_constant_i32(8 << ot));
 }
