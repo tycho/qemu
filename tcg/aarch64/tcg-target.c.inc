@@ -545,6 +545,10 @@ typedef enum {
     Irrr_LSRV          = 0x1ac02400,
     Irrr_ASRV          = 0x1ac02800,
     Irrr_RORV          = 0x1ac02c00,
+    Irrr_CRC32CB       = 0x1ac05000,  /* FEAT_CRC32 */
+    Irrr_CRC32CH       = 0x1ac05400,
+    Irrr_CRC32CW       = 0x1ac05800,
+    Irrr_CRC32CX       = 0x1ac05c00,  /* with sf */
     Irrr_SMULH         = 0x9b407c00,
     Irrr_UMULH         = 0x9bc07c00,
     Irrr_UDIV          = 0x1ac00800,
@@ -2409,8 +2413,26 @@ static const TCGOutOpBinary outop_ctz = {
     .out_rri = tgen_ctzi,
 };
 
+static TCGConstraintSetIndex cset_crc32c(TCGType type, unsigned flags)
+{
+    return cpuinfo & CPUINFO_CRC32 ? C_O1_I2(r, r, r) : C_NotImplemented;
+}
+
+static void tgen_crc32c(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                        TCGReg a2, MemOp size)
+{
+    static const AArch64Insn insn[4] = {
+        Irrr_CRC32CB, Irrr_CRC32CH, Irrr_CRC32CW, Irrr_CRC32CX
+    };
+
+    /* Each writes a W register: the result is zero-extended. */
+    tcg_out_insn_rrr(s, insn[size], size == MO_64, a0, a1, a2);
+}
+
 static const TCGOutOpCrc32c outop_crc32c = {
-    .base.static_constraint = C_NotImplemented,
+    .base.static_constraint = C_Dynamic,
+    .base.dynamic_constraint = cset_crc32c,
+    .out_rrr = tgen_crc32c,
 };
 
 static void tgen_divs(TCGContext *s, TCGType type,
