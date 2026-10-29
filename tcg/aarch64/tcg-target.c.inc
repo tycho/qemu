@@ -2305,6 +2305,21 @@ static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
     return true;
 }
 
+/* A folded access's slow path: the helper's address argument plus addr_ofs. */
+static void tcg_out_ldst_addr_ofs(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    TCGReg r = tcg_target_call_iarg_regs[1];
+    AArch64Insn insn = lb->addr_ofs < 0 ? Iaddsub_imm_SUBI : Iaddsub_imm_ADDI;
+    uint64_t v = lb->addr_ofs < 0 ? -lb->addr_ofs : lb->addr_ofs;
+
+    if (v & 0xfff000) {
+        tcg_out_insn_addsub_imm(s, insn, 1, r, r, v & 0xfff000);
+    }
+    if (v & 0xfff) {
+        tcg_out_insn_addsub_imm(s, insn, 1, r, r, v & 0xfff);
+    }
+}
+
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     MemOp opc = get_memop(lb->oi);
@@ -2319,6 +2334,7 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     tcg_out_ldst_writeback(s, lb);
     tcg_out_ldst_save(s, lb->save_regs, false, 0);
     tcg_out_ld_helper_args(s, lb, &ldst_helper_param);
+    tcg_out_ldst_addr_ofs(s, lb);
     tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
     tcg_out_pinned_clobbered(s, false, 0);
     if (lb->type == TCG_TYPE_V128) {
@@ -2361,6 +2377,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     } else {
         tcg_out_st_helper_args(s, lb, &ldst_helper_param);
     }
+    tcg_out_ldst_addr_ofs(s, lb);
     tcg_out_call_int(s, qemu_st_helpers[opc & MO_SIZE]);
     tcg_out_pinned_clobbered(s, false, 0);
     tcg_out_ldst_save(s, lb->save_regs, true, 0);
@@ -3151,6 +3168,46 @@ static void tcg_out_qemu_ldst_vec(TCGContext *s, TCGReg data,
     if (ldst) {
         ldst->type = TCG_TYPE_V128;
         ldst->datalo_reg = data;
+        ldst->raddr = tcg_splitwx_to_rx(s->code_ptr);
+    }
+}
+
+/*
+ * x-lean: a 128-bit guest access at base + index or base + an offset
+ * (qemu_ld_vec_x, qemu_st_vec_x, tcg_ldst_x_arg), where the guest address
+ * is the host address (tcg_target_ldst_x_ok).  An offset is a multiple of
+ * the access's alignment, whose test then needs only the base; the slow
+ * path adds the offset (addr_ofs).  An ordered access is LDAPUR or STLUR
+ * (FEAT_LRCPC3), with a 9-bit offset.
+ */
+static void tcg_out_qemu_ldst_vec_x(TCGContext *s, TCGReg data, TCGReg base,
+                                    TCGReg index, TCGArg arg, bool is_ld)
+{
+    MemOpIdx oi = tcg_ldst_x_oi(arg);
+    unsigned shift = tcg_ldst_x_shift(arg);
+    int ofs = tcg_ldst_x_ofs(arg);
+    AArch64Insn insn = is_ld ? Ildst_imm_LDRVQ : Ildst_imm_STRVQ;
+    TCGLabelQemuLdst *ldst;
+    HostAddress h;
+
+    ldst = prepare_host_addr(s, &h, base, oi, is_ld, false);
+    tcg_debug_assert(h.base == base && h.index == TCG_REG_XZR);
+    if (get_memop(oi) & MO_ACQ_REL) {
+        tcg_debug_assert(have_lrcpc3 && shift != TCG_LDST_X_SCALED);
+        tcg_out32(s, (is_ld ? 0x1dc00800 : 0x1d800800)
+                  | (ofs & 0x1ff) << 12 | base << 5 | (data & 31));
+    } else if (shift == TCG_LDST_X_SCALED) {
+        tcg_out_insn_ldst_uimm(s, insn, data, base, ofs);
+        ofs <<= MO_128;
+    } else if (index != TCG_REG_XZR && !ofs) {
+        tcg_out_insn_ldst_reg(s, insn, data, base, TCG_TYPE_I64, index);
+    } else {
+        tcg_out_insn_ldst_imm(s, insn, data, base, ofs);
+    }
+    if (ldst) {
+        ldst->type = TCG_TYPE_V128;
+        ldst->datalo_reg = data;
+        ldst->addr_ofs = ofs;
         ldst->raddr = tcg_splitwx_to_rx(s->code_ptr);
     }
 }
@@ -5454,6 +5511,11 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_qemu_st_vec:
         tcg_out_qemu_ldst_vec(s, a0, a1, args[2], false);
         break;
+    case INDEX_op_qemu_ld_vec_x:
+    case INDEX_op_qemu_st_vec_x:
+        tcg_out_qemu_ldst_vec_x(s, a0, a1, const_args[2] ? TCG_REG_XZR : a2,
+                                args[3], opc == INDEX_op_qemu_ld_vec_x);
+        break;
     case INDEX_op_perm_vec:
         tcg_out_perm_vec(s, vece, a0, a1, a2, args[3]);
         break;
@@ -6276,6 +6338,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I1(w, r);
     case INDEX_op_qemu_st_vec:
         return C_O0_I2(w, r);
+    case INDEX_op_qemu_ld_vec_x:
+        return C_O1_I2(w, r, rz);
+    case INDEX_op_qemu_st_vec_x:
+        return C_O0_I3(w, r, rz);
     case INDEX_op_perm_vec:
     case INDEX_op_tbl_vec:
     case INDEX_op_zip_vec:
