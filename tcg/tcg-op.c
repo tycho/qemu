@@ -529,6 +529,20 @@ void tcg_gen_clzi(TCGType type, TCGTemp *dst, TCGTemp *src1, int64_t src2)
     tcg_gen_clz(type, dst, src1, tcg_constant_internal(type, src2));
 }
 
+/*
+ * The CRC-32C of the low 8 << size bits of val, continuing from the low
+ * 32 bits of acc (reflected, no inversion in or out), zero-extended; size
+ * is MO_8 to MO_32, or to MO_64 for TCG_TYPE_I64.  No fallback: check
+ * tcg_op_supported() first.
+ */
+void tcg_gen_crc32c(TCGType type, TCGTemp *dst, TCGTemp *acc,
+                    TCGTemp *val, MemOp size)
+{
+    tcg_debug_assert(size <= (type == TCG_TYPE_I32 ? MO_32 : MO_64));
+    tcg_debug_assert(tcg_op_supported(INDEX_op_crc32c, type, 0));
+    tcg_gen_op_ttti(INDEX_op_crc32c, type, dst, acc, val, size);
+}
+
 void tcg_gen_ctpop(TCGType type, TCGTemp *dst, TCGTemp *src)
 {
     if (tcg_op_supported(INDEX_op_ctpop, type, 0)) {
