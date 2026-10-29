@@ -787,6 +787,14 @@ void tcg_gen_clrsb_i32(TCGv_i32 ret, TCGv_i32 arg)
     }
 }
 
+void tcg_gen_crc32c_i32(TCGv_i32 ret, TCGv_i32 acc, TCGv_i32 val,
+                        MemOp size)
+{
+    tcg_debug_assert(size <= MO_32);
+    tcg_debug_assert(tcg_op_supported(INDEX_op_crc32c, TCG_TYPE_I32, 0));
+    tcg_gen_op4i_i32(INDEX_op_crc32c, ret, acc, val, size);
+}
+
 void tcg_gen_ctpop_i32(TCGv_i32 ret, TCGv_i32 arg1)
 {
     if (tcg_op_supported(INDEX_op_ctpop, TCG_TYPE_I32, 0)) {
@@ -2087,6 +2095,14 @@ void tcg_gen_clrsb_i64(TCGv_i64 ret, TCGv_i64 arg)
     } else {
         gen_helper_clrsb_i64(ret, arg);
     }
+}
+
+void tcg_gen_crc32c_i64(TCGv_i64 ret, TCGv_i64 acc, TCGv_i64 val,
+                        MemOp size)
+{
+    tcg_debug_assert(size <= MO_64);
+    tcg_debug_assert(tcg_op_supported(INDEX_op_crc32c, TCG_TYPE_I64, 0));
+    tcg_gen_op4i_i64(INDEX_op_crc32c, ret, acc, val, size);
 }
 
 void tcg_gen_ctpop_i64(TCGv_i64 ret, TCGv_i64 arg1)
