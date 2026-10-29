@@ -1351,7 +1351,7 @@ BINARY_IMM_SSE(VDPPS,      dpps)
 #define gen_helper_dppd_ymm NULL
 BINARY_IMM_SSE(VDPPD,      dppd)
 BINARY_IMM_SSE(VMPSADBW,   mpsadbw)
-BINARY_IMM_SSE(PCLMULQDQ,  pclmulqdq)
+BINARY_IMM_SSE(PCLMULQDQ_helper, pclmulqdq)
 
 
 #define UNARY_INT_GVEC(uname, func, ...)                                           \
@@ -1854,6 +1854,29 @@ static void gen_VAESENCLAST(DisasContext *s, X86DecodedInsn *decode)
 {
     if (!gen_aes_round(s, decode, false, false)) {
         gen_VAESENCLAST_helper(s, decode);
+    }
+}
+
+/*
+ * x-crypto: PCLMULQDQ per 128-bit lane with TCG's carry-less multiply,
+ * imm[0] choosing the first source's quadword and imm[4] the second's.
+ */
+static void gen_PCLMULQDQ(DisasContext *s, X86DecodedInsn *decode)
+{
+    unsigned sel = (decode->immediate & 1) | ((decode->immediate >> 3) & 2);
+
+    if (!crypto_can(INDEX_op_clmul64_vec, MO_64)) {
+        gen_PCLMULQDQ_helper(s, decode);
+        return;
+    }
+    for (int lane = 0; lane <= s->vex_l; lane++) {
+        TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_ld_vec(a, tcg_env, decode->op[1].offset + lane * 16);
+        tcg_gen_ld_vec(b, tcg_env, decode->op[2].offset + lane * 16);
+        tcg_gen_clmul64_vec(a, a, b, sel);
+        tcg_gen_st_vec(a, tcg_env, decode->op[0].offset + lane * 16);
     }
 }
 
