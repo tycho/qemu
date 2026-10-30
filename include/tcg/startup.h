@@ -54,6 +54,14 @@ extern unsigned tcg_units;
  */
 extern bool tcg_region_entry;
 
+/*
+ * A conditional branch to a unit stub (region_stub_pass) whose emitted
+ * code is only its branch to a block of the unit goes to that block
+ * directly, on backends that support it (tcg_stub_thread_supported).
+ */
+extern bool tcg_stub_thread;
+bool tcg_stub_thread_supported(void);
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size

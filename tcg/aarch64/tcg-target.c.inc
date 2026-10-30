@@ -128,6 +128,9 @@ static bool reloc_pc14(tcg_insn_unit *src_rw, const tcg_insn_unit *target)
     return false;
 }
 
+/* patch_reloc checks the branch's reach before it changes the insn. */
+#define TCG_TARGET_HAS_STUB_THREAD
+
 static bool patch_reloc(tcg_insn_unit *code_ptr, int type,
                         intptr_t value, intptr_t addend)
 {
