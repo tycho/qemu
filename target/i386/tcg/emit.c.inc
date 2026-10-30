@@ -4475,6 +4475,23 @@ static inline void gen_pinsr(DisasContext *s, X86DecodedInsn *decode, MemOp ot)
     int mask = (vec_len >> ot) - 1;
     int val = decode->immediate & mask;
 
+    /*
+     * With tcg_vint, the element goes into the vector in a host register,
+     * not through a store into CPU state, which a following 128-bit load
+     * of the register can't forward from.  insert_vec has no generic
+     * expansion: the backend must emit it itself.
+     */
+    if (decode->op[0].unit == X86_OP_SSE && tcg_vint &&
+        tcg_can_emit_vec_op(INDEX_op_insert_vec, TCG_TYPE_V128, ot) > 0) {
+        TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
+        TCGv_i64 e = tcg_temp_new_i64();
+
+        tcg_gen_extu_tl_i64(e, s->T1);
+        tcg_gen_ld_vec(v, tcg_env, decode->op[1].offset);
+        tcg_gen_insert_vec_i64(ot, v, v, e, val);
+        tcg_gen_st_vec(v, tcg_env, decode->op[0].offset);
+        return;
+    }
     if (vperm_insert_ok(decode, ot)) {
         TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
 
