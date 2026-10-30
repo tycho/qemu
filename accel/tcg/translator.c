@@ -17,6 +17,11 @@
 #include "exec/translator.h"
 #ifdef CONFIG_USER_ONLY
 #include "gdbstub/user.h"
+#ifdef CONFIG_USER_ONLY
+#include "user/guest-host.h"
+#include "user/page-protection.h"
+#include "exec/page-protection.h"
+#endif
 #endif
 #include "exec/plugin-gen.h"
 #include "tcg/tcg-op-common.h"
@@ -153,6 +158,44 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
 
     /* Check for the dest on the same page as the start of the TB.  */
     return use_cross_page_goto_tb() || translator_is_same_page(db, dest);
+}
+
+bool translator_ptr_guard(DisasContextBase *db, vaddr pc, vaddr addr,
+                          MemOp mop, uint64_t *val)
+{
+#if defined(CONFIG_USER_ONLY) && defined(CONFIG_LINUX)
+    unsigned size = memop_size(mop);
+    uint8_t buf[8];
+    struct iovec local = { .iov_base = buf, .iov_len = size };
+    struct iovec remote = { .iov_len = size };
+
+    if (!tcg_ijguard || (tb_cflags(db->tb) & CF_NO_GOTO_TB) ||
+        !ptr_guard_allowed(pc) ||
+        (mop & MO_BSWAP) != MO_LE || (size != 4 && size != 8) ||
+        !page_check_range(addr, size, PAGE_READ)) {
+        return false;
+    }
+    /*
+     * A readable mapping can still fault (a file truncated under it, for
+     * one): read through the kernel, which fails instead of raising a
+     * signal.  The guest may not reach this load at all, so a failure
+     * just means no guard.
+     */
+    remote.iov_base = g2h_untagged_vaddr(addr);
+    if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != size) {
+        return false;
+    }
+    *val = size == 4 ? ldl_le_p(buf) : ldq_le_p(buf);
+    return translator_use_goto_tb(db, *val);
+#else
+    return false;
+#endif
+}
+
+void translator_gen_ptr_respec(DisasContextBase *db, vaddr pc)
+{
+    gen_helper_ptr_respec(tcg_env, tcg_constant_ptr(db->tb),
+                          tcg_constant_i64(pc));
 }
 
 bool translator_use_inline_lookup(DisasContextBase *db)

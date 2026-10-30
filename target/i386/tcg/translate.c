@@ -127,6 +127,8 @@ typedef struct DisasContext {
      */
     bool rs_call;
     bool rs_ret;
+    /* The CALL's return lands through the lookup (gen_JMP_m's guard). */
+    bool rs_land_unlinked;
     target_ulong rs_next;
     TCGv_i64 rs_key;    /* tcg_retstack_env: the CALL's key, at run time */
     bool cc_op_dirty;
@@ -275,7 +277,8 @@ STUB_HELPER(vmsave, TCGv_env env, TCGv_i32 aflag)
 STUB_HELPER(write_crN, TCGv_env env, TCGv_i32 reg, TCGv val)
 #endif
 
-static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num);
+static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
+                        int tb_num);
 static void gen_jmp_rel_csize(DisasContext *s, int diff, int tb_num);
 static void gen_exception_gpf(DisasContext *s);
 
@@ -2202,6 +2205,9 @@ static void gen_ret_landing(DisasContext *s, TCGLabel *land, int slot)
 /* A goto_tb slot for the return landing other than @used, or -1. */
 static int ret_landing_slot(DisasContext *s, int used)
 {
+    if (s->rs_land_unlinked) {
+        return -1;
+    }
     return translator_use_goto_tb(&s->base, rs_next_pc(s))
            ? (used < 0 ? 0 : used ^ 1) : -1;
 }
@@ -2304,12 +2310,14 @@ gen_eob(DisasContext *s, int mode)
         gen_ret_landing(s, land, ret_landing_slot(s, -1));
     }
     s->rs_call = s->rs_ret = false;
+    s->rs_land_unlinked = false;
 
     s->base.is_jmp = DISAS_NORETURN;
 }
 
 /* Jump to eip+diff, truncating the result to OT. */
-static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
+static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
+                        int tb_num)
 {
     bool use_goto_tb = s->jmp_opt;
     target_ulong mask = -1;
@@ -3819,6 +3827,7 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->cpuid_xsave_features = env->features[FEAT_XSAVE];
     dc->jmp_direct = false;
     dc->rs_call = dc->rs_ret = false;
+    dc->rs_land_unlinked = false;
     dc->rs_key = NULL;
     dc->jmp_opt = !((cflags & CF_NO_GOTO_TB) ||
                     (flags & (HF_RF_MASK | HF_TF_MASK | HF_INHIBIT_IRQ_MASK)));
