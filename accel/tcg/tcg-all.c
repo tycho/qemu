@@ -277,6 +277,20 @@ static void tcg_set_region_entry(Object *obj, bool value, Error **errp)
     tcg_region_entry = value;
 }
 
+static bool tcg_get_stub_thread(Object *obj, Error **errp)
+{
+    return tcg_stub_thread;
+}
+
+static void tcg_set_stub_thread(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_stub_thread_supported()) {
+        error_setg(errp, "x-stubthread: not supported by this TCG backend");
+        return;
+    }
+    tcg_stub_thread = value;
+}
+
 /* Units of up to this many blocks with x-superblock=units. */
 #define TCG_UNIT_BLOCKS 3
 
@@ -369,6 +383,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "In a multi-block region (x-superblock), translate a block that "
         "every jump in enters with the same guest condition-code state "
         "for that state");
+
+    object_class_property_add_bool(oc, "x-stubthread",
+                                   tcg_get_stub_thread,
+                                   tcg_set_stub_thread);
+    object_class_property_set_description(oc, "x-stubthread",
+        "In a unit (x-superblock), a conditional jump between its blocks "
+        "goes straight to the other block when no state has to be put in "
+        "place on the way");
 }
 
 static const TypeInfo tcg_accel_type = {

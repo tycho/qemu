@@ -121,6 +121,7 @@ struct TCGLabel {
     void *snap;                 /* the allocator's state at the branch */
     void *loopregs;             /* XLBL_LOOP: the globals kept in registers */
     int nb_loopregs;
+    bool stub;                  /* a unit stub moved by region_stub_pass */
 };
 
 typedef struct TCGPool {

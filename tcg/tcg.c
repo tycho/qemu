@@ -241,6 +241,7 @@ bool tcg_region;
 unsigned tcg_superblock;
 unsigned tcg_units;
 bool tcg_region_entry;
+bool tcg_stub_thread;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
@@ -3847,6 +3848,44 @@ static bool op_falls_through(const TCGOp *op)
     }
 }
 
+bool tcg_stub_thread_supported(void)
+{
+#ifdef TCG_TARGET_HAS_STUB_THREAD
+    return true;
+#else
+    return false;
+#endif
+}
+
+/*
+ * tcg_stub_thread: unit stub @l's br to @dest, after the allocator has put
+ * that path's state in place.  If that emitted nothing, the state at the
+ * stub's one conditional branch is already the one @dest expects: point
+ * that branch at @dest, so that its taken side runs one branch instead of
+ * two.  The stub's code stays, unreached; if @dest is out of the
+ * branch's reach, nothing changes.
+ */
+static void stub_thread(TCGContext *s, const TCGOp *set, TCGLabel *l,
+                        TCGLabel *dest)
+{
+    const TCGOp *before = QTAILQ_PREV(set, link);
+    TCGLabelUse *u = QSIMPLEQ_FIRST(&l->branches);
+    TCGRelocation *r = QSIMPLEQ_FIRST(&l->relocs);
+
+    if (!before || op_falls_through(before) ||
+        l->u.value_ptr != tcg_splitwx_to_rx(s->code_ptr) ||
+        !dest->has_value) {
+        return;
+    }
+    if (!u || QSIMPLEQ_NEXT(u, next) || u->op->opc != INDEX_op_brcond ||
+        !r || QSIMPLEQ_NEXT(r, next)) {
+        return;
+    }
+    if (patch_reloc(r->ptr, r->type, dest->u.value, r->addend)) {
+        QSIMPLEQ_REMOVE_HEAD(&l->relocs, next);
+    }
+}
+
 /*
  * Units (tcg_units): a conditional jump between two blocks of a unit is a
  * brcond to a label holding a br to the taken block's region label, then
@@ -3877,6 +3916,7 @@ static void region_stub_pass(TCGContext *s)
                 QTAILQ_REMOVE(&s->ops, br, link);
                 QTAILQ_INSERT_TAIL(&s->ops, op, link);
                 QTAILQ_INSERT_TAIL(&s->ops, br, link);
+                l->stub = true;
             }
         }
         if (end) {
@@ -7986,6 +8026,14 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
                     l->snap = xblk_snap(s);
                 } else if (x && l->xkind == XLBL_LOOP && l->nb_loopregs) {
                     xblk_loop_back(s, l);
+                }
+                if (tcg_stub_thread && l->region) {
+                    const TCGOp *prev = QTAILQ_PREV(op, link);
+
+                    if (prev && prev->opc == INDEX_op_set_label &&
+                        arg_label(prev->args[0])->stub) {
+                        stub_thread(s, prev, arg_label(prev->args[0]), l);
+                    }
                 }
                 tcg_out_br(s, l);
                 if (s->xblk) {
