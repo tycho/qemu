@@ -275,7 +275,8 @@ STUB_HELPER(vmsave, TCGv_env env, TCGv_i32 aflag)
 STUB_HELPER(write_crN, TCGv_env env, TCGv_i32 reg, TCGv val)
 #endif
 
-static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num);
+static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
+                        int tb_num);
 static void gen_jmp_rel_csize(DisasContext *s, int diff, int tb_num);
 static void gen_exception_gpf(DisasContext *s);
 
@@ -2309,7 +2310,8 @@ gen_eob(DisasContext *s, int mode)
 }
 
 /* Jump to eip+diff, truncating the result to OT. */
-static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
+static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
+                        int tb_num)
 {
     bool use_goto_tb = s->jmp_opt;
     target_ulong mask = -1;

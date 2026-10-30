@@ -241,6 +241,7 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
 }
 
 bool tcg_ijmp_inline;
+bool tcg_ijguard;
 TCGXPage tcg_xpage;
 bool tcg_jcgen;
 bool tcg_jc_ctx;
@@ -306,6 +307,22 @@ static void tcg_set_tblookup(Object *obj, bool value, Error **errp)
     tcg_tb_flags_canon = value;
     tcg_retstack = value;
     tcg_goto_tb_cold = value;
+}
+
+static bool tcg_get_ijguard(Object *obj, Error **errp)
+{
+    return tcg_ijguard;
+}
+
+static void tcg_set_ijguard(Object *obj, bool value, Error **errp)
+{
+#ifndef CONFIG_USER_ONLY
+    if (value) {
+        error_setg(errp, "x-ijguard: user mode only");
+        return;
+    }
+#endif
+    tcg_ijguard = value;
 }
 
 static bool tcg_get_sysret(Object *obj, Error **errp)
@@ -396,6 +413,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "indirect jumps (in a short helper call at direct jumps to "
         "another page), and pack TB structs next to their code (x86 "
         "guests)");
+
+    object_class_property_add_bool(oc, "x-ijguard", tcg_get_ijguard,
+                                   tcg_set_ijguard);
+    object_class_property_set_description(oc, "x-ijguard",
+        "In user mode, leave a jump or call through a pointer at a "
+        "constant address directly to the pointer's value at translation "
+        "time when it still holds it, else through the usual lookup and "
+        "translate the site again");
 
     object_class_property_add_bool(oc, "x-sysret", tcg_get_sysret,
                                    tcg_set_sysret);
