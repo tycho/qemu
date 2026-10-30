@@ -26,6 +26,8 @@ DEF_HELPER_FLAGS_4(lookup_tb_ptr_jc, TCG_CALL_NO_WG_SE,
 DEF_HELPER_FLAGS_4(lookup_tb_ptr_jcp, TCG_CALL_NO_RWG_SE,
                    cptr, env, i64, i64, i32)
 
+DEF_HELPER_FLAGS_3(ptr_respec, TCG_CALL_NO_RWG, void, env, ptr, i64)
+
 DEF_HELPER_FLAGS_1(exit_atomic, TCG_CALL_NO_WG, noreturn, env)
 
 #ifndef IN_HELPER_PROTO

@@ -38,6 +38,18 @@ typedef enum {
     TCG_XPAGE_STUB,
 } TCGXPage;
 extern TCGXPage tcg_xpage;
+
+/*
+ * tcg_ijguard: in user mode, guard jumps and calls through a pointer at a
+ * constant address with the pointer's value at translation time
+ * (translator_ptr_guard).
+ */
+extern bool tcg_ijguard;
+
+#ifdef CONFIG_USER_ONLY
+bool ptr_guard_allowed(vaddr pc);
+void ptr_guard_respec(TranslationBlock *tb, vaddr pc);
+#endif
 void tcg_jc_layout_init(void);
 
 /*

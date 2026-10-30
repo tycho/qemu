@@ -491,6 +491,16 @@ const void *HELPER(lookup_tb_ptr_jc)(CPUArchState *env, uint64_t pc,
     return ptr ? ptr : HELPER(lookup_tb_ptr)(env);
 }
 
+/* The miss path of a guard from translator_ptr_guard() in @tb. */
+void HELPER(ptr_respec)(CPUArchState *env, void *tb, uint64_t pc)
+{
+#ifdef CONFIG_USER_ONLY
+    ptr_guard_respec(tb, pc);
+#else
+    g_assert_not_reached();
+#endif
+}
+
 /* x-xpage=stub: the jump cache's layout for the backend's probe. */
 void tcg_jc_layout_init(void)
 {
