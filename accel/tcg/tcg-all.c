@@ -124,6 +124,9 @@ static void xtcg_fork_defaults(Object *obj)
 #endif
         { "x-regionflags", "on" },
         { "x-tblookup", "on" },
+#ifdef CONFIG_USER_ONLY
+        { "x-ijguard", "on" },
+#endif
         { "x-sysret", "on" },
         { "x-xpage", "stub" },
         { "x-tblayout", "split" },
