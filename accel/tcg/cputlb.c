@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xtcg-stats.h"
 #include "qemu/main-loop.h"
 #include "qemu/target-info.h"
 #include "accel/tcg/cpu-loop.h"
@@ -425,8 +426,13 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
 {
     CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
     CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
+    size_t old_size = tlb_n_entries(fast);
 
+    xtcg_stat_inc(XS_TLB_FLUSH_IDX);
     tlb_mmu_resize_locked(desc, fast, now);
+    if (tlb_n_entries(fast) != old_size) {
+        xtcg_stat_inc(XS_TLB_RESIZE);
+    }
     tlb_mmu_flush_locked(desc, fast);
     /* A growth asked for before the flush is stale: the flush resized. */
     desc->grow_pending = false;
@@ -1611,6 +1617,10 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
     const TCGCPUOps *ops = cpu->cc->tcg_ops;
     CPUTLBEntryFull full;
 
+    xtcg_stat_inc(XS_TLB_FILL);
+    xtcg_hist_inc(XH_TLB_FILL_BITS,
+                  ctz64(tlb_n_entries(cpu_tlb_fast(cpu, mmu_idx))));
+    xtcg_hist_inc(XH_TLB_FILL_MMUIDX, mmu_idx);
     if (ops->tlb_fill_align) {
         if (ops->tlb_fill_align(cpu, &full, addr, type, mmu_idx,
                                 memop, size, probe, ra)) {
@@ -1707,6 +1717,7 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
             qemu_spin_unlock(&cpu->neg.tlb.c.lock);
             tlb_ng_note(&cpu->neg.tlb.d[mmu_idx], cpu_tlb_fast(cpu, mmu_idx),
                         index, f1->global);
+            xtcg_stat_inc(XS_TLB_VICTIM_HIT);
             return true;
         }
     }
@@ -1719,8 +1730,10 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
     ram_addr_t ram_addr = mem_vaddr + full->xlat_offset;
 
     trace_memory_notdirty_write_access(mem_vaddr, ram_addr, size);
+    xtcg_stat_inc(XS_NOTDIRTY_WRITE);
 
     if (!physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
+        xtcg_stat_inc(XS_NOTDIRTY_CODE);
         tb_invalidate_phys_range_fast(cpu, ram_addr, size, retaddr);
     }
 

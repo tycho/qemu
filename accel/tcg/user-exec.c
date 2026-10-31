@@ -17,6 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include "qemu/xtcg-stats.h"
 #include "accel/tcg/cpu-ops.h"
 #include "disas/disas.h"
 #include "exec/vaddr.h"
@@ -742,6 +743,7 @@ int page_unprotect(CPUState *cpu, tb_page_addr_t address, uintptr_t pc)
     bool current_tb_invalidated;
 
     assert((cpu == NULL) == (pc == 0));
+    xtcg_stat_inc(XS_PAGE_UNPROTECT);
 
     /*
      * Technically this isn't safe inside a signal handler.  However we
@@ -776,6 +778,7 @@ int page_unprotect(CPUState *cpu, tb_page_addr_t address, uintptr_t pc)
         vaddr start, len, i;
         int prot;
 
+        xtcg_stat_inc(XS_PAGE_UNPROTECT_DONE);
         if (host_page_size <= TARGET_PAGE_SIZE) {
             start = address & TARGET_PAGE_MASK;
             len = TARGET_PAGE_SIZE;
@@ -816,6 +819,9 @@ int page_unprotect(CPUState *cpu, tb_page_addr_t address, uintptr_t pc)
     mmap_unlock();
 
     /* If current TB was invalidated return to main loop */
+    if (current_tb_invalidated) {
+        xtcg_stat_inc(XS_PAGE_UNPROTECT_CUR);
+    }
     return current_tb_invalidated ? 2 : 1;
 }
 
