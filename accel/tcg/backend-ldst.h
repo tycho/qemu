@@ -10,6 +10,7 @@
 #define ACCEL_TCG_BACKEND_LDST_H
 
 #include "tcg-target-mo.h"
+#include "tcg/startup.h"
 
 /**
  * tcg_req_mo:
@@ -35,6 +36,42 @@
     do {                          \
         if (tcg_req_mo(cpu->cc->tcg_ops->guest_default_memory_order, type)) { \
             smp_mb();             \
+        }                         \
+    } while (0)
+
+/**
+ * cpu_req_mo_after_ld:
+ * @cpu: CPUState
+ *
+ * With x-tso=acqrel, generated code orders a load by making it a
+ * load-acquire, which orders later accesses after it.  A plain load done
+ * in C (the slow path, or a helper) must be ordered the same way: issue a
+ * host barrier after it.  (Stores need nothing extra: cpu_req_mo issues
+ * the barrier before them.)
+ */
+#define cpu_req_mo_after_ld(cpu)  \
+    do {                          \
+        if (unlikely(tcg_tso_mode == TCG_TSO_ACQREL) && \
+            tcg_req_mo(cpu->cc->tcg_ops->guest_default_memory_order, \
+                       TCG_MO_LD_LD | TCG_MO_LD_ST)) { \
+            smp_mb_acquire(); /* order the load before later accesses */ \
+        }                         \
+    } while (0)
+
+/**
+ * cpu_tso_atomic_fence:
+ *
+ * With x-tso=acqrel, a later load-acquire (RCpc) may be satisfied before
+ * the store of a host atomic read-modify-write is visible, whereas a
+ * locked x86 instruction is a full barrier.  Issue one after atomics.
+ * (Unnecessary with LSE ...AL atomics by the Armv8 model, which is what
+ * the helpers compile to on this host; kept since the helpers' atomic
+ * implementation is up to the compiler.)
+ */
+#define cpu_tso_atomic_fence()    \
+    do {                          \
+        if (unlikely(tcg_tso_mode == TCG_TSO_ACQREL)) { \
+            smp_mb(); /* a locked op is a full barrier */ \
         }                         \
     } while (0)
 
