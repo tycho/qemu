@@ -8604,7 +8604,7 @@ static void tcg_reg_alloc_dup(TCGContext *s, const TCGOp *op)
     its = arg_temp(op->args[1]);
 
     /* ENV should not be modified.  */
-    tcg_debug_assert(!temp_readonly(ots));
+    tcg_debug_assert(temp_writable(ots));
 
     itype = its->type;
     vece = TCGOP_VECE(op);
