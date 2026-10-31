@@ -40,6 +40,11 @@
 #include <poll.h>
 #endif
 
+#ifdef CONFIG_KQUEUE_NSEC
+#include <sys/event.h>
+#include "qemu/processor.h"
+#endif
+
 #ifdef CONFIG_PRCTL_PR_SET_TIMERSLACK
 #include <sys/prctl.h>
 #endif
@@ -324,8 +329,129 @@ int qemu_timeout_ns_to_ms(int64_t ns)
 /* qemu implementation of g_poll which uses a nanosecond timeout but is
  * otherwise identical to g_poll
  */
+QemuHostPoll qemu_host_poll;
+
+#ifdef CONFIG_KQUEUE_NSEC
+/*
+ * Nanosecond timeouts without ppoll(): each thread keeps a kqueue whose
+ * descriptor turns readable when a one-shot EVFILT_TIMER fires, and
+ * g_polls it together with the caller's descriptors, with no timeout of
+ * its own.  NOTE_CRITICAL asks
+ * the kernel not to coalesce the timer with others.
+ *
+ * QEMU_HOST_POLL_SPIN wakes a margin before the deadline and then polls
+ * without blocking until it, so that the deadline is met even though the
+ * timer itself fires late; the spin keeps the thread on its core.  The
+ * margin adapts to the host: a wakeup that still lands past the deadline
+ * by more than HOST_POLL_NOISE widens it by as much (up to
+ * HOST_POLL_MARGIN_MAX), any other wakeup narrows it by HOST_POLL_DECAY
+ * (down to HOST_POLL_MARGIN_MIN), to give back CPU time when the host
+ * keeps time well.
+ */
+#define HOST_POLL_MARGIN_INIT   50000
+#define HOST_POLL_MARGIN_MIN    10000
+#define HOST_POLL_MARGIN_MAX    250000
+#define HOST_POLL_NOISE         2000
+#define HOST_POLL_DECAY         250
+
+static __thread int host_poll_kq = -1;
+static __thread GPollFD *host_poll_fds;
+static __thread guint host_poll_cap;
+static __thread int64_t host_poll_margin = HOST_POLL_MARGIN_INIT;
+
+static int64_t host_poll_now(void)
+{
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+static bool host_poll_timer(int64_t ns, bool add)
+{
+    struct kevent ev;
+
+    EV_SET(&ev, 1, EVFILT_TIMER, add ? EV_ADD | EV_ONESHOT : EV_DELETE,
+           NOTE_NSECONDS | NOTE_CRITICAL, ns, NULL);
+    return kevent(host_poll_kq, &ev, 1, NULL, 0, NULL) == 0;
+}
+
+/* Returns -2 if the kqueue can't be used: the caller falls back. */
+static int qemu_poll_kqueue(GPollFD *fds, guint nfds, int64_t timeout)
+{
+    bool spin = qemu_host_poll == QEMU_HOST_POLL_SPIN;
+    int64_t deadline = host_poll_now() + timeout;
+    int64_t wait = spin ? timeout - host_poll_margin : timeout;
+    int ret;
+
+    if (host_poll_kq < 0) {
+        host_poll_kq = kqueue();
+        if (host_poll_kq < 0) {
+            return -2;
+        }
+        qemu_set_cloexec(host_poll_kq);
+    }
+    if (wait > 0) {
+        if (!host_poll_timer(wait, true)) {
+            return -2;
+        }
+        if (nfds + 1 > host_poll_cap) {
+            host_poll_cap = nfds + 1;
+            host_poll_fds = g_renew(GPollFD, host_poll_fds, host_poll_cap);
+        }
+        memcpy(host_poll_fds, fds, nfds * sizeof(GPollFD));
+        host_poll_fds[nfds] = (GPollFD) {
+            .fd = host_poll_kq, .events = G_IO_IN,
+        };
+        /* g_poll: macOS's poll() can't wait on character devices */
+        ret = g_poll(host_poll_fds, nfds + 1, -1);
+        /* fired or not, its event must not wake the next poll */
+        host_poll_timer(0, false);
+        if (ret < 0) {
+            return ret;
+        }
+        for (guint i = 0; i < nfds; i++) {
+            fds[i].revents = host_poll_fds[i].revents;
+        }
+        ret -= host_poll_fds[nfds].revents != 0;
+        if (ret > 0 || !spin) {
+            return ret;
+        }
+    }
+
+    /* spin to the deadline, still answering the descriptors */
+    for (;;) {
+        int64_t now = host_poll_now();
+
+        if (now >= deadline) {
+            if (wait > 0) {
+                int64_t late = now - deadline;
+                if (late > HOST_POLL_NOISE) {
+                    host_poll_margin = MIN(host_poll_margin + late,
+                                           HOST_POLL_MARGIN_MAX);
+                } else {
+                    host_poll_margin = MAX(host_poll_margin - HOST_POLL_DECAY,
+                                           HOST_POLL_MARGIN_MIN);
+                }
+            }
+            return 0;
+        }
+        ret = g_poll(fds, nfds, 0);
+        if (ret != 0) {
+            return ret;
+        }
+        cpu_relax();
+    }
+}
+#endif
+
 int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
 {
+#ifdef CONFIG_KQUEUE_NSEC
+    if (qemu_host_poll != QEMU_HOST_POLL_POLL && timeout > 0) {
+        int ret = qemu_poll_kqueue(fds, nfds, timeout);
+        if (ret != -2) {
+            return ret;
+        }
+    }
+#endif
 #ifdef CONFIG_PPOLL
     if (timeout < 0) {
         return ppoll((struct pollfd *)fds, nfds, NULL, NULL);
