@@ -24,6 +24,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "qemu/timer.h"
 #include "host/counter.h"
 #include "system/tcg.h"
@@ -878,26 +879,51 @@ static void tcg_set_lazy_incdec(Object *obj, bool value, Error **errp)
     tcg_lazy_incdec = value;
 }
 
+static bool tcg_get_region_entry(Object *obj, Error **errp)
 {
+    return tcg_region_entry;
 }
 
+static void tcg_set_region_entry(Object *obj, bool value, Error **errp)
 {
+    tcg_region_entry = value;
 }
 
+/* Units of up to this many blocks with x-superblock=units. */
+#define TCG_UNIT_BLOCKS 3
 
+/* Profile samples a loop needs with x-superblock=units. */
+#define TCG_UNIT_SAMPLES 4
 
+static char *tcg_get_superblock(Object *obj, Error **errp)
 {
+    if (tcg_units) {
+        return g_strdup(tcg_superblock ? "units" : "units-only");
     }
+    return g_strdup_printf("%u", tcg_superblock);
 }
 
+static void tcg_set_superblock(Object *obj, const char *value, Error **errp)
 {
+    uint64_t n;
 
+    if (!strcmp(value, "units")) {
+        tcg_superblock = TCG_UNIT_SAMPLES;
+        tcg_units = TCG_UNIT_BLOCKS;
         return;
     }
+    if (!strcmp(value, "units-only")) {
+        tcg_superblock = 0;
+        tcg_units = TCG_UNIT_BLOCKS;
         return;
     }
+    if (qemu_strtou64(value, NULL, 0, &n) < 0 || n > UINT32_MAX) {
+        error_setg(errp, "x-superblock: a number of samples, 'units' or "
+                   "'units-only'");
         return;
     }
+    tcg_superblock = n;
+    tcg_units = 0;
 }
 
 };
@@ -1203,7 +1229,23 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "x86: INC and DEC after an unknown flags state keep that state "
         "for CF rather than computing it");
 
+    object_class_property_add_str(oc, "x-superblock",
+                                  tcg_get_superblock, tcg_set_superblock);
+    object_class_property_set_description(oc, "x-superblock",
+        "With x-region: after this many profile samples (one per ms) in a "
+        "loop, translate the loop's blocks that have run as one translation "
+        "block (0: never, the default); 'units': 4 samples, and in user "
+        "mode every other translation block holds the blocks it reaches by "
+        "direct jumps, up to 3; 'units-only': those units, and no sampled "
+        "loops");
 
+    object_class_property_add_bool(oc, "x-regionflags",
+                                   tcg_get_region_entry,
+                                   tcg_set_region_entry);
+    object_class_property_set_description(oc, "x-regionflags",
+        "In a multi-block region (x-superblock), translate a block that "
+        "every jump in enters with the same guest condition-code state "
+        "for that state");
 
 
 
