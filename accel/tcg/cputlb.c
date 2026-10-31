@@ -579,6 +579,10 @@ static void tlb_flush_nonglobal_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
         tlb_flush_one_mmuidx_locked(cpu, mmu_idx, now);
         return;
     }
+    /* As at a full flush: a growth asked for before this one is stale. */
+    desc->grow_pending = false;
+    desc->n_fills = 0;
+    desc->fill_window_ns = now;
     if (tlb_mmu_resize_locked(desc, fast, now)) {
         tlb_mmu_flush_locked(desc, fast);
         return;
