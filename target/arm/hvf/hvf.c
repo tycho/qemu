@@ -22,6 +22,8 @@
 #include "cpu-sysregs.h"
 
 #include <mach/mach_time.h>
+#include <dlfcn.h>
+#include <AvailabilityMacros.h>
 
 #include "system/address-spaces.h"
 #include "system/memory.h"
@@ -1321,7 +1323,46 @@ static bool hvf_arm_el2_supported(void)
 }
 
 
-hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
+/*
+ * The IPA granule is the smallest mapping hv_vm_map() accepts.  macOS 26
+ * sets it through a public API; older releases only have a private one.
+ */
+static hv_return_t hvf_set_ipa_granule(hv_vm_config_t config,
+                                       uint32_t ipa_granule_size)
+{
+    static hv_return_t (*set_ipa_granule)(hv_vm_config_t, uint32_t);
+
+#if defined(__MAC_26_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_26_0
+    if (__builtin_available(macOS 26, *)) {
+        hv_ipa_granule_t granule;
+
+        if (ipa_granule_size == 4096) {
+            granule = HV_IPA_GRANULE_4KB;
+        } else if (ipa_granule_size == 16384) {
+            granule = HV_IPA_GRANULE_16KB;
+        } else {
+            error_report("HVF: unsupported IPA granule 0x%x", ipa_granule_size);
+            return HV_UNSUPPORTED;
+        }
+        return hv_vm_config_set_ipa_granule(config, granule);
+    }
+#endif
+
+    if (!set_ipa_granule) {
+        set_ipa_granule = dlsym(RTLD_NEXT, "_hv_vm_config_set_ipa_granule");
+    }
+    if (set_ipa_granule) {
+        return set_ipa_granule(config, ipa_granule_size);
+    }
+    if (ipa_granule_size != qemu_real_host_page_size()) {
+        error_report("HVF: this macOS cannot set the IPA granule");
+        return HV_UNSUPPORTED;
+    }
+    return HV_SUCCESS;
+}
+
+hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range,
+                               uint32_t ipa_granule_size)
 {
     hv_return_t ret;
     hv_vm_config_t config = hv_vm_config_create();
@@ -1331,6 +1372,13 @@ hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
         goto cleanup;
     }
     chosen_ipa_bit_size = pa_range;
+
+    if (ipa_granule_size) {
+        ret = hvf_set_ipa_granule(config, ipa_granule_size);
+        if (ret != HV_SUCCESS) {
+            goto cleanup;
+        }
+    }
 
     if (__builtin_available(macOS 15.0, *)) {
         if (hvf_nested_virt_enabled()) {
@@ -1496,6 +1544,21 @@ int hvf_arch_init_vcpu(CPUState *cpu)
     if (!hvf_irqchip_in_kernel()) {
         cpu->accel->wfi_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                              hvf_wfi_timer_cb, cpu);
+    }
+
+    if (hvf_tso_mode) {
+        /* the ACTLR_EL1 bit that makes the vCPU's memory model TSO */
+        const uint64_t actlr_el1_tso = 1 << 1;
+        uint64_t actlr;
+
+        if (__builtin_available(macOS 15, *)) {
+            ret = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_ACTLR_EL1,
+                                      &actlr);
+            assert_hvf_ok(ret);
+            ret = hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_ACTLR_EL1,
+                                      actlr | actlr_el1_tso);
+            assert_hvf_ok(ret);
+        }
     }
 
     aarch64_add_sme_properties(OBJECT(cpu));
@@ -2512,7 +2575,14 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         break;
     case EC_AA64_SMC:
         cpu_synchronize_state(cpu);
-        if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_SMC) {
+        /*
+         * Windows for Arm makes an OEM SMCCC call through SMC whatever the
+         * PSCI conduit, and crashes on the UNDEF an inactive conduit gets:
+         * answer SMC calls as SMCCC calls in either case (an unknown one
+         * returns -1).
+         */
+        if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_SMC ||
+            arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_HVC) {
             /* Secure Monitor Call exception, we need to advance $pc */
             advance_pc = true;
 
