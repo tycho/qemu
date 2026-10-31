@@ -3418,8 +3418,6 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_frecpes_vec:
     case INDEX_op_frsqrtes_vec:
         return has_type && TCG_TARGET_HAS_fp_vec;
-    case INDEX_op_extract_vec:
-        return has_type && TCG_TARGET_HAS_extract_vec;
     case INDEX_op_movz_vec:
         return has_type && TCG_TARGET_HAS_movz_vec;
 
@@ -4859,120 +4857,6 @@ static void goto_tb_cold_pass(TCGContext *s)
     }
 #endif
 }
-
-/*
- */
-
-
-
-{
-
-    }
-        }
-    }
-        }
-    }
-    }
-        }
-    }
-}
-
-{
-    }
-}
-
-static void __attribute__((noinline))
-{
-
-    }
-
-
-            continue;
-        }
-                }
-            }
-        }
-        case INDEX_op_qemu_ld:
-        case INDEX_op_qemu_st:
-        case INDEX_op_qemu_ld2:
-        case INDEX_op_qemu_st2:
-
-                break;
-            }
-
-                }
-            }
-
-                }
-            }
-            break;
-        }
-        default:
-            break;
-        }
-
-
-
-                }
-            }
-            } else {
-            }
-        }
-
-            }
-        }
-    }
-}
-
-/*
- */
-{
-
-
-        switch (op->opc) {
-        case INDEX_op_qemu_ld:
-        case INDEX_op_qemu_st:
-        case INDEX_op_qemu_ld2:
-        case INDEX_op_qemu_st2:
-            break;
-        default:
-            break;
-        }
-    }
-        }
-    }
-    }
-}
-#endif
-
-/*
- */
-{
-
-}
-
-{
-
-    }
-}
-
-{
-
-    }
-}
-
-{
-    }
-}
-
-{
-}
-
-{
-    return false;
-#endif
-}
-
 
 /*
  * tcg_alignfold: alignment checks implied by an earlier one.  A guest
@@ -7174,9 +7058,9 @@ liveness_pass_1(TCGContext *s)
                 assert_carry_dead(s);
                 if (!la_xblk_branch(s, op, nb_temps, true)) {
                     la_bb_sync(s, nb_globals, nb_temps);
-                }
-                if (s->boundary_in) {
-                    la_boundary_live(s);
+                    if (s->boundary_in) {
+                        la_boundary_live(s);
+                    }
                 }
             } else if (def->flags & TCG_OPF_BB_END) {
                 assert_carry_dead(s);
@@ -7184,9 +7068,9 @@ liveness_pass_1(TCGContext *s)
                     ? !la_xblk_label(s, op, nb_temps)
                     : !la_xblk_branch(s, op, nb_temps, false)) {
                     la_bb_end(s, nb_globals, nb_temps);
-                }
-                if (s->boundary_in) {
-                    la_boundary_live(s);
+                    if (s->boundary_in) {
+                        la_boundary_live(s);
+                    }
                 }
             } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
                 assert_carry_dead(s);
@@ -11703,10 +11587,6 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     s->nb_region_homes = 0;
     s->xblk = tcg_region && xblk_classify(s);
     s->xblk_pass = 1;
-    if (s->nb_pinned_vec) {
-        pinned_alias_pass(s);
-    }
-    liveness_pass_1(s);
     s->xblk_home = NULL;
     if (s->xblk) {
         s->xblk_home = tcg_malloc(s->nb_temps);
@@ -11714,6 +11594,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     }
     if (s->xblk_region) {
         xblk_region_homes(s);
+    }
+    if (s->nb_pinned_vec) {
+        pinned_alias_pass(s);
     }
     liveness_pass_1(s);
     if (s->xblk_region) {
@@ -11854,7 +11737,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             arg_label(op->args[0])->cold != s->lay_cold_now) {
             tb_layout_switch(s, !s->lay_cold_now, &hot, &cold_cur, &hot_hw);
         }
-        ft = op_falls_through(op);
+        ft = tb_layout_falls_through(op);
 
         switch (opc) {
         case INDEX_op_extrl_i64_i32:
@@ -12026,9 +11909,6 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             break;
 #endif
         case INDEX_op_br:
-            if (s->boundary_in) {
-                tcg_reg_alloc_boundary_place(s);
-            }
             {
                 TCGLabel *l = arg_label(op->args[0]);
                 bool x = s->xblk && l->xbranch == op;

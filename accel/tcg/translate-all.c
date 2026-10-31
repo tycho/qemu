@@ -1024,8 +1024,6 @@ void tcg_drop_jmp_cache(CPUState *cpu)
     if (unlikely(jc == NULL)) {
         return;
     }
-    qatomic_set(&jc->salt, 0);
-    qatomic_set(&jc->gsalt, TB_JMP_GSALT_BASE);
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
         qatomic_set(&jc->array[i].tb, NULL);
     }

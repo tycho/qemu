@@ -1684,12 +1684,9 @@ static void apic_unrealize(DeviceState *dev)
 }
 
 static const Property apic_properties[] = {
+    DEFINE_PROP_BOOL("x-lockless-tpr", APICCommonState, lockless_tpr, false),
     DEFINE_PROP_BOOL("x-vcpu-timer", APICCommonState, vcpu_timer, false),
     DEFINE_PROP_BOOL("x-posted", APICCommonState, posted, false),
-};
-
-static const Property apic_properties[] = {
-    DEFINE_PROP_BOOL("x-lockless-tpr", APICCommonState, lockless_tpr, false),
 };
 
 static void apic_class_init(ObjectClass *klass, const void *data)
@@ -1697,7 +1694,6 @@ static void apic_class_init(ObjectClass *klass, const void *data)
     APICCommonClass *k = APIC_COMMON_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    device_class_set_props(dc, apic_properties);
     k->realize = apic_realize;
     k->unrealize = apic_unrealize;
     k->set_base = apic_set_base;
