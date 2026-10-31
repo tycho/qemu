@@ -371,6 +371,7 @@ bool tcg_alignfold;
 bool tcg_atomic;
 TCGJumpCacheLayout tcg_jc_layout;
 const void *tcg_xpage_stub;
+bool tcg_repstr;
 bool tcg_vexzero;
 bool tcg_crypto;
 __thread TCGContext *tcg_ctx;
