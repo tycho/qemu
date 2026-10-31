@@ -70,6 +70,8 @@ struct TCGState {
     uint32_t haltpoll_us;
     OnOffAuto apictimer;
     OnOffAuto apicpost;
+    bool hyperv;
+    bool hvtimers;
 };
 typedef struct TCGState TCGState;
 
@@ -216,13 +218,25 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
         tcg_tsc_counter = HOST_COUNTER_SUPPORTED && !icount_enabled();
     }
 
+#ifndef CONFIG_USER_ONLY
     /*
+     * x-hyperv: the reference TSC page and reference time are the TSC
+     * scaled to 100 ns, which needs the TSC at a fixed 1 GHz.
      */
+    if (s->hyperv) {
+        if (!tcg_tsc_counter) {
+            error_report("x-hyperv needs x-hosttime (and no icount)");
             return -EINVAL;
         }
+        tcg_hyperv = true;
     }
+    /* x-hvtimers: the SynIC and synthetic timers, with x-hyperv */
+    if (s->hvtimers) {
+        if (!s->hyperv) {
+            error_report("x-hvtimers needs x-hyperv");
             return -EINVAL;
         }
+        tcg_hvtimers = true;
     }
 #endif
 
@@ -1125,16 +1139,24 @@ static void tcg_set_repstr(Object *obj, bool value, Error **errp)
     tcg_repstr = value;
 }
 
+static bool tcg_get_hyperv(Object *obj, Error **errp)
 {
+    return TCG_STATE(obj)->hyperv;
 }
 
+static void tcg_set_hyperv(Object *obj, bool value, Error **errp)
 {
+    TCG_STATE(obj)->hyperv = value;
 }
 
+static bool tcg_get_hvtimers(Object *obj, Error **errp)
 {
+    return TCG_STATE(obj)->hvtimers;
 }
 
+static void tcg_set_hvtimers(Object *obj, bool value, Error **errp)
 {
+    TCG_STATE(obj)->hvtimers = value;
 }
 
 {
@@ -1469,7 +1491,19 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "x86: the local APIC timer fires on its vCPU, woken by a deadline "
         "thread, instead of on the main loop (off, on, auto: as x-apicpost)");
 
+    object_class_property_add_bool(oc, "x-hyperv",
+                                   tcg_get_hyperv, tcg_set_hyperv);
+    object_class_property_set_description(oc, "x-hyperv",
+        "x86 system mode: implement the Hyper-V interface for hv-relaxed, "
+        "hv-vpindex, hv-time and hv-frequencies (otherwise ignored under "
+        "TCG), and turn them on by default; needs x-hosttime");
 
+    object_class_property_add_bool(oc, "x-hvtimers",
+                                   tcg_get_hvtimers, tcg_set_hvtimers);
+    object_class_property_set_description(oc, "x-hvtimers",
+        "x86 system mode, with x-hyperv: also implement hv-synic, hv-stimer "
+        "and hv-stimer-direct (the SynIC's message page and Hyper-V's "
+        "synthetic timers), and turn them on by default");
 
 }
 
