@@ -95,6 +95,14 @@ static TCGReg tcg_target_call_oarg_reg(TCGCallReturnKind kind, int slot)
 
 #define TCG_REG_GUEST_BASE TCG_REG_X28
 
+/*
+ * tcg_tlbpin: the pinned mmu index's CPUTLBDescFast.{mask, table}.
+ * System mode only, out of the allocator when the setting is on.
+ */
+#define TCG_TARGET_HAS_TLB_PIN
+#define TCG_REG_TLB_MASK   TCG_REG_X28
+#define TCG_REG_TLB_TABLE  TCG_REG_X27
+
 static bool reloc_pc26(tcg_insn_unit *src_rw, const tcg_insn_unit *target)
 {
     const tcg_insn_unit *src_rx = tcg_splitwx_to_rx(src_rw);
@@ -1664,6 +1672,20 @@ static void tcg_out_goto(TCGContext *s, const tcg_insn_unit *target)
     tcg_out_insn(s, branch, B, offset);
 }
 
+/*
+ * tcg_tlbpin: load the TB's pinned TLB mask and table, at the TB's start
+ * and after every call (a helper may flush or resize the TLB).
+ */
+static void tcg_out_tlb_pin_load(TCGContext *s)
+{
+    if (s->tlb_pin_ofs) {
+        QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, mask) != 0);
+        QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, table) != 8);
+        tcg_out_insn(s, ldstpair, LDP, TCG_REG_TLB_MASK, TCG_REG_TLB_TABLE,
+                     TCG_AREG0, s->tlb_pin_ofs, 1, 0);
+    }
+}
+
 static void tcg_out_call_int(TCGContext *s, const tcg_insn_unit *target)
 {
     ptrdiff_t offset = tcg_pcrel_diff(s, target) >> 2;
@@ -1673,6 +1695,7 @@ static void tcg_out_call_int(TCGContext *s, const tcg_insn_unit *target)
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP0, (intptr_t)target);
         tcg_out_insn(s, bcond_reg, BLR, TCG_REG_TMP0);
     }
+    tcg_out_tlb_pin_load(s);
 }
 
 static void tcg_out_call(TCGContext *s, const tcg_insn_unit *target,
@@ -2305,17 +2328,24 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
         unsigned mem_index = get_mmuidx(oi);
         TCGReg addr_adj;
         uint64_t compare_mask;
+        TCGReg mask = TCG_REG_TMP0, table = TCG_REG_TMP1;
 
         ldst = new_ldst_label(s);
         ldst->is_ld = is_ld;
         ldst->oi = oi;
         ldst->addr_reg = addr_reg;
 
-        /* Load CPUTLBDescFast.{mask,table} into {tmp0,tmp1}. */
-        QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, mask) != 0);
-        QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, table) != 8);
-        tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP1, TCG_AREG0,
-                     tlb_mask_table_ofs(s, mem_index), 1, 0);
+        if (s->tlb_pin_ofs && mem_index == s->tlb_pin_idx) {
+            /* tcg_tlbpin: CPUTLBDescFast.{mask,table} are in registers. */
+            mask = TCG_REG_TLB_MASK;
+            table = TCG_REG_TLB_TABLE;
+        } else {
+            /* Load CPUTLBDescFast.{mask,table} into {tmp0,tmp1}. */
+            QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, mask) != 0);
+            QEMU_BUILD_BUG_ON(offsetof(CPUTLBDescFast, table) != 8);
+            tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP0, TCG_REG_TMP1,
+                         TCG_AREG0, tlb_mask_table_ofs(s, mem_index), 1, 0);
+        }
 
         /*
          * Extract the TLB index from the address into X0.  The bits of a
@@ -2323,11 +2353,11 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
          * out of the index.
          */
         tcg_out_insn(s, addsub_realshift, AND_LSR, addr_type,
-                     TCG_REG_TMP0, TCG_REG_TMP0, addr_reg,
+                     TCG_REG_TMP0, mask, addr_reg,
                      TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS);
 
         /* Add the tlb_table pointer, forming the CPUTLBEntry address. */
-        tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP1, TCG_REG_TMP1,
+        tcg_out_insn(s, addsub_shift, ADD, 1, TCG_REG_TMP1, table,
                      TCG_REG_TMP0);
 
         /* Load the tlb comparator into TMP0, and the fast path addend. */
@@ -6150,6 +6180,10 @@ static void tcg_target_init(TCGContext *s)
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_TMP1);
     tcg_regset_set_reg(s->reserved_regs, TCG_REG_TMP2);
     tcg_regset_set_reg(s->reserved_regs, TCG_VEC_TMP0);
+    if (tcg_use_softmmu && tcg_tlbpin) {
+        tcg_regset_set_reg(s->reserved_regs, TCG_REG_TLB_MASK);
+        tcg_regset_set_reg(s->reserved_regs, TCG_REG_TLB_TABLE);
+    }
     if (!tcg_vregs_all) {
         for (TCGReg r = TCG_REG_V8; r <= TCG_REG_V15; r++) {
             tcg_regset_set_reg(s->reserved_regs, r);
@@ -6385,6 +6419,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
 static void tcg_out_tb_start(TCGContext *s)
 {
     tcg_out_bti(s, BTI_J);
+    tcg_out_tlb_pin_load(s);
 }
 
 static void tcg_out_nop_fill(tcg_insn_unit *p, int count)

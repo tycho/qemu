@@ -580,6 +580,13 @@ struct TCGContext {
     /* tcg_alignfold: a guest access of this TB checks its alignment. */
     bool align_access;
 
+    /*
+     * tcg_tlbpin: the offset from env of the pinned mmu index's
+     * CPUTLBDescFast, or 0 (none) for this TB.
+     */
+    int tlb_pin_ofs;
+    int tlb_pin_idx;
+
     GHashTable *const_table[TCG_TYPE_COUNT];
     TCGTempSet free_temps[TCG_TYPE_COUNT];
     TCGTemp temps[TCG_MAX_TEMPS]; /* globals first, temps after */
