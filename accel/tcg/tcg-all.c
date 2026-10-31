@@ -667,10 +667,14 @@ static void tcg_set_bti(Object *obj, bool value, Error **errp)
     tcg_bti = value;
 }
 
+static bool tcg_get_addr32(Object *obj, Error **errp)
 {
+    return tcg_addr32;
 }
 
+static void tcg_set_addr32(Object *obj, bool value, Error **errp)
 {
+    tcg_addr32 = value;
 }
 
 {
@@ -979,6 +983,11 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Where the host has BTI, guard generated code with it (default); "
         "off: no landing pads and no guarded pages");
 
+    object_class_property_add_bool(oc, "x-addr32",
+                                   tcg_get_addr32, tcg_set_addr32);
+    object_class_property_set_description(oc, "x-addr32",
+        "Translate with 32-bit guest addresses where the target allows "
+        "(x86 outside long mode): no zero-extension per access");
 
 
 
