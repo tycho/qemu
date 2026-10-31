@@ -1936,6 +1936,13 @@ void tcg_prologue_init(void)
 void tcg_func_start(TCGContext *s)
 {
     tcg_pool_reset(s);
+#ifdef CONFIG_DEBUG_TCG
+    /*
+     * A TB overflow longjmps out of the translator, perhaps from inside a
+     * gvec expansion that has set its list of vector opcodes.
+     */
+    s->vecop_list = NULL;
+#endif
     s->nb_temps = s->nb_globals;
 
     /* No temps have been previously allocated for size or locality.  */
