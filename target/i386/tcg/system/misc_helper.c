@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "tcg/startup.h"
 #include "qemu/main-loop.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
@@ -322,6 +323,19 @@ void helper_wrmsr(CPUX86State *env)
 
         break;
     }
+    case MSR_IA32_TSC:
+        /* Writing the TSC moves IA32_TSC_ADJUST by as much (SDM 18.17.3). */
+        if (tcg_tsc_counter) {
+            env->tsc_adjust += val - cpu_get_tsc(env);
+            x86_tsc_counter_set(env, val);
+        }
+        break;
+    case MSR_TSC_ADJUST:
+        if (tcg_tsc_counter) {
+            x86_tsc_counter_set(env, cpu_get_tsc(env) + val - env->tsc_adjust);
+            env->tsc_adjust = val;
+        }
+        break;
     default:
         if ((uint32_t)env->regs[R_ECX] >= MSR_MC0_CTL
             && (uint32_t)env->regs[R_ECX] < MSR_MC0_CTL +
@@ -500,6 +514,12 @@ void helper_rdmsr(CPUX86State *env)
 
         break;
     }
+    case MSR_IA32_TSC:
+        val = tcg_tsc_counter ? cpu_get_tsc(env) : 0;
+        break;
+    case MSR_TSC_ADJUST:
+        val = tcg_tsc_counter ? env->tsc_adjust : 0;
+        break;
     default:
         if ((uint32_t)env->regs[R_ECX] >= MSR_MC0_CTL
             && (uint32_t)env->regs[R_ECX] < MSR_MC0_CTL +

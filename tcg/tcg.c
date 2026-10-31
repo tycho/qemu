@@ -356,6 +356,7 @@ bool tcg_retstack_env;
 intptr_t tcg_retep_off;
 bool tcg_tb_flags_canon;
 bool tcg_addr32;
+bool tcg_tsc_counter;
 
 bool tcg_atomic;
 TCGJumpCacheLayout tcg_jc_layout;
@@ -1001,6 +1002,7 @@ static int tcg_out_pool_finalize(TCGContext *s)
 #define C_O0_I3(I1, I2, I3)             C_PFX3(c_o0_i3_, I1, I2, I3),
 #define C_O0_I4(I1, I2, I3, I4)         C_PFX4(c_o0_i4_, I1, I2, I3, I4),
 
+#define C_O1_I0(O1)                     C_PFX1(c_o1_i0_, O1),
 #define C_O1_I1(O1, I1)                 C_PFX2(c_o1_i1_, O1, I1),
 #define C_O1_I2(O1, I1, I2)             C_PFX3(c_o1_i2_, O1, I1, I2),
 #define C_O1_I3(O1, I1, I2, I3)         C_PFX4(c_o1_i3_, O1, I1, I2, I3),
@@ -1029,6 +1031,7 @@ static TCGConstraintSetIndex tcg_target_op_def(TCGOpcode, TCGType, unsigned);
 #undef C_O0_I2
 #undef C_O0_I3
 #undef C_O0_I4
+#undef C_O1_I0
 #undef C_O1_I1
 #undef C_O1_I2
 #undef C_O1_I3
@@ -1055,6 +1058,7 @@ typedef struct TCGConstraintSet {
 #define C_O0_I3(I1, I2, I3)             { 0, 3, { #I1, #I2, #I3 } },
 #define C_O0_I4(I1, I2, I3, I4)         { 0, 4, { #I1, #I2, #I3, #I4 } },
 
+#define C_O1_I0(O1)                     { 1, 0, { #O1 } },
 #define C_O1_I1(O1, I1)                 { 1, 1, { #O1, #I1 } },
 #define C_O1_I2(O1, I1, I2)             { 1, 2, { #O1, #I1, #I2 } },
 #define C_O1_I3(O1, I1, I2, I3)         { 1, 3, { #O1, #I1, #I2, #I3 } },
@@ -1079,6 +1083,7 @@ static const TCGConstraintSet constraint_sets[] = {
 #undef C_O0_I2
 #undef C_O0_I3
 #undef C_O0_I4
+#undef C_O1_I0
 #undef C_O1_I1
 #undef C_O1_I2
 #undef C_O1_I3
@@ -1100,6 +1105,7 @@ static const TCGConstraintSet constraint_sets[] = {
 #define C_O0_I3(I1, I2, I3)             C_PFX3(c_o0_i3_, I1, I2, I3)
 #define C_O0_I4(I1, I2, I3, I4)         C_PFX4(c_o0_i4_, I1, I2, I3, I4)
 
+#define C_O1_I0(O1)                     C_PFX1(c_o1_i0_, O1)
 #define C_O1_I1(O1, I1)                 C_PFX2(c_o1_i1_, O1, I1)
 #define C_O1_I2(O1, I1, I2)             C_PFX3(c_o1_i2_, O1, I1, I2)
 #define C_O1_I3(O1, I1, I2, I3)         C_PFX4(c_o1_i3_, O1, I1, I2, I3)
@@ -1247,6 +1253,11 @@ typedef struct TCGOutOpQemuLdSt2 {
     void (*out)(TCGContext *s, TCGType type, TCGReg dlo, TCGReg dhi,
                 TCGReg addr, MemOpIdx oi);
 } TCGOutOpQemuLdSt2;
+
+typedef struct TCGOutOpHostCounter {
+    TCGOutOp base;
+    void (*out_r)(TCGContext *s, TCGReg a0, bool ordered);
+} TCGOutOpHostCounter;
 
 typedef struct TCGOutOpUnary {
     TCGOutOp base;
@@ -1521,6 +1532,12 @@ void tcg_pinned_unwind(const uint64_t (*regs)[2], int nregs)
     }
 }
 
+#ifndef TCG_TARGET_HAS_host_counter
+static const TCGOutOpHostCounter outop_host_counter = {
+    .base.static_constraint = C_NotImplemented,
+};
+#endif
+
 #ifndef CONFIG_TCG_INTERPRETER
 /* Validate CPUTLBDescFast placement. */
 QEMU_BUILD_BUG_ON((int)(offsetof(CPUNegativeOffsetState, tlb.f[0]) -
@@ -1623,6 +1640,7 @@ static const TCGOutOp * const all_outop[NB_OPS] = {
     OUTOP(INDEX_op_clz, TCGOutOpBinary, outop_clz),
     OUTOP(INDEX_op_crc32c, TCGOutOpCrc32c, outop_crc32c),
     OUTOP(INDEX_op_ctpop, TCGOutOpUnary, outop_ctpop),
+    OUTOP(INDEX_op_host_counter, TCGOutOpHostCounter, outop_host_counter),
     OUTOP(INDEX_op_ctz, TCGOutOpBinary, outop_ctz),
     OUTOP(INDEX_op_deposit, TCGOutOpDeposit, outop_deposit),
     OUTOP(INDEX_op_divs, TCGOutOpBinary, outop_divs),
@@ -8160,6 +8178,15 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             } else {
                 out->out_rrr(s, type, new_args[0], new_args[1], new_args[2]);
             }
+        }
+        break;
+
+    case INDEX_op_host_counter:
+        {
+            const TCGOutOpHostCounter *out =
+                container_of(all_outop[op->opc], TCGOutOpHostCounter, base);
+
+            out->out_r(s, new_args[0], new_args[1]);
         }
         break;
 

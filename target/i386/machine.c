@@ -1,4 +1,5 @@
 #include "qemu/osdep.h"
+#include "tcg/startup.h"
 #include "cpu.h"
 #include "exec/cputlb.h"
 #include "hw/isa/isa.h"
@@ -223,6 +224,12 @@ static int cpu_pre_save(void *opaque)
     CPUX86State *env = &cpu->env;
     int i;
     env->v_tpr = env->int_ctl & V_TPR_MASK;
+#ifndef CONFIG_USER_ONLY
+    /* tcg_tsc_counter: env->tsc carries the TSC (as KVM's does). */
+    if (tcg_enabled() && tcg_tsc_counter) {
+        env->tsc = cpu_get_tsc(env);
+    }
+#endif
     /* FPU */
     env->fpus_vmstate = (env->fpus & ~0x3800) | (env->fpstt & 0x7) << 11;
     env->fptag_vmstate = 0;
@@ -324,6 +331,12 @@ static int cpu_post_load(void *opaque, int version_id)
                      "migrated TSC frequency");
         return -EINVAL;
     }
+
+#ifndef CONFIG_USER_ONLY
+    if (tcg_enabled() && tcg_tsc_counter) {
+        x86_tsc_counter_set(env, env->tsc);
+    }
+#endif
 
     if (env->fpregs_format_vmstate) {
         error_report("Unsupported old non-softfloat CPU state");
