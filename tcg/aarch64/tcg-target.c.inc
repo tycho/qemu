@@ -1886,7 +1886,6 @@ static const TCGOutOpHostCounter outop_host_counter = {
     .out_r = tgen_host_counter,
 };
 
-
 /*
  * ISB rather than YIELD: on current Apple cores YIELD costs no more than
  * a NOP, while ISB holds the core for some tens of cycles, as x86 PAUSE
@@ -5547,12 +5546,6 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                   | ((const_args[2] ? TCG_REG_XZR : a2) & 0x1f) << 5
                   | (a0 & 0x1f));
         break;
-    case INDEX_op_extract_vec:
-        /* UMOV: imm5 = index << (vece + 1) | 1 << vece; Q for doublewords. */
-        tcg_out32(s, 0x0e003c00 | (vece == MO_64) << 30
-                  | (a2 << (vece + 1) | 1 << vece) << 16
-                  | (a1 & 0x1f) << 5 | (a0 & 0x1f));
-        break;
     case INDEX_op_add_vec:
         if (is_scalar) {
             tcg_out_insn(s, rrr_e, ADD, vece, a0, a1, a2);
@@ -6042,7 +6035,6 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
 int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
 {
     switch (opc) {
-    case INDEX_op_extract_vec:
     case INDEX_op_movz_vec:
         return vece == MO_32 || vece == MO_64;
     case INDEX_op_extract_vec:
@@ -6332,8 +6324,6 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_ld_vec:
     case INDEX_op_dupm_vec:
         return C_O1_I1(w, r);
-    case INDEX_op_extract_vec:
-        return C_O1_I1(r, w);
     case INDEX_op_extract_vec:
         return C_O1_I1(r, w);
     case INDEX_op_insert_vec:

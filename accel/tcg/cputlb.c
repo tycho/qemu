@@ -54,7 +54,6 @@
 #include "qemu/plugin-memory.h"
 #endif
 #include "tcg/tcg-ldst.h"
-#include "tcg/startup.h"
 #include "backend-ldst.h"
 
 
@@ -363,6 +362,7 @@ static bool tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
         return false;
     }
     tlb_mmu_realloc_locked(desc, fast, new_size, now);
+    return true;
 }
 
 /*
@@ -401,7 +401,6 @@ static void tlb_mmu_realloc_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
         fast->table = g_try_new(CPUTLBEntry, new_size);
         desc->fulltlb = tlb_fulltlb_alloc(new_size, true);
     }
-    return true;
 }
 
 static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
@@ -1365,7 +1364,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     hwaddr iotlb, xlat, sz, paddr_page;
     vaddr addr_page;
     int asidx, wp_flags, prot;
-    bool is_ram, is_romd, grow = false;
+    bool is_ram, is_romd, was_used, grow = false;
 
     assert_cpu_is_self(cpu);
 

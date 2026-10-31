@@ -138,6 +138,8 @@ typedef struct DisasContext {
      */
     bool rs_call;
     bool rs_ret;
+    /* The CALL's return lands through the lookup (gen_JMP_m's guard). */
+    bool rs_land_unlinked;
     target_ulong rs_next;
     TCGv_i64 rs_key;    /* tcg_retstack_env: the CALL's key, at run time */
     /*
@@ -2637,6 +2639,9 @@ static int ret_landing_slot(DisasContext *s, int used)
 {
     int slot = used < 0 ? 0 : used ^ 1;
 
+    if (s->rs_land_unlinked) {
+        return -1;
+    }
     if (!translator_use_goto_tb(&s->base, rs_next_pc(s)) ||
         !translator_goto_tb_slot(&s->base, &slot)) {
         return -1;
@@ -2686,7 +2691,7 @@ static void gen_lookup_and_goto_ptr(DisasContext *s, int mode)
 static void
 gen_eob(DisasContext *s, int mode)
 {
-    bool inhibit_reset;
+    bool inhibit_reset, req_done = false;
     TCGLabel *req = NULL, *land = NULL;
 
     gen_update_cc_op(s);
@@ -2711,12 +2716,14 @@ gen_eob(DisasContext *s, int mode)
     } else if ((mode == DISAS_JUMP || mode == DISAS_JUMP_FAR) &&
                /* give irqs a chance to happen */
                !inhibit_reset) {
-        req = translator_edge_check(&s->base, s->base.pc_first);
         if (mode == DISAS_JUMP && s->rs_ret && use_retstack(s)) {
             TCGv_i64 key = tcg_temp_new_i64();
 
             tcg_gen_extu_tl_i64(key, cpu_eip);
             if (tb_cflags(s->base.tb) & CF_PCREL) {
+                /* The exit check first: a hit leaves the TB. */
+                req = translator_edge_check(&s->base, s->base.pc_first);
+                req_done = true;
                 tcg_gen_ret_tb(key, rs_tag(s));
             } else {
                 /*
@@ -2733,6 +2740,9 @@ gen_eob(DisasContext *s, int mode)
             land = gen_new_label();
             tcg_gen_push_ret(rs_push_key(s), gen_new_label(), land,
                              rs_tag(s));
+        }
+        if (!req_done) {
+            req = translator_edge_check(&s->base, s->base.pc_first);
         }
         gen_lookup_and_goto_ptr(s, mode);
         tcg_gen_push_ret_done();
@@ -2854,7 +2864,9 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
     }
     if (s->rs_call && use_retstack(s)) {
         /* gen_eob pushes the return and calls through the lookup. */
-        tcg_gen_movi_tl(cpu_eip, new_eip);
+        if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
+            tcg_gen_movi_tl(cpu_eip, new_eip);
+        }
         s->jmp_direct = true;
         gen_eob(s, DISAS_JUMP);
         return;

@@ -27,7 +27,6 @@
 #include "qemu/cutils.h"
 #include "qemu/timer.h"
 #include "host/counter.h"
-#include "qemu/timer.h"
 #include "system/tcg.h"
 #include "exec/replay-core.h"
 #include "exec/icount.h"

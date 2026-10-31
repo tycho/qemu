@@ -203,9 +203,9 @@ static bool tb_lookup_cmp(const void *p, const void *d)
 }
 
 /*
- * The TB for state @s.  With x-tblookup, @stale, if non-NULL, is the TB
- * of a jump-cache entry for s.pc under an older salt, the answer if it
- * still matches.
+ * The TB for state @s, whose first page is @stale's if @stale is
+ * non-NULL: with x-tblookup, a jump-cache entry for s.pc under an older
+ * salt, which is the answer if it still matches.
  */
 static TranslationBlock *tb_htable_lookup_stale(CPUState *cpu,
                                                 TCGTBCPUState s,
@@ -336,9 +336,9 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 
     /*
      * With x-tblookup, an entry for this pc made under an older salt (a
-     * flush since: a TLB flush, a CR3 write) holds the TB that was right
-     * then; it is again if it matches the current state and pages, as
-     * the hash table's would.
+     * flush of the non-global translations since, a CR3 write) holds the
+     * TB that was right then; it is again if it matches the current
+     * state and pages, as the hash table's would.
      */
     if (tcg_ijmp_inline && tb && tcg_jcgen &&
         !((jc->array[hash].pc ^ s.pc) & (jc->salt_step - 1))) {
