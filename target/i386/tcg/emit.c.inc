@@ -5406,7 +5406,24 @@ static void gen_POP2(DisasContext *s, X86DecodedInsn *decode)
 static void gen_POP(DisasContext *s, X86DecodedInsn *decode)
 {
     X86DecodedOp *op = &decode->op[0];
-    MemOp ot = gen_pop_T0(s);
+    MemOp ot;
+
+    if (tcg_lean && op->unit == X86_OP_INT && !op->has_ea &&
+        op->n != R_ESP && op->ot == MO_TL &&
+        mo_pushpop(s, s->dflag) == MO_TL) {
+        /*
+         * Load straight into the destination register: a load that
+         * faults doesn't write it, and the stack pointer update after it
+         * doesn't read it.  T0 is a copy for the writeback.
+         */
+        gen_lea_ss_ofs(s, s->A0, cpu_regs[R_ESP], 0);
+        gen_op_ld_v(s, MO_TL, cpu_regs[op->n], s->A0);
+        tcg_gen_mov_tl(s->T0, cpu_regs[op->n]);
+        gen_pop_update(s, MO_TL);
+        return;
+    }
+
+    ot = gen_pop_T0(s);
 
     assert(ot >= op->ot);
     if (op->has_ea || op->unit == X86_OP_SEG) {

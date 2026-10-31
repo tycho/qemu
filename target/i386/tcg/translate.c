@@ -2248,9 +2248,24 @@ static void gen_push_v(DisasContext *s, TCGv val)
     MemOp d_ot = mo_pushpop(s, s->dflag);
     MemOp a_ot = mo_stacksize(s);
     int size = 1 << d_ot;
-    TCGv new_esp = tcg_temp_new();
+    TCGv new_esp;
     bool old;
 
+    if (tcg_lean && a_ot == MO_64) {
+        /*
+         * The address apart from the new stack pointer, which is updated
+         * after the store: an access at rsp - size can take the offset in
+         * the host's addressing mode.
+         */
+        TCGv addr = tcg_temp_new();
+
+        gen_lea_ss_ofs(s, addr, cpu_regs[R_ESP], -size);
+        gen_op_st_v(s, d_ot, val, addr);
+        tcg_gen_subi_tl(cpu_regs[R_ESP], cpu_regs[R_ESP], size);
+        return;
+    }
+
+    new_esp = tcg_temp_new();
     tcg_gen_subi_tl(new_esp, cpu_regs[R_ESP], size);
 
     /* Now reduce the value to the address size and apply SS base.  */
@@ -2370,6 +2385,13 @@ static void gen_leave(DisasContext *s)
     old = gen_stack_private(true);
     gen_op_ld_v(s, d_ot, s->T0, s->A0);
     gen_stack_private(old);
+
+    if (tcg_lean && a_ot == MO_64 && d_ot == MO_64) {
+        /* The new stack pointer straight from the old frame pointer. */
+        tcg_gen_addi_tl(cpu_regs[R_ESP], cpu_regs[R_EBP], 1 << d_ot);
+        tcg_gen_mov_tl(cpu_regs[R_EBP], s->T0);
+        return;
+    }
 
     tcg_gen_addi_tl(s->T1, cpu_regs[R_EBP], 1 << d_ot);
 
