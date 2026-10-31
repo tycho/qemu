@@ -145,6 +145,18 @@ static bool patch_reloc(tcg_insn_unit *code_ptr, int type,
         return reloc_pc19(code_ptr, (const tcg_insn_unit *)value);
     case R_AARCH64_TSTBR14:
         return reloc_pc14(code_ptr, (const tcg_insn_unit *)value);
+    case R_AARCH64_ADR_PREL_LO21:
+        {
+            const tcg_insn_unit *rx = tcg_splitwx_to_rx(code_ptr);
+            ptrdiff_t disp = tcg_ptr_byte_diff((void *)value, rx);
+
+            if (disp != sextract64(disp, 0, 21)) {
+                return false;
+            }
+            *code_ptr = deposit32(deposit32(*code_ptr, 29, 2, disp),
+                                  5, 19, disp >> 2);
+            return true;
+        }
     default:
         g_assert_not_reached();
     }
@@ -1152,7 +1164,7 @@ static void tcg_out_bti(TCGContext *s, AArch64Insn insn)
      * While BTI insns are nops on hosts without FEAT_BTI,
      * there is no point in emitting them in that case either.
      */
-    if (cpuinfo & CPUINFO_BTI) {
+    if ((cpuinfo & CPUINFO_BTI) && tcg_bti) {
         tcg_out32(s, insn);
     }
 }
@@ -1425,6 +1437,20 @@ static void tcg_out_movi(TCGContext *s, TCGType type, TCGReg rd,
         tcg_out_insn_movw(s, opc, type, rd, t0 >> s0, s0);
         if (t1 != 0) {
             tcg_out_insn(s, movw, MOVK, type, rd, value >> s1, s1);
+        }
+        return;
+    }
+
+    /*
+     * Built in place in cold code (tcg_tblayout), whose pool could be out
+     * of LDR's reach.
+     */
+    if (s->lay_cold_now) {
+        tcg_out_insn(s, movw, MOVZ, type, rd, value & 0xffff, 0);
+        for (int sh = 16; sh < 64; sh += 16) {
+            if ((value >> sh) & 0xffff) {
+                tcg_out_insn(s, movw, MOVK, type, rd, value >> sh, sh);
+            }
         }
         return;
     }
@@ -2033,13 +2059,36 @@ static TCGRegSet ldst_outputs(TCGLabelQemuLdst *lb)
 {
     TCGRegSet set = 0;
 
-    if (lb->is_ld) {
         tcg_regset_set_reg(set, lb->datalo_reg);
         if (lb->type == TCG_TYPE_I128) {
             tcg_regset_set_reg(set, lb->datahi_reg);
         }
     }
     return set;
+}
+
+/*
+ * tcg_tblayout: a branch to the slow path, which goes to the cold part,
+ * where the fast path's conditional branch can reach it.
+ */
+static bool tcg_out_ldst_veneer(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+        return false;
+    }
+    lb->label_ptr[0] = s->code_ptr;
+    lb->veneer = true;
+    tcg_out_insn(s, branch, B, 0);
+    return true;
+}
+
+/* Point the fast path's branch, or its veneer, at the slow path. */
+static bool tcg_out_ldst_slow_entry(TCGContext *s, TCGLabelQemuLdst *lb)
+{
+    const tcg_insn_unit *target = tcg_splitwx_to_rx(s->code_ptr);
+
+    return lb->veneer ? reloc_pc26(lb->label_ptr[0], target)
+                      : reloc_pc19(lb->label_ptr[0], target);
 }
 
 /*
@@ -2055,9 +2104,48 @@ static TCGRegSet ldst_outputs(TCGLabelQemuLdst *lb)
  * helper's return address (in the insn's code) but not from a host pc
  * out here.
  */
+/*
+ */
+
+{
+
+    }
+        }
+        }
+#endif
+    }
+}
+
+/*
+ */
+{
+
+        return false;
+    }
+
+    if (lb->is_ld) {
+    }
+    }
+    }
+    }
+    }
+    return true;
+}
+
+/*
+ */
+{
+        return false;
+    }
+    for (int i = 0; i < s->nb_pinned; i++) {
+        }
+    }
+    return true;
+}
+
 static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
 {
-    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+    }
         return false;
     }
     if (lb->is_ld) {
@@ -2074,6 +2162,12 @@ static bool tcg_out_acqrel_fallback(TCGContext *s, TCGLabelQemuLdst *lb)
     return true;
 }
 
+{
+
+    }
+    }
+}
+
 static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     MemOp opc = get_memop(lb->oi);
@@ -2081,7 +2175,7 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     if (lb->fallback) {
         return tcg_out_acqrel_fallback(s, lb);
     }
-    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
         return false;
     }
 
@@ -2109,7 +2203,7 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     if (lb->fallback) {
         return tcg_out_acqrel_fallback(s, lb);
     }
-    if (!reloc_pc19(lb->label_ptr[0], tcg_splitwx_to_rx(s->code_ptr))) {
+    if (!tcg_out_ldst_slow_entry(s, lb)) {
         return false;
     }
 
@@ -3057,6 +3151,65 @@ static void tcg_out_exit_tb(TCGContext *s, uintptr_t a0)
     }
 }
 
+/*
+ * A goto_tb slot whose unlinked path is at the TB's end (goto_tb_cold):
+ * one branch, to the reset label until linked.  Right before that label,
+ * tcg_out_goto_tb_tramp() leaves the way to a TB out of branch range.
+ */
+#define TCG_TARGET_HAS_GOTO_TB_COLD
+
+static void tcg_out_goto_tb_cold(TCGContext *s, int which)
+{
+    set_jmp_insn_offset(s, which);
+    s->gen_tb->jmp_cold |= 1u << which;
+    tcg_out_reloc(s, s->code_ptr, R_AARCH64_JUMP26,
+                  s->call_tb_reset[which], 0);
+    tcg_out_insn(s, branch, B, 0);
+}
+
+/*
+ * TB structs and cold code out of the code stream (tcg_tblayout): the
+ * trampolines reach a struct anywhere in the region, cold code builds its
+ * constants in place.
+ */
+#define TCG_TARGET_HAS_TBLAYOUT
+
+static void tcg_out_goto_tb_tramp(TCGContext *s, int which)
+{
+    intptr_t target = get_jmp_target_addr(s, which);
+    intptr_t i_off = tcg_pcrel_diff(s, (void *)target);
+
+    if (i_off == sextract64(i_off, 0, 21)) {
+        tcg_out_insn(s, ldlit, LDR, i_off >> 2, TCG_REG_TMP0);
+    } else {
+        intptr_t src_rx = (intptr_t)tcg_splitwx_to_rx(s->code_ptr);
+
+        /* The TB struct out of literal range: ADRP and LDR reach it. */
+        s->gen_tb->jmp_far |= 1u << which;
+        tcg_out_insn(s, pcrel, ADRP, TCG_REG_TMP0,
+                     (target >> 12) - (src_rx >> 12));
+        tcg_out_insn_ldst_uimm(s, Ildst_imm_LDRX, TCG_REG_TMP0, TCG_REG_TMP0,
+                               (target & 0xfff) >> 3);
+    }
+    tcg_out_insn(s, bcond_reg, BR, TCG_REG_TMP0);
+}
+
+/* The trampoline's distance from the reset label after it. */
+static int tramp_size(const TranslationBlock *tb, int n)
+{
+    return tb->jmp_far & (1u << n) ? 12 : 8;
+}
+
+/*
+ * The reset label after the trampoline.  A thread in the trampoline when
+ * the slot is unlinked loads the reset address and branches there
+ * indirectly: like goto_tb's, the label is a BTI landing pad.
+ */
+static void tcg_out_goto_tb_land(TCGContext *s)
+{
+    tcg_out_bti(s, BTI_J);
+}
+
 static void tcg_out_goto_tb(TCGContext *s, int which)
 {
     /*
@@ -3065,7 +3218,21 @@ static void tcg_out_goto_tb(TCGContext *s, int which)
      * in range early, regardless of direct branch distance.
      */
     intptr_t i_off = tcg_pcrel_diff(s, (void *)get_jmp_target_addr(s, which));
-    tcg_debug_assert(i_off == sextract64(i_off, 0, 21));
+
+    /*
+     * The TB struct out of literal range: a slot like goto_tb_cold's, one
+     * branch to the reset label while unlinked, with the trampoline right
+     * before that label.
+     */
+    if (i_off != sextract64(i_off, 0, 21)) {
+        set_jmp_insn_offset(s, which);
+        s->gen_tb->jmp_cold |= 1u << which;
+        tcg_out_insn(s, branch, B, 4);
+        tcg_out_goto_tb_tramp(s, which);
+        set_jmp_reset_offset(s, which);
+        tcg_out_goto_tb_land(s);
+        return;
+    }
 
     set_jmp_insn_offset(s, which);
     tcg_out32(s, Ibranch_B);
@@ -3074,9 +3241,165 @@ static void tcg_out_goto_tb(TCGContext *s, int which)
     tcg_out_bti(s, BTI_J);
 }
 
+/*
+ * The return stack (tcg_gen_push_ret): its top in tcg_retstack_reg, a
+ * ring with guard pages at both ends (tcg_retstack_fault).
+ */
+#define TCG_TARGET_HAS_RETSTACK
+
+/*
+ * tcg_retstack_env (system mode): the top in env at tcg_retsp_off, 32-byte
+ * entries {key, epoch + tag, landing} in a ring aligned to its size, which
+ * wraps (BFXIL keeps the ring's base bits).  An entry is good only under
+ * the epoch it was pushed in (tcg_retep_off, in steps of
+ * TCG_RETSTACK_TAGS) with the same tag, and while the vCPU has no
+ * breakpoints (as the jump-cache probes require).
+ */
+#define TCG_TARGET_HAS_RETSTACK_ENV
+#define RETSTACK_ENV_BITS 14
+QEMU_BUILD_BUG_ON(TCG_RETSTACK_SIZE != 1 << RETSTACK_ENV_BITS);
+
+static void tcg_out_push_ret_env(TCGContext *s, TCGReg key, TCGLabel *ret,
+                                 unsigned tag)
+{
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_AREG0, tcg_retsp_off);
+    tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_TMP1,
+                 TCG_REG_TMP0, 32);
+    tcg_out_bfm(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_REG_TMP1, 0,
+                RETSTACK_ENV_BITS - 1);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_TMP1, TCG_AREG0, tcg_retep_off);
+    if (tag) {
+        tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_TMP1,
+                     TCG_REG_TMP1, tag);
+    }
+    tcg_out_insn(s, ldstpair, STP, key, TCG_REG_TMP1, TCG_REG_TMP0, 0, 1, 0);
+    tcg_out_reloc(s, s->code_ptr, R_AARCH64_ADR_PREL_LO21, ret, 0);
+    tcg_out_insn(s, pcrel, ADR, TCG_REG_TMP1, 0);
+    tcg_out_st(s, TCG_TYPE_I64, TCG_REG_TMP1, TCG_REG_TMP0, 16);
+    tcg_out_st(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_AREG0, tcg_retsp_off);
+    s->gen_tb->jmp_call |= TB_JMP_RET_LANDING;
+}
+
+static void tcg_out_ccmp_eq(TCGContext *s, TCGReg rn, TCGReg rm)
+{
+    /* CCMP Rn, Rm, #0, EQ: NE unless EQ before and Rn == Rm. */
+    tcg_out32(s, 0x7a400000 | TCG_TYPE_I64 << 31 | rm << 16
+              | tcg_cond_to_aarch64[TCG_COND_EQ] << 12 | rn << 5);
+}
+
+static void tcg_out_ret_tb_env(TCGContext *s, TCGReg key, unsigned tag)
+{
+    /*
+     * No breakpoints first: their offset may need TMP0 to load, which
+     * then holds the top.
+     */
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_TMP1, TCG_AREG0, tcg_jc_layout.bp_ofs);
+    tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_EQ, TCG_REG_TMP1, 0, true);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_AREG0, tcg_retsp_off);
+    tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP1, TCG_REG_LR, TCG_REG_TMP0,
+                 0, 1, 0);
+    tcg_out_ccmp_eq(s, TCG_REG_TMP1, key);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_TMP1, TCG_AREG0, tcg_retep_off);
+    if (tag) {
+        tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_TMP1,
+                     TCG_REG_TMP1, tag);
+    }
+    tcg_out_ccmp_eq(s, TCG_REG_LR, TCG_REG_TMP1);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_LR, TCG_REG_TMP0, 16);
+    tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64, TCG_REG_TMP1,
+                 TCG_REG_TMP0, 32);
+    tcg_out_bfm(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_REG_TMP1, 0,
+                RETSTACK_ENV_BITS - 1);
+    tcg_out_st(s, TCG_TYPE_I64, TCG_REG_TMP0, TCG_AREG0, tcg_retsp_off);
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 2);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+}
+
+static void tcg_out_push_ret(TCGContext *s, TCGReg key, TCGLabel *ret,
+                             unsigned tag)
+{
+    if (tcg_retstack_reg < 0) {
+        tcg_out_push_ret_env(s, key, ret, tag);
+        return;
+    }
+    tcg_out_reloc(s, s->code_ptr, R_AARCH64_ADR_PREL_LO21, ret, 0);
+    tcg_out_insn(s, pcrel, ADR, TCG_REG_TMP1, 0);
+    tcg_out_insn(s, ldstpair, STP, key, TCG_REG_TMP1, tcg_retstack_reg,
+                 -16, 1, 1);
+    s->gen_tb->jmp_call |= TB_JMP_RET_LANDING;
+}
+
+/*
+ * A goto_tb slot that leaves by BL, so that the host's return predictor
+ * expects the return to the next insn.  Unlinked, a B to the reset label;
+ * linked to a TB out of branch range, a BL to the trampoline before it
+ * (tcg_out_goto_tb_tramp).
+ */
+static void tcg_out_call_tb(TCGContext *s, int which)
+{
+    set_jmp_insn_offset(s, which);
+    s->gen_tb->jmp_call |= 1u << which;
+    tcg_out_reloc(s, s->code_ptr, R_AARCH64_JUMP26,
+                  s->call_tb_reset[which], 0);
+    tcg_out_insn(s, branch, B, 0);
+}
+
+/* goto_ptr by a call: BL to a BR, so that the return is predicted too. */
+static void tcg_out_call_ptr(TCGContext *s, TCGReg a0)
+{
+    tcg_out_insn(s, branch, B, 2);
+    tcg_out_insn(s, bcond_reg, BR, a0);
+    tcg_out_insn(s, branch, BL, -1);
+}
+
+static void tcg_out_ret_tb(TCGContext *s, TCGReg key, unsigned tag)
+{
+    if (tcg_retstack_reg < 0) {
+        tcg_out_ret_tb_env(s, key, tag);
+        return;
+    }
+    tcg_out_insn(s, ldstpair, LDP, TCG_REG_TMP1, TCG_REG_LR,
+                 tcg_retstack_reg, 16, 0, 1);
+    tcg_out_insn(s, addsub_shift, SUBS, TCG_TYPE_I64,
+                 TCG_REG_XZR, TCG_REG_TMP1, key);
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 2);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+}
+
 static void tcg_out_goto_ptr(TCGContext *s, TCGReg a0)
 {
     tcg_out_insn(s, bcond_reg, BR, a0);
+}
+
+/*
+ * A conditional branch to a goto_tb slot's insn (TranslationBlock.jmp_cond)
+ * is a B.cond, CBZ or CBNZ: it reaches +-1 MiB.
+ */
+#define TCG_TARGET_HAS_COND_LINK
+
+static bool tcg_cond_link_reloc(int type)
+{
+    return type == R_AARCH64_CONDBR19;
+}
+
+/*
+ * Point slot @n's conditional branch at the TB the slot is now linked to
+ * (@d_addr), when in range; else, and when unlinked, at the slot.
+ */
+static void tb_set_cond_link(const TranslationBlock *tb, int n, bool linked,
+                             uintptr_t d_addr, uintptr_t jmp_rx,
+                             uintptr_t jmp_rw)
+{
+    uintptr_t c_rx = (uintptr_t)tb->tc.ptr + tb->jmp_cond[n] - 1;
+    uintptr_t c_rw = c_rx + (jmp_rw - jmp_rx);
+    ptrdiff_t off = d_addr - c_rx;
+    uint32_t insn = qatomic_read((uint32_t *)c_rw);
+
+    if (!linked || off != sextract64(off, 0, 21)) {
+        off = jmp_rx - c_rx;
+    }
+    qatomic_set((uint32_t *)c_rw, deposit32(insn, 5, 19, off >> 2));
+    flush_idcache_range(c_rx, c_rw, 4);
 }
 
 void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
@@ -3085,6 +3408,43 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     uintptr_t d_addr = tb->jmp_target_addr[n];
     ptrdiff_t d_offset = d_addr - jmp_rx;
     tcg_insn_unit insn;
+
+    if (tb->jmp_call & (1u << n)) {
+        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
+
+        /*
+         * A call slot: BL to a TB in range, else BL to the trampoline
+         * before the reset label, which branches to it (the return
+         * address stays the insn after the slot); unlinked, B to its exit.
+         */
+        if (d_addr == reset) {
+            insn = deposit32(Ibranch_B, 0, 26, (reset - jmp_rx) >> 2);
+        } else {
+            if (d_offset != sextract64(d_offset, 0, 28)) {
+                d_offset = reset - tramp_size(tb, n) - jmp_rx;
+            }
+            insn = deposit32(Ibranch_BL, 0, 26, d_offset >> 2);
+        }
+        qatomic_set((uint32_t *)jmp_rw, insn);
+        flush_idcache_range(jmp_rx, jmp_rw, 4);
+        return;
+    }
+
+    if (tb->jmp_cold & (1u << n)) {
+        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
+
+        /* To the TB, or by way of the trampoline before the reset label. */
+        if (d_offset != sextract64(d_offset, 0, 28)) {
+            d_offset = reset - tramp_size(tb, n) - jmp_rx;
+        }
+        insn = deposit32(Ibranch_B, 0, 26, d_offset >> 2);
+        qatomic_set((uint32_t *)jmp_rw, insn);
+        flush_idcache_range(jmp_rx, jmp_rw, 4);
+        if (tb->jmp_cond[n]) {
+            tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw);
+        }
+        return;
+    }
 
     /* Either directly branch, or indirect branch load. */
     if (d_offset == sextract64(d_offset, 0, 28)) {
@@ -3098,6 +3458,11 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
     }
     qatomic_set((uint32_t *)jmp_rw, insn);
     flush_idcache_range(jmp_rx, jmp_rw, 4);
+    if (tb->jmp_cond[n]) {
+        uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp_reset_offset[n];
+
+        tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw);
+    }
 }
 
 
@@ -5674,6 +6039,105 @@ static void tcg_out_ld_st_d8_d15(TCGContext *s, bool load)
     }
 }
 
+/*
+ * x-xpage=stub: the shared jump-cache probe of cross-page direct jumps,
+ * after the epilogue.  Called as helper_lookup_tb_ptr_jcp is: X0 = env,
+ * X1 = pc, X2 = cs_base, W3 = flags; returns the TB's code in X0, or 0.
+ * The same checks as that helper, from tcg_jc_layout, with no frame and
+ * nothing but caller-saved registers: X4-X12, and X16 for far offsets.
+ */
+static void tcg_out_xpage_stub(TCGContext *s)
+{
+    const TCGJumpCacheLayout *l = &tcg_jc_layout;
+    ptrdiff_t miss[8];
+    int nmiss = 0, fs = l->fold_shift, gs = l->group_shift;
+    int ms = l->mix_shift, pb = l->page_bits;
+    int cb = l->cache_bits, es = l->entry_shift;
+    ptrdiff_t key_ok = -1;
+
+    tcg_xpage_stub = tcg_splitwx_to_rx(s->code_ptr);
+    tcg_out_bti(s, BTI_C);
+
+    /* X4 = the jump cache; X6 = the entry's offset (tb_jmp_cache_hash_func) */
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_X4, TCG_REG_X0, l->jc_ofs);
+    /* X7 = the group: (pc ^ pc >> mix) >> group shift, in place */
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X5, TCG_REG_X1, ms, 63);
+    tcg_out_insn(s, logic_shift, EOR, TCG_TYPE_I64, TCG_REG_X5, TCG_REG_X5,
+                 TCG_REG_X1);
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X7, TCG_REG_X5, gs,
+                 gs + cb - pb - 1);
+    tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X7, TCG_REG_X7,
+                 (64 - (pb + es)) & 63, cb - pb - 1);
+    /* X6 = the slot: the pc's low bits, folded where a page is larger */
+    if (fs) {
+        tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X6, TCG_REG_X1, fs, 63);
+        tcg_out_insn(s, logic_shift, EOR, TCG_TYPE_I64, TCG_REG_X6,
+                     TCG_REG_X6, TCG_REG_X1);
+        tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X6, TCG_REG_X6,
+                     (64 - es) & 63, pb - 1);
+    } else {
+        tcg_out_ubfm(s, TCG_TYPE_I64, TCG_REG_X6, TCG_REG_X1,
+                     (64 - es) & 63, pb - 1);
+    }
+    tcg_out_insn(s, logic_shift, ORR, TCG_TYPE_I64, TCG_REG_X6, TCG_REG_X6,
+                 TCG_REG_X7);
+    tcg_out_insn(s, addsub_shift, ADD, TCG_TYPE_I64, TCG_REG_X8, TCG_REG_X4,
+                 TCG_REG_X6);
+
+    /* X9 = the entry's TB; its key against pc ^ salt (or ^ gsalt). */
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_X9, TCG_REG_X8, l->entry_tb_ofs);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_X10, TCG_REG_X8, l->entry_pc_ofs);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_X11, TCG_REG_X4, l->salt_ofs);
+    tcg_out_insn(s, logic_shift, EOR, TCG_TYPE_I64, TCG_REG_X11, TCG_REG_X11,
+                 TCG_REG_X1);
+    tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_EQ, TCG_REG_X10, TCG_REG_X11, false);
+    if (l->global) {
+        key_ok = s->code_ptr - s->code_buf;
+        tcg_out_insn(s, bcond_imm, B_C, TCG_COND_EQ, 0);
+        tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_X11, TCG_REG_X4, l->gsalt_ofs);
+        tcg_out_insn(s, logic_shift, EOR, TCG_TYPE_I64, TCG_REG_X11,
+                     TCG_REG_X11, TCG_REG_X1);
+        tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_EQ, TCG_REG_X10, TCG_REG_X11,
+                    false);
+    }
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+    if (key_ok >= 0) {
+        reloc_pc19(s->code_buf + key_ok, tcg_splitwx_to_rx(s->code_ptr));
+    }
+
+    /* A TB, no breakpoints, and the TB's cs_base, flags and cflags. */
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, cbz, CBZ, TCG_TYPE_I64, TCG_REG_X9, 0);
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_X11, TCG_REG_X0, l->bp_ofs);
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, cbz, CBNZ, TCG_TYPE_I64, TCG_REG_X11, 0);
+    tcg_out_ld(s, TCG_TYPE_I64, TCG_REG_X11, TCG_REG_X9, l->tb_cs_base_ofs);
+    tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_EQ, TCG_REG_X11, TCG_REG_X2, false);
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+    tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_X11, TCG_REG_X9, l->tb_flags_ofs);
+    tcg_out_cmp(s, TCG_TYPE_I32, TCG_COND_EQ, TCG_REG_X11, TCG_REG_X3, false);
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+    tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_X11, TCG_REG_X9, l->tb_cflags_ofs);
+    tcg_out_ld(s, TCG_TYPE_I32, TCG_REG_X12, TCG_REG_X0, l->cflags_ofs);
+    tcg_out_cmp(s, TCG_TYPE_I32, TCG_COND_EQ, TCG_REG_X11, TCG_REG_X12, false);
+    miss[nmiss++] = s->code_ptr - s->code_buf;
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+
+    /* Hit: the TB's code. */
+    tcg_out_ld(s, TCG_TYPE_PTR, TCG_REG_X0, TCG_REG_X9, l->tb_ptr_ofs);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+
+    /* Miss: 0. */
+    for (int i = 0; i < nmiss; i++) {
+        reloc_pc19(s->code_buf + miss[i], tcg_splitwx_to_rx(s->code_ptr));
+    }
+    tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X0, 0);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+}
+
 static void tcg_target_qemu_prologue(TCGContext *s)
 {
     TCGReg r;
@@ -5711,12 +6175,22 @@ static void tcg_target_qemu_prologue(TCGContext *s)
          * to zero-extend the guest address via the address index register slot,
          * therefore we need to load even a zero guest base into a register.
          */
-        tcg_out_movi(s, TCG_TYPE_PTR, TCG_REG_GUEST_BASE, guest_base);
+        if (tcg_retstack && tcg_retsp_off && tcg_retstack_addr64 &&
+            !guest_base) {
+            /* Guest addresses don't use it: it holds the return stack. */
+            tcg_retstack_reg = TCG_REG_X28;
+        } else {
+            tcg_out_movi(s, TCG_TYPE_PTR, TCG_REG_GUEST_BASE, guest_base);
+        }
         tcg_regset_set_reg(s->reserved_regs, TCG_REG_GUEST_BASE);
     }
 
     tcg_out_mov(s, TCG_TYPE_PTR, TCG_AREG0, tcg_target_call_iarg_regs[0]);
     tcg_out_pinned_ld(s);
+    if (tcg_retstack_reg >= 0) {
+        tcg_out_ld(s, TCG_TYPE_I64, tcg_retstack_reg, TCG_AREG0,
+                   tcg_retsp_off);
+    }
     tcg_out_boundary_ldst(s, true);
     tcg_out_insn(s, bcond_reg, BR, tcg_target_call_iarg_regs[1]);
 
@@ -5732,6 +6206,10 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     tb_ret_addr = tcg_splitwx_to_rx(s->code_ptr);
     tcg_out_bti(s, BTI_J);
     tcg_out_pinned_st(s);
+    if (tcg_retstack_reg >= 0) {
+        tcg_out_st(s, TCG_TYPE_I64, tcg_retstack_reg, TCG_AREG0,
+                   tcg_retsp_off);
+    }
     tcg_out_boundary_ldst(s, false);
 
     /* Remove TCG locals stack space.  */
@@ -5751,6 +6229,10 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     tcg_out_insn(s, ldstpair, LDP, TCG_REG_FP, TCG_REG_LR,
                  TCG_REG_SP, PUSH_SIZE, 0, 1);
     tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+
+    if (tcg_use_softmmu && tcg_jc_layout.valid) {
+        tcg_out_xpage_stub(s);
+    }
 }
 
 static void tcg_out_tb_start(TCGContext *s)

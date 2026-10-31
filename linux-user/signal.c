@@ -1108,6 +1108,18 @@ static void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
     if (info->si_code > 0) {
         switch (host_sig) {
         case SIGSEGV:
+#ifdef HOST_SIGNAL_SET_XREG
+            if (tcg_retstack_reg >= 0 &&
+                in_code_gen_buffer((void *)host_signal_pc(uc))) {
+                uintptr_t top = tcg_retstack_fault(cpu,
+                                                   (uintptr_t)info->si_addr);
+
+                if (top) {
+                    host_signal_set_xreg(uc, tcg_retstack_reg, top);
+                    return;
+                }
+            }
+#endif
             /* Only returns on handle_sigsegv_accerr_write success. */
             host_sigsegv_handler(cpu, info, uc);
             return;

@@ -41,6 +41,18 @@ struct TCGCPUOps {
     bool precise_smc;
 
     /**
+     * @jmp_cache_salt_shift: if set, returns the lowest pc bit from which
+     *                        @cpu's pcs, in its current mode, never need
+     *                        the bits up to 63 to tell apart TBs with the
+     *                        same cs_base and flags, so that the jump
+     *                        cache may keep a salt there and flush in
+     *                        O(1).  The mode may change only where a TLB
+     *                        flush of @cpu follows the change, before the
+     *                        cache is used.
+     */
+    int (*jmp_cache_salt_shift)(CPUState *cpu);
+
+    /**
      * @guest_default_memory_order: default barrier that is required
      *                              for the guest memory ordering.
      */

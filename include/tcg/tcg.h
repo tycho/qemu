@@ -120,6 +120,10 @@ struct TCGLabel {
     void *snap;                 /* the allocator's state at the branch */
     void *loopregs;             /* XLBL_LOOP: the globals kept in registers */
     int nb_loopregs;
+    /* 1 + the goto_tb_cold slot whose unlinked path starts here, or 0. */
+    uint8_t cold_slot;
+    /* Starts code that only a jump reaches, not run in the common case. */
+    bool cold;
 };
 
 typedef struct TCGPool {
@@ -514,6 +518,28 @@ struct TCGContext {
     struct TCGLabelPoolData *pool_labels;
 
     TCGLabel *exitreq_label;
+    /* The reset label of each call_tb slot (tcg_gen_call_tb), or NULL. */
+    TCGLabel *call_tb_reset[8];
+    /*
+     * tcg_tblayout: the region's current chunk (hot code from lay_chunk
+     * to lay_hot_end, then TB structs and cold code from lay_cold up to
+     * lay_cold_end); whether this TB uses it (lay_on), must be generated
+     * again without cold code (lay_retry), and whether code is being
+     * emitted in the cold part (lay_cold_now).
+     */
+    void *lay_chunk, *lay_hot_end, *lay_cold, *lay_cold_end;
+    bool lay_on, lay_retry, lay_cold_now;
+    /* The next chunk's hot part, in 64ths, or 0 for the initial share. */
+    unsigned lay_hot64;
+    /*
+     * tcg_goto_tb_cold: the last label emitted, and its offset in the
+     * code, for a goto_tb slot right at it (TranslationBlock.jmp_cond).
+     */
+    TCGLabel *slot_label;
+    size_t slot_label_off;
+    /* tcg_gen_push_ret() for a call that leaves through goto_ptr. */
+    TCGLabel *call_ret, *call_land;
+    bool call_ret_set;
 
 #ifdef CONFIG_PLUGIN
     /*
@@ -800,6 +826,7 @@ static inline bool tcg_op_buf_full(void)
 void *tcg_malloc_internal(TCGContext *s, int size);
 void tcg_pool_reset(TCGContext *s);
 TranslationBlock *tcg_tb_alloc(TCGContext *s);
+void *tcg_tb_data_highwater(TCGContext *s);
 
 void tcg_region_reset_all(void);
 

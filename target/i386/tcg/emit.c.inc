@@ -3310,13 +3310,19 @@ static void gen_BZHI(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_CALL(DisasContext *s, X86DecodedInsn *decode)
 {
+    rs_call_key(s);
     gen_push_v(s, eip_next_tl(s));
+    s->rs_call = true;
+    s->rs_next = CODE64(s) ? s->pc : (uint32_t)(s->pc - s->cs_base);
     gen_JMP(s, decode);
 }
 
 static void gen_CALL_m(DisasContext *s, X86DecodedInsn *decode)
 {
+    rs_call_key(s);
     gen_push_v(s, eip_next_tl(s));
+    s->rs_call = true;
+    s->rs_next = CODE64(s) ? s->pc : (uint32_t)(s->pc - s->cs_base);
     gen_JMP_m(s, decode);
 }
 
@@ -4320,8 +4326,70 @@ static void gen_JMP(DisasContext *s, X86DecodedInsn *decode)
     gen_jmp_rel(s, s->dflag, decode->immediate, 0);
 }
 
+/*
+ * A jump or call through a pointer at a constant address (a PLT stub's
+ * jmp *slot(%rip), call *slot(%rip), i386's jmp *slot): if the pointer
+ * still holds its value at translation time, leave directly to it
+ * (translator_ptr_guard).  s->T0 holds the loaded pointer.  Returns false
+ * where that doesn't apply.
+ */
+static bool gen_JMP_m_guarded(DisasContext *s, X86DecodedInsn *decode)
+{
+    /* JMP_m and CALL_m read their operand as op[1]. */
+    X86DecodedOp *op = &decode->op[1];
+    MemOp ot = CODE64(s) ? MO_64 : MO_32;
+    int seg = s->override >= 0 ? s->override : decode->mem.def_seg;
+    target_ulong addr;
+    uint64_t val;
+    bool rs_call, rs_ret, jmp_direct;
+    TCGLabel *miss;
+
+    /* The direct exit goes to the value as a linear address: flat code. */
+    if (!op->has_ea || op->ot != ot || s->aflag != ot || !s->jmp_opt ||
+        (!CODE64(s) && !CODE32(s)) || s->cs_base ||
+        decode->mem.index >= 0 ||
+        decode->mem.base != (CODE64(s) ? -2 : -1) ||
+        seg >= R_FS || (seg >= 0 && ADDSEG(s))) {
+        return false;
+    }
+    addr = CODE64(s) ? decode->mem.disp : (uint32_t)decode->mem.disp;
+    if (!translator_ptr_guard(&s->base, s->base.pc_next, addr, ot | MO_LE,
+                              &val)) {
+        return false;
+    }
+
+    miss = gen_new_label();
+    gen_bnd_jmp(s);
+    gen_update_cc_op(s);
+    tcg_gen_brcondi_tl(TCG_COND_NE, s->T0, val, miss);
+
+    /* What the direct exit consumes, the miss path needs again. */
+    rs_call = s->rs_call;
+    rs_ret = s->rs_ret;
+    jmp_direct = s->jmp_direct;
+    gen_jmp_rel(s, ot, val - s->pc, 0);
+    s->rs_call = rs_call;
+    s->rs_ret = rs_ret;
+    s->jmp_direct = jmp_direct;
+    /* The direct exit's goto_tb slots are taken: land through the lookup. */
+    s->rs_land_unlinked = true;
+
+    /*
+     * The pointer as loaded, not read again: a CALL's push may have
+     * overwritten it since.
+     */
+    gen_set_label(miss);
+    translator_gen_ptr_respec(&s->base, s->base.pc_next);
+    gen_op_jmp_v(s, s->T0);
+    s->base.is_jmp = DISAS_JUMP;
+    return true;
+}
+
 static void gen_JMP_m(DisasContext *s, X86DecodedInsn *decode)
 {
+    if (gen_JMP_m_guarded(s, decode)) {
+        return;
+    }
     gen_op_jmp_v(s, s->T0);
     gen_bnd_jmp(s);
     s->base.is_jmp = DISAS_JUMP;
@@ -5873,6 +5941,7 @@ static void gen_RET(DisasContext *s, X86DecodedInsn *decode)
     gen_stack_update(s, adjust + (1 << ot));
     gen_op_jmp_v(s, s->T0);
     gen_bnd_jmp(s);
+    s->rs_ret = true;
     s->base.is_jmp = DISAS_JUMP;
 }
 
