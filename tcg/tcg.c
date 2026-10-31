@@ -9422,9 +9422,13 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         {
             const TCGOutOpQemuLdStX *out =
                 container_of(all_outop[op->opc], TCGOutOpQemuLdStX, base);
+            TCGTemp *its = arg_temp(op->args[2]);
+            /* A constant 0 index may be in a register an earlier op set. */
+            bool index_zero = const_args[2] ||
+                              (its->kind == TEMP_CONST && its->val == 0);
 
             out->out(s, type, new_args[0], new_args[1], new_args[2],
-                     const_args[2], new_args[3]);
+                     index_zero, new_args[3]);
         }
         break;
 

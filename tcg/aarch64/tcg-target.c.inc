@@ -3300,7 +3300,7 @@ static void tgen_qemu_ld_x(TCGContext *s, TCGType type, TCGReg data,
         };
         uint32_t insn = 0;
 
-        tcg_debug_assert(index == TCG_REG_XZR);
+        tcg_debug_assert(index == TCG_REG_XZR || index_zero);
         if (ofs && have_lrcpc2) {
             switch (mop & MO_SSIZE) {
             case MO_SB:
@@ -3349,7 +3349,7 @@ static void tgen_qemu_st_x(TCGContext *s, TCGType type, TCGReg data,
             0x19000000, 0x59000000, 0x99000000, 0xd9000000
         };
 
-        tcg_debug_assert(index == TCG_REG_XZR);
+        tcg_debug_assert(index == TCG_REG_XZR || index_zero);
         if (ofs && have_lrcpc2) {
             tcg_out32(s, stlur[mop & MO_SIZE] | (ofs & 0x1ff) << 12 |
                       base << 5 | data);
