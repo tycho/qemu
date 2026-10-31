@@ -487,10 +487,9 @@ static void tlb_flush_vtlb_page_mask_locked(CPUState *cpu, int mmu_idx,
     int k;
 
     assert_cpu_is_self(cpu);
+    /* n_used_entries counts the main table's entries only. */
     for (k = 0; k < CPU_VTLB_SIZE; k++) {
-        if (tlb_flush_entry_mask_locked(&d->vtable[k], page, mask)) {
-            tlb_n_used_entries_dec(cpu, mmu_idx);
-        }
+        tlb_flush_entry_mask_locked(&d->vtable[k], page, mask);
     }
 }
 
@@ -1034,7 +1033,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     hwaddr iotlb, xlat, sz, paddr_page;
     vaddr addr_page;
     int asidx, wp_flags, prot;
-    bool is_ram, is_romd;
+    bool is_ram, is_romd, was_used;
 
     assert_cpu_is_self(cpu);
 
@@ -1135,7 +1134,6 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         /* Evict the old entry into the victim tlb.  */
         copy_tlb_helper_locked(tv, te);
         desc->vfulltlb[vidx] = desc->fulltlb[index];
-        tlb_n_used_entries_dec(cpu, mmu_idx);
     }
 
     /* refill the tlb */
@@ -1179,8 +1177,18 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     tlb_set_compare(full, &tn, addr_page, write_flags,
                     MMU_DATA_STORE, prot & PAGE_WRITE);
 
+    /*
+     * The main table's entries in use: one more if the slot was empty.
+     * Replacing an entry (evicted, or the same page refilled with other
+     * permissions) leaves the count as it was.
+     */
+    was_used = !tlb_entry_is_empty(te);
     copy_tlb_helper_locked(te, &tn);
-    tlb_n_used_entries_inc(cpu, mmu_idx);
+    if (!tlb_entry_is_empty(te) && !was_used) {
+        tlb_n_used_entries_inc(cpu, mmu_idx);
+    } else if (tlb_entry_is_empty(te) && was_used) {
+        tlb_n_used_entries_dec(cpu, mmu_idx);
+    }
     qemu_spin_unlock(&tlb->c.lock);
 }
 
@@ -1327,6 +1335,10 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
              * an entry under the lock: swap them together.
              */
             qemu_spin_lock(&cpu->neg.tlb.c.lock);
+            /* The entry moves to an empty main-table slot: one more there. */
+            if (tlb_entry_is_empty(tlb)) {
+                tlb_n_used_entries_inc(cpu, mmu_idx);
+            }
             copy_tlb_helper_locked(&tmptlb, tlb);
             copy_tlb_helper_locked(tlb, vtlb);
             copy_tlb_helper_locked(vtlb, &tmptlb);
