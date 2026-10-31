@@ -67,6 +67,13 @@ virtio_gpu_base_generate_edid(VirtIOGPUBase *g, int scanout,
         .refresh_rate = g->req_state[scanout].refresh_rate,
     };
 
+    /* a UI may know its refresh rate before it has a size to request */
+    if (!info.refresh_rate && g->scanout[scanout].con &&
+        qemu_console_ui_info_supported(g->scanout[scanout].con)) {
+        info.refresh_rate =
+            qemu_console_get_ui_info(g->scanout[scanout].con)->refresh_rate;
+    }
+
     for (output_idx = 0, node = g->conf.outputs;
          output_idx <= scanout && node; output_idx++, node = node->next) {
         if (output_idx == scanout && node->value->name) {

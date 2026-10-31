@@ -164,4 +164,14 @@ static inline void _g_clear_fd_ignore_error(int *fd_ptr)
 #define G_NORETURN G_GNUC_NORETURN
 #endif
 
+/*
+ * g_unix_open_pipe() takes O_CLOEXEC from GLib 2.78 on, and logs each use
+ * of FD_CLOEXEC as deprecated.
+ */
+#if GLIB_CHECK_VERSION(2, 78, 0)
+#define QEMU_G_UNIX_PIPE_CLOEXEC O_CLOEXEC
+#else
+#define QEMU_G_UNIX_PIPE_CLOEXEC FD_CLOEXEC
+#endif
+
 #endif
