@@ -257,6 +257,12 @@ struct CPUTLBEntryFull {
     uint8_t slow_flags[MMU_ACCESS_COUNT];
 
     /*
+     * @global: the translation does not depend on the current address
+     * space, and survives tlb_flush_nonglobal_by_mmuidx.
+     */
+    bool global;
+
+    /*
      * Allow target-specific additions to this structure.
      * This may be used to cache items from the guest cpu
      * page tables for later use by the implementation.
@@ -283,6 +289,18 @@ struct CPUTLBEntryFull {
  * the TCG fast path.
  */
 typedef struct CPUTLBDesc {
+    /*
+     * Whether an entry marked global may be in the tlb or the victim tlb
+     * (since the last flush of all entries).
+     */
+    bool has_global;
+    /*
+     * tcg_tlb_nglist: how many tlb slots were filled with a non-global
+     * entry since the last flush; the slots are listed after fulltlb's
+     * entries (tlb_ng_slots).  In has_global's padding: this struct's
+     * size moves CPUState's fields relative to env in every build.
+     */
+    uint16_t ng_count;
     /*
      * Describe a region covering all of the large pages allocated
      * into the tlb.  When any page within this region is flushed,

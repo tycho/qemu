@@ -509,17 +509,38 @@ extern bool tcg_flags_dead;
 extern bool tcg_lazy_incdec;
 
 /*
+ * x86 guests: what a CR3 write flushes from the softmmu TLB (the TCG
+ * accelerator property x-cr3-flush).
  */
+typedef enum TCGCR3Flush {
+    TCG_CR3_FLUSH_ALL,      /* every mmu index */
+    TCG_CR3_FLUSH_PAGING,   /* the indexes that translate through paging */
+    TCG_CR3_FLUSH_NONGLOBAL, /* ... and of those, only non-global entries */
+} TCGCR3Flush;
 
+extern TCGCR3Flush tcg_cr3_flush;
 
 /*
+ * tcg_tlb_nglist (with x-cr3-flush=nonglobal, fixed at machine init):
+ * each softmmu tlb lists the slots it fills with non-global entries, so
+ * that a flush of the non-global entries (an x86 CR3 write) clears those
+ * instead of scanning the table.
  */
+extern bool tcg_tlb_nglist;
 
 /*
+ * tcg_tlb_dirtyfilter (with x-cr3-flush=nonglobal, fixed at machine
+ * init): each softmmu tlb keeps a bitmap of the host pages of its
+ * writable RAM entries, so that clearing a page's dirty state (code
+ * translated from it) scans only the tlbs that may map it.
  */
+extern bool tcg_tlb_dirtyfilter;
 
 /*
+ * x86 guests: offer PCIDs (CPUID PCID and INVPCID; the TCG accelerator
+ * property x-pcid).
  */
+extern bool tcg_pcid;
 
 /*
  */

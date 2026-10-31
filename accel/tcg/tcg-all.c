@@ -208,7 +208,9 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 
     /*
      */
+        }
     }
+        }
     }
 #endif
 
@@ -225,13 +227,27 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 
     /*
      */
+        };
+        };
+        AccelClass *ac = ACCEL_GET_CLASS(as);
 
+        }
+            ac->compat_props = g_ptr_array_new();
+        }
+        }
+        }
     }
 
 
 
     /*
+     * With x-cr3-flush=nonglobal, each tlb also lists the slots it fills
+     * with non-global entries, and keeps a bitmap of the host pages it
+     * maps writable.  Both start empty: they are kept from the start or
+     * not at all, whatever the setting later.
      */
+    tcg_tlb_nglist = tcg_cr3_flush == TCG_CR3_FLUSH_NONGLOBAL;
+    tcg_tlb_dirtyfilter = tcg_tlb_nglist;
 #endif
 
     tcg_allowed = true;
@@ -926,21 +942,37 @@ static void tcg_set_superblock(Object *obj, const char *value, Error **errp)
     tcg_units = 0;
 }
 
+static const char * const tcg_cr3_flush_names[] = {
+    [TCG_CR3_FLUSH_ALL] = "all",
+    [TCG_CR3_FLUSH_PAGING] = "paging",
+    [TCG_CR3_FLUSH_NONGLOBAL] = "nonglobal",
 };
 
+static char *tcg_get_cr3_flush(Object *obj, Error **errp)
 {
+    return g_strdup(tcg_cr3_flush_names[tcg_cr3_flush]);
 }
 
+static void tcg_set_cr3_flush(Object *obj, const char *value, Error **errp)
 {
+    for (int i = 0; i < ARRAY_SIZE(tcg_cr3_flush_names); i++) {
+        if (!strcmp(value, tcg_cr3_flush_names[i])) {
+            tcg_cr3_flush = i;
             return;
         }
     }
+    error_setg(errp, "Invalid 'x-cr3-flush' value: %s "
+               "(all, paging, nonglobal)", value);
 }
 
+static bool tcg_get_pcid(Object *obj, Error **errp)
 {
+    return tcg_pcid;
 }
 
+static void tcg_set_pcid(Object *obj, bool value, Error **errp)
 {
+    tcg_pcid = value;
 }
 
 {
@@ -1247,7 +1279,17 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "every jump in enters with the same guest condition-code state "
         "for that state");
 
+    object_class_property_add_str(oc, "x-cr3-flush",
+                                  tcg_get_cr3_flush, tcg_set_cr3_flush);
+    object_class_property_set_description(oc, "x-cr3-flush",
+        "x86: what a CR3 write flushes from the TLB: all (every mmu index), "
+        "paging (not the physical-address ones, which don't depend on "
+        "CR3), or nonglobal (as paging, but keep global pages, as a MOV "
+        "to CR3 without PCIDs does)");
 
+    object_class_property_add_bool(oc, "x-pcid", tcg_get_pcid, tcg_set_pcid);
+    object_class_property_set_description(oc, "x-pcid",
+        "x86: offer process-context identifiers (CPUID PCID and INVPCID)");
 
 
 
