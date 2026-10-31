@@ -83,6 +83,7 @@ this code that are retained.
 #include <math.h>
 #include "qemu/bitops.h"
 #include "fpu/softfloat.h"
+#include "fpu/softfloat-vec.h"
 #include "fpu/softfloat-parts.h"
 
 /* We only need stdlib for abort() */
@@ -207,10 +208,22 @@ GEN_INPUT_FLUSH3(float64_input_flush3, float64)
  * On x86_64/aarch64, using the former over the latter can yield a ~6% speedup.
  * On power64 however, using isinf() reduces fp-bench performance by up to 50%.
  */
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(HOST_X86_64)
 # define QEMU_HARDFLOAT_USE_ISINF   1
 #else
 # define QEMU_HARDFLOAT_USE_ISINF   0
+#endif
+
+/*
+ * On AArch64 the host's cumulative exception flags can be the guest's
+ * (host/fpenv.h).  A floating-point comparison of a denormal result would
+ * then raise a flag of its own, so the checks on a hardfloat result use
+ * integer tests there.
+ */
+#ifdef HOST_AARCH64
+# define QEMU_HARDFLOAT_RESULT_USE_FP   0
+#else
+# define QEMU_HARDFLOAT_RESULT_USE_FP   1
 #endif
 
 /*
@@ -230,11 +243,7 @@ GEN_INPUT_FLUSH3(float64_input_flush3, float64)
 
 static inline bool can_use_fpu(const float_status *s)
 {
-    if (QEMU_NO_HARDFLOAT) {
-        return false;
-    }
-    return likely(s->float_exception_flags & float_flag_inexact &&
-                  get_float_rounding_mode(s) == float_round_nearest_even);
+    return float_hardfloat_ok(s);
 }
 
 /*
@@ -335,6 +344,32 @@ static inline bool f64_is_inf(union_float64 a)
     return float64_is_infinity(a.s);
 }
 
+/* fabsf(a) <= FLT_MIN, fabs(a) <= DBL_MIN */
+static inline bool f32_is_tiny(union_float32 a)
+{
+    if (QEMU_HARDFLOAT_RESULT_USE_FP) {
+        return fabsf(a.h) <= FLT_MIN;
+    }
+    return (a.s & 0x7fffffff) <= 0x00800000;
+}
+
+static inline bool f64_is_tiny(union_float64 a)
+{
+    if (QEMU_HARDFLOAT_RESULT_USE_FP) {
+        return fabs(a.h) <= DBL_MIN;
+    }
+    return (a.s & 0x7fffffffffffffffULL) <= 0x0010000000000000ULL;
+}
+
+/* fabs(a) <= FLT_MIN, for a float64 (float64_muladd's threshold) */
+static inline bool f64_is_below_flt_min(union_float64 a)
+{
+    if (QEMU_HARDFLOAT_RESULT_USE_FP) {
+        return fabs(a.h) <= FLT_MIN;
+    }
+    return (a.s & 0x7fffffffffffffffULL) <= 0x3810000000000000ULL;
+}
+
 static inline float32
 float32_gen2(float32 xa, float32 xb, float_status *s,
              hard_f32_op2_fn hard, soft_f32_op2_fn soft,
@@ -357,7 +392,7 @@ float32_gen2(float32 xa, float32 xb, float_status *s,
     ur.h = hard(ua.h, ub.h);
     if (unlikely(f32_is_inf(ur))) {
         float_raise(float_flag_overflow, s);
-    } else if (unlikely(fabsf(ur.h) <= FLT_MIN) && post(ua, ub)) {
+    } else if (unlikely(f32_is_tiny(ur)) && post(ua, ub)) {
         goto soft;
     }
     return ur.s;
@@ -388,7 +423,7 @@ float64_gen2(float64 xa, float64 xb, float_status *s,
     ur.h = hard(ua.h, ub.h);
     if (unlikely(f64_is_inf(ur))) {
         float_raise(float_flag_overflow, s);
-    } else if (unlikely(fabs(ur.h) <= DBL_MIN) && post(ua, ub)) {
+    } else if (unlikely(f64_is_tiny(ur)) && post(ua, ub)) {
         goto soft;
     }
     return ur.s;
@@ -1984,7 +2019,7 @@ float64_muladd_scalbn(float64 a, float64 b, float64 c,
     return pack_raw64(&pr, &float64_params);
 }
 
-static bool force_soft_fma;
+bool float_force_soft_fma;
 
 float32 QEMU_FLATTEN
 float32_muladd(float32 xa, float32 xb, float32 xc, int flags, float_status *s)
@@ -2007,7 +2042,7 @@ float32_muladd(float32 xa, float32 xb, float32 xc, int flags, float_status *s)
         goto soft;
     }
 
-    if (unlikely(force_soft_fma)) {
+    if (unlikely(float_force_soft_fma)) {
         goto soft;
     }
 
@@ -2042,7 +2077,7 @@ float32_muladd(float32 xa, float32 xb, float32 xc, int flags, float_status *s)
 
         if (unlikely(f32_is_inf(ur))) {
             float_raise(float_flag_overflow, s);
-        } else if (unlikely(fabsf(ur.h) <= FLT_MIN)) {
+        } else if (unlikely(f32_is_tiny(ur))) {
             ua = ua_orig;
             uc = uc_orig;
             goto soft;
@@ -2075,7 +2110,7 @@ float64_muladd(float64 xa, float64 xb, float64 xc, int flags, float_status *s)
         goto soft;
     }
 
-    if (unlikely(force_soft_fma)) {
+    if (unlikely(float_force_soft_fma)) {
         goto soft;
     }
 
@@ -2110,7 +2145,7 @@ float64_muladd(float64 xa, float64 xb, float64 xc, int flags, float_status *s)
 
         if (unlikely(f64_is_inf(ur))) {
             float_raise(float_flag_overflow, s);
-        } else if (unlikely(fabs(ur.h) <= FLT_MIN)) {
+        } else if (unlikely(f64_is_below_flt_min(ur))) {
             ua = ua_orig;
             uc = uc_orig;
             goto soft;
@@ -5159,6 +5194,6 @@ static void __attribute__((constructor)) softfloat_init(void)
     uc.s = 0x0020000000000000ULL;
     ur.h = fma(ua.h, ub.h, uc.h);
     if (ur.s != 0x0020000000000001ULL) {
-        force_soft_fma = true;
+        float_force_soft_fma = true;
     }
 }

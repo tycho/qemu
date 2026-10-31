@@ -345,6 +345,11 @@ typedef struct X86DecodedOp {
     X86OpExt ext;
     bool has_ea;
     int offset;   /* For MMX and SSE */
+    /*
+     * With x-ssefp=native, a 32- or 64-bit SSE operand loaded from memory,
+     * duplicated into each element; NULL otherwise.
+     */
+    TCGv_vec scalar;
 
     union {
 	target_ulong imm;
