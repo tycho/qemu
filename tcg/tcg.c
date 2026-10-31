@@ -9041,6 +9041,8 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             lazy = &s->lazy_dead[--s->nb_lazy_dead];
             tcg_debug_assert(lazy->op == op);
             ldst_record_writeback(s, i_allocated_regs);
+        } else if (s->boundary_in && op->opc == INDEX_op_push_ret) {
+            /* Liveness leaves the boundary globals in place, unsynced. */
         } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
             /* sync globals if the op has side effects and might trigger
                an exception. */
