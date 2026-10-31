@@ -196,6 +196,8 @@ extern bool tcg_pin_user;
 extern bool tcg_pin_vec;
 extern bool tcg_pin_cc;
 extern bool tcg_pin_pc;
+/*
+ */
 
 /*
  * tcg_pin_system_ok: whether the backend can pin guest registers in system
@@ -240,6 +242,22 @@ extern bool tcg_vregs_all;
  * accesses and before exits).
  */
 void tcg_set_env_scratch(intptr_t ofs, intptr_t size);
+
+/*
+ * A TB whose direct jump returns to its first insn branches back within
+ * the TB instead of chaining to itself, and the register allocator keeps
+ * values in host registers across the labels of such a loop.
+ */
+extern bool tcg_region;
+
+/*
+ */
+
+/*
+ */
+
+/*
+ */
 
 /**
  * tcg_init: Initialize the TCG runtime
