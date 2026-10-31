@@ -99,6 +99,13 @@ static inline bool tcg_iolazy_active(void)
  */
 extern bool tcg_mmio_lockless;
 
+/*
+ * x-tlb-grow: grow a softmmu TLB between flushes once it has had this
+ * many times its size in fills within 100 ms while over 35% used, and
+ * size it for 15-35% use at flushes (0: QEMU's sizing, only at flushes).
+ */
+extern unsigned tcg_tlb_grow;
+
 extern bool icount_align_option;
 
 /*
