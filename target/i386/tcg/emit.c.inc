@@ -848,6 +848,15 @@ static bool vint_can(TCGOpcode opc, unsigned vece)
     return tcg_vint && tcg_can_emit_vec_op(opc, TCG_TYPE_V128, vece) != 0;
 }
 
+/*
+ * The backend emits opc itself: for the ops TCG has no generic expansion
+ * of (tcg_gen_zip_vec and the like emit the op as it is).
+ */
+static bool vint_can_direct(TCGOpcode opc, unsigned vece)
+{
+    return tcg_vint && tcg_can_emit_vec_op(opc, TCG_TYPE_V128, vece) > 0;
+}
+
 static void vint_zip_b(TCGv_vec r, TCGv_vec a, TCGv_vec b, int64_t high)
 {
     tcg_gen_zip_vec(MO_8, r, a, b, high);
@@ -885,8 +894,9 @@ static void vint_byteshift(TCGv_vec r, TCGv_vec a, TCGv_vec zero, int64_t n)
 #define PUNPCK_BYTES(uname, lname, high)                                      \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
 {                                                                             \
-    if ((s->prefix & PREFIX_DATA) && vint_can(INDEX_op_zip_vec, MO_8)         \
-        && gen_vint_lanes(s, decode, 1, 2, vint_zip_b, high)) {               \
+    if ((s->prefix & PREFIX_DATA) &&                                          \
+        vint_can_direct(INDEX_op_zip_vec, MO_8) &&                            \
+        gen_vint_lanes(s, decode, 1, 2, vint_zip_b, high)) {                  \
         return;                                                               \
     }                                                                         \
     gen_binary_int_sse(s, decode,                                             \
@@ -1399,8 +1409,8 @@ static bool gen_vint_broadcast(DisasContext *s, X86DecodedInsn *decode,
     } else {
         TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
 
-        if (vece == MO_8 ? !vint_can(INDEX_op_tbl_vec, MO_8)
-                         : !vint_can(INDEX_op_perm_vec, vece)) {
+        if (vece == MO_8 ? !vint_can_direct(INDEX_op_tbl_vec, MO_8)
+                         : !vint_can_direct(INDEX_op_perm_vec, vece)) {
             return false;
         }
         tcg_gen_ld_vec(a, tcg_env, decode->op[2].offset);
@@ -1541,25 +1551,25 @@ PUNPCK_BYTES(PUNPCKLBW,  punpcklbw, false)
 PUNPCK_INT_MMX(PUNPCKLWD,  punpcklwd, MO_16, false)
 PUNPCK_INT_MMX(PUNPCKLDQ,  punpckldq, MO_32, false)
 VINT_BINARY(PACKSSWB, packsswb, gen_helper_packsswb_mmx,
-            vint_can(INDEX_op_narrow_vec, MO_8),
+            vint_can_direct(INDEX_op_narrow_vec, MO_8),
             vint_pack, TCG_NARROW_SAT_S | MO_8 << 8)
 VINT_BINARY(PACKUSWB, packuswb, gen_helper_packuswb_mmx,
-            vint_can(INDEX_op_narrow_vec, MO_8),
+            vint_can_direct(INDEX_op_narrow_vec, MO_8),
             vint_pack, TCG_NARROW_SAT_SU | MO_8 << 8)
 PUNPCK_BYTES(PUNPCKHBW,  punpckhbw, true)
 PUNPCK_INT_MMX(PUNPCKHWD,  punpckhwd, MO_16, true)
 PUNPCK_INT_MMX(PUNPCKHDQ,  punpckhdq, MO_32, true)
 VINT_BINARY(PACKSSDW, packssdw, gen_helper_packssdw_mmx,
-            vint_can(INDEX_op_narrow_vec, MO_16),
+            vint_can_direct(INDEX_op_narrow_vec, MO_16),
             vint_pack, TCG_NARROW_SAT_S | MO_16 << 8)
 
 VINT_BINARY(PAVGB, pavgb, gen_helper_pavgb_mmx,
-            vint_can(INDEX_op_avgr_vec, MO_8), vint_pavg, MO_8)
+            vint_can_direct(INDEX_op_avgr_vec, MO_8), vint_pavg, MO_8)
 VINT_BINARY(PAVGW, pavgw, gen_helper_pavgw_mmx,
-            vint_can(INDEX_op_avgr_vec, MO_16), vint_pavg, MO_16)
+            vint_can_direct(INDEX_op_avgr_vec, MO_16), vint_pavg, MO_16)
 VINT_BINARY(PMADDWD, pmaddwd, gen_helper_pmaddwd_mmx,
-            vint_can(INDEX_op_mulw_vec, MO_16)
-            && vint_can(INDEX_op_addp_vec, MO_32),
+            vint_can_direct(INDEX_op_mulw_vec, MO_16)
+            && vint_can_direct(INDEX_op_addp_vec, MO_32),
             vint_pmaddwd, 0)
 /*
  * AVX-VNNI with tcg_vint: VPDPBUSD as a mixed-sign byte dot product into
@@ -1581,13 +1591,13 @@ static bool gen_vnni_host(DisasContext *s, X86DecodedInsn *decode, int kind)
         }
         /* fall through */
     case VNNI_BUSD:
-        if (!vint_can(INDEX_op_usdot4_vec, MO_32)) {
+        if (!vint_can_direct(INDEX_op_usdot4_vec, MO_32)) {
             return false;
         }
         break;
     case VNNI_WSSD:
-        if (!vint_can(INDEX_op_mulw_vec, MO_16) ||
-            !vint_can(INDEX_op_addp_vec, MO_32)) {
+        if (!vint_can_direct(INDEX_op_mulw_vec, MO_16) ||
+            !vint_can_direct(INDEX_op_addp_vec, MO_32)) {
             return false;
         }
         break;
@@ -1640,22 +1650,22 @@ VNNI_SSE(VPDPWSSD, vpdpwssd, VNNI_WSSD)
 VNNI_SSE(VPDPWSSDS, vpdpwssds, -1)
 
 VINT_BINARY(PMULHUW, pmulhuw, gen_helper_pmulhuw_mmx,
-            vint_can(INDEX_op_mulw_vec, MO_16)
-            && vint_can(INDEX_op_narrow_vec, MO_16),
+            vint_can_direct(INDEX_op_mulw_vec, MO_16)
+            && vint_can_direct(INDEX_op_narrow_vec, MO_16),
             vint_pmulh, false | 16 << 1)
 VINT_BINARY(PMULHW, pmulhw, gen_helper_pmulhw_mmx,
-            vint_can(INDEX_op_mulw_vec, MO_16)
-            && vint_can(INDEX_op_narrow_vec, MO_16),
+            vint_can_direct(INDEX_op_mulw_vec, MO_16)
+            && vint_can_direct(INDEX_op_narrow_vec, MO_16),
             vint_pmulh, true | 16 << 1)
 VINT_BINARY(PMULUDQ, pmuludq, gen_helper_pmuludq_mmx,
-            vint_can(INDEX_op_mulw_vec, MO_32)
-            && vint_can(INDEX_op_perm_vec, MO_32),
+            vint_can_direct(INDEX_op_mulw_vec, MO_32)
+            && vint_can_direct(INDEX_op_perm_vec, MO_32),
             vint_pmul_even, false)
 VINT_BINARY(PSADBW, psadbw, gen_helper_psadbw_mmx,
-            vint_can(INDEX_op_abd_vec, MO_8)
-            && vint_can(INDEX_op_addlp_vec, MO_8)
-            && vint_can(INDEX_op_addlp_vec, MO_16)
-            && vint_can(INDEX_op_addlp_vec, MO_32),
+            vint_can_direct(INDEX_op_abd_vec, MO_8)
+            && vint_can_direct(INDEX_op_addlp_vec, MO_8)
+            && vint_can_direct(INDEX_op_addlp_vec, MO_16)
+            && vint_can_direct(INDEX_op_addlp_vec, MO_32),
             vint_psadbw, 0)
 
 SHIFT_XMM(PSLLW_r, psllw, MO_16, INDEX_op_shlv_vec)
@@ -1668,26 +1678,26 @@ SHIFT_XMM(PSRAW_r, psraw, MO_16, INDEX_op_sarv_vec)
 SHIFT_XMM(PSRAD_r, psrad, MO_32, INDEX_op_sarv_vec)
 
 VINT_BINARY(PHADDW, phaddw, gen_helper_phaddw_mmx,
-            vint_can(INDEX_op_addp_vec, MO_16), vint_phadd, MO_16)
+            vint_can_direct(INDEX_op_addp_vec, MO_16), vint_phadd, MO_16)
 VINT_BINARY(PHADDD, phaddd, gen_helper_phaddd_mmx,
-            vint_can(INDEX_op_addp_vec, MO_32), vint_phadd, MO_32)
+            vint_can_direct(INDEX_op_addp_vec, MO_32), vint_phadd, MO_32)
 VINT_BINARY(PHADDSW, phaddsw, gen_helper_phaddsw_mmx,
-            vint_can(INDEX_op_perm_vec, MO_16)
+            vint_can_direct(INDEX_op_perm_vec, MO_16)
             && vint_can(INDEX_op_ssadd_vec, MO_16),
             vint_phop, VINT_PHADDS | MO_16 << 8)
 VINT_BINARY(PHSUBW, phsubw, gen_helper_phsubw_mmx,
-            vint_can(INDEX_op_perm_vec, MO_16),
+            vint_can_direct(INDEX_op_perm_vec, MO_16),
             vint_phop, VINT_PHSUB | MO_16 << 8)
 VINT_BINARY(PHSUBD, phsubd, gen_helper_phsubd_mmx,
-            vint_can(INDEX_op_perm_vec, MO_32),
+            vint_can_direct(INDEX_op_perm_vec, MO_32),
             vint_phop, VINT_PHSUB | MO_32 << 8)
 VINT_BINARY(PHSUBSW, phsubsw, gen_helper_phsubsw_mmx,
-            vint_can(INDEX_op_perm_vec, MO_16)
+            vint_can_direct(INDEX_op_perm_vec, MO_16)
             && vint_can(INDEX_op_sssub_vec, MO_16),
             vint_phop, VINT_PHSUBS | MO_16 << 8)
 VINT_BINARY(PMADDUBSW, pmaddubsw, gen_helper_pmaddubsw_mmx,
-            vint_can(INDEX_op_widen_vec, MO_8)
-            && vint_can(INDEX_op_perm_vec, MO_16)
+            vint_can_direct(INDEX_op_widen_vec, MO_8)
+            && vint_can_direct(INDEX_op_perm_vec, MO_16)
             && vint_can(INDEX_op_ssadd_vec, MO_16),
             vint_pmaddubsw, 0)
 /*
@@ -1738,8 +1748,8 @@ VINT_BINARY(PSIGNW, psignw, gen_helper_psignw_mmx, vint_psign_ok(MO_16),
 VINT_BINARY(PSIGND, psignd, gen_helper_psignd_mmx, vint_psign_ok(MO_32),
             vint_psign, MO_32)
 VINT_BINARY(PMULHRSW, pmulhrsw, gen_helper_pmulhrsw_mmx,
-            vint_can(INDEX_op_mulw_vec, MO_16)
-            && vint_can(INDEX_op_narrow_vec, MO_16),
+            vint_can_direct(INDEX_op_mulw_vec, MO_16)
+            && vint_can_direct(INDEX_op_narrow_vec, MO_16),
             vint_pmulh, true | 15 << 1 | 1 << 6)
 
 /* Instructions with no MMX equivalent.  */
@@ -1767,7 +1777,7 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
 PUNPCK_INT_SSE(PUNPCKLQDQ, punpcklqdq, MO_64, false)
 PUNPCK_INT_SSE(PUNPCKHQDQ, punpckhqdq, MO_64, true)
 VINT_BINARY(VPACKUSDW, packusdw, NULL,
-            vint_can(INDEX_op_narrow_vec, MO_16),
+            vint_can_direct(INDEX_op_narrow_vec, MO_16),
             vint_pack, TCG_NARROW_SAT_SU | MO_16 << 8)
 BINARY_INT_SSE(VPERMILPS,  vpermilps)
 BINARY_INT_SSE(VPERMILPD,  vpermilpd)
@@ -1775,8 +1785,8 @@ BINARY_INT_SSE(VMASKMOVPS, vpmaskmovd)
 BINARY_INT_SSE(VMASKMOVPD, vpmaskmovq)
 
 VINT_BINARY(PMULDQ, pmuldq, NULL,
-            vint_can(INDEX_op_mulw_vec, MO_32)
-            && vint_can(INDEX_op_perm_vec, MO_32),
+            vint_can_direct(INDEX_op_mulw_vec, MO_32)
+            && vint_can_direct(INDEX_op_perm_vec, MO_32),
             vint_pmul_even, true)
 
 BINARY_INT_SSE(VAESDEC_helper, aesdec)
@@ -1904,7 +1914,7 @@ static bool gen_vint_ptest(DisasContext *s, X86DecodedInsn *decode,
     TCGv_i64 zx, cx;
     TCGv t;
 
-    if (!tcg_vint || !vint_can(INDEX_op_extract_vec, MO_64)
+    if (!tcg_vint || !vint_can_direct(INDEX_op_extract_vec, MO_64)
         || !vint_can(INDEX_op_andc_vec, MO_64)) {
         return false;
     }
@@ -1999,7 +2009,7 @@ static bool gen_vint_movx(DisasContext *s, X86DecodedInsn *decode,
     TCGv_vec src, r[2];
 
     for (unsigned e = svece; e < dvece; e++) {
-        if (!vint_can(INDEX_op_widen_vec, e)) {
+        if (!vint_can_direct(INDEX_op_widen_vec, e)) {
             return false;
         }
     }
@@ -2257,7 +2267,7 @@ static TCGLabel *gen_vint_gather(DisasContext *s, X86DecodedInsn *decode,
     TCGv addr;
     TCGLabel *slow, *done;
 
-    if (!vint_can(INDEX_op_insert_vec, esz)) {
+    if (!vint_can_direct(INDEX_op_insert_vec, esz)) {
         return NULL;
     }
     t = tcg_temp_new_i64();
@@ -3972,7 +3982,7 @@ static void gen_MOVD_from(DisasContext *s, X86DecodedInsn *decode)
 static bool zext_to_xmm_vec(X86DecodedInsn *decode, MemOp ot)
 {
     return decode->op[0].unit == X86_OP_SSE &&
-           vint_can(INDEX_op_insert_vec, ot);
+           vint_can_direct(INDEX_op_insert_vec, ot);
 }
 
 static void gen_zext_to_xmm(DisasContext *s, X86DecodedInsn *decode,
@@ -4042,10 +4052,10 @@ static bool gen_vint_movmsk(DisasContext *s, X86DecodedInsn *decode,
     TCGv_i64 acc, x;
 
     if (!tcg_vint || decode->op[2].unit != X86_OP_SSE
-        || !vint_can(INDEX_op_extract_vec, MO_64)
-        || (vece == MO_8 && !(vint_can(INDEX_op_addp_vec, MO_8)
+        || !vint_can_direct(INDEX_op_extract_vec, MO_64)
+        || (vece == MO_8 && !(vint_can_direct(INDEX_op_addp_vec, MO_8)
                               && vint_can(INDEX_op_cmp_vec, MO_8)))
-        || (vece == MO_32 && !(vint_can(INDEX_op_addp_vec, MO_32)
+        || (vece == MO_32 && !(vint_can_direct(INDEX_op_addp_vec, MO_32)
                                && vint_can(INDEX_op_sari_vec, MO_32)))
         || (vece == MO_64 && !vint_can(INDEX_op_shri_vec, MO_64))) {
         return false;
@@ -4340,7 +4350,7 @@ static void gen_PALIGNR(DisasContext *s, X86DecodedInsn *decode)
     TCGv_i32 imm;
 
     /* Bytes imm to imm + 15 of op2:op1 (op2's bytes come first). */
-    if ((s->prefix & PREFIX_DATA) && vint_can(INDEX_op_ext_vec, MO_8)) {
+    if ((s->prefix & PREFIX_DATA) && vint_can_direct(INDEX_op_ext_vec, MO_8)) {
         if ((uint8_t)decode->immediate >= 32) {
             int vec_len = vector_len(s, decode);
 
@@ -4478,11 +4488,10 @@ static inline void gen_pinsr(DisasContext *s, X86DecodedInsn *decode, MemOp ot)
     /*
      * With tcg_vint, the element goes into the vector in a host register,
      * not through a store into CPU state, which a following 128-bit load
-     * of the register can't forward from.  insert_vec has no generic
-     * expansion: the backend must emit it itself.
+     * of the register can't forward from.
      */
-    if (decode->op[0].unit == X86_OP_SSE && tcg_vint &&
-        tcg_can_emit_vec_op(INDEX_op_insert_vec, TCG_TYPE_V128, ot) > 0) {
+    if (decode->op[0].unit == X86_OP_SSE &&
+        vint_can_direct(INDEX_op_insert_vec, ot)) {
         TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V128);
         TCGv_i64 e = tcg_temp_new_i64();
 
@@ -4820,7 +4829,7 @@ static void gen_PSRLDQ_i(DisasContext *s, X86DecodedInsn *decode)
     int vec_len = vector_len(s, decode);
     TCGv_ptr imm_vec;
 
-    if (vint_can(INDEX_op_ext_vec, MO_8)
+    if (vint_can_direct(INDEX_op_ext_vec, MO_8)
         && gen_vint_lanes(s, decode, 1, -1, vint_byteshift,
                           (int64_t)MIN((uint8_t)decode->immediate, 16))) {
         return;
@@ -4839,7 +4848,7 @@ static void gen_PSLLDQ_i(DisasContext *s, X86DecodedInsn *decode)
     int vec_len = vector_len(s, decode);
     TCGv_ptr imm_vec;
 
-    if (vint_can(INDEX_op_ext_vec, MO_8)
+    if (vint_can_direct(INDEX_op_ext_vec, MO_8)
         && gen_vint_lanes(s, decode, 1, -1, vint_byteshift,
                           -(int64_t)MIN((uint8_t)decode->immediate, 16))) {
         return;
@@ -5564,7 +5573,7 @@ static void gen_SFENCE(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_SHA1NEXTE(DisasContext *s, X86DecodedInsn *decode)
 {
-    if (vint_can(INDEX_op_ext_vec, MO_8) &&
+    if (vint_can_direct(INDEX_op_ext_vec, MO_8) &&
         vint_can(INDEX_op_rotli_vec, MO_32)) {
         /* b + { 0, 0, 0, rol(a[3], 30) } */
         TCGv_vec zero = tcg_constant_vec(TCG_TYPE_V128, MO_64, 0);
@@ -5585,7 +5594,7 @@ static void gen_SHA1NEXTE(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_SHA1MSG1(DisasContext *s, X86DecodedInsn *decode)
 {
-    if (vint_can(INDEX_op_ext_vec, MO_8)) {
+    if (vint_can_direct(INDEX_op_ext_vec, MO_8)) {
         /* a ^ { b[2], b[3], a[0], a[1] } */
         TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
         TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
@@ -5602,7 +5611,7 @@ static void gen_SHA1MSG1(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_SHA1MSG2(DisasContext *s, X86DecodedInsn *decode)
 {
-    if (vint_can(INDEX_op_ext_vec, MO_8) &&
+    if (vint_can_direct(INDEX_op_ext_vec, MO_8) &&
         vint_can(INDEX_op_rotli_vec, MO_32)) {
         /*
          * r = rol(a ^ { 0, b[0], b[1], b[2] }, 1) gives elements 1-3;
@@ -5649,7 +5658,7 @@ static void gen_SHA1RNDS4(DisasContext *s, X86DecodedInsn *decode)
      * elements 0 to 3 (x86: 3 to 0) and take the round constant added to
      * the message words; e is 0.
      */
-    if (crypto_can(f[i], MO_32) && vint_can(INDEX_op_ext_vec, MO_8) &&
+    if (crypto_can(f[i], MO_32) && vint_can_direct(INDEX_op_ext_vec, MO_8) &&
         tcg_can_emit_vec_op(INDEX_op_rotli_vec, TCG_TYPE_V128, MO_64)) {
         TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
         TCGv_vec w = tcg_temp_new_vec(TCG_TYPE_V128);
