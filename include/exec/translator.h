@@ -230,6 +230,37 @@ bool translator_loop_back(DisasContextBase *db, vaddr dest);
 TCGLabel *translator_edge_check(DisasContextBase *db, vaddr dest);
 
 /**
+ * translator_ptr_guard
+ * @db: Disassembly context
+ * @pc: virtual pc of the jump or call
+ * @addr: guest virtual address of the pointer it goes through
+ * @mop: size and byte order of the pointer
+ * @val: the pointer's current value
+ *
+ * For a jump or call at @pc through a pointer at the constant address
+ * @addr: return true if the target should guard the transfer with the
+ * pointer's value at translation time, setting @val to it.  The target
+ * then compares the loaded pointer with @val, leaves through a direct
+ * jump to @val on a match, and otherwise calls
+ * translator_gen_ptr_respec() before its usual indirect jump.  Reads
+ * @addr without faulting; @val is a prediction only.  User mode with
+ * x-ijguard, while the site has re-speculations left.
+ */
+bool translator_ptr_guard(DisasContextBase *db, vaddr pc, vaddr addr,
+                          MemOp mop, uint64_t *val);
+
+/**
+ * translator_gen_ptr_respec
+ * @db: Disassembly context
+ * @pc: virtual pc of the guarded jump or call
+ *
+ * On the miss path of a guard from translator_ptr_guard(): invalidate
+ * this TB, so that the site is translated again with the pointer's new
+ * value, or, once the site has used its re-speculations, without a guard.
+ */
+void translator_gen_ptr_respec(DisasContextBase *db, vaddr pc);
+
+/**
  * translator_use_inline_lookup
  * @db: Disassembly context
  *
