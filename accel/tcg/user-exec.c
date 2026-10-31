@@ -602,6 +602,43 @@ bool page_check_range(vaddr start, vaddr len, int flags)
     return ret;
 }
 
+/*
+ * Guards from translator_ptr_guard(): re-speculations per site (guest pc),
+ * under mmap_lock.  A site is guarded in at most PTR_GUARD_RESPEC + 1
+ * translations, then translated without a guard.
+ */
+#define PTR_GUARD_RESPEC 2
+
+static GHashTable *ptr_guard_sites;
+
+bool ptr_guard_allowed(vaddr pc)
+{
+    assert_memory_lock();
+    return !ptr_guard_sites ||
+           GPOINTER_TO_UINT(g_hash_table_lookup(ptr_guard_sites,
+                                                (gconstpointer)(uintptr_t)pc))
+           <= PTR_GUARD_RESPEC;
+}
+
+void ptr_guard_respec(TranslationBlock *tb, vaddr pc)
+{
+    mmap_lock();
+    /* Another thread's miss may have got here first. */
+    if (!(qatomic_read(&tb->cflags) & CF_INVALID)) {
+        gpointer key = (gpointer)(uintptr_t)pc;
+        unsigned n;
+
+        if (!ptr_guard_sites) {
+            ptr_guard_sites = g_hash_table_new(g_direct_hash,
+                                               g_direct_equal);
+        }
+        n = GPOINTER_TO_UINT(g_hash_table_lookup(ptr_guard_sites, key));
+        g_hash_table_insert(ptr_guard_sites, key, GUINT_TO_POINTER(n + 1));
+        tb_phys_invalidate(tb, -1);
+    }
+    mmap_unlock();
+}
+
 bool page_check_range_empty(vaddr start, vaddr last)
 {
     assert(last >= start);

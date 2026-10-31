@@ -19,6 +19,11 @@
 #include "exec/icount.h"
 #ifdef CONFIG_USER_ONLY
 #include "gdbstub/user.h"
+#ifdef CONFIG_USER_ONLY
+#include "user/guest-host.h"
+#include "user/page-protection.h"
+#include "exec/page-protection.h"
+#endif
 #endif
 #include "exec/plugin-gen.h"
 #include "tcg/tcg-op-common.h"
@@ -753,6 +758,40 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
 
     /* Check for the dest on the same page as the start of the TB.  */
     return use_cross_page_goto_tb() || translator_is_same_page(db, dest);
+}
+
+bool translator_ptr_guard(DisasContextBase *db, vaddr pc, vaddr addr,
+                          MemOp mop, uint64_t *val)
+{
+#ifdef CONFIG_USER_ONLY
+    unsigned size = memop_size(mop);
+    void *host;
+
+    if (!tcg_ijguard || !ptr_guard_allowed(pc) ||
+        !page_check_range(addr, size, PAGE_READ)) {
+        return false;
+    }
+    host = g2h_untagged_vaddr(addr);
+    switch (mop & (MO_SIZE | MO_BSWAP)) {
+    case MO_LEUL:
+        *val = ldl_le_p(host);
+        break;
+    case MO_LEUQ:
+        *val = ldq_le_p(host);
+        break;
+    default:
+        return false;
+    }
+    return translator_use_goto_tb(db, *val);
+#else
+    return false;
+#endif
+}
+
+void translator_gen_ptr_respec(DisasContextBase *db, vaddr pc)
+{
+    gen_helper_ptr_respec(tcg_env, tcg_constant_ptr(db->tb),
+                          tcg_constant_i64(pc));
 }
 
 bool translator_use_inline_lookup(DisasContextBase *db)
