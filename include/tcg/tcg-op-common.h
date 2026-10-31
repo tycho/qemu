@@ -116,6 +116,13 @@ void tcg_gen_clzi_i32(TCGv_i32 ret, TCGv_i32 arg1, uint32_t arg2);
 void tcg_gen_ctzi_i32(TCGv_i32 ret, TCGv_i32 arg1, uint32_t arg2);
 void tcg_gen_clrsb_i32(TCGv_i32 ret, TCGv_i32 arg);
 void tcg_gen_ctpop_i32(TCGv_i32 a1, TCGv_i32 a2);
+/*
+ * The CRC-32C of the low 8 << size bits of val, continuing from the low
+ * 32 bits of acc (reflected, no inversion in or out), zero-extended; size
+ * is MO_8 to MO_32.  No fallback: check tcg_op_supported() first.
+ */
+void tcg_gen_crc32c_i32(TCGv_i32 ret, TCGv_i32 acc, TCGv_i32 val,
+                        MemOp size);
 void tcg_gen_rotl_i32(TCGv_i32 ret, TCGv_i32 arg1, TCGv_i32 arg2);
 void tcg_gen_rotli_i32(TCGv_i32 ret, TCGv_i32 arg1, int32_t arg2);
 void tcg_gen_rotr_i32(TCGv_i32 ret, TCGv_i32 arg1, TCGv_i32 arg2);
@@ -224,6 +231,9 @@ void tcg_gen_clzi_i64(TCGv_i64 ret, TCGv_i64 arg1, uint64_t arg2);
 void tcg_gen_ctzi_i64(TCGv_i64 ret, TCGv_i64 arg1, uint64_t arg2);
 void tcg_gen_clrsb_i64(TCGv_i64 ret, TCGv_i64 arg);
 void tcg_gen_ctpop_i64(TCGv_i64 a1, TCGv_i64 a2);
+/* As tcg_gen_crc32c_i32, with size MO_8 to MO_64. */
+void tcg_gen_crc32c_i64(TCGv_i64 ret, TCGv_i64 acc, TCGv_i64 val,
+                        MemOp size);
 void tcg_gen_rotl_i64(TCGv_i64 ret, TCGv_i64 arg1, TCGv_i64 arg2);
 void tcg_gen_rotli_i64(TCGv_i64 ret, TCGv_i64 arg1, int64_t arg2);
 void tcg_gen_rotr_i64(TCGv_i64 ret, TCGv_i64 arg1, TCGv_i64 arg2);
@@ -341,6 +351,23 @@ void tcg_gen_qemu_ld_i64_chk(TCGv_i64, TCGTemp *, TCGArg, MemOp, TCGType);
 void tcg_gen_qemu_st_i64_chk(TCGv_i64, TCGTemp *, TCGArg, MemOp, TCGType);
 void tcg_gen_qemu_ld_i128_chk(TCGv_i128, TCGTemp *, TCGArg, MemOp, TCGType);
 void tcg_gen_qemu_st_i128_chk(TCGv_i128, TCGTemp *, TCGArg, MemOp, TCGType);
+/*
+ * 128-bit guest accesses with the value in a vector, where the backend has
+ * them and the access needs no more than 64-bit atomicity (each half, if
+ * aligned), no byte swap and no plugin memory callback: check with
+ * tcg_can_qemu_ldst_vec() first.
+ */
+bool tcg_can_qemu_ldst_vec(MemOp);
+void tcg_gen_qemu_ld_vec_chk(TCGv_vec, TCGTemp *, TCGArg, MemOp, TCGType);
+void tcg_gen_qemu_st_vec_chk(TCGv_vec, TCGTemp *, TCGArg, MemOp, TCGType);
+/*
+ * Two such accesses that make up one guest access whose parts need no
+ * order among themselves (e.g. a 32-byte access): ordered once, as one.
+ */
+void tcg_gen_qemu_ld_vec2_chk(TCGv_vec, TCGTemp *, MemOp,
+                              TCGv_vec, TCGTemp *, MemOp, TCGArg, TCGType);
+void tcg_gen_qemu_st_vec2_chk(TCGv_vec, TCGTemp *, MemOp,
+                              TCGv_vec, TCGTemp *, MemOp, TCGArg, TCGType);
 
 /* Atomic ops */
 
@@ -452,7 +479,173 @@ void tcg_gen_atomic_fetch_or_i128_chk(TCGv_i128, TCGTemp *, TCGv_i128,
 void tcg_gen_mov_vec(TCGv_vec, TCGv_vec);
 void tcg_gen_dup_i32_vec(unsigned vece, TCGv_vec, TCGv_i32);
 void tcg_gen_dup_i64_vec(unsigned vece, TCGv_vec, TCGv_i64);
+/*
+ * A 128-bit vector from two 64-bit values, element 0 from lo.  No
+ * fallback: check tcg_can_emit_vec_op(INDEX_op_concat_i64_vec) first.
+ */
+void tcg_gen_concat_i64_vec(TCGv_vec r, TCGv_i64 lo, TCGv_i64 hi);
+/*
+ * A 128-bit vector of elements chosen from a and b: element i of r is
+ * element (pattern >> 4 * i) & 15 of the concatenation a:b, whose elements
+ * 0 to n-1 are a's and n to 2n-1 b's (n = 16 >> vece; vece is MO_16,
+ * MO_32 or MO_64).  No fallback: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_perm_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                      uint32_t pattern);
+void tcg_gen_tbl_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b);
+/*
+ * Interleave the elements of the low (or, with @high, the high) halves of
+ * a and b: r = a[k], b[k], a[k + 1], b[k + 1], ... from k = 0 (or n / 2),
+ * for n elements of vece in 128 bits.  No fallback: check
+ * tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_zip_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                     bool high);
+/*
+ * Bytes n to n + 15 of the concatenation a:b, whose bytes 0 to 15 are a's
+ * (0 <= n <= 15).  No fallback: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_ext_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, unsigned n);
+/*
+ * The elements of a's low (or, with @high, high) half, sign-extended (or,
+ * without @is_signed, zero-extended) from vece to vece + 1: r[i] =
+ * ext(a[i]) or ext(a[n / 2 + i]), for n elements of vece in 128 bits (vece
+ * is MO_8, MO_16 or MO_32).  No fallback: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_widen_vec(unsigned vece, TCGv_vec r, TCGv_vec a,
+                       bool is_signed, bool high);
+/*
+ * Widening multiply: r[i] = a[k + i] * b[k + i] at twice the element size,
+ * exact, for the elements of the low halves (k = 0) or, with @high, the
+ * high halves (k = n / 2) of a and b; signed or unsigned.  vece is the
+ * inputs' element size (MO_8, MO_16 or MO_32).  No fallback: check
+ * tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_mulw_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                      bool is_signed, bool high);
+/*
+ * Pairwise add: element i of r is the sum (modulo 2^size) of elements
+ * 2 * i and 2 * i + 1 of the concatenation a:b.  No fallback: check
+ * tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_addp_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+/*
+ * Dot products of bytes, into 32-bit elements of 128-bit vectors: each
+ * element of r is that element of a plus the sum of the products of the
+ * four bytes of b and c at its position, modulo 2^32; both bytes signed
+ * (sdot4), unsigned (udot4), or those of b unsigned and those of c signed
+ * (usdot4).
+ */
+void tcg_gen_sdot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c);
+void tcg_gen_udot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c);
+void tcg_gen_usdot4_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c);
+/*
+ * SHA-1 and AES building blocks on 128-bit vectors, as Arm's cryptographic
+ * extension defines them (SHA1C/SHA1P/SHA1M, AESE/AESD/AESMC/AESIMC).
+ *
+ * sha1c, sha1p, sha1m: four SHA-1 rounds with the choose, parity or
+ * majority function: a holds the state, a, b, c and d in elements 0 to 3;
+ * element 0 of e is the fifth word; w holds the message words plus round
+ * constant for the four rounds, in order.  r is the new a, b, c, d.
+ *
+ * aese: SubBytes(ShiftRows(a ^ k)); aesd: InvSubBytes(InvShiftRows(a ^ k));
+ * aesmc: MixColumns(a); aesimc: InvMixColumns(a); the state in the byte
+ * order of the AES standard's column-major array.
+ *
+ * Only where the backend has them: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_sha1c_vec(TCGv_vec r, TCGv_vec a, TCGv_vec e, TCGv_vec w);
+void tcg_gen_sha1p_vec(TCGv_vec r, TCGv_vec a, TCGv_vec e, TCGv_vec w);
+void tcg_gen_sha1m_vec(TCGv_vec r, TCGv_vec a, TCGv_vec e, TCGv_vec w);
+void tcg_gen_aese_vec(TCGv_vec r, TCGv_vec a, TCGv_vec k);
+void tcg_gen_aesd_vec(TCGv_vec r, TCGv_vec a, TCGv_vec k);
+void tcg_gen_aesmc_vec(TCGv_vec r, TCGv_vec a);
+void tcg_gen_aesimc_vec(TCGv_vec r, TCGv_vec a);
+/*
+ * SHA-256 building blocks on 128-bit vectors, as Arm's cryptographic
+ * extension defines them (SHA256H, SHA256H2, SHA256SU0, SHA256SU1), with
+ * the state in elements 0 to 3 (a, b, c, d and e, f, g, h).
+ *
+ * sha256h: four rounds; abcd and efgh are the state, wk the message words
+ * plus round constants for the four rounds, in order; r is the new a, b,
+ * c, d.  sha256h2: the same rounds, r the new e, f, g, h.
+ *
+ * sha256su0: r[i] = a[i] + sigma0(t[i]), t = a[1], a[2], a[3], b[0].
+ * sha256su1: r[i] = a[i] + t0[i] + sigma1(x[i]), t0 = b[1], b[2], b[3],
+ * c[0], and x = c[2], c[3], r[0], r[1].
+ *
+ * Only where the backend has them: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_sha256h_vec(TCGv_vec r, TCGv_vec abcd, TCGv_vec efgh,
+                         TCGv_vec wk);
+void tcg_gen_sha256h2_vec(TCGv_vec r, TCGv_vec efgh, TCGv_vec abcd,
+                          TCGv_vec wk);
+void tcg_gen_sha256su0_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_sha256su1_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, TCGv_vec c);
+/*
+ * The 128-bit carry-less product of a 64-bit element of a and one of b:
+ * a[sel & 1] and b[sel >> 1] (0 <= sel <= 3).  No fallback: check
+ * tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_clmul64_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, unsigned sel);
+/*
+ * How narrow_vec fits a wide element into a narrow one: keep its low bits,
+ * or saturate signed to signed, signed to unsigned, or unsigned to
+ * unsigned.
+ */
+typedef enum {
+    TCG_NARROW_TRUNC,
+    TCG_NARROW_SAT_S,
+    TCG_NARROW_SAT_SU,
+    TCG_NARROW_SAT_U,
+} TCGNarrow;
+/*
+ * Narrow: r is the elements of a, then those of b, each shifted right by
+ * @shift (0 <= shift <= the narrow element size; arithmetically for the
+ * signed saturations, else logically, which for TCG_NARROW_TRUNC gives the
+ * same bits; with @round, after adding 1 << (shift - 1) at full
+ * precision), then fitted by @kind into vece (MO_8, MO_16 or MO_32) from
+ * vece + 1.  No fallback: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_narrow_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                        TCGNarrow kind, unsigned shift, bool round);
+/*
+ * Absolute difference: r[i] = |a[i] - b[i]|, the inputs signed or unsigned
+ * and the result unsigned (it fits).  vece is MO_8, MO_16 or MO_32.  No
+ * fallback: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_abd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b,
+                     bool is_signed);
+/*
+ * Pairwise add long: r[i] = a[2 * i] + a[2 * i + 1] at twice the element
+ * size (exact), the elements signed or unsigned.  vece is the input's
+ * (MO_8, MO_16 or MO_32).  No fallback: check tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_addlp_vec(unsigned vece, TCGv_vec r, TCGv_vec a, bool is_signed);
+/*
+ * Rounding average of unsigned elements: r[i] = (a[i] + b[i] + 1) >> 1,
+ * without overflow.  vece is MO_8, MO_16 or MO_32.  No fallback: check
+ * tcg_can_emit_vec_op() first.
+ */
+void tcg_gen_avgr_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_dup_mem_vec(unsigned vece, TCGv_vec, TCGv_ptr, tcg_target_long);
+/*
+ * Element @idx of @a (of size vece), zero-extended into @r.  No fallback:
+ * check tcg_can_emit_vec_op(INDEX_op_extract_vec) first.
+ */
+void tcg_gen_extract_vec_i64(unsigned vece, TCGv_i64 r, TCGv_vec a,
+                             unsigned idx);
+/*
+ * @a with element @idx (of size vece) replaced by the low bits of @b.  No
+ * fallback: check tcg_can_emit_vec_op(INDEX_op_insert_vec) first.
+ */
+void tcg_gen_insert_vec_i64(unsigned vece, TCGv_vec r, TCGv_vec a,
+                            TCGv_i64 b, unsigned idx);
+/*
+ * Element 0 (of size vece) the low bits of @b, every other element zero.
+ * No fallback: check tcg_can_emit_vec_op(INDEX_op_movz_vec) first.
+ */
+void tcg_gen_movz_vec_i64(unsigned vece, TCGv_vec r, TCGv_i64 b);
 void tcg_gen_dupi_vec(unsigned vece, TCGv_vec, uint64_t);
 void tcg_gen_add_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_sub_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
