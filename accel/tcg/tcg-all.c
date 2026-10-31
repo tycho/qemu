@@ -175,9 +175,14 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #if defined(CONFIG_SOFTMMU)
     /*
      * There's no guest base to take into account, so go ahead and
-     * initialize the prologue now.
+     * initialize the prologue now; or, where guest registers may be
+     * pinned, once the front end has pinned them (tcg_exec_realizefn).
      */
-    tcg_prologue_init();
+    if (tcg_pin && tcg_pin_system_ok()) {
+        tcg_prologue_deferred = true;
+    } else {
+        tcg_prologue_init();
+    }
 #endif
 
 #ifdef CONFIG_USER_ONLY
@@ -186,6 +191,8 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 
     return 0;
 }
+
+bool tcg_prologue_deferred;
 
 static char *tcg_get_thread(Object *obj, Error **errp)
 {
@@ -451,6 +458,72 @@ static void tcg_set_ssefp(Object *obj, const char *value, Error **errp)
     tcg_ssefp_vec = vec;
 }
 
+static bool tcg_get_regcache(Object *obj, Error **errp)
+{
+    return tcg_dse && tcg_ldstkeep && tcg_lazysync
+           && tcg_vecglobal && tcg_ymmglobal && tcg_vregs_all;
+}
+
+static void tcg_set_regcache(Object *obj, bool value, Error **errp)
+{
+    tcg_dse = value;
+    tcg_ldstkeep = value;
+    tcg_lazysync = value;
+    tcg_vecglobal = value;
+    tcg_ymmglobal = value;
+    tcg_vregs_all = value;
+}
+
+static bool tcg_get_pin(Object *obj, Error **errp)
+{
+    return tcg_pin;
+}
+
+static void tcg_set_pin(Object *obj, bool value, Error **errp)
+{
+    tcg_pin = value;
+}
+
+static bool tcg_get_pincc(Object *obj, Error **errp)
+{
+    return tcg_pin_cc;
+}
+
+static void tcg_set_pincc(Object *obj, bool value, Error **errp)
+{
+    tcg_pin_cc = value;
+}
+
+static bool tcg_get_pinpc(Object *obj, Error **errp)
+{
+    return tcg_pin_pc;
+}
+
+static void tcg_set_pinpc(Object *obj, bool value, Error **errp)
+{
+    tcg_pin_pc = value;
+}
+
+static bool tcg_get_ccregs(Object *obj, Error **errp)
+{
+    return tcg_cc_regs;
+}
+
+static void tcg_set_ccregs(Object *obj, bool value, Error **errp)
+{
+    tcg_cc_regs = value;
+}
+
+static bool tcg_get_pinvec(Object *obj, Error **errp)
+{
+    return tcg_pin_vec;
+}
+
+static void tcg_set_pinvec(Object *obj, bool value, Error **errp)
+{
+    tcg_pin_vec = value;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -555,6 +628,44 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "and flags), native (run with the guest's FP mode in the host "
         "FPU; needs a host that can express it) or auto (native where "
         "possible, else vec on AArch64 hosts and soft elsewhere)");
+
+    object_class_property_add_bool(oc, "x-regcache",
+                                   tcg_get_regcache, tcg_set_regcache);
+    object_class_property_set_description(oc, "x-regcache",
+        "Keep guest registers in host registers: remove dead stores to CPU "
+        "state, keep dirty and vector values in registers across guest "
+        "memory accesses, and the x86 vector registers as TCG globals");
+
+    object_class_property_add_bool(oc, "x-pin", tcg_get_pin, tcg_set_pin);
+    object_class_property_set_description(oc, "x-pin",
+        "Keep the guest's most used registers in host registers across "
+        "TBs (user mode where the host signal handler can store them; system "
+        "mode where the backend has callee-saved registers for them)");
+
+    object_class_property_add_bool(oc, "x-pinvec", tcg_get_pinvec,
+                                   tcg_set_pinvec);
+    object_class_property_set_description(oc, "x-pinvec",
+        "With x-pin and x-regcache, keep the guest's vector registers in "
+        "host registers across TBs too");
+
+    object_class_property_add_bool(oc, "x-pincc", tcg_get_pincc,
+                                   tcg_set_pincc);
+    object_class_property_set_description(oc, "x-pincc",
+        "With x-pin, keep the guest's condition-code operation in a host "
+        "register across TBs too, where the host has one to spare");
+
+    object_class_property_add_bool(oc, "x-pinpc", tcg_get_pinpc,
+                                   tcg_set_pinpc);
+    object_class_property_set_description(oc, "x-pinpc",
+        "With x-pin, in system mode, keep the guest PC in a host register "
+        "across TBs, ahead of the guest's general registers");
+
+    object_class_property_add_bool(oc, "x-ccregs", tcg_get_ccregs,
+                                   tcg_set_ccregs);
+    object_class_property_set_description(oc, "x-ccregs",
+        "With x-pin and x-regcache, keep the guest's condition-code "
+        "operands in host registers between TBs, where the host has "
+        "registers for them");
 }
 
 static const TypeInfo tcg_accel_type = {

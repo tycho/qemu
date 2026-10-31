@@ -26,6 +26,8 @@
 /* 16-byte aligned, single-copy atomic acquire/release: LDIAPP/STILP */
 #define TCG_TARGET_HAS_qemu_ldst_i128_acqrel \
     (TCG_TARGET_HAS_qemu_ldst_acqrel && have_lrcpc3)
+/* tcg_out_pinned_st_pairs, and the slow paths' shared copy of it */
+#define TCG_TARGET_HAS_PINNED_ST_PAIRS
 
 /* optional instructions */
 #define TCG_TARGET_HAS_extr_i64_i32     0
@@ -66,6 +68,7 @@
 #define TCG_TARGET_HAS_minmax_vec       1
 #define TCG_TARGET_HAS_bitsel_vec       1
 #define TCG_TARGET_HAS_cmpsel_vec       0
+#define TCG_TARGET_HAS_extract_vec      1
 #define TCG_TARGET_HAS_extract_vec      1
 #define TCG_TARGET_HAS_insert_vec       1
 #define TCG_TARGET_HAS_movz_vec         1
