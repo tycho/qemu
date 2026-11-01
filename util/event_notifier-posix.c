@@ -51,7 +51,7 @@ int event_notifier_init(EventNotifier *e, int active)
         if (errno != ENOSYS) {
             return -errno;
         }
-        if (!g_unix_open_pipe(fds, FD_CLOEXEC, NULL)) {
+        if (!g_unix_open_pipe(fds, QEMU_G_UNIX_PIPE_CLOEXEC, NULL)) {
             return -errno;
         }
         if (!qemu_set_blocking(fds[0], false, &local_err)) {
