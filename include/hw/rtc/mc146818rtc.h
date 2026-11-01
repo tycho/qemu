@@ -47,6 +47,7 @@ struct MC146818RtcState {
     LostTickPolicy lost_tick_policy;
     Notifier suspend_notifier;
     QLIST_ENTRY(MC146818RtcState) link;
+    bool lockless_uip; /* x-lockless-uip: index and UIP polls without the BQL */
 };
 
 #define RTC_ISA_IRQ 8

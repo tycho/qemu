@@ -16,6 +16,7 @@
 #include "exec/target_page.h"
 #include "exec/translator.h"
 #include "tcg/startup.h"
+#include "exec/icount.h"
 #ifdef CONFIG_USER_ONLY
 #include "gdbstub/user.h"
 #ifdef CONFIG_USER_ONLY
@@ -515,6 +516,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     }
 
     while (true) {
+        vaddr insn_pc = db->pc_next;
+
         *max_insns = ++db->num_insns;
         ops->insn_start(db, cpu);
         db->insn_start = tcg_last_op();
@@ -559,6 +562,16 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             break;
         }
 
+        /*
+         * End the TB after an instruction known to do I/O, so that its
+         * accesses happen with can_do_io set.
+         */
+        if (tcg_iolast && !icount_enabled() &&
+            tb_io_insn_known(insn_pc)) {
+            db->is_jmp = DISAS_TOO_MANY;
+            break;
+        }
+
         /* Stop translation if the output buffer is full,
            or we have executed all of the allowed instructions.  */
         if (tcg_op_buf_full() || db->num_insns >= db->max_insns) {
@@ -580,16 +593,20 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
      * there, and every reader (cputlb.c, watchpoint.c, icount) is in
      * system_ss, so skip the two stores per TB entirely.
      */
-    if (db->num_insns == 1) {
+    if (tcg_iolazy_active()) {
+        /* I/O finds whether its insn is the last (cpu_io_last_insn). */
+    } else if (db->num_insns == 1) {
         tcg_debug_assert(first_insn_start == db->insn_start);
     } else {
         tcg_debug_assert(first_insn_start != db->insn_start);
         tcg_ctx->emit_before_op = first_insn_start;
         set_can_do_io(db, false);
     }
-    tcg_ctx->emit_before_op = db->insn_start;
-    set_can_do_io(db, true);
-    tcg_ctx->emit_before_op = NULL;
+    if (!tcg_iolazy_active()) {
+        tcg_ctx->emit_before_op = db->insn_start;
+        set_can_do_io(db, true);
+        tcg_ctx->emit_before_op = NULL;
+    }
 #endif
 
     /* May be used by disas_log or plugin callbacks. */
