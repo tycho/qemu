@@ -76,9 +76,7 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
 
     cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     while (cmd) {
-        cmd->vq = vq;
-        cmd->error = 0;
-        cmd->finished = false;
+        virtio_gpu_ctrl_cmd_init(cmd, vq);
         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     }
@@ -109,7 +107,7 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
     ERRP_GUARD();
     VirtIOGPUBase *b = VIRTIO_GPU_BASE(qdev);
     VirtIOGPU *g = VIRTIO_GPU(b);
-#if !defined(CONFIG_WIN32)
+#if !defined(CONFIG_WIN32) && !defined(CONFIG_DARWIN)
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
     void *map;
 #endif
@@ -142,7 +140,8 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
     g->parent_obj.conf.flags |= 1 << VIRTIO_GPU_FLAG_CONTEXT_INIT_ENABLED;
 #endif
 
-#if !defined(CONFIG_WIN32)
+#if !defined(CONFIG_WIN32) && !defined(CONFIG_DARWIN)
+    /* the background for fixed blob mappings (VIRGL_HAS_MAP_FIXED) */
     if (virtio_gpu_hostmem_enabled(b->conf)) {
         map = qemu_ram_mmap(-1, b->conf.hostmem, qemu_real_host_page_size(),
                             0, 0);
@@ -170,6 +169,8 @@ static const Property virtio_gpu_gl_properties[] = {
                     VIRTIO_GPU_FLAG_VENUS_ENABLED, false),
     DEFINE_PROP_BIT("drm_native_context", VirtIOGPU, parent_obj.conf.flags,
                     VIRTIO_GPU_FLAG_DRM_ENABLED, false),
+    DEFINE_PROP_BIT("neptune", VirtIOGPU, parent_obj.conf.flags,
+                    VIRTIO_GPU_FLAG_NEPTUNE_ENABLED, false),
 };
 
 static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)
