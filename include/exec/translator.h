@@ -211,6 +211,66 @@ bool translator_loop_back(DisasContextBase *db, vaddr dest);
 TCGLabel *translator_edge_check(DisasContextBase *db, vaddr dest);
 
 /**
+ * translator_ptr_guard
+ * @db: Disassembly context
+ * @pc: virtual pc of the jump or call
+ * @addr: guest virtual address of the pointer it goes through
+ * @mop: size and byte order of the pointer
+ * @val: the pointer's current value
+ *
+ * For a jump or call at @pc through a pointer at the constant address
+ * @addr: return true if the target should guard the transfer with the
+ * pointer's value at translation time, setting @val to it.  The target
+ * then compares the loaded pointer with @val, leaves through a direct
+ * jump to @val on a match, and otherwise calls
+ * translator_gen_ptr_respec() before its usual indirect jump.  Reads
+ * @addr without faulting; @val is a prediction only.  User mode with
+ * x-ijguard, while the site has re-speculations left.
+ */
+bool translator_ptr_guard(DisasContextBase *db, vaddr pc, vaddr addr,
+                          MemOp mop, uint64_t *val);
+
+/**
+ * translator_gen_ptr_respec
+ * @db: Disassembly context
+ * @pc: virtual pc of the guarded jump or call
+ *
+ * On the miss path of a guard from translator_ptr_guard(): invalidate
+ * this TB, so that the site is translated again with the pointer's new
+ * value, or, once the site has used its re-speculations, without a guard.
+ */
+void translator_gen_ptr_respec(DisasContextBase *db, vaddr pc);
+
+/**
+ * translator_use_inline_lookup
+ * @db: Disassembly context
+ *
+ * Return true if translator_lookup_and_goto_ptr() may be used to end the
+ * current TB.
+ */
+bool translator_use_inline_lookup(DisasContextBase *db);
+
+/**
+ * translator_lookup_and_goto_ptr
+ * @db: Disassembly context
+ * @pc: virtual pc of the next TB
+ * @cs_base: cs_base of the next TB
+ * @flags: flags of the next TB
+ * @direct: the jump is direct (its target is fixed), to another page
+ *
+ * Like tcg_gen_lookup_and_goto_ptr(), for a target that knows at
+ * translation time the CPU state at this TB exit: @cs_base and @flags must
+ * be what TCGCPUOps.get_tb_cpu_state() would return there, and @pc its pc.
+ * Probe the vCPU's jump cache, and call helper_lookup_tb_ptr only on a
+ * miss.  An indirect jump probes in generated code; a @direct one, which
+ * runs rarely per site but has many sites, in a short helper call.  Only
+ * valid when translator_use_inline_lookup() returns true.
+ */
+void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
+                                    uint64_t cs_base, uint32_t flags,
+                                    bool direct);
+
+/**
  * translator_io_start
  * @db: Disassembly context
  *

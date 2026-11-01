@@ -2355,6 +2355,11 @@ typedef struct CPUArchState {
 
     /* Bitmap of available CPU topology levels for this CPU. */
     DECLARE_BITMAP(avail_cpu_topo, CPU_TOPOLOGY_LEVEL__MAX);
+
+    /* The top of the return stack (tcg_gen_push_ret). */
+    uintptr_t retsp;
+    /* tcg_retstack_env: the return stack's epoch (tcg_retstack_bump). */
+    uint64_t retep;
 } CPUX86State;
 
 /**

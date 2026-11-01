@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/memalign.h"
 #include "qemu/qemu-print.h"
 #include "qapi/error.h"
 #include "qapi/type-helpers.h"
@@ -28,11 +29,13 @@
 #include "accel/tcg/host-fp.h"
 #include "trace.h"
 #include "disas/disas.h"
+#include "exec/tb-flush.h"
 #include "exec/cpu-interrupt.h"
 #include "exec/page-protection.h"
 #include "exec/mmap-lock.h"
 #include "exec/translation-block.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
 #include "exec/log.h"
@@ -198,8 +201,21 @@ static bool tb_lookup_cmp(const void *p, const void *d)
     return false;
 }
 
-static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
+/*
+ * The TB for state @s.  With x-tblookup, @stale, if non-NULL, is the TB
+ * of a jump-cache entry for s.pc under an older salt, the answer if it
+ * still matches.
+ */
+static TranslationBlock *tb_htable_lookup_stale(CPUState *cpu,
+                                                TCGTBCPUState s,
+                                                TranslationBlock *stale)
 {
+    /*
+     * The page walks may leave the vCPU's execution (an accessed bit set
+     * through MMIO), during which a full flush may free @stale: it is
+     * read only while no flush has happened since this snapshot.
+     */
+    unsigned flush_count = qatomic_read(&tb_ctx.tb_flush_count);
     tb_page_addr_t phys_pc;
     struct tb_desc desc;
     uint32_t h;
@@ -211,9 +227,29 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
         return NULL;
     }
     desc.page_addr0 = phys_pc;
+    /* Again after the comparison: its second page's walk may invalidate it. */
+    if (stale && flush_count == qatomic_read(&tb_ctx.tb_flush_count) &&
+        !(tb_cflags(stale) & CF_INVALID) &&
+        tb_lookup_cmp(stale, &desc) &&
+        flush_count == qatomic_read(&tb_ctx.tb_flush_count) &&
+        !(qatomic_read(&stale->cflags) & CF_INVALID)) {
+        return stale;
+    }
     h = tb_hash_func(phys_pc, (s.cflags & CF_PCREL ? 0 : s.pc),
                      s.flags, s.cs_base, s.cflags);
     return qht_lookup_custom(&tb_ctx.htable, &desc, h, tb_lookup_cmp);
+}
+
+static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
+{
+    return tb_htable_lookup_stale(cpu, s, NULL);
+}
+
+/* tcg_jc_ctx: whether the jump cache holds TBs for state @s. */
+static inline bool tb_jmp_cache_ctx_match(CPUJumpCache *jc, TCGTBCPUState s)
+{
+    return jc->ctx_cs_base == s.cs_base && jc->ctx_flags == s.flags &&
+           jc->ctx_cflags == s.cflags;
 }
 
 /**
@@ -235,29 +271,63 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     TranslationBlock *tb;
     CPUJumpCache *jc;
     uint32_t hash;
+    vaddr key;
 
     /* we should never be trying to look up an INVALID tb */
     tcg_debug_assert(!(s.cflags & CF_INVALID));
 
     hash = tb_jmp_cache_hash_func(s.pc);
     jc = cpu->tb_jmp_cache;
+    key = s.pc ^ qatomic_read(&jc->salt);
 
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
-               jc->array[hash].pc == s.pc &&
+               jc->array[hash].pc == key &&
                tb->cs_base == s.cs_base &&
                tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
         goto hit;
     }
 
-    tb = tb_htable_lookup(cpu, s);
+    /*
+     * tcg_jc_ctx: entries are made only for the TB state of the current
+     * salt; in another state, move the salt on first.  The generated
+     * lookup runs in the state its TB was made for (the front end sends a
+     * TB that changes it to the helper), which is then the cache's.
+     */
+    if (tcg_jc_ctx && !tb_jmp_cache_ctx_match(jc, s)) {
+        /* A one-off state (a TB of a single insn, say) isn't cached. */
+        if (s.cflags & CF_COUNT_MASK) {
+            return tb_htable_lookup(cpu, s);
+        }
+        tcg_flush_jmp_cache(cpu);
+        jc->ctx_cs_base = s.cs_base;
+        jc->ctx_flags = s.flags;
+        jc->ctx_cflags = s.cflags;
+        key = s.pc ^ qatomic_read(&jc->salt);
+    }
+
+    /*
+     * With x-tblookup, an entry for this pc made under an older salt (a
+     * flush since: a TLB flush, a CR3 write) holds the TB that was right
+     * then; it is again if it matches the current state and pages, as
+     * the hash table's would.
+     */
+    if (tcg_ijmp_inline && tb && tcg_jcgen &&
+        !((jc->array[hash].pc ^ s.pc) & (jc->salt_step - 1))) {
+        tb = tb_htable_lookup_stale(cpu, s, tb);
+    } else {
+        tb = tb_htable_lookup(cpu, s);
+    }
     if (tb == NULL) {
         return NULL;
     }
 
-    jc->array[hash].pc = s.pc;
+    jc->array[hash].pc = key;
     qatomic_set(&jc->array[hash].tb, tb);
+#ifndef CONFIG_USER_ONLY
+    set_bit(tb_jmp_cache_filter_bit(s.pc), jc->filter);
+#endif
 
 hit:
     /*
@@ -408,6 +478,85 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     }
 
     return tb->tc.ptr;
+}
+
+/*
+ * translator_lookup_and_goto_ptr's jump-cache probe, out of line, for
+ * direct jumps to another page.  @cs_base and @flags are the calling TB's,
+ * which the next TB must share (see translator_lookup_and_goto_ptr);
+ * anything else goes to helper_lookup_tb_ptr.
+ */
+const void *HELPER(lookup_tb_ptr_jc)(CPUArchState *env, uint64_t pc,
+                                     uint64_t cs_base, uint32_t flags)
+{
+    const void *ptr = HELPER(lookup_tb_ptr_jcp)(env, pc, cs_base, flags);
+
+    return ptr ? ptr : HELPER(lookup_tb_ptr)(env);
+}
+
+/* The miss path of a guard from translator_ptr_guard() in @tb. */
+void HELPER(ptr_respec)(CPUArchState *env, void *tb, uint64_t pc)
+{
+#ifdef CONFIG_USER_ONLY
+    ptr_guard_respec(tb, pc);
+#else
+    g_assert_not_reached();
+#endif
+}
+
+/* x-xpage=stub: the jump cache's layout for the backend's probe. */
+void tcg_jc_layout_init(void)
+{
+#ifndef CONFIG_USER_ONLY
+    TCGJumpCacheLayout *l = &tcg_jc_layout;
+
+    QEMU_BUILD_BUG_ON(sizeof(((CPUJumpCache *)0)->array[0]) != 16);
+    l->jc_ofs = (int)offsetof(CPUState, tb_jmp_cache) -
+                  (int)sizeof(CPUState);
+    l->bp_ofs = (int)offsetof(CPUState, breakpoints.tqh_first) -
+                  (int)sizeof(CPUState);
+    l->cflags_ofs = (int)offsetof(CPUState, tcg_cflags) -
+                  (int)sizeof(CPUState);
+    l->salt_ofs = offsetof(CPUJumpCache, salt);
+    l->entry_tb_ofs = offsetof(CPUJumpCache, array[0].tb);
+    l->entry_pc_ofs = offsetof(CPUJumpCache, array[0].pc);
+    l->entry_shift = 4;
+    l->fold_shift = TB_JMP_FOLD_SHIFT;
+    l->group_shift = TB_JMP_GROUP_SHIFT;
+    l->mix_shift = TB_JMP_MIX_SHIFT;
+    l->page_bits = TB_JMP_PAGE_BITS;
+    l->cache_bits = TB_JMP_CACHE_BITS;
+    l->tb_cs_base_ofs = offsetof(TranslationBlock, cs_base);
+    l->tb_flags_ofs = offsetof(TranslationBlock, flags);
+    l->tb_cflags_ofs = offsetof(TranslationBlock, cflags);
+    l->tb_ptr_ofs = offsetof(TranslationBlock, tc.ptr);
+    l->valid = true;
+#endif
+}
+
+/*
+ * The jump-cache probe of helper_lookup_tb_ptr_jc alone: NULL on a miss.
+ * It reads no guest state and can't fault or leave (no page walk, no
+ * breakpoint exit), so the caller needn't store the guest's globals for
+ * it; the caller looks up a miss with helper_lookup_tb_ptr, which may.
+ */
+const void *HELPER(lookup_tb_ptr_jcp)(CPUArchState *env, uint64_t pc,
+                                      uint64_t cs_base, uint32_t flags)
+{
+    CPUState *cpu = env_cpu(env);
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    uint32_t hash = tb_jmp_cache_hash_func(pc);
+    TranslationBlock *tb = qatomic_read(&jc->array[hash].tb);
+
+    if (likely(tb &&
+               jc->array[hash].pc == (pc ^ qatomic_read(&jc->salt)) &&
+               QTAILQ_EMPTY(&cpu->breakpoints) &&
+               tb->cs_base == cs_base &&
+               tb->flags == flags &&
+               tb_cflags(tb) == cpu->tcg_cflags)) {
+        return tb->tc.ptr;
+    }
+    return NULL;
 }
 
 /* Return the current PC from CPU, which may be cached in TB. */
@@ -1010,8 +1159,13 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                  */
                 h = tb_jmp_cache_hash_func(s.pc);
                 jc = cpu->tb_jmp_cache;
-                jc->array[h].pc = s.pc;
-                qatomic_set(&jc->array[h].tb, tb);
+                if (!tcg_jc_ctx || tb_jmp_cache_ctx_match(jc, s)) {
+                    jc->array[h].pc = s.pc ^ qatomic_read(&jc->salt);
+                    qatomic_set(&jc->array[h].tb, tb);
+#ifndef CONFIG_USER_ONLY
+                    set_bit(tb_jmp_cache_filter_bit(s.pc), jc->filter);
+#endif
+                }
             }
 
 #ifndef CONFIG_USER_ONLY
@@ -1117,6 +1271,9 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
             tcg_prologue_init();
             tcg_prologue_deferred = false;
         }
+        /* Once the front end has said where the return stack lives. */
+        tcg_retstack_env = tcg_sysret && tcg_retstack && tcg_retsp_off &&
+                           tcg_retep_off && tcg_jc_layout.valid;
 #endif
         tcg_target_initialized = true;
     }
@@ -1124,7 +1281,29 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
     /* Pick up one-insn-per-tb and -d nochain from the command line. */
     tcg_update_cflags(cpu);
 
-    cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
+    cpu->tb_jmp_cache = qemu_memalign(TB_JMP_CACHE_ALIGN,
+                                      sizeof(CPUJumpCache));
+    memset(cpu->tb_jmp_cache, 0, sizeof(CPUJumpCache));
+    if (tcg_retstack_env) {
+        /* A ring aligned to its size, which wraps (tcg_out_push_ret). */
+        cpu->tb_jmp_cache->retring = qemu_memalign(TCG_RETSTACK_SIZE,
+                                                   TCG_RETSTACK_SIZE);
+        tcg_retstack_reset(cpu);
+    } else if (tcg_retstack && tcg_retsp_off) {
+        size_t page = qemu_real_host_page_size();
+        char *p = mmap(NULL, TCG_RETSTACK_SIZE + 2 * page, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        if (p != MAP_FAILED &&
+            !mprotect(p + page, TCG_RETSTACK_SIZE, PROT_READ | PROT_WRITE)) {
+            cpu->tb_jmp_cache->retring = p + page;
+            tcg_retstack_reset(cpu);
+        }
+    }
+    if (tcg_jcgen) {
+        cpu->tb_jmp_cache->salt_step =
+            1ull << cpu->cc->tcg_ops->jmp_cache_salt_shift(cpu);
+    }
     tlb_init(cpu);
 #ifndef CONFIG_USER_ONLY
     tcg_iommu_init_notifier_list(cpu);
@@ -1135,6 +1314,14 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
 }
 
 /* undo the initializations in reverse order */
+static void tb_jmp_cache_free(CPUJumpCache *jc)
+{
+    if (tcg_retstack_env) {
+        qemu_vfree(jc->retring);
+    }
+    qemu_vfree(jc);
+}
+
 void tcg_exec_unrealizefn(CPUState *cpu)
 {
 #ifndef CONFIG_USER_ONLY
@@ -1142,5 +1329,5 @@ void tcg_exec_unrealizefn(CPUState *cpu)
 #endif /* !CONFIG_USER_ONLY */
 
     tlb_destroy(cpu);
-    g_free_rcu(cpu->tb_jmp_cache, rcu);
+    call_rcu(cpu->tb_jmp_cache, tb_jmp_cache_free, rcu);
 }

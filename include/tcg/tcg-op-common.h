@@ -76,6 +76,31 @@ void tcg_gen_exit_tb(const TranslationBlock *tb, unsigned idx);
  */
 void tcg_gen_goto_tb(unsigned idx);
 
+/*
+ * A return stack in host code (tcg_retstack_reg): a ring of pairs of a
+ * guest return address (@key) and the host code that continues there,
+ * whose top the backend keeps in a register.
+ *
+ * tcg_gen_push_ret() - push @key and @tag with the host address of label @ret,
+ *   which the caller sets where execution continues after the call
+ *   returns (with the guest state of that return, as at a TB entry).
+ *   With @call, the goto_ptr ops until tcg_gen_push_ret_done() leave by
+ *   a host call, the first followed by @ret, all leading to @call.
+ * tcg_gen_call_tb() - leave the TB through goto_tb slot @idx by a host
+ *   call, so that the host predicts the return to the next op; @reset is
+ *   where the slot leads while unlinked (the code that leaves to the main
+ *   loop), set by the caller after the code at the return.
+ * tcg_gen_ret_tb() - pop the top entry; if its key is @key and its tag
+ *   @tag, return to its host code, else continue.  A tag is a front-end
+ *   constant below TCG_RETSTACK_TAGS (an id of the TB's state, say),
+ *   which only tcg_retstack_env backends keep: elsewhere it must be 0.
+ */
+void tcg_gen_push_ret(TCGv_i64 key, TCGLabel *ret, TCGLabel *call,
+                      unsigned tag);
+void tcg_gen_push_ret_done(void);
+void tcg_gen_call_tb(unsigned idx, TCGLabel *reset);
+void tcg_gen_ret_tb(TCGv_i64 key, unsigned tag);
+
 /**
  * tcg_gen_boundary_in() - the boundary globals arrive in their registers
  *
@@ -94,6 +119,27 @@ void tcg_gen_boundary_in(void);
  * this op is equivalent to calling tcg_gen_exit_tb() with 0 as the argument.
  */
 void tcg_gen_lookup_and_goto_ptr(void);
+
+/**
+ * tcg_gen_lookup_jc_and_goto_ptr() - look up @pc in the jump cache and jump
+ * @pc: guest address of the next TB
+ * @cs_base: the current TB's cs_base, which the next TB must share
+ * @flags: the current TB's flags, which the next TB must share
+ *
+ * Like tcg_gen_lookup_and_goto_ptr(), by a call that probes the jump
+ * cache before the full lookup.  Not with CF_NO_GOTO_PTR.
+ */
+void tcg_gen_lookup_jc_and_goto_ptr(TCGv_i64 pc, uint64_t cs_base,
+                                    uint32_t flags);
+
+/**
+ * tcg_gen_goto_ptr() - jump to a TB's host code
+ * @ptr: host address of the TB's code, as helper_lookup_tb_ptr returns
+ *
+ * The caller must have established that the TB is valid for the current
+ * CPU state, as tcg_gen_lookup_and_goto_ptr() does.
+ */
+void tcg_gen_goto_ptr(TCGv_ptr ptr);
 
 void tcg_gen_plugin_cb(unsigned from);
 void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo);

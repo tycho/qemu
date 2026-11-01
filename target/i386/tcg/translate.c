@@ -129,6 +129,17 @@ typedef struct DisasContext {
     TCGOp *fp_entry_and;
     uint32_t fp_entry_mask;
     bool jmp_opt; /* use direct block chaining for direct jumps */
+    bool jmp_direct; /* the TB ends in a direct jump to another page */
+    /*
+     * The return stack (tcg_retstack): the TB ends in a near CALL, whose
+     * return address is rs_next, or in a near RET.
+     */
+    bool rs_call;
+    bool rs_ret;
+    /* The CALL's return lands through the lookup (gen_JMP_m's guard). */
+    bool rs_land_unlinked;
+    target_ulong rs_next;
+    TCGv_i64 rs_key;    /* tcg_retstack_env: the CALL's key, at run time */
     bool cc_op_dirty;
     /*
      * The insn stores to memory after its flags consumers run (its
@@ -194,6 +205,12 @@ typedef struct DisasContext {
  * EFLAGS.TF to determine singlestep trap (SYSCALL/SYSRET).
  */
 #define DISAS_EOB_RECHECK_TF   DISAS_TARGET_4
+
+/*
+ * EIP has already been updated.  Like DISAS_JUMP, for a far jump that
+ * may also have changed CS and the hflags.
+ */
+#define DISAS_JUMP_FAR         DISAS_TARGET_5
 
 /* The environment in which user-only runs is constrained. */
 #ifdef CONFIG_USER_ONLY
@@ -280,7 +297,8 @@ STUB_HELPER(vmsave, TCGv_env env, TCGv_i32 aflag)
 STUB_HELPER(write_crN, TCGv_env env, TCGv_i32 reg, TCGv val)
 #endif
 
-static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num);
+static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
+                        int tb_num);
 static void gen_jmp_rel_csize(DisasContext *s, int diff, int tb_num);
 static void gen_exception_gpf(DisasContext *s);
 
@@ -2004,7 +2022,7 @@ static void gen_far_call(DisasContext *s)
                               tcg_constant_i32(s->dflag - 1),
                               eip_next_i32(s));
     }
-    s->base.is_jmp = DISAS_JUMP;
+    s->base.is_jmp = DISAS_JUMP_FAR;
 }
 
 static void gen_far_jmp(DisasContext *s)
@@ -2018,7 +2036,7 @@ static void gen_far_jmp(DisasContext *s)
         gen_op_movl_seg_real(s, R_CS, s->T1);
         gen_op_jmp_v(s, s->T0);
     }
-    s->base.is_jmp = DISAS_JUMP;
+    s->base.is_jmp = DISAS_JUMP_FAR;
 }
 
 static void gen_svm_check_intercept(DisasContext *s, uint32_t type)
@@ -2216,6 +2234,190 @@ static void gen_bnd_jmp(DisasContext *s)
 }
 
 /*
+ * tcg_retstack_env: the return stack's entries carry an id of the TB's
+ * flags as their tag, so that a landing is entered only by a RET in the
+ * state its CALL was translated in.  0: no id left.
+ */
+#define RS_FLAGS_IDS (TCG_RETSTACK_TAGS - 1)
+
+static int rs_flags_id(uint32_t flags)
+{
+    static uint32_t tab[RS_FLAGS_IDS + 1];
+    static int used;
+    static GMutex lock;
+    int n = qatomic_load_acquire(&used), id = 0;
+
+    for (int i = 1; i <= n; i++) {
+        if (tab[i] == flags) {
+            return i;
+        }
+    }
+    g_mutex_lock(&lock);
+    for (int i = 1; i <= used; i++) {
+        if (tab[i] == flags) {
+            id = i;
+            break;
+        }
+    }
+    if (!id && used < RS_FLAGS_IDS) {
+        id = used + 1;
+        tab[id] = flags;
+        qatomic_store_release(&used, id);
+    }
+    g_mutex_unlock(&lock);
+    return id;
+}
+
+/*
+ * Whether a near CALL or RET at the end of the TB uses the return stack:
+ * under the same conditions as the inline lookup of the next TB.  With
+ * tcg_retstack_env (system mode), in code whose EIP is its pc.
+ */
+static bool use_retstack(DisasContext *s)
+{
+    if (tcg_retstack_reg >= 0) {
+        if (tb_cflags(s->base.tb) & CF_PCREL) {
+            return false;
+        }
+    } else if (!tcg_retstack_env ||
+               !(CODE64(s) || (CODE32(s) && s->cs_base == 0)) ||
+               s->dflag == MO_16 || !rs_flags_id(s->flags)) {
+        return false;
+    }
+    return s->jmp_opt &&
+           !(tb_cflags(s->base.tb) & CF_NO_GOTO_PTR) &&
+           s->flags == s->base.tb->flags &&
+           !(s->flags & (HF_RF_MASK | HF_MPX_IU_MASK)) &&
+           translator_use_inline_lookup(&s->base);
+}
+
+/* The return stack's tag for the TB's state (tcg_gen_push_ret). */
+static unsigned rs_tag(DisasContext *s)
+{
+    return tcg_retstack_env ? rs_flags_id(s->flags) : 0;
+}
+
+/*
+ * At a near CALL: with tcg_retstack_env, the key of the return address
+ * the CALL pushes, before the jump moves EIP on.
+ */
+static void rs_call_key(DisasContext *s)
+{
+    if (tcg_retstack_env && (tb_cflags(s->base.tb) & CF_PCREL)) {
+        TCGv_i64 pc = tcg_temp_new_i64();
+
+        if (CODE64(s)) {
+            tcg_gen_extu_tl_i64(pc, eip_next_tl(s));
+        } else {
+            TCGv t = tcg_temp_new();
+
+            tcg_gen_ext32u_tl(t, eip_next_tl(s));
+            tcg_gen_extu_tl_i64(pc, t);
+        }
+        s->rs_key = pc;
+    }
+}
+
+/* The key the CALL that ends the TB pushes. */
+static TCGv_i64 rs_push_key(DisasContext *s)
+{
+    if (tcg_retstack_env) {
+        assert(s->rs_key);
+        return s->rs_key;
+    }
+    return tcg_constant_i64(s->rs_next);
+}
+
+/* The pc of the return address of the CALL that ends the TB. */
+static target_ulong rs_next_pc(DisasContext *s)
+{
+    return CODE64(s) ? s->rs_next : (uint32_t)(s->rs_next + s->cs_base);
+}
+
+/*
+ * The return landing, where the host returns to after the guest RET to
+ * the CALL's return address: chain to it through goto_tb @slot, or look
+ * it up if @slot is negative.
+ */
+static void gen_ret_landing(DisasContext *s, TCGLabel *land, int slot)
+{
+    bool pcrel = tb_cflags(s->base.tb) & CF_PCREL;
+
+    gen_set_label(land);
+    if (slot >= 0) {
+        /* With CF_PCREL, EIP is the address the RET returned to. */
+        tcg_gen_goto_tb(slot);
+        if (!pcrel) {
+            tcg_gen_movi_tl(cpu_eip, s->rs_next);
+        }
+        tcg_gen_exit_tb(s->base.tb, slot);
+    } else if (pcrel) {
+        TCGv_i64 pc = tcg_temp_new_i64();
+
+        if (CODE64(s)) {
+            tcg_gen_extu_tl_i64(pc, cpu_eip);
+        } else {
+            TCGv t = tcg_temp_new();
+
+            tcg_gen_ext32u_tl(t, cpu_eip);
+            tcg_gen_extu_tl_i64(pc, t);
+        }
+        translator_lookup_and_goto_ptr(&s->base, pc, s->cs_base, s->flags,
+                                       false);
+    } else {
+        /* No goto_tb slot for it: look it up. */
+        tcg_gen_movi_tl(cpu_eip, s->rs_next);
+        translator_lookup_and_goto_ptr(&s->base,
+                                       tcg_constant_i64(rs_next_pc(s)),
+                                       s->cs_base, s->flags, false);
+    }
+}
+
+/* A goto_tb slot for the return landing other than @used, or -1. */
+static int ret_landing_slot(DisasContext *s, int used)
+{
+    if (s->rs_land_unlinked) {
+        return -1;
+    }
+    return translator_use_goto_tb(&s->base, rs_next_pc(s))
+           ? (used < 0 ? 0 : used ^ 1) : -1;
+}
+
+/*
+ * Look up the next TB after a near jump.  The CPU state is then the one
+ * this TB was translated for: an insn that changes the hflags or CS ends
+ * the TB by returning to the main loop, or updates s->flags.  The
+ * exceptions are RF, which gen_eob clears, and BND JMP, which may clear
+ * HF_MPX_IU; with those, and after a far jump, use the helper.
+ */
+static void gen_lookup_and_goto_ptr(DisasContext *s, int mode)
+{
+    TCGv_i64 pc;
+
+    if (mode != DISAS_JUMP ||
+        s->flags != s->base.tb->flags ||
+        (s->flags & (HF_RF_MASK | HF_MPX_IU_MASK)) ||
+        !translator_use_inline_lookup(&s->base)) {
+        tcg_gen_lookup_and_goto_ptr();
+        return;
+    }
+
+    /* As x86_get_tb_cpu_state computes the pc. */
+    pc = tcg_temp_new_i64();
+    if (CODE64(s)) {
+        tcg_gen_extu_tl_i64(pc, cpu_eip);
+    } else {
+        TCGv t = tcg_temp_new();
+
+        tcg_gen_addi_tl(t, cpu_eip, s->cs_base);
+        tcg_gen_ext32u_tl(t, t);
+        tcg_gen_extu_tl_i64(pc, t);
+    }
+    translator_lookup_and_goto_ptr(&s->base, pc, s->cs_base, s->flags,
+                                   s->jmp_direct);
+}
+
+/*
  * Generate an end of block, including common tasks such as generating
  * single step traps, resetting the RF flag, and handling the interrupt
  * shadow.
@@ -2225,6 +2427,7 @@ gen_eob(DisasContext *s, int mode)
 {
     bool inhibit_reset;
     TCGLabel *req = NULL;
+    TCGLabel *land = NULL;
 
     gen_update_cc_op(s);
 
@@ -2245,11 +2448,34 @@ gen_eob(DisasContext *s, int mode)
         tcg_gen_exit_tb(NULL, 0);
     } else if (s->flags & HF_TF_MASK) {
         gen_helper_single_step(tcg_env);
-    } else if (mode == DISAS_JUMP &&
+    } else if ((mode == DISAS_JUMP || mode == DISAS_JUMP_FAR) &&
                /* give irqs a chance to happen */
                !inhibit_reset) {
         req = translator_edge_check(&s->base, s->base.pc_first);
-        tcg_gen_lookup_and_goto_ptr();
+        if (mode == DISAS_JUMP && s->rs_ret && use_retstack(s)) {
+            TCGv_i64 key = tcg_temp_new_i64();
+
+            tcg_gen_extu_tl_i64(key, cpu_eip);
+            if (tb_cflags(s->base.tb) & CF_PCREL) {
+                tcg_gen_ret_tb(key, rs_tag(s));
+            } else {
+                /*
+                 * A hit returns to the code after the CALL, which sets
+                 * EIP from constants wherever it is needed: store it on
+                 * the miss path only.
+                 */
+                tcg_gen_discard_tl(cpu_eip);
+                tcg_gen_ret_tb(key, 0);
+                tcg_gen_trunc_i64_tl(cpu_eip, key);
+            }
+        } else if (mode == DISAS_JUMP && s->rs_call && use_retstack(s)) {
+            /* The lookup leaves by a host call; land comes after it. */
+            land = gen_new_label();
+            tcg_gen_push_ret(rs_push_key(s), gen_new_label(), land,
+                             rs_tag(s));
+        }
+        gen_lookup_and_goto_ptr(s, mode);
+        tcg_gen_push_ret_done();
     } else {
         tcg_gen_exit_tb(NULL, 0);
     }
@@ -2257,12 +2483,18 @@ gen_eob(DisasContext *s, int mode)
         gen_set_label(req);
         tcg_gen_exit_tb(NULL, 0);
     }
+    if (land) {
+        gen_ret_landing(s, land, ret_landing_slot(s, -1));
+    }
+    s->rs_call = s->rs_ret = false;
+    s->rs_land_unlinked = false;
 
     s->base.is_jmp = DISAS_NORETURN;
 }
 
 /* Jump to eip+diff, truncating the result to OT. */
-static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
+static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
+                        int tb_num)
 {
     bool use_goto_tb = s->jmp_opt;
     target_ulong mask = -1;
@@ -2299,6 +2531,29 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
         new_pc = (uint32_t)(new_eip + s->cs_base);
     }
 
+    /*
+     * A CALL with the return stack: push the return, then leave through
+     * a goto_tb slot that calls, so the host predicts the return to the
+     * landing that follows.  Through the lookup, gen_eob does the same.
+     */
+    if (s->rs_call && use_retstack(s) && use_goto_tb &&
+        translator_use_goto_tb(&s->base, new_pc)) {
+        TCGLabel *land = gen_new_label();
+        TCGLabel *reset = gen_new_label();
+
+        s->rs_call = false;
+        tcg_gen_push_ret(rs_push_key(s), land, NULL, rs_tag(s));
+        tcg_gen_call_tb(tb_num, reset);
+        gen_ret_landing(s, land, ret_landing_slot(s, tb_num));
+        gen_set_label(reset);
+        if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
+            tcg_gen_movi_tl(cpu_eip, new_eip);
+        }
+        tcg_gen_exit_tb(s->base.tb, tb_num);
+        s->base.is_jmp = DISAS_NORETURN;
+        return;
+    }
+
     if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)
         && translator_loop_back(&s->base, new_pc)) {
         /*
@@ -2324,6 +2579,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, int diff, int tb_num)
             tcg_gen_movi_tl(cpu_eip, new_eip);
         }
         if (s->jmp_opt) {
+            s->jmp_direct = true;
             gen_eob(s, DISAS_JUMP);   /* jump to another page */
         } else {
             gen_eob(s, DISAS_EOB_ONLY);  /* exit to main loop */
@@ -3827,6 +4083,11 @@ void tcg_x86_init(void)
     cpu_cc_src2 = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, cc_src2),
                                      "cc_src2");
     cpu_eip = tcg_global_mem_new(tcg_env, offsetof(CPUX86State, eip), eip_name);
+    tcg_retsp_off = offsetof(CPUX86State, retsp);
+    tcg_retep_off = offsetof(CPUX86State, retep);
+#ifdef TARGET_X86_64
+    tcg_retstack_addr64 = true;
+#endif
 
     for (i = 0; i < CPU_NB_EREGS; ++i) {
         cpu_regs[i] = tcg_global_mem_new(tcg_env,
@@ -4006,6 +4267,10 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->cpuid_7_0_ecx_features = env->features[FEAT_7_0_ECX];
     dc->cpuid_7_1_eax_features = env->features[FEAT_7_1_EAX];
     dc->cpuid_xsave_features = env->features[FEAT_XSAVE];
+    dc->jmp_direct = false;
+    dc->rs_call = dc->rs_ret = false;
+    dc->rs_land_unlinked = false;
+    dc->rs_key = NULL;
     dc->jmp_opt = !((cflags & CF_NO_GOTO_TB) ||
                     (flags & (HF_RF_MASK | HF_TF_MASK | HF_INHIBIT_IRQ_MASK)));
 
@@ -4151,6 +4416,7 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     case DISAS_EOB_ONLY:
     case DISAS_EOB_RECHECK_TF:
     case DISAS_JUMP:
+    case DISAS_JUMP_FAR:
         gen_eob(dc, dc->base.is_jmp);
         break;
     default:

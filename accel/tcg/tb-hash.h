@@ -25,37 +25,68 @@
 #include "exec/translation-block.h"
 #include "qemu/xxhash.h"
 #include "tb-jmp-cache.h"
+#include "internal-common.h"
 
 #ifdef CONFIG_SOFTMMU
 
-/* Only the bottom TB_JMP_PAGE_BITS of the jump cache hash bits vary for
-   addresses on the same page.  The top bits are the same.  This allows
-   TLB invalidation to quickly clear a subset of the hash table.  */
-#define TB_JMP_PAGE_BITS (TB_JMP_CACHE_BITS / 2)
+/*
+ * The jump cache's slots come in groups of TB_JMP_PAGE_SIZE, and every pc
+ * of a guest page hashes into one group, so that a TLB flush of the page
+ * clears only that group.  The group comes from the pc above both the
+ * page and the group's size (TB_JMP_GROUP_SHIFT), mixed with the bits
+ * TB_JMP_MIX_SHIFT higher; the slot from the pc's low TB_JMP_PAGE_BITS,
+ * folded with the bits up to the page's size where a page is larger
+ * (TB_JMP_FOLD_SHIFT).  With 4 KiB pages the offset folds two bits, so
+ * code on one page seldom conflicts with itself; with the default 64K
+ * slots, a group's entries are 16 KiB, one host page where pages are
+ * that size.
+ */
+#if TB_JMP_CACHE_BITS < 7
+#error "TB_JMP_CACHE_BITS: at least 7, for 64 groups of 2 or more slots"
+#endif
+#define TB_JMP_PAGE_BITS (TB_JMP_CACHE_BITS - 6)
 #define TB_JMP_PAGE_SIZE (1 << TB_JMP_PAGE_BITS)
 #define TB_JMP_ADDR_MASK (TB_JMP_PAGE_SIZE - 1)
 #define TB_JMP_PAGE_MASK (TB_JMP_CACHE_SIZE - TB_JMP_PAGE_SIZE)
+#define TB_JMP_GROUP_SHIFT MAX(TARGET_PAGE_BITS, TB_JMP_PAGE_BITS)
+#define TB_JMP_FOLD_SHIFT (TB_JMP_GROUP_SHIFT - TB_JMP_PAGE_BITS)
+#define TB_JMP_MIX_SHIFT (TB_JMP_CACHE_BITS - TB_JMP_PAGE_BITS)
 
 static inline unsigned int tb_jmp_cache_hash_page(vaddr pc)
 {
-    vaddr tmp;
-    tmp = pc ^ (pc >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS));
-    return (tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK;
+    vaddr tmp = pc ^ (pc >> TB_JMP_MIX_SHIFT);
+
+    return ((tmp >> TB_JMP_GROUP_SHIFT) << TB_JMP_PAGE_BITS) & TB_JMP_PAGE_MASK;
 }
 
 static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
 {
-    vaddr tmp;
-    tmp = pc ^ (pc >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS));
-    return (((tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK)
-           | (tmp & TB_JMP_ADDR_MASK));
+    unsigned fold = TB_JMP_FOLD_SHIFT;
+    vaddr off = fold ? pc ^ (pc >> fold) : pc;
+
+    return tb_jmp_cache_hash_page(pc) | (off & TB_JMP_ADDR_MASK);
+}
+
+/* @pc's page's bit in CPUJumpCache.filter, within its group's bits. */
+static inline unsigned int tb_jmp_cache_filter_bit(vaddr pc)
+{
+    uint64_t h = (uint64_t)(pc >> TARGET_PAGE_BITS) * 0x9e3779b97f4a7c15ull;
+
+    return tb_jmp_cache_hash_page(pc) | (h >> (64 - TB_JMP_PAGE_BITS));
 }
 
 #else
 
-/* In user-mode we can get better hashing because we do not have a TLB */
+/*
+ * In user-mode we can get better hashing because we do not have a TLB.
+ * With the inline lookup, the pc's low bits alone: guest code spreads
+ * over them, and the generated code takes them in one host insn.
+ */
 static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
 {
+    if (tcg_ijmp_inline) {
+        return pc & (TB_JMP_CACHE_SIZE - 1);
+    }
     return (pc ^ (pc >> TB_JMP_CACHE_BITS)) & (TB_JMP_CACHE_SIZE - 1);
 }
 

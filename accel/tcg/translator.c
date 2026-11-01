@@ -18,12 +18,20 @@
 #include "tcg/startup.h"
 #ifdef CONFIG_USER_ONLY
 #include "gdbstub/user.h"
+#ifdef CONFIG_USER_ONLY
+#include "user/guest-host.h"
+#include "user/page-protection.h"
+#include "exec/page-protection.h"
+#endif
 #endif
 #include "exec/plugin-gen.h"
 #include "tcg/tcg-op-common.h"
+#include "tcg/startup.h"
 #include "internal-common.h"
 #include "disas/disas.h"
 #include "tb-internal.h"
+#include "tb-hash.h"
+#include "tcg/tcg-temp-internal.h"
 
 #ifndef CONFIG_USER_ONLY
 static void set_can_do_io(DisasContextBase *db, bool val)
@@ -191,6 +199,249 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
 
     /* Check for the dest on the same page as the start of the TB.  */
     return use_cross_page_goto_tb() || translator_is_same_page(db, dest);
+}
+
+bool translator_ptr_guard(DisasContextBase *db, vaddr pc, vaddr addr,
+                          MemOp mop, uint64_t *val)
+{
+#if defined(CONFIG_USER_ONLY) && defined(CONFIG_LINUX)
+    unsigned size = memop_size(mop);
+    uint8_t buf[8];
+    struct iovec local = { .iov_base = buf, .iov_len = size };
+    struct iovec remote = { .iov_len = size };
+
+    if (!tcg_ijguard || (tb_cflags(db->tb) & CF_NO_GOTO_TB) ||
+        !ptr_guard_allowed(pc) ||
+        (mop & MO_BSWAP) != MO_LE || (size != 4 && size != 8) ||
+        !page_check_range(addr, size, PAGE_READ)) {
+        return false;
+    }
+    /*
+     * A readable mapping can still fault (a file truncated under it, for
+     * one): read through the kernel, which fails instead of raising a
+     * signal.  The guest may not reach this load at all, so a failure
+     * just means no guard.
+     */
+    remote.iov_base = g2h_untagged_vaddr(addr);
+    if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != size) {
+        return false;
+    }
+    *val = size == 4 ? ldl_le_p(buf) : ldq_le_p(buf);
+    return translator_use_goto_tb(db, *val);
+#else
+    return false;
+#endif
+}
+
+void translator_gen_ptr_respec(DisasContextBase *db, vaddr pc)
+{
+    gen_helper_ptr_respec(tcg_env, tcg_constant_ptr(db->tb),
+                          tcg_constant_i64(pc));
+}
+
+bool translator_use_inline_lookup(DisasContextBase *db)
+{
+    return tcg_ijmp_inline &&
+           !(tb_cflags(db->tb) & (CF_NO_GOTO_PTR | CF_USE_ICOUNT)) &&
+           !qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC);
+}
+
+/*
+ * Byte offset of @pc's entry in CPUJumpCache.array, computed as
+ * tb_jmp_cache_hash_func() does.
+ */
+static void gen_jmp_cache_offset(TCGv_i64 off, TCGv_i64 pc)
+{
+#define JC_ENTRY_SIZE sizeof_field(CPUJumpCache, array[0])
+    const unsigned e = ctz32(JC_ENTRY_SIZE);
+
+    QEMU_BUILD_BUG_ON(JC_ENTRY_SIZE & (JC_ENTRY_SIZE - 1));
+#undef JC_ENTRY_SIZE
+#ifdef CONFIG_SOFTMMU
+    TCGv_i64 tmp = tcg_temp_ebb_new_i64();
+    TCGv_i64 hi = tcg_temp_ebb_new_i64();
+    const unsigned fold = TB_JMP_FOLD_SHIFT;
+
+    tcg_gen_shri_i64(hi, pc, TB_JMP_MIX_SHIFT);
+    tcg_gen_xor_i64(hi, hi, pc);
+    tcg_gen_shri_i64(hi, hi, TB_JMP_GROUP_SHIFT);
+    tcg_gen_deposit_z_i64(hi, hi, e + TB_JMP_PAGE_BITS,
+                          TB_JMP_CACHE_BITS - TB_JMP_PAGE_BITS);
+    if (fold) {
+        tcg_gen_shri_i64(tmp, pc, fold);
+        tcg_gen_xor_i64(tmp, tmp, pc);
+        tcg_gen_deposit_z_i64(off, tmp, e, TB_JMP_PAGE_BITS);
+    } else {
+        tcg_gen_deposit_z_i64(off, pc, e, TB_JMP_PAGE_BITS);
+    }
+    tcg_gen_or_i64(off, off, hi);
+    tcg_temp_free_i64(hi);
+    tcg_temp_free_i64(tmp);
+#else
+    /* Only the inline lookup uses this: tcg_ijmp_inline's hash. */
+    tcg_gen_deposit_z_i64(off, pc, e, TB_JMP_CACHE_BITS);
+#endif
+}
+
+/*
+ * Whether a breakpoint can be inserted while generated code runs, and so
+ * whether the inline lookup must defer to the helper, which checks them.
+ */
+static bool inline_lookup_checks_breakpoints(void)
+{
+#ifdef CONFIG_USER_ONLY
+    return gdb_may_set_breakpoints();
+#else
+    return true;
+#endif
+}
+
+static void gen_inline_lookup(TCGv_i64 pc, uint64_t cs_base, uint32_t flags)
+{
+    TCGLabel *miss = gen_new_label();
+    TCGv_ptr jc = tcg_temp_ebb_new_ptr();
+    TCGv_ptr tb = tcg_temp_ebb_new_ptr();
+    TCGv_i64 t64 = tcg_temp_ebb_new_i64();
+    TCGv_i32 t32 = tcg_temp_ebb_new_i32();
+    TCGv_i32 cf = tcg_temp_ebb_new_i32();
+    TCGv_i64 key = pc;
+
+    plugin_gen_disable_mem_helpers();
+
+    /*
+     * The same checks as tb_lookup(), against the jump cache only.  The
+     * cache holds only TBs that are valid for the vCPU's current mappings:
+     * TLB flushes clear it (or move its salt on), and TB invalidation
+     * removes the TB from it.
+     * The pc is compared before the first branch, so it needn't stay live
+     * across them.
+     */
+    tcg_gen_ld_ptr(jc, tcg_env,
+                   offsetof(CPUState, tb_jmp_cache) - sizeof(CPUState));
+    if (tcg_jcgen) {
+        /* Entries hold pc ^ salt; a flush moves the salt on. */
+        key = tcg_temp_ebb_new_i64();
+        tcg_gen_ld_i64(key, jc, offsetof(CPUJumpCache, salt));
+        tcg_gen_xor_i64(key, key, pc);
+    }
+    gen_jmp_cache_offset(t64, pc);
+    tcg_gen_trunc_i64_ptr(tb, t64);
+    tcg_gen_add_ptr(jc, jc, tb);
+    QEMU_BUILD_BUG_ON(sizeof(vaddr) != sizeof(uint64_t));
+    tcg_gen_ld_i64(t64, jc, offsetof(CPUJumpCache, array[0].pc));
+    tcg_gen_ld_ptr(tb, jc, offsetof(CPUJumpCache, array[0].tb));
+    tcg_gen_brcond_i64(TCG_COND_NE, t64, key, miss);
+    tcg_gen_brcondi_ptr(TCG_COND_EQ, tb, 0, miss);
+
+    /* check_for_breakpoints() runs only in the helper. */
+    if (inline_lookup_checks_breakpoints()) {
+        tcg_gen_ld_ptr(jc, tcg_env,
+                       offsetof(CPUState, breakpoints.tqh_first) -
+                       sizeof(CPUState));
+        tcg_gen_brcondi_ptr(TCG_COND_NE, jc, 0, miss);
+    }
+
+    if (tcg_jc_ctx) {
+        /*
+         * The cache holds TBs for this TB's state only (tcg_jc_ctx); still,
+         * an entry may be a TB invalidated since, which must not run.
+         */
+        tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, cflags));
+        tcg_gen_brcondi_i32(TCG_COND_TSTNE, t32, CF_INVALID, miss);
+    } else {
+        tcg_gen_ld_i64(t64, tb, offsetof(TranslationBlock, cs_base));
+        tcg_gen_brcondi_i64(TCG_COND_NE, t64, cs_base, miss);
+        tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, flags));
+        tcg_gen_brcondi_i32(TCG_COND_NE, t32, flags, miss);
+
+        /* curr_cflags(); a stale TB has CF_INVALID set and never matches. */
+        tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, cflags));
+        tcg_gen_ld_i32(cf, tcg_env,
+                       offsetof(CPUState, tcg_cflags) - sizeof(CPUState));
+        tcg_gen_brcond_i32(TCG_COND_NE, t32, cf, miss);
+    }
+
+    tcg_gen_ld_ptr(tb, tb, offsetof(TranslationBlock, tc.ptr));
+    tcg_gen_goto_ptr(tb);
+
+    gen_set_label(miss);
+    if (tcg_tblayout) {
+        /*
+         * The miss path stores and reloads every pinned register around
+         * the helper: with tcg_tblayout it goes to the cold part, and
+         * the checks' branches reach it through one branch here.
+         */
+        TCGLabel *cold = gen_new_label();
+
+        tcg_gen_br(cold);
+        gen_set_label(cold);
+        cold->cold = true;
+    }
+    tcg_gen_lookup_and_goto_ptr();
+
+    if (key != pc) {
+        tcg_temp_free_i64(key);
+    }
+    tcg_temp_free_i32(cf);
+    tcg_temp_free_i32(t32);
+    tcg_temp_free_i64(t64);
+    tcg_temp_free_ptr(tb);
+    tcg_temp_free_ptr(jc);
+}
+
+/*
+ * tcg_xpage=stub: the jump-cache probe in a call that reads no guest
+ * state, the backend's shared probe (tcg_xpage_stub) or, without one,
+ * helper_lookup_tb_ptr_jcp, so the guest's globals stay in host registers
+ * across it; on a miss, the full lookup, which may fault and so is a call
+ * that stores them.
+ */
+static void gen_probe_lookup(TCGv_i64 pc, uint64_t cs_base, uint32_t flags)
+{
+    TCGLabel *miss = gen_new_label();
+    TCGv_ptr ptr = tcg_temp_ebb_new_ptr();
+
+    plugin_gen_disable_mem_helpers();
+    if (tcg_xpage_stub) {
+        /* The backend's probe, with the C probe's signature and flags. */
+        tcg_gen_call4((void *)tcg_xpage_stub, &helper_info_lookup_tb_ptr_jcp,
+                      tcgv_ptr_temp(ptr), tcgv_ptr_temp(tcg_env),
+                      tcgv_i64_temp(pc),
+                      tcgv_i64_temp(tcg_constant_i64(cs_base)),
+                      tcgv_i32_temp(tcg_constant_i32(flags)));
+    } else {
+        gen_helper_lookup_tb_ptr_jcp(ptr, tcg_env, pc,
+                                     tcg_constant_i64(cs_base),
+                                     tcg_constant_i32(flags));
+    }
+    tcg_gen_brcondi_ptr(TCG_COND_EQ, ptr, 0, miss);
+    tcg_gen_goto_ptr(ptr);
+    tcg_temp_free_ptr(ptr);
+
+    gen_set_label(miss);
+    if (tcg_tblayout) {
+        /* As gen_inline_lookup's miss path: in the cold part. */
+        TCGLabel *cold = gen_new_label();
+
+        tcg_gen_br(cold);
+        gen_set_label(cold);
+        cold->cold = true;
+    }
+    tcg_gen_lookup_and_goto_ptr();
+}
+
+void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
+                                    uint64_t cs_base, uint32_t flags,
+                                    bool direct)
+{
+    assert(translator_use_inline_lookup(db));
+    if (direct && tcg_xpage == TCG_XPAGE_STUB) {
+        gen_probe_lookup(pc, cs_base, flags);
+    } else if (direct) {
+        tcg_gen_lookup_jc_and_goto_ptr(pc, cs_base, flags);
+    } else {
+        gen_inline_lookup(pc, cs_base, flags);
+    }
 }
 
 void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
