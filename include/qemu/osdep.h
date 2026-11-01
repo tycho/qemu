@@ -859,6 +859,10 @@ typedef enum {
 extern bool qemu_thread_jit_lazy;
 extern __thread QemuThreadJitMode qemu_thread_jit_mode;
 
+/* xtcg Phase-1 counters, see qemu/xtcg-stats.h */
+extern bool xtcg_stats;
+void xtcg_stats_jit(bool execute);
+
 static inline void qemu_thread_jit_execute(void)
 {
     if (qemu_thread_jit_lazy) {
@@ -866,6 +870,9 @@ static inline void qemu_thread_jit_execute(void)
             return;
         }
         qemu_thread_jit_mode = QEMU_THREAD_JIT_EXECUTE;
+    }
+    if (unlikely(xtcg_stats)) {
+        xtcg_stats_jit(true);
     }
     pthread_jit_write_protect_np(true);
 }
@@ -877,6 +884,9 @@ static inline void qemu_thread_jit_write(void)
             return;
         }
         qemu_thread_jit_mode = QEMU_THREAD_JIT_WRITE;
+    }
+    if (unlikely(xtcg_stats)) {
+        xtcg_stats_jit(false);
     }
     pthread_jit_write_protect_np(false);
 }
