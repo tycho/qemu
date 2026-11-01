@@ -85,6 +85,36 @@ TCGTemp *tcg_alias_element(TCGContext *s, TCGTemp *base, intptr_t off,
  */
 TCGTemp *tcg_constant_internal(TCGType type, int64_t val);
 
+/*
+ * The constant argument of qemu_ld_x and qemu_st_x: the MemOpIdx (bits
+ * 0-31), the shift of the index (bits 32-34) and an offset (bits 40-52).
+ * Either the shift or the offset is used: with an offset the index is the
+ * constant 0, and the offset is signed (9 bits), or unsigned (12 bits) in
+ * units of the access size with the shift TCG_LDST_X_SCALED.
+ */
+#define TCG_LDST_X_SCALED 4
+
+static inline TCGArg tcg_ldst_x_arg(MemOpIdx oi, unsigned shift, int ofs)
+{
+    return (TCGArg)oi | (TCGArg)shift << 32 | (TCGArg)(ofs & 0x1fff) << 40;
+}
+
+static inline MemOpIdx tcg_ldst_x_oi(TCGArg arg)
+{
+    return (MemOpIdx)arg;
+}
+
+static inline unsigned tcg_ldst_x_shift(TCGArg arg)
+{
+    return extract64(arg, 32, 3);
+}
+
+static inline int tcg_ldst_x_ofs(TCGArg arg)
+{
+    return tcg_ldst_x_shift(arg) == TCG_LDST_X_SCALED
+           ? extract64(arg, 40, 12) : sextract64(arg, 40, 9);
+}
+
 TCGOp *tcg_gen_op1(TCGOpcode, TCGType, TCGArg);
 TCGOp *tcg_gen_op2(TCGOpcode, TCGType, TCGArg, TCGArg);
 TCGOp *tcg_gen_op3(TCGOpcode, TCGType, TCGArg, TCGArg, TCGArg);
