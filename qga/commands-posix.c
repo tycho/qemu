@@ -111,8 +111,8 @@ static int ga_run_command(const char *argv[], const char *in_str,
     char *str = NULL;
     ssize_t len = 0;
 
-    if ((in_str && !g_unix_open_pipe(infd, FD_CLOEXEC, NULL)) ||
-        !g_unix_open_pipe(outfd, FD_CLOEXEC, NULL)) {
+    if ((in_str && !g_unix_open_pipe(infd, QEMU_G_UNIX_PIPE_CLOEXEC, NULL)) ||
+        !g_unix_open_pipe(outfd, QEMU_G_UNIX_PIPE_CLOEXEC, NULL)) {
         error_setg(errp, "cannot create pipe FDs");
         goto out;
     }
