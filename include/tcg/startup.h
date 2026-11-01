@@ -567,7 +567,11 @@ bool tcg_lean_narrow32(void);
 extern bool tcg_alignfold;
 
 /*
+ * x86 guests (accel property x-repstr): REP STOS and REP MOVS a page at
+ * a time with the host's widest stores where they can, as CPUs with fast
+ * string operations do.
  */
+extern bool tcg_repstr;
 
 /*
  */
