@@ -30,6 +30,8 @@ TCGv_vec tcg_temp_new_vec_matching(TCGv_vec match);
 TCGv_i32 tcg_global_mem_new_i32(TCGv_ptr reg, intptr_t off, const char *name);
 TCGv_i64 tcg_global_mem_new_i64(TCGv_ptr reg, intptr_t off, const char *name);
 TCGv_ptr tcg_global_mem_new_ptr(TCGv_ptr reg, intptr_t off, const char *name);
+TCGv_vec tcg_global_mem_new_vec(TCGv_ptr reg, intptr_t off, TCGType type,
+                                const char *name);
 
 /* Generic ops.  */
 static inline void tcg_gen_insn_start(uint64_t pc, uint64_t a1,
@@ -73,6 +75,14 @@ void tcg_gen_exit_tb(const TranslationBlock *tb, unsigned idx);
  * changes.
  */
 void tcg_gen_goto_tb(unsigned idx);
+
+/**
+ * tcg_gen_boundary_in() - the boundary globals arrive in their registers
+ *
+ * At the start of a TB (translator_loop), and where control returns into
+ * a TB from another one.
+ */
+void tcg_gen_boundary_in(void);
 
 /**
  * tcg_gen_lookup_and_goto_ptr() - look up the current TB, jump to it if valid
@@ -629,6 +639,12 @@ void tcg_gen_addlp_vec(unsigned vece, TCGv_vec r, TCGv_vec a, bool is_signed);
  */
 void tcg_gen_avgr_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_dup_mem_vec(unsigned vece, TCGv_vec, TCGv_ptr, tcg_target_long);
+/*
+ * Element @idx of @a (of size vece), zero-extended into @r.  No fallback:
+ * check tcg_can_emit_vec_op(INDEX_op_extract_vec) first.
+ */
+void tcg_gen_extract_vec_i64(unsigned vece, TCGv_i64 r, TCGv_vec a,
+                             unsigned idx);
 /*
  * Element @idx of @a (of size vece), zero-extended into @r.  No fallback:
  * check tcg_can_emit_vec_op(INDEX_op_extract_vec) first.

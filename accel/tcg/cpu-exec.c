@@ -47,6 +47,8 @@
 #include "tb-context.h"
 #include "tb-internal.h"
 #include "internal-common.h"
+#include "tcg/startup.h"
+#include "qemu/plugin.h"
 #if !defined(CONFIG_USER_ONLY)
 #include "accel/tcg/iommu.h"
 #endif
@@ -1098,7 +1100,24 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
         assert(tcg_ops->translate_code);
         assert(tcg_ops->get_tb_cpu_state);
         assert(tcg_ops->mmu_index);
+#ifndef CONFIG_USER_ONLY
+        if (tcg_prologue_deferred) {
+            /*
+             * Pin guest registers if no plugin, which would read them
+             * from env, is loaded (plugins are loaded before the vCPUs
+             * are created); then the prologue, which loads and stores
+             * the pinned ones.
+             */
+            tcg_pin_user = tcg_pin && !qemu_plugins_loaded();
+        }
+#endif
         tcg_ops->initialize();
+#ifndef CONFIG_USER_ONLY
+        if (tcg_prologue_deferred) {
+            tcg_prologue_init();
+            tcg_prologue_deferred = false;
+        }
+#endif
         tcg_target_initialized = true;
     }
 

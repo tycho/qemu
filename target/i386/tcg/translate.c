@@ -3781,6 +3781,54 @@ void tcg_x86_init(void)
                                          reg_names[i]);
     }
 
+#ifndef CONFIG_USER_ONLY
+    /*
+     * With tcg_pin_pc, EIP first: in system mode TBs are PC-relative, and
+     * every exit adds its displacement to EIP; the next TB reads it.
+     */
+    if (tcg_pin_user && tcg_pin_pc) {
+        tcg_temp_pin(tcgv_tl_temp(cpu_eip));
+    }
+#endif
+
+    /*
+     * With tcg_pin_user, as many general registers as the backend allows
+     * stay in host registers across TBs, the most used first: summed over
+     * compilers, an interpreter and image code, these load and store most
+     * at block boundaries.  A 32-bit guest has only the first eight.
+     */
+    if (tcg_pin_user) {
+        static const int pin_order[] = {
+            R_ESP, R_EAX, R_EDI, R_EBX, R_EDX, R_ECX, 12, R_ESI,
+            14, R_EBP, 15, 13, 9, 10, 8, 11,
+        };
+
+        for (i = 0; i < ARRAY_SIZE(pin_order); ++i) {
+            if (pin_order[i] < CPU_NB_REGS &&
+                !tcg_temp_pin(tcgv_tl_temp(cpu_regs[pin_order[i]]))) {
+                break;
+            }
+        }
+        /*
+         * With tcg_pin_cc, CC_OP after them, if a register is left: every
+         * exit sets it, most TBs that read the flags read it.
+         */
+        if (tcg_pin_cc && i == ARRAY_SIZE(pin_order)) {
+            tcg_temp_pin(tcgv_i32_temp(cpu_cc_op));
+        }
+        /*
+         * With tcg_cc_regs, CC_DST and CC_SRC in host registers between
+         * TBs: a TB that sets the flags leaves them for the next, and one
+         * that reads them first doesn't load them.
+         */
+        if (tcg_cc_regs &&
+            tcg_boundary_global_add(tcgv_tl_temp(cpu_cc_dst))) {
+            bool both = tcg_boundary_global_add(tcgv_tl_temp(cpu_cc_src));
+
+            tcg_debug_assert(both);
+        }
+    }
+
     for (i = 0; i < 6; ++i) {
         cpu_seg_base[i]
             = tcg_global_mem_new(tcg_env,
@@ -3798,6 +3846,58 @@ void tcg_x86_init(void)
                                      offsetof(CPUX86State, bnd_regs[i].ub),
                                      bnd_regu_names[i]);
     }
+
+    /*
+     * With tcg_vecglobal, the low 128 bits of each xmm register as a
+     * vector global; whole-register loads and stores become moves of it.
+     * With tcg_pin_vec too, they stay in host registers across TBs.
+     */
+    if (tcg_vecglobal) {
+        static const char xmm_names[CPU_NB_REGS][6] = {
+            "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+#ifdef TARGET_X86_64
+            "xmm8", "xmm9", "xmm10", "xmm11",
+            "xmm12", "xmm13", "xmm14", "xmm15",
+#endif
+        };
+
+        for (i = 0; i < CPU_NB_REGS; ++i) {
+            TCGv_vec v = tcg_global_mem_new_vec(tcg_env,
+                                    offsetof(CPUX86State, xmm_regs[i].ZMM_X(0)),
+                                    TCG_TYPE_V128, xmm_names[i]);
+
+            if (v && tcg_pin_user && tcg_pin_vec) {
+                tcg_temp_pin(tcgv_vec_temp(v));
+            }
+        }
+    }
+
+    /*
+     * With tcg_ymmglobal, the upper 128 bits of each ymm register too, so
+     * that 256-bit AVX code, which hosts without 256-bit vectors run as
+     * two 128-bit halves, keeps both halves in host registers.
+     */
+    if (tcg_vecglobal && tcg_ymmglobal) {
+        static const char ymmh_names[CPU_NB_REGS][7] = {
+            "ymm0h", "ymm1h", "ymm2h", "ymm3h",
+            "ymm4h", "ymm5h", "ymm6h", "ymm7h",
+#ifdef TARGET_X86_64
+            "ymm8h", "ymm9h", "ymm10h", "ymm11h",
+            "ymm12h", "ymm13h", "ymm14h", "ymm15h",
+#endif
+        };
+
+        for (i = 0; i < CPU_NB_REGS; ++i) {
+            tcg_global_mem_new_vec(tcg_env,
+                                   offsetof(CPUX86State, xmm_regs[i].ZMM_X(1)),
+                                   TCG_TYPE_V128, ymmh_names[i]);
+        }
+    }
+
+    /* xmm_t0 and mmx_t0 hold an operand only within one instruction. */
+    tcg_set_env_scratch(offsetof(CPUX86State, xmm_t0),
+                        offsetof(CPUX86State, mmx_t0) + sizeof(MMXReg)
+                        - offsetof(CPUX86State, xmm_t0));
 }
 
 static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)

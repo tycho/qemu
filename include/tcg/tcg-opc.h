@@ -122,6 +122,8 @@ DEF(insn_start, 0, 0, INSN_START_WORDS, TCG_OPF_NOT_PRESENT)
 DEF(exit_tb, 0, 0, 1, TCG_OPF_BB_EXIT | TCG_OPF_BB_END | TCG_OPF_NOT_PRESENT)
 DEF(goto_tb, 0, 0, 1, TCG_OPF_BB_EXIT | TCG_OPF_BB_END | TCG_OPF_NOT_PRESENT)
 DEF(goto_ptr, 0, 1, 0, TCG_OPF_BB_EXIT | TCG_OPF_BB_END)
+/* A TB's start, or a return into it: the boundary globals arrive. */
+DEF(boundary_in, 2, 0, 0, TCG_OPF_NOT_PRESENT)
 
 DEF(plugin_cb, 0, 0, 1, TCG_OPF_NOT_PRESENT)
 DEF(plugin_mem_cb, 0, 1, 1, TCG_OPF_NOT_PRESENT)
@@ -177,6 +179,7 @@ DEF(avgr_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(extract_vec, 1, 1, 1, TCG_OPF_VECTOR)
 DEF(insert_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(movz_vec, 1, 1, 0, TCG_OPF_VECTOR)
+DEF(extract_vec, 1, 1, 1, TCG_OPF_VECTOR)
 
 DEF(add_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(sub_vec, 1, 2, 0, TCG_OPF_VECTOR)

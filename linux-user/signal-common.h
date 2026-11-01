@@ -35,6 +35,9 @@ static inline bool is_vdso_sigreturn(abi_ulong pc)
 
 void setup_sigtramp(abi_ulong tramp_page);
 
+/* Whether the host signal handler supports tcg_lazysync. */
+bool host_signal_lazysync_ok(void);
+
 int on_sig_stack(unsigned long sp);
 int sas_ss_flags(unsigned long sp);
 abi_ulong target_sigsp(abi_ulong sp, struct target_sigaction *ka);

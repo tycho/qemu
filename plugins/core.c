@@ -682,6 +682,11 @@ static bool free_dyn_cb_arr(void *p, uint32_t h, void *userp)
     return true;
 }
 
+bool qemu_plugins_loaded(void)
+{
+    return !QTAILQ_EMPTY(&plugin.ctxs);
+}
+
 void qemu_plugin_flush_cb(void)
 {
     qht_iter_remove(&plugin.dyn_cb_arr_ht, free_dyn_cb_arr, NULL);

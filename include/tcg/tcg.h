@@ -120,6 +120,7 @@ typedef struct TCGPool {
 
 #define TCG_MAX_TEMPS 512
 #define TCG_MAX_INSNS 512
+#define TCG_MAX_ALIAS 32
 
 /* when the size of the arguments of a called function is smaller than
    this value, they are statically allocated in the TB stack frame */
@@ -249,6 +250,13 @@ typedef TCGv_i64 TCGv_vaddr;
 #define TCG_CALL_NO_SIDE_EFFECTS    0x0004
 /* Helper is G_NORETURN.  */
 #define TCG_CALL_NO_RETURN          0x0008
+/*
+ * Helper uses no vector registers and doesn't access the memory of
+ * vector globals: pinned vector globals stay in their registers across
+ * the call.  Its file must be compiled QEMU_GENERAL_REGS_ONLY from before
+ * any code the helper runs; where the compiler can't, the flag is 0.
+ */
+#define TCG_CALL_NO_VREG (QEMU_HAVE_GENERAL_REGS_ONLY ? 0x0010 : 0)
 
 /* convenience version of most used call flags */
 #define TCG_CALL_NO_RWG         TCG_CALL_NO_READ_GLOBALS
@@ -305,6 +313,19 @@ typedef struct TCGTemp {
     unsigned int mem_allocated:1;
     unsigned int temp_allocated:1;
     unsigned int temp_subindex:2;
+    /*
+     * A global that the code also reaches through its memory: by loads
+     * and stores of env other than its own, and by helpers given
+     * pointers into env (tcg_global_mem_new_vec).
+     */
+    unsigned int env_alias:1;
+    /* A global held in a fixed host register across TBs (tcg_temp_pin). */
+    unsigned int pinned:1;
+    /*
+     * 1 + its index in TCGContext.boundary (tcg_boundary_global_add), or
+     * 0: a global in a host register at every TB boundary.
+     */
+    unsigned int boundary:2;
 
     int64_t val;
     struct TCGTemp *mem_base;
@@ -369,7 +390,32 @@ static inline TCGRegSet output_pref(const TCGOp *op, unsigned i)
     return i < ARRAY_SIZE(op->output_pref) ? op->output_pref[i] : 0;
 }
 
+/* tcg_lazysync: a dirty global at a guest access, in a register or constant. */
+typedef struct TCGLdstWriteback {
+    TCGType type;
+    TCGReg reg;             /* the register holding the global's value */
+    TCGReg base;            /* its canonical location: base + offset */
+    intptr_t offset;
+    bool is_const;          /* the value is @val, in no register */
+    int64_t val;
+} TCGLdstWriteback;
+
+/*
+ * tcg_lazysync in user mode: a guest access's code, [start, end) from the
+ * start of the TB, and the dirty globals a fault there must store.
+ */
+typedef struct TCGLazyMap {
+    uint32_t start, end;
+    const TCGLdstWriteback *wb;
+    unsigned nb_wb;
+} TCGLazyMap;
+
 struct TCGContext {
+    /*
+     * System mode: the shared store of the pinned globals that this TB's
+     * slow paths call (tcg_out_ldst_finalize), or NULL.
+     */
+    const tcg_insn_unit *pin_st_tail;
     /* The open run of grouped guest accesses (tcg_tso_vec_group). */
     bool tso_run_ld;            /* loads not yet ordered before later ops */
     bool tso_run_st;            /* the run's stores have had their barrier */
@@ -380,11 +426,45 @@ struct TCGContext {
     int nb_globals;
     int nb_temps;
     int nb_indirects;
+    uint16_t *la_globals;       /* liveness: the globals the ops use */
+    int nb_la_globals;
+    int nb_alias;                         /* env_alias globals */
+    uint16_t alias_temp[TCG_MAX_ALIAS];   /* their temp indices */
+    TCGTemp *alias_base;                  /* their base, and the span */
+    intptr_t alias_lo, alias_hi;          /* of their memory */
     int nb_ops;
     TCGType addr_type;            /* TCG_TYPE_I32 or TCG_TYPE_I64 */
     TCGBar guest_mo;
 
     TCGRegSet reserved_regs;
+    /*
+     * Pinned globals (tcg_temp_pin), in the order of their registers:
+     * room for every general and vector register a backend can give.
+     */
+    int nb_pinned;
+    int nb_pinned_vec;          /* of them, vector globals */
+    TCGTemp *pinned[64];
+    /*
+     * Boundary globals (tcg_boundary_global_add): in their host registers
+     * (tcg_target_boundary_regs), not in memory, wherever control passes
+     * between TBs or into the epilogue, and at labels; ordinary globals
+     * inside a TB.  boundary_in: this TB imports them (INDEX_op_boundary_in).
+     * boundary_undef: those the front end discarded since they were last
+     * written, which may hold anything.  boundary_check: the allocator is
+     * checking a boundary, where they may be dirty in their registers.
+     */
+    TCGTemp *boundary[2];
+    int nb_boundary;
+    bool boundary_in;
+    bool boundary_check;
+    unsigned boundary_undef;
+    TCGRegSet ldst_save_regs;   /* for the next guest access label */
+    TCGLdstWriteback *ldst_wb;  /* likewise, tcg_lazysync */
+    unsigned ldst_nb_wb;
+    struct TCGLazyDead *lazy_dead;  /* tcg_lazysync, from liveness */
+    int nb_lazy_dead;
+    TCGLazyMap *lazy_map;       /* tcg_lazysync, user mode: per access */
+    int nb_lazy_map;
     intptr_t current_frame_offset;
     intptr_t frame_start;
     intptr_t frame_end;
@@ -501,6 +581,34 @@ static inline bool temp_readonly(TCGTemp *ts)
 {
     return ts->kind >= TEMP_FIXED;
 }
+
+/* Whether an op may write @ts: any temp but env and constants. */
+static inline bool temp_writable(TCGTemp *ts)
+{
+    return !temp_readonly(ts) || ts->pinned;
+}
+
+/*
+ * tcg_temp_pin: hold the global @ts in a host register of its own for as
+ * long as generated code runs, across TBs, instead of in its env slot.
+ * The slot is current outside generated code, around helpers that may
+ * read globals, and after a host signal in generated code
+ * (tcg_pinned_unwind).  User mode only, with tcg_pin_user; returns false
+ * if the backend has no register left, and @ts stays an ordinary global.
+ * A V128 global that aliases its env memory (tcg_global_mem_new_vec) takes
+ * a register from the backend's vector bank; its memory is made current
+ * before the ops that access it, and the register after those that write
+ * it.
+ */
+bool tcg_temp_pin(TCGTemp *ts);
+bool tcg_boundary_global_add(TCGTemp *ts);
+
+/*
+ * tcg_pinned_unwind: after a host signal in generated code, store the
+ * pinned globals from @regs, the host's registers at the signal,
+ * numbered as TCGReg.
+ */
+void tcg_pinned_unwind(const uint64_t (*regs)[2], int nregs);
 
 extern __thread TCGContext *tcg_ctx;
 extern const void *tcg_code_gen_epilogue;

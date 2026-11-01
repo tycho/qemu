@@ -22,6 +22,13 @@ extern bool one_insn_per_tb;
 extern bool icount_align_option;
 
 /*
+ * tcg_prologue_deferred: system mode generates the prologue when the
+ * first vCPU is created, after the front end has pinned its guest
+ * registers (tcg_pin_system_ok), instead of at accelerator init.
+ */
+extern bool tcg_prologue_deferred;
+
+/*
  * Return true if CS is not running in parallel with other cpus, either
  * because there are no other cpus or we are within an exclusive context.
  */
