@@ -237,6 +237,9 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
     __attribute__((unused));
 
 TCGContext tcg_init_ctx;
+bool tcg_fpcheck_runtime;
+bool tcg_iopl_runtime;
+
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
