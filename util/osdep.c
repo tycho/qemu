@@ -46,6 +46,11 @@ int socket_set_nodelay(int fd)
     return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &v, sizeof(v));
 }
 
+#ifdef CONFIG_DARWIN
+bool qemu_thread_jit_lazy;
+__thread QemuThreadJitMode qemu_thread_jit_mode;
+#endif
+
 int qemu_madvise(void *addr, size_t len, int advice)
 {
     if (advice == QEMU_MADV_INVALID) {
