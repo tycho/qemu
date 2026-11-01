@@ -2965,6 +2965,17 @@ int hvf_arch_vcpu_exec(CPUState *cpu)
             return EXCP_INTERRUPT;
         }
 
+        /*
+         * A kick from cpu_exit() (queued run_on_cpu work, a stop request)
+         * that arrives while this thread is handling an exit, outside
+         * hv_vcpu_run(), is not held by Hypervisor.framework for the next
+         * run: leave for the outer loop here, as the request asks.  The
+         * store-release is in cpu_exit().
+         */
+        if (qatomic_load_acquire(&cpu->exit_request)) {
+            return EXCP_INTERRUPT;
+        }
+
         bql_unlock();
         cpu_exec_start(cpu);
         r = hv_vcpu_run(cpu->accel->fd);
