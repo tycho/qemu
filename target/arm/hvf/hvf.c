@@ -2334,6 +2334,336 @@ static void hvf_sync_vtimer(CPUState *cpu)
     }
 }
 
+/*
+ * MMIO accesses that a data abort reports without a valid instruction
+ * syndrome (ISV=0): load/store pairs, SIMD&FP loads and stores, and
+ * single-register forms with writeback.  The instruction is decoded here
+ * and its accesses are emulated a register, or 8 bytes, at a time.
+ */
+typedef struct HVFMMIOInsn {
+    unsigned rt[2];
+    unsigned rn;
+    unsigned nregs;
+    unsigned esize;         /* bytes per register */
+    bool load;
+    bool vector;            /* SIMD&FP registers */
+    bool sign;              /* sign-extend a loaded value... */
+    bool sf;                /* ...to 64 bits rather than 32 */
+    bool writeback;
+    bool postindex;
+    int64_t offset;
+} HVFMMIOInsn;
+
+/* LDP, STP, LDNP, STNP and LDPSW, general-purpose and SIMD&FP */
+static bool hvf_decode_ldst_pair(uint32_t insn, HVFMMIOInsn *d)
+{
+    unsigned opc = extract32(insn, 30, 2);
+    unsigned idx = extract32(insn, 23, 2);
+
+    d->vector = extract32(insn, 26, 1);
+    d->load = extract32(insn, 22, 1);
+    if (d->vector) {
+        if (opc == 3) {
+            return false;
+        }
+        d->esize = 4 << opc;
+    } else if (opc == 0 || opc == 2) {
+        d->esize = 4 << (opc >> 1);
+    } else if (opc == 1 && d->load && idx != 0) {
+        /* LDPSW */
+        d->esize = 4;
+        d->sign = true;
+        d->sf = true;
+    } else {
+        /* STGP, and unallocated encodings */
+        return false;
+    }
+    d->nregs = 2;
+    d->rt[0] = extract32(insn, 0, 5);
+    d->rt[1] = extract32(insn, 10, 5);
+    d->rn = extract32(insn, 5, 5);
+    d->offset = sextract32(insn, 15, 7) * (int64_t)d->esize;
+    d->writeback = idx & 1;
+    d->postindex = idx == 1;
+    return true;
+}
+
+/*
+ * LDR, STR and their sized and sign-extending forms, general-purpose and
+ * SIMD&FP: unsigned immediate, register offset, unscaled immediate,
+ * pre- and post-index, and unprivileged.
+ */
+static bool hvf_decode_ldst_single(CPUARMState *env, uint32_t insn,
+                                   HVFMMIOInsn *d)
+{
+    unsigned size = extract32(insn, 30, 2);
+    unsigned opc = extract32(insn, 22, 2);
+
+    d->vector = extract32(insn, 26, 1);
+    d->nregs = 1;
+    d->rt[0] = extract32(insn, 0, 5);
+    d->rn = extract32(insn, 5, 5);
+    if (d->vector) {
+        if (opc & 2) {
+            if (size) {
+                return false;
+            }
+            d->esize = 16;
+        } else {
+            d->esize = 1 << size;
+        }
+        d->load = opc & 1;
+    } else {
+        d->esize = 1 << size;
+        d->load = opc != 0;
+        if (opc == 2) {
+            /* size 3 is a prefetch */
+            if (size == 3) {
+                return false;
+            }
+            d->sign = true;
+            d->sf = true;
+        } else if (opc == 3) {
+            if (size >= 2) {
+                return false;
+            }
+            d->sign = true;
+        }
+    }
+
+    if (extract32(insn, 24, 1)) {
+        /* Unsigned immediate */
+        d->offset = extract32(insn, 10, 12) * (int64_t)d->esize;
+    } else if (extract32(insn, 21, 1)) {
+        /* Register offset */
+        unsigned rm = extract32(insn, 16, 5);
+        unsigned option = extract32(insn, 13, 3);
+        uint64_t off = rm == 31 ? 0 : env->xregs[rm];
+
+        switch (option) {
+        case 2: /* UXTW */
+            off = (uint32_t)off;
+            break;
+        case 3: /* LSL */
+        case 7: /* SXTX */
+            break;
+        case 6: /* SXTW */
+            off = (int32_t)off;
+            break;
+        default:
+            return false;
+        }
+        if (extract32(insn, 12, 1)) {
+            off <<= ctz32(d->esize);
+        }
+        d->offset = off;
+    } else {
+        unsigned idx = extract32(insn, 10, 2);
+
+        /* There is no unprivileged SIMD&FP form */
+        if (idx == 2 && d->vector) {
+            return false;
+        }
+        d->offset = sextract32(insn, 12, 9);
+        d->writeback = idx & 1;
+        d->postindex = idx == 1;
+    }
+    return true;
+}
+
+static bool hvf_decode_mmio_insn(CPUARMState *env, uint32_t insn,
+                                 HVFMMIOInsn *d)
+{
+    memset(d, 0, sizeof(*d));
+    if ((insn & 0x3a000000) == 0x28000000) {
+        return hvf_decode_ldst_pair(insn, d);
+    }
+    if ((insn & 0x3b200000) == 0x38000000 ||
+        (insn & 0x3b200c00) == 0x38200800 ||
+        (insn & 0x3b000000) == 0x39000000) {
+        return hvf_decode_ldst_single(env, insn, d);
+    }
+    return false;
+}
+
+/*
+ * Emulate the MMIO access of the instruction @insn at the guest's PC, whose
+ * data abort reported the virtual address @far and the IPA @ipa.  Accesses
+ * on the IPA's 4K page use it; any other page is translated through the
+ * guest's stage 1 tables, without permission checks.  Returns NULL on
+ * success, otherwise why the access wasn't emulated, with the guest state
+ * unchanged.
+ */
+static const char *hvf_emulate_mmio(CPUState *cpu, uint32_t insn,
+                                    uint64_t far, uint64_t ipa)
+{
+    CPUARMState *env = cpu_env(cpu);
+    AddressSpace *as = cpu_get_address_space(cpu, ARMASIdx_NS);
+    const uint64_t page_bits = MAKE_64BIT_MASK(12, 44);
+    uint8_t buf[32] = { 0 };
+    hwaddr pa[4];
+    unsigned chunk, nchunks, i;
+    uint64_t base, addr;
+    HVFMMIOInsn d;
+
+    if (!hvf_decode_mmio_insn(env, insn, &d)) {
+        return "instruction not emulated";
+    }
+    if (arm_cpu_data_is_big_endian(env)) {
+        return "big-endian data";
+    }
+
+    /*
+     * As in TCG, a pair of W registers is a single 64-bit access, and
+     * anything wider than 64 bits is split into 64-bit accesses.
+     */
+    if (!d.vector && d.nregs == 2 && d.esize == 4) {
+        chunk = 8;
+    } else {
+        chunk = MIN(d.esize, 8);
+    }
+    nchunks = d.nregs * d.esize / chunk;
+    base = env->xregs[d.rn];
+    addr = d.postindex ? base : base + d.offset;
+
+    for (i = 0; i < nchunks; i++) {
+        uint64_t va = addr + i * chunk;
+
+        if ((va & 0xfff) + chunk > 0x1000) {
+            return "access crosses a page";
+        }
+        if (((va ^ far) & page_bits) == 0) {
+            pa[i] = (ipa & ~0xfffULL) | (va & 0xfff);
+        } else {
+            TranslateForDebugResult res;
+
+            if (!cpu_translate_for_debug(cpu, va, &res)) {
+                return "address of another element doesn't translate";
+            }
+            pa[i] = res.physaddr;
+        }
+    }
+
+    if (d.load) {
+        for (i = 0; i < nchunks; i++) {
+            address_space_read(as, pa[i], MEMTXATTRS_UNSPECIFIED,
+                               buf + i * chunk, chunk);
+        }
+        for (i = 0; i < d.nregs; i++) {
+            uint8_t *p = buf + i * d.esize;
+            unsigned rt = d.rt[i];
+            uint64_t v;
+
+            if (d.vector) {
+                ARMVectorReg *z = &env->vfp.zregs[rt];
+
+                memset(z, 0, sizeof(*z));
+                z->d[0] = ldn_le_p(p, MIN(d.esize, 8));
+                if (d.esize == 16) {
+                    z->d[1] = ldq_le_p(p + 8);
+                }
+                continue;
+            }
+            v = ldn_le_p(p, d.esize);
+            if (d.sign) {
+                v = sextract64(v, 0, d.esize * 8);
+                if (!d.sf) {
+                    v = (uint32_t)v;
+                }
+            }
+            if (rt != 31) {
+                env->xregs[rt] = v;
+            }
+        }
+    } else {
+        for (i = 0; i < d.nregs; i++) {
+            uint8_t *p = buf + i * d.esize;
+            unsigned rt = d.rt[i];
+
+            if (d.vector) {
+                ARMVectorReg *z = &env->vfp.zregs[rt];
+
+                stn_le_p(p, MIN(d.esize, 8), z->d[0]);
+                if (d.esize == 16) {
+                    stq_le_p(p + 8, z->d[1]);
+                }
+            } else {
+                stn_le_p(p, d.esize, rt == 31 ? 0 : env->xregs[rt]);
+            }
+        }
+        for (i = 0; i < nchunks; i++) {
+            address_space_write(as, pa[i], MEMTXATTRS_UNSPECIFIED,
+                                buf + i * chunk, chunk);
+        }
+    }
+
+    if (d.writeback) {
+        env->xregs[d.rn] = base + d.offset;
+    }
+    trace_hvf_data_abort_emulate(env->pc, insn, addr, pa[0], d.load);
+    return NULL;
+}
+
+/*
+ * Report a data abort that can't be emulated, with what is needed to
+ * find the access: the instruction, the addresses and the region.
+ */
+static void hvf_report_data_abort(CPUState *cpu,
+                                  hv_vcpu_exit_exception_t *excp,
+                                  bool iswrite, const char *why)
+{
+    static unsigned reports;
+    const unsigned max_reports = 16;
+    CPUARMState *env = cpu_env(cpu);
+    AddressSpace *as = cpu_get_address_space(cpu, ARMASIdx_NS);
+    unsigned n = qatomic_fetch_inc(&reports);
+    g_autofree char *insn_str = NULL;
+    MemoryRegion *mr;
+    hwaddr xlat;
+    uint32_t insn;
+
+    if (n >= max_reports) {
+        return;
+    }
+    if (cpu_memory_rw_debug(cpu, env->pc, &insn, sizeof(insn), false)) {
+        insn_str = g_strdup("(unreadable)");
+    } else {
+        insn_str = g_strdup_printf("0x%08x", le32_to_cpu(insn));
+    }
+
+    RCU_READ_LOCK_GUARD();
+    mr = address_space_translate(as, excp->physical_address, &xlat, NULL,
+                                 iswrite, MEMTXATTRS_UNSPECIFIED);
+    error_report("hvf: vCPU %d: data abort not emulated (%s): pc 0x%016"
+                 PRIx64 " EL%d insn %s %s va 0x%016" PRIx64 " ipa 0x%016"
+                 PRIx64 " (%s+0x%" HWADDR_PRIx ") esr 0x%08" PRIx64
+                 "; the guest gets a synchronous external abort",
+                 cpu->cpu_index, why, env->pc, arm_current_el(env), insn_str,
+                 iswrite ? "write" : "read", excp->virtual_address,
+                 excp->physical_address, memory_region_name(mr), xlat,
+                 excp->syndrome);
+    if (n == max_reports - 1) {
+        error_report("hvf: not reporting further data aborts");
+    }
+}
+
+/* Give the guest a synchronous external abort on the data access at @far */
+static void hvf_inject_data_abort(CPUState *cpu, uint64_t far, bool iswrite)
+{
+    CPUARMState *env = cpu_env(cpu);
+    int el = arm_current_el(env);
+    int target_el = MAX(el, 1);
+
+    if (el == 0 && (arm_hcr_el2_eff(env) & HCR_TGE)) {
+        target_el = 2;
+    }
+    env->exception.vaddress = far;
+    hvf_raise_exception(cpu, EXCP_DATA_ABORT,
+                        syn_data_abort_no_iss(el == target_el, 0, 1, 0, 0,
+                                              iswrite, 0x10),
+                        target_el);
+}
+
 static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
 {
     CPUARMState *env = cpu_env(cpu);
@@ -2416,13 +2746,14 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
             MemoryRegion *mr = address_space_translate(as, ipa, &xlat,
                                                        NULL, true,
                                                        MEMTXATTRS_UNSPECIFIED);
-            if (memory_region_is_ram(mr)) {
+            /*
+             * A write to ROM is emulated below, where the memory core
+             * discards it.
+             */
+            if (memory_region_is_ram(mr) && !mr->readonly) {
                 uintptr_t page_size = qemu_real_host_page_size();
                 intptr_t page_mask = -(intptr_t)page_size;
                 uint64_t ipa_page = ipa & page_mask;
-
-                /* TODO: Inject exception to the guest. */
-                assert(!mr->readonly);
 
                 if (memory_region_get_dirty_log_mask(mr)) {
                     memory_region_set_dirty(mr, xlat, page_size);
@@ -2434,17 +2765,35 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
             }
         }
 
-        /*
-         * TODO: If s1ptw, this is an error in the guest os page tables.
-         * Inject the exception into the guest.
-         */
-        assert(!s1ptw);
+        /* The guest's stage 1 translation tables aren't in RAM. */
+        if (s1ptw) {
+            cpu_synchronize_state(cpu);
+            hvf_report_data_abort(cpu, excp, iswrite,
+                                  "translation table walk");
+            hvf_inject_data_abort(cpu, excp->virtual_address, iswrite);
+            break;
+        }
 
-        /*
-         * TODO: ISV will be 0 for SIMD or SVE accesses.
-         * Inject the exception into the guest.
-         */
-        assert(isv);
+        if (!isv) {
+            const char *why;
+            uint32_t insn;
+
+            cpu_synchronize_state(cpu);
+            if (cpu_memory_rw_debug(cpu, env->pc, &insn, sizeof(insn),
+                                    false)) {
+                why = "instruction unreadable";
+            } else {
+                why = hvf_emulate_mmio(cpu, le32_to_cpu(insn),
+                                       excp->virtual_address, ipa);
+            }
+            if (why) {
+                hvf_report_data_abort(cpu, excp, iswrite, why);
+                hvf_inject_data_abort(cpu, excp->virtual_address, iswrite);
+            } else {
+                advance_pc = true;
+            }
+            break;
+        }
 
         /*
          * Emulate MMIO.
