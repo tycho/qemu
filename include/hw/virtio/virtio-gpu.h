@@ -112,6 +112,7 @@ enum virtio_gpu_base_conf_flags {
     VIRTIO_GPU_FLAG_VENUS_ENABLED,
     VIRTIO_GPU_FLAG_RESOURCE_UUID_ENABLED,
     VIRTIO_GPU_FLAG_DRM_ENABLED,
+    VIRTIO_GPU_FLAG_NEPTUNE_ENABLED,
 };
 
 #define virtio_gpu_virgl_enabled(_cfg) \
@@ -136,6 +137,8 @@ enum virtio_gpu_base_conf_flags {
     (_cfg.flags & (1 << VIRTIO_GPU_FLAG_VENUS_ENABLED))
 #define virtio_gpu_drm_enabled(_cfg) \
     (_cfg.flags & (1 << VIRTIO_GPU_FLAG_DRM_ENABLED))
+#define virtio_gpu_neptune_enabled(_cfg) \
+    (_cfg.flags & (1 << VIRTIO_GPU_FLAG_NEPTUNE_ENABLED))
 
 struct virtio_gpu_base_conf {
     uint32_t max_outputs;
@@ -152,8 +155,30 @@ struct virtio_gpu_ctrl_command {
     struct virtio_gpu_ctrl_hdr cmd_hdr;
     uint32_t error;
     bool finished;
+    /* Set if process_cmd deferred completion; keep at cmdq head for resume. */
+    bool suspended;
+    /*
+     * Set if process_cmd took ownership of the command to complete it later
+     * (a mapped blob's teardown waits for the memory region to finalize):
+     * it leaves cmdq without a response and without blocking the queue.
+     */
+    bool deferred;
     QTAILQ_ENTRY(virtio_gpu_ctrl_command) next;
 };
+
+/*
+ * virtqueue_pop() does not zero the element, so every popper must reset
+ * the per-command state that virtio_gpu_process_cmdq() reads.
+ */
+static inline void virtio_gpu_ctrl_cmd_init(struct virtio_gpu_ctrl_command *cmd,
+                                            VirtQueue *vq)
+{
+    cmd->vq = vq;
+    cmd->error = 0;
+    cmd->finished = false;
+    cmd->suspended = false;
+    cmd->deferred = false;
+}
 
 struct VirtIOGPUBase {
     VirtIODevice parent_obj;
@@ -251,6 +276,8 @@ typedef enum {
     RS_RESET,       /* inited and reset pending, moves to start after reset */
 } RenderState;
 
+struct virtio_gpu_virgl_hostmem_region;
+
 struct VirtIOGPUGL {
     struct VirtIOGPU parent_obj;
 
@@ -260,12 +287,19 @@ struct VirtIOGPUGL {
     QEMUTimer *print_stats;
 
     QEMUBH *cmdq_resume_bh;
+    /*
+     * Hostmem regions whose MemoryRegion finalized; cmdq_resume_bh finishes
+     * their unmap (and any deferred unref) on the main loop.
+     */
+    QTAILQ_HEAD(, virtio_gpu_virgl_hostmem_region) unmap_done_list;
 
     QEMUBH *async_fence_bh;
     QSLIST_HEAD(, virtio_gpu_virgl_context_fence) async_fenceq;
 
     MemoryRegion hostmem_background;
     void *hostmem_mmap;
+    /* fences retire via async_fence_bh; fence_poll is only a watchdog */
+    bool async_fence_enabled;
 };
 
 struct VhostUserGPU {

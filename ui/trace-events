@@ -156,6 +156,7 @@ qemu_spice_gl_cursor(int qid, bool enabled, bool hotspot) "%d enabled %d, hotspo
 qemu_spice_gl_forward_dmabuf(int qid, uint32_t width, uint32_t height) "%d %dx%d"
 qemu_spice_gl_render_dmabuf(int qid, uint32_t width, uint32_t height) "%d %dx%d"
 qemu_spice_gl_update(int qid, uint32_t x, uint32_t y, uint32_t w, uint32_t h) "%d +%d+%d %dx%d"
+qemu_spice_gl_block(int qid, bool block) "%d block %d"
 
 # keymaps.c
 keymap_parse(const char *file) "file %s"
