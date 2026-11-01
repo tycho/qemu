@@ -355,6 +355,7 @@ bool tcg_sysret;
 bool tcg_retstack_env;
 intptr_t tcg_retep_off;
 bool tcg_tb_flags_canon;
+bool tcg_addr32;
 
 bool tcg_atomic;
 TCGJumpCacheLayout tcg_jc_layout;

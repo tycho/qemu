@@ -444,7 +444,11 @@ extern TCGJumpCacheLayout tcg_jc_layout;
 extern const void *tcg_xpage_stub;
 
 /*
+ * tcg_addr32: a target with 64-bit addresses may translate a TB with
+ * 32-bit ones (x86 outside long mode), and the optimizer lets an access
+ * with a 32-bit address read through an extension of the low 32 bits.
  */
+extern bool tcg_addr32;
 
 /*
  */
