@@ -504,6 +504,14 @@ static void tcg_set_pinpc(Object *obj, bool value, Error **errp)
     tcg_pin_pc = value;
 }
 
+{
+}
+
+{
+        return;
+    }
+}
+
 static bool tcg_get_ccregs(Object *obj, Error **errp)
 {
     return tcg_cc_regs;
@@ -522,6 +530,194 @@ static bool tcg_get_pinvec(Object *obj, Error **errp)
 static void tcg_set_pinvec(Object *obj, bool value, Error **errp)
 {
     tcg_pin_vec = value;
+}
+
+static bool tcg_get_region(Object *obj, Error **errp)
+{
+    return tcg_region;
+}
+
+static void tcg_set_region(Object *obj, bool value, Error **errp)
+{
+    tcg_region = value;
+}
+
+};
+
+{
+}
+
+{
+            return;
+        }
+    }
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+        return;
+    }
+#endif
+}
+
+{
+}
+
+{
+        return;
+    }
+        return;
+    }
+}
+
+{
+}
+
+{
+            return;
+        }
+    } else {
+    }
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+        return;
+    }
+}
+
+{
+}
+
+{
+
+    } else {
+    }
+}
+
+{
+}
+
+{
+    } else {
+    }
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+
+
+{
+    }
+}
+
+{
+
+        return;
+    }
+        return;
+    }
+        return;
+    }
+}
+
+};
+
+{
+}
+
+{
+            return;
+        }
+    }
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+}
+
+{
+        return;
+    }
 }
 
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
@@ -666,6 +862,42 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "With x-pin and x-regcache, keep the guest's condition-code "
         "operands in host registers between TBs, where the host has "
         "registers for them");
+
+    object_class_property_add_bool(oc, "x-region",
+                                   tcg_get_region, tcg_set_region);
+    object_class_property_set_description(oc, "x-region",
+        "Let a translation block loop back to its own start instead of "
+        "chaining to itself, keeping the loop's guest registers in host "
+        "registers (not with plugins or icount)");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 }
 
 static const TypeInfo tcg_accel_type = {

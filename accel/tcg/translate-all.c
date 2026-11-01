@@ -421,6 +421,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     tb->cs_base = s.cs_base;
     tb->flags = s.flags;
     tb->cflags = s.cflags;
+    tb->loops = false;
     tb_set_page_addr0(tb, phys_pc);
     tb_set_page_addr1(tb, -1);
     if (phys_pc != -1) {
