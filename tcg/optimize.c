@@ -3274,6 +3274,10 @@ void tcg_optimize(TCGContext *s)
         case INDEX_op_qemu_st2:
             done = fold_qemu_st(&ctx, op);
             break;
+        case INDEX_op_qemu_atomic:
+            /* The old value, zero-extended from the access size. */
+            done = fold_qemu_ld_1reg(&ctx, op);
+            break;
         case INDEX_op_rems:
         case INDEX_op_remu:
             done = fold_remainder(&ctx, op);

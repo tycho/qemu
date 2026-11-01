@@ -31,6 +31,9 @@
 #include "tb-internal.h"
 #include "system/tcg.h"
 #include "tcg/tcg.h"
+#include "tcg/tcg-ldst.h"
+#include "accel/tcg/probe.h"
+#include "tcg/startup.h"
 #include "tb-hash.h"
 #include "tb-context.h"
 #include "internal-common.h"
@@ -1265,3 +1268,87 @@ void tb_invalidate_phys_range_fast(CPUState *cpu, ram_addr_t start,
 }
 
 #endif /* CONFIG_USER_ONLY */
+
+/*
+ * In user mode, fault on the first page before touching the second: the
+ * helpers below may read or write the page-crossing access's second page
+ * first.  (System mode's softmmu lookup already goes in order.)
+ */
+static void tso_cross_probe(CPUArchState *env, uint64_t addr, MemOpIdx oi,
+                            MMUAccessType access_type, uintptr_t retaddr)
+{
+#ifdef CONFIG_USER_ONLY
+    int size = memop_size(get_memop(oi));
+
+    if ((addr & ~TARGET_PAGE_MASK) + size > TARGET_PAGE_SIZE) {
+        probe_access(env, addr, 1, access_type, get_mmuidx(oi), retaddr);
+    }
+#endif
+}
+
+/*
+ * An MO_ACQ_REL access of guest insn @site crossed a 16-byte boundary.
+ * Once the insn is promoted, invalidate the TB at @retaddr and leave it
+ * before the access, so that the insn is retranslated with
+ * MO_ACQ_REL_CROSS (see tcg_gen_ldst_order) and executed again.  The TB
+ * must not go on: invalidation takes it off its pages' TB lists, and the
+ * precise SMC check finds the current TB among those, so a store of the
+ * TB's own to code further on in it would not stop it.
+ */
+static void tso_cross_note(CPUState *cpu, uint64_t addr, MemOpIdx oi,
+                           uintptr_t retaddr, uint64_t site)
+{
+    TranslationBlock *tb;
+
+    /* In system mode, a TLB miss comes here too. */
+    if ((addr & 15) + memop_size(get_memop(oi)) <= 16 ||
+        !tcg_tso_cross_count(site)) {
+        return;
+    }
+    tb = tcg_tb_lookup(retaddr);
+    if (tb && !(tb_cflags(tb) & CF_INVALID)) {
+        mmap_lock();
+        tb_phys_invalidate(tb, -1);
+        mmap_unlock();
+        cpu_restore_state_from_tb(cpu, tb, retaddr);
+        cpu_loop_exit_noexc(cpu);
+    }
+}
+
+tcg_target_ulong helper_tso_cross_ld(CPUArchState *env, uint64_t addr,
+                                     MemOpIdx oi, uintptr_t retaddr,
+                                     uint64_t site)
+{
+    tso_cross_note(env_cpu(env), addr, oi, retaddr, site);
+    tso_cross_probe(env, addr, oi, MMU_DATA_LOAD, retaddr);
+    switch (get_memop(oi) & MO_SIZE) {
+    case MO_16:
+        return helper_lduw_mmu(env, addr, oi, retaddr);
+    case MO_32:
+        return helper_ldul_mmu(env, addr, oi, retaddr);
+    case MO_64:
+        return helper_ldq_mmu(env, addr, oi, retaddr);
+    default:
+        g_assert_not_reached();
+    }
+}
+
+void helper_tso_cross_st(CPUArchState *env, uint64_t addr, uint64_t val,
+                         MemOpIdx oi, uintptr_t retaddr, uint64_t site)
+{
+    tso_cross_note(env_cpu(env), addr, oi, retaddr, site);
+    tso_cross_probe(env, addr, oi, MMU_DATA_STORE, retaddr);
+    switch (get_memop(oi) & MO_SIZE) {
+    case MO_16:
+        helper_stw_mmu(env, addr, val, oi, retaddr);
+        break;
+    case MO_32:
+        helper_stl_mmu(env, addr, val, oi, retaddr);
+        break;
+    case MO_64:
+        helper_stq_mmu(env, addr, val, oi, retaddr);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}

@@ -6930,6 +6930,22 @@ static abi_long do_map_shadow_stack(CPUArchState *env, abi_ulong addr,
 
 
 static pthread_mutex_t clone_lock = PTHREAD_MUTEX_INITIALIZER;
+
+bool parallel_shared;
+
+void end_parallel_context(CPUState *cs)
+{
+    if (!tcg_reserial || parallel_shared || !tcg_cflags_has(cs, CF_PARALLEL)) {
+        return;
+    }
+    /*
+     * Serial code is correct with one thread, as before the first clone.
+     * The flush, run when @cs next leaves generated code, ends its chains
+     * of parallel TBs; the TBs it translates from then on are serial.
+     */
+    qatomic_set(&cs->tcg_cflags, cs->tcg_cflags & ~CF_PARALLEL);
+    queue_tb_flush(cs);
+}
 typedef struct {
     CPUArchState *env;
     pthread_mutex_t mutex;
@@ -9827,6 +9843,9 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
              * from cpu lists. We can clean-up the rest of the thread
              * data without the lock held.
              */
+            if (first_cpu && !CPU_NEXT(first_cpu)) {
+                end_parallel_context(first_cpu);
+            }
 
             pthread_mutex_unlock(&clone_lock);
 

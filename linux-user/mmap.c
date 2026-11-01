@@ -1037,6 +1037,7 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int target_prot,
      * be atomic with respect to an external process.
      */
     if (ret != -1 && (flags & MAP_TYPE) != MAP_PRIVATE) {
+        parallel_shared = true;
         begin_parallel_context(thread_cpu);
     }
 
@@ -1581,6 +1582,7 @@ abi_ulong target_shmat(CPUArchState *cpu_env, int shmid,
      * supported by the host -- anything that requires EXCP_ATOMIC will not
      * be atomic with respect to an external process.
      */
+    parallel_shared = true;
     begin_parallel_context(cpu);
 
     if (qemu_loglevel_mask(CPU_LOG_PAGE)) {

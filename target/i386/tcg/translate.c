@@ -24,6 +24,7 @@
 #include "exec/translation-block.h"
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-op-gvec.h"
+#include "tcg/startup.h"
 #include "exec/translator.h"
 #include "exec/target_page.h"
 #include "fpu/softfloat.h"
@@ -2004,6 +2005,18 @@ static void gen_lea_ss_ofs(DisasContext *s, TCGv dest, TCGv src, target_ulong of
     gen_lea_v_seg_dest(s, mo_stacksize(s), dest, src, R_SS, -1);
 }
 
+/*
+ * Implicit stack accesses (push, pop, call, ret, enter, leave) are to this
+ * thread's stack whatever the insn's other operand is (x-tso-stack).
+ */
+static bool gen_stack_private(bool private)
+{
+    bool old = tcg_ctx->ldst_private;
+
+    tcg_ctx->ldst_private = private;
+    return old;
+}
+
 /* Generate a push. It depends on ss32, addseg and dflag.  */
 static void gen_push_v(DisasContext *s, TCGv val)
 {
@@ -2011,12 +2024,15 @@ static void gen_push_v(DisasContext *s, TCGv val)
     MemOp a_ot = mo_stacksize(s);
     int size = 1 << d_ot;
     TCGv new_esp = tcg_temp_new();
+    bool old;
 
     tcg_gen_subi_tl(new_esp, cpu_regs[R_ESP], size);
 
     /* Now reduce the value to the address size and apply SS base.  */
     gen_lea_ss_ofs(s, s->A0, new_esp, 0);
+    old = gen_stack_private(true);
     gen_op_st_v(s, d_ot, val, s->A0);
+    gen_stack_private(old);
     gen_op_mov_reg_v(s, a_ot, R_ESP, new_esp);
 }
 
@@ -2024,9 +2040,12 @@ static void gen_push_v(DisasContext *s, TCGv val)
 static MemOp gen_pop_T0(DisasContext *s)
 {
     MemOp d_ot = mo_pushpop(s, s->dflag);
+    bool old;
 
     gen_lea_ss_ofs(s, s->T0, cpu_regs[R_ESP], 0);
+    old = gen_stack_private(true);
     gen_op_ld_v(s, d_ot, s->T0, s->T0);
+    gen_stack_private(old);
 
     return d_ot;
 }
@@ -2040,12 +2059,14 @@ static void gen_pusha(DisasContext *s)
 {
     MemOp d_ot = s->dflag;
     int size = 1 << d_ot;
+    bool old = gen_stack_private(true);
     int i;
 
     for (i = 0; i < 8; i++) {
         gen_lea_ss_ofs(s, s->A0, cpu_regs[R_ESP], (i - 8) * size);
         gen_op_st_v(s, d_ot, cpu_regs[7 - i], s->A0);
     }
+    gen_stack_private(old);
 
     gen_stack_update(s, -8 * size);
 }
@@ -2054,6 +2075,7 @@ static void gen_popa(DisasContext *s)
 {
     MemOp d_ot = s->dflag;
     int size = 1 << d_ot;
+    bool old = gen_stack_private(true);
     int i;
 
     for (i = 0; i < 8; i++) {
@@ -2065,6 +2087,7 @@ static void gen_popa(DisasContext *s)
         gen_op_ld_v(s, d_ot, s->T0, s->A0);
         gen_op_mov_reg_v(s, d_ot, 7 - i, s->T0);
     }
+    gen_stack_private(old);
 
     gen_stack_update(s, 8 * size);
 }
@@ -2074,6 +2097,7 @@ static void gen_enter(DisasContext *s, int esp_addend, int level)
     MemOp d_ot = mo_pushpop(s, s->dflag);
     MemOp a_ot = mo_stacksize(s);
     int size = 1 << d_ot;
+    bool old = gen_stack_private(true);
 
     /* Push BP; compute FrameTemp into T1.  */
     tcg_gen_subi_tl(s->T1, cpu_regs[R_ESP], size);
@@ -2101,6 +2125,8 @@ static void gen_enter(DisasContext *s, int esp_addend, int level)
         gen_op_st_v(s, d_ot, s->T1, s->A0);
     }
 
+    gen_stack_private(old);
+
     /* Copy the FrameTemp value to EBP.  */
     gen_op_mov_reg_v(s, d_ot, R_EBP, s->T1);
 
@@ -2113,9 +2139,12 @@ static void gen_leave(DisasContext *s)
 {
     MemOp d_ot = mo_pushpop(s, s->dflag);
     MemOp a_ot = mo_stacksize(s);
+    bool old;
 
     gen_lea_ss_ofs(s, s->A0, cpu_regs[R_EBP], 0);
+    old = gen_stack_private(true);
     gen_op_ld_v(s, d_ot, s->T0, s->A0);
+    gen_stack_private(old);
 
     tcg_gen_addi_tl(s->T1, cpu_regs[R_EBP], 1 << d_ot);
 
@@ -2268,10 +2297,27 @@ static inline void gen_stq_env_A0(DisasContext *s, int offset)
     tcg_gen_qemu_st_i64(t, s->A0, s->mem_index, MO_LEUQ);
 }
 
-static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align)
+/*
+ * The atomicity of a 16-byte vector access: with AVX, x86 makes an aligned
+ * one atomic as a whole.  Under x-tso-vec=none, where vector accesses are
+ * not ordered (tcg_tso_vec_none), only each 8-byte half is, so that the
+ * host needs no 16-byte atomic access for them; with x-tso-vec=atomic,
+ * the aligned integer moves (MOVDQA, VMOVDQA) that 16-byte atomic loads
+ * and stores use stay atomic as a whole, and ordered.
+ */
+static MemOp sse_atom(DisasContext *s, bool atomic_move)
 {
-    MemOp atom = (s->cpuid_ext_features & CPUID_EXT_AVX
-                  ? MO_ATOM_IFALIGN : MO_ATOM_IFALIGN_PAIR);
+    if (!(s->cpuid_ext_features & CPUID_EXT_AVX) ||
+        (tcg_tso_vec_none && !(tcg_tso_vec_atomic && atomic_move))) {
+        return MO_ATOM_IFALIGN_PAIR;
+    }
+    return MO_ATOM_IFALIGN;
+}
+
+static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align,
+                                  bool atomic_move)
+{
+    MemOp atom = sse_atom(s, atomic_move);
     MemOp mop = MO_128 | MO_LE | atom | (align ? MO_ALIGN_16 : 0);
     int mem_index = s->mem_index;
     TCGv_i128 t = tcg_temp_new_i128();
@@ -2280,10 +2326,10 @@ static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align)
     tcg_gen_st_i128(t, tcg_env, offset);
 }
 
-static inline void gen_sto_env_A0(DisasContext *s, int offset, bool align)
+static inline void gen_sto_env_A0(DisasContext *s, int offset, bool align,
+                                  bool atomic_move)
 {
-    MemOp atom = (s->cpuid_ext_features & CPUID_EXT_AVX
-                  ? MO_ATOM_IFALIGN : MO_ATOM_IFALIGN_PAIR);
+    MemOp atom = sse_atom(s, atomic_move);
     MemOp mop = MO_128 | MO_LE | atom | (align ? MO_ALIGN_16 : 0);
     int mem_index = s->mem_index;
     TCGv_i128 t = tcg_temp_new_i128();
