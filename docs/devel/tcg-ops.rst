@@ -385,6 +385,16 @@ Logical
        | The name *ctpop* is short for "count population", and matches
          the function name used in ``include/qemu/host-utils.h``.
 
+   * - crc32c *t0*, *t1*, *t2*, *size*
+
+     - | *t0* = the CRC-32C (Castagnoli polynomial) of the low 8 << *size*
+         bits of *t2*, continuing from the low 32 bits of *t1*: reflected,
+         with no inversion of the input or the result, zero-extended.
+         *size* is ``MO_8`` to ``MO_32``, or to ``MO_64`` for 64-bit
+         operations.
+       |
+       | Optional: check ``tcg_op_supported()`` first.
+
 
 Shifts/Rotates
 --------------
@@ -791,6 +801,133 @@ specifies the length of the element (if applicable) in log2 8-bit units.
    * - dup_vec *v0*, *r1*
 
      - | Duplicate the low N bits of *r1* into TYPE/VECE copies across *v0*.
+
+   * - concat_i64_vec *v0*, *r1*, *r2*
+
+     - | A 128-bit vector from two 64-bit integers: element 0 is *r1*,
+         element 1 is *r2* (elements of ``TCGOP_VECE`` = MO_64).
+
+   * - qemu_ld_vec *v0*, *t1*, *flags*, *memidx*
+
+       qemu_st_vec *v0*, *t1*, *flags*, *memidx*
+
+     - | As qemu_ld/st_i128, with the 128-bit value in the vector *v0*.
+         Only for accesses that need at most two single-copy atomic 64-bit
+         halves, with no byte swap: check with tcg_can_qemu_ldst_vec().
+
+   * - perm_vec *v0*, *v1*, *v2*, *pattern*
+
+     - | Permute: element *i* of *v0* is element (*pattern* >> 4 * *i*) & 15
+         of the concatenation *v1*:*v2*, whose elements 0 to *n*-1 are
+         *v1*'s and *n* to 2*n*-1 *v2*'s, for *n* elements of
+         ``TCGOP_VECE`` (MO_16, MO_32 or MO_64) in 128 bits.  The pattern
+         is a constant, so a backend can pick the instructions for it.
+
+   * - zip_vec *v0*, *v1*, *v2*, *high*
+
+     - | Interleave: *v0* holds the elements of the low halves of *v1* and
+         *v2* (the high halves if *high* is 1), alternately from *v1* and
+         *v2*, starting with *v1*'s (128-bit vectors, elements of
+         ``TCGOP_VECE``).
+
+   * - ext_vec *v0*, *v1*, *v2*, *n*
+
+     - | Extract: bytes *n* to *n* + 15 of the concatenation *v1*:*v2*,
+         whose bytes 0 to 15 are *v1*'s (128-bit vectors, 0 <= *n* <= 15).
+
+   * - clmul64_vec *v0*, *v1*, *v2*, *sel*
+
+     - | Carry-less multiply: *v0* is the 128-bit carry-less product of
+         64-bit element *sel* & 1 of *v1* and element *sel* >> 1 of *v2*
+         (128-bit vectors, 0 <= *sel* <= 3).  Optional.
+
+   * - sha256h_vec *v0*, *v1*, *v2*, *v3*
+
+       sha256h2_vec *v0*, *v1*, *v2*, *v3*
+
+     - | Four SHA-256 rounds, as Arm's SHA256H and SHA256H2: the state is
+         a, b, c, d in elements 0 to 3 of *v1* and e, f, g, h in those of
+         *v2* (for sha256h2, the other way around), *v3* the message words
+         plus round constants, in order.  *v0* is the new a, b, c, d (for
+         sha256h2, e, f, g, h).  Optional.
+
+   * - sha256su0_vec *v0*, *v1*, *v2*
+
+       sha256su1_vec *v0*, *v1*, *v2*, *v3*
+
+     - | The SHA-256 message schedule, as Arm's SHA256SU0 and SHA256SU1:
+         sha256su0 gives *v1*\[i] + sigma0(t[i]), t = *v1*\[1], *v1*\[2],
+         *v1*\[3], *v2*\[0]; sha256su1 gives *v1*\[i] + t0[i] +
+         sigma1(x[i]), t0 = *v2*\[1], *v2*\[2], *v2*\[3], *v3*\[0], x =
+         *v3*\[2], *v3*\[3], *v0*\[0], *v0*\[1].  Optional.
+
+   * - widen_vec *v0*, *v1*, *k*
+
+     - | Widen: the elements of the low half of *v1* (the high half if
+         bit 1 of *k* is set), sign-extended if bit 0 of *k* is set, else
+         zero-extended, from ``TCGOP_VECE`` (MO_8, MO_16 or MO_32) to twice
+         that size (128-bit vectors).
+
+   * - mulw_vec *v0*, *v1*, *v2*, *k*
+
+     - | Widening multiply: element *i* of *v0* is the exact product of
+         elements *i* of the low halves of *v1* and *v2* (the high halves if
+         bit 1 of *k* is set), signed if bit 0 of *k* is set, at twice the
+         element size ``TCGOP_VECE`` (MO_8, MO_16 or MO_32) of the inputs.
+
+   * - addp_vec *v0*, *v1*, *v2*
+
+     - | Pairwise add: element *i* of *v0* is the sum, modulo 2 to the
+         element size, of elements 2 * *i* and 2 * *i* + 1 of the
+         concatenation *v1*:*v2* (128-bit vectors).
+
+   * - narrow_vec *v0*, *v1*, *v2*, *k*
+
+     - | Narrow: *v0* holds the elements of *v1*, then those of *v2*, each
+         shifted right by *k* & 0xff (0 to the narrow element size;
+         arithmetically for the signed saturations, else logically; if bit 12
+         of *k* is set, rounding: 1 << (shift - 1) is added first, at full
+         precision), then fitted into ``TCGOP_VECE`` (MO_8, MO_16 or
+         MO_32) from twice that size by (*k* >> 8) & 15: keep the low
+         bits (``TCG_NARROW_TRUNC``), or saturate signed to signed
+         (``TCG_NARROW_SAT_S``), signed to unsigned (``TCG_NARROW_SAT_SU``)
+         or unsigned to unsigned (``TCG_NARROW_SAT_U``).
+
+   * - abd_vec *v0*, *v1*, *v2*, *is_signed*
+
+     - | Absolute difference: element *i* of *v0* is \|*v1*\[*i*\] -
+         *v2*\[*i*\]\|, the inputs signed if *is_signed* is 1, else
+         unsigned; the result is unsigned (``TCGOP_VECE`` MO_8, MO_16 or
+         MO_32).
+
+   * - addlp_vec *v0*, *v1*, *is_signed*
+
+     - | Pairwise add long: element *i* of *v0* is the exact sum of
+         elements 2 * *i* and 2 * *i* + 1 of *v1* at twice the element
+         size ``TCGOP_VECE`` (MO_8, MO_16 or MO_32) of the input, signed
+         if *is_signed* is 1.
+
+   * - avgr_vec *v0*, *v1*, *v2*
+
+     - | Rounding average of unsigned elements: (*v1*\[*i*\] +
+         *v2*\[*i*\] + 1) >> 1 without overflow (``TCGOP_VECE`` MO_8,
+         MO_16 or MO_32).
+
+   * - tbl_vec *v0*, *v1*, *v2*
+
+     - | Table lookup: byte *i* of *v0* is the byte of *v1* that byte *i*
+         of *v2* indexes, or 0 if that index is 16 or more (128-bit
+         vectors, ``TCGOP_VECE`` = MO_8).
+
+   * - extract_vec *r0*, *v1*, *idx*
+
+     - | Element *idx* of *v1*, of size ``TCGOP_VECE``, zero-extended into
+         the 64-bit integer *r0*.
+
+   * - insert_vec *v0*, *v1*, *r2*, *idx*
+
+     - | *v1* with element *idx*, of size ``TCGOP_VECE``, replaced by the
+         low bits of the 64-bit integer *r2*.
 
    * - dupi_vec *v0*, *c*
 
