@@ -1006,9 +1006,21 @@ static void virtio_net_set_features(VirtIODevice *vdev,
 static int virtio_net_handle_rx_mode(VirtIONet *n, uint8_t cmd,
                                      struct iovec *iov, unsigned int iov_cnt)
 {
+    VirtIODevice *vdev = VIRTIO_DEVICE(n);
     uint8_t on;
     size_t s;
     NetClientState *nc = qemu_get_queue(n->nic);
+
+    /*
+     * A driver that didn't negotiate the receive filter keeps the
+     * reset state, which receives everything.
+     */
+    if (!virtio_vdev_has_feature(vdev, VIRTIO_NET_F_CTRL_RX) ||
+        (cmd != VIRTIO_NET_CTRL_RX_PROMISC &&
+         cmd != VIRTIO_NET_CTRL_RX_ALLMULTI &&
+         !virtio_vdev_has_feature(vdev, VIRTIO_NET_F_CTRL_RX_EXTRA))) {
+        return VIRTIO_NET_ERR;
+    }
 
     s = iov_to_buf(iov, iov_cnt, 0, &on, sizeof(on));
     if (s != sizeof(on)) {
@@ -1101,7 +1113,8 @@ static int virtio_net_handle_mac(VirtIONet *n, uint8_t cmd,
         return VIRTIO_NET_OK;
     }
 
-    if (cmd != VIRTIO_NET_CTRL_MAC_TABLE_SET) {
+    if (cmd != VIRTIO_NET_CTRL_MAC_TABLE_SET ||
+        !virtio_vdev_has_feature(vdev, VIRTIO_NET_F_CTRL_RX)) {
         return VIRTIO_NET_ERR;
     }
 
