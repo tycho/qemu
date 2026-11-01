@@ -189,6 +189,8 @@ F: include/accel/tcg/
 F: host/include/*/host/cpuinfo.h
 F: host/include/*/host/fpenv.h
 F: util/cpuinfo-*.c
+F: host/include/*/host/counter.h
+F: util/host-counter-*.c
 F: include/tcg/
 F: tests/decode/
 
