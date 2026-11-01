@@ -111,6 +111,26 @@ void tcg_gen_ret_tb(TCGv_i64 key, unsigned tag);
  */
 void tcg_gen_boundary_in(void);
 
+/*
+ * Chain-dead globals: guest state that a TB may leave unstored when it
+ * jumps to a TB that writes it before reading it (TranslationBlock
+ * chain_dead_in), such as a guest's condition codes.
+ *
+ * tcg_chain_dead_add() - add @ts to the set (at front-end init).
+ * tcg_chain_dead_read_since() - whether the ops after @after (from the
+ *   TB's first if NULL) might read a chain-dead global before writing it:
+ *   an op reading it, a helper call that may read globals or raise an
+ *   exception, a guest access (a fault shows the globals); or might
+ *   branch or leave.
+ * tcg_gen_goto_tb_dead() - leave through goto_tb slot @idx, where the
+ *   chain-dead globals need not be in memory; the main loop links @idx
+ *   along with the slot @exit_idx of the tcg_gen_goto_tb() that follows,
+ *   and only to a TB that is chain_dead_in.  Unlinked, it continues.
+ */
+void tcg_chain_dead_add(TCGTemp *ts);
+bool tcg_chain_dead_read_since(TCGOp *after);
+void tcg_gen_goto_tb_dead(unsigned idx, unsigned exit_idx);
+
 /**
  * tcg_gen_lookup_and_goto_ptr() - look up the current TB, jump to it if valid
  * @addr: Guest address of the target TB

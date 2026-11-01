@@ -159,6 +159,13 @@ struct TranslationBlock {
      * it, so that the taken path doesn't take a second branch.
      */
     uint32_t jmp_cond[2];
+    /*
+     * For a goto_tb slot, 1 + the slot of its tcg_gen_goto_tb_dead(), or 0;
+     * and whether this TB writes the chain-dead globals before it reads
+     * them, so that jumps to it may skip storing them.
+     */
+    uint8_t jmp_dead[2];
+    bool chain_dead_in;
     uint32_t jmp_insn_offset[2];  /* offset of direct jump insn */
     uintptr_t jmp_target_addr[2]; /* target address */
 

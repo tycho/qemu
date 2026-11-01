@@ -70,6 +70,16 @@ static const char * const cc_op_str[] = {
     [CC_OP_INCL] = "INCL",
     [CC_OP_INCQ] = "INCQ",
 
+    [CC_OP_INCLB] = "INCLB",
+    [CC_OP_INCLW] = "INCLW",
+    [CC_OP_INCLL] = "INCLL",
+    [CC_OP_INCLQ] = "INCLQ",
+
+    [CC_OP_DECLB] = "DECLB",
+    [CC_OP_DECLW] = "DECLW",
+    [CC_OP_DECLL] = "DECLL",
+    [CC_OP_DECLQ] = "DECLQ",
+
     [CC_OP_DECB] = "DECB",
     [CC_OP_DECW] = "DECW",
     [CC_OP_DECL] = "DECL",
