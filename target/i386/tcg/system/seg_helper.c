@@ -133,14 +133,26 @@ bool x86_cpu_exec_halt(CPUState *cpu)
     X86CPU *x86_cpu = X86_CPU(cpu);
     CPUX86State *env = &x86_cpu->env;
 
-    if (cpu_test_interrupt(cpu, CPU_INTERRUPT_POLL)) {
+    /*
+     * Clear POLL before polling, as the running path does: a request
+     * raised meanwhile (posted interrupts and timers raise it without the
+     * BQL) stays raised for the next pass instead of being erased.
+     */
+    while (cpu_test_interrupt(cpu, CPU_INTERRUPT_POLL)) {
         bql_lock();
-        apic_poll_irq(x86_cpu->apic_state);
         cpu_reset_interrupt(cpu, CPU_INTERRUPT_POLL);
+        apic_poll_irq(x86_cpu->apic_state);
         bql_unlock();
     }
 
-    if (!cpu_has_work(cpu)) {
+    /*
+     * POLL means work for the host thread, not an event that ends HLT: a
+     * POLL raised after the loop above keeps the thread awake (the idle
+     * check counts it) and is handled at the next call.
+     */
+    if (!x86_cpu_pending_interrupt(cpu,
+            qatomic_load_acquire(&cpu->interrupt_request) &
+            ~CPU_INTERRUPT_POLL)) {
         return false;
     }
 

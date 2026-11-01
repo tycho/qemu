@@ -767,6 +767,29 @@ int qemu_timeout_ns_to_ms(int64_t ns);
  */
 int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout);
 
+/*
+ * How qemu_poll_ns() waits for a timeout where there is no ppoll():
+ * QEMU_HOST_POLL_POLL, g_poll() with the timeout rounded up to
+ * milliseconds; QEMU_HOST_POLL_KQUEUE, a one-shot nanosecond kqueue
+ * timer whose descriptor joins the poll set; QEMU_HOST_POLL_SPIN, the
+ * same timer set a margin early, then the descriptors polled without
+ * blocking until the deadline.  The kqueue modes need kqueue timers in
+ * nanoseconds (QEMU_HOST_POLL_KQUEUE_SUPPORTED).
+ */
+typedef enum QemuHostPoll {
+    QEMU_HOST_POLL_POLL,
+    QEMU_HOST_POLL_KQUEUE,
+    QEMU_HOST_POLL_SPIN,
+} QemuHostPoll;
+
+#ifdef CONFIG_KQUEUE_NSEC
+#define QEMU_HOST_POLL_KQUEUE_SUPPORTED 1
+#else
+#define QEMU_HOST_POLL_KQUEUE_SUPPORTED 0
+#endif
+
+extern QemuHostPoll qemu_host_poll;
+
 /**
  * qemu_soonest_timeout:
  * @timeout1: first timeout in nanoseconds (or -1 for infinite)

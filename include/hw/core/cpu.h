@@ -601,6 +601,7 @@ struct CPUState {
     int32_t exception_index;
 
     bool vcpu_dirty;
+    bool halt_polling;  /* MTTCG halt polling: halted, spinning, not asleep */
     AccelCPUState *accel;
 
     /* Used to keep track of an outstanding cpu throttle thread for migration

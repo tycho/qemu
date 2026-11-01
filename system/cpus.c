@@ -521,6 +521,12 @@ void bql_lock_impl(const char *file, int line)
     bql_lock_fn(&bql, file, line);
 }
 
+bool bql_trylock(void)
+{
+    g_assert(!bql_locked());
+    return qemu_mutex_trylock(&bql) == 0;
+}
+
 void bql_unlock(void)
 {
     g_assert(bql_locked());

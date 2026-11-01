@@ -366,6 +366,11 @@ bool qemu_in_main_thread(void);
  * is a no-op there.
  */
 #define bql_lock() bql_lock_impl(__FILE__, __LINE__)
+
+/*
+ * bql_trylock: take the BQL if it is free; true if taken.
+ */
+bool bql_trylock(void);
 void bql_lock_impl(const char *file, int line);
 
 /**
