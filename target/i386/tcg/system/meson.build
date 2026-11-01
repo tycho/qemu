@@ -5,6 +5,7 @@ i386_system_ss.add(when: ['CONFIG_TCG', 'CONFIG_SYSTEM_ONLY'], if_true: files(
   'bpt_helper.c',
   'misc_helper.c',
   'fpu_helper.c',
+  'hyperv.c',
   'svm_helper.c',
   'seg_helper.c',
 ))
