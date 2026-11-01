@@ -2704,6 +2704,24 @@ gen_eob(DisasContext *s, int mode)
     s->base.is_jmp = DISAS_NORETURN;
 }
 
+/*
+ * The CC operation a jump within a multi-block region leaves for the
+ * block it enters (translator_region_target): a static one whose CF is
+ * computed inline, or -1: after ADC and SBB, whose CF needs the helper, a
+ * dynamic entry state costs no more.
+ */
+static int region_entry_cc_op(DisasContext *s)
+{
+    switch (s->cc_op) {
+    case CC_OP_DYNAMIC:
+    case CC_OP_ADCB ... CC_OP_ADCQ:
+    case CC_OP_SBBB ... CC_OP_SBBQ:
+        return -1;
+    default:
+        return s->cc_op;
+    }
+}
+
 /* Jump to eip+diff, truncating the result to OT. */
 static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
                         int tb_num)
@@ -2766,6 +2784,31 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
         return;
     }
 
+    if (s->jmp_opt) {
+        bool backward;
+        TCGLabel *l = translator_region_target(&s->base, new_pc, &backward,
+                                               region_entry_cc_op(s));
+
+        if (l) {
+            /*
+             * Within a multi-block region: branch to the destination's
+             * block; a backward branch checks the exit request first and
+             * leaves the TB through the code below if one is pending.
+             */
+            TCGLabel *exit = backward ? gen_new_label() : NULL;
+
+            if (exit) {
+                translator_exit_check(&s->base, exit);
+            }
+            tcg_gen_br(l);
+            s->base.is_jmp = DISAS_NORETURN;
+            if (!exit) {
+                return;
+            }
+            gen_set_label(exit);
+        }
+    }
+
     if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)
         && translator_loop_back(&s->base, new_pc)) {
         /*
@@ -2773,7 +2816,8 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
          * from the TB, or, with CF_PCREL, from cpu_eip, already updated.
          */
         s->base.is_jmp = DISAS_NORETURN;
-    } else if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)) {
+    } else if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)
+               && translator_goto_tb_slot(&s->base, &tb_num)) {
         /* jump to same page: we can use a direct jump */
         TCGLabel *req = translator_edge_check(&s->base, new_pc);
 
@@ -2811,7 +2855,8 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
 
 /*
  * Whether gen_jmp_rel(s, ot, diff, ...) would branch back within the TB
- * (tcg_region), from the same conditions it uses.
+ * (tcg_region, or an earlier block of a multi-block region), from the same
+ * conditions it uses.
  */
 static bool gen_jmp_rel_loops(DisasContext *s, MemOp ot, int diff)
 {
@@ -2839,6 +2884,9 @@ static bool gen_jmp_rel_loops(DisasContext *s, MemOp ot, int diff)
         }
     } else if (!CODE64(s)) {
         new_pc = (uint32_t)(new_eip + s->cs_base);
+    }
+    if (s->base.region) {
+        return translator_region_backward(&s->base, new_pc);
     }
     return new_pc == s->base.pc_first
            && translator_use_goto_tb(&s->base, new_pc);
@@ -4682,7 +4730,7 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
              * chance to happen.
              */
             dc->base.is_jmp = DISAS_EOB_NEXT;
-        } else if (!translator_is_same_page(&dc->base, dc->base.pc_next)) {
+        } else if (!translator_in_tb_pages(&dc->base, dc->base.pc_next)) {
             dc->base.is_jmp = DISAS_TOO_MANY;
         }
     }
@@ -4751,12 +4799,38 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
 #endif
 }
 
+/*
+ * Another block of a multi-block region: every jump into it leaves cc_op
+ * in env (gen_jmp_rel runs with cc_op clean) and, with CF_PCREL, cpu_eip
+ * at the block's pc.  If every jump leaves the same CC operation
+ * (translator_region_entry), the block starts with it, as straight-line
+ * code after the jump would: the flags globals hold its operands.  A SUB's
+ * first operand, a temp, is rebuilt: CC_DST + CC_SRC, exact in the
+ * operation's width, which is all its consumers read.
+ */
+static void i386_tr_block_start(DisasContextBase *dcbase, CPUState *cpu)
+{
+    DisasContext *dc = container_of(dcbase, DisasContext, base);
+    int entry = translator_region_entry(dcbase);
+
+    dc->cc_op = entry < 0 ? CC_OP_DYNAMIC : entry;
+    dc->cc_op_dirty = false;
+    dc->cc_srcT = NULL;
+    if (cc_op_live(dc->cc_op) & USES_CC_SRCT) {
+        dc->cc_srcT = tcg_temp_new();
+        tcg_gen_add_tl(dc->cc_srcT, cpu_cc_dst, cpu_cc_src);
+    }
+    dc->pc = dc->base.pc_next;
+    dc->pc_save = dc->base.pc_next;
+}
+
 static const TranslatorOps i386_tr_ops = {
     .init_disas_context = i386_tr_init_disas_context,
     .tb_start           = i386_tr_tb_start,
     .insn_start         = i386_tr_insn_start,
     .translate_insn     = i386_tr_translate_insn,
     .tb_stop            = i386_tr_tb_stop,
+    .block_start        = i386_tr_block_start,
     .edge_checks        = true,
 };
 

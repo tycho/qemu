@@ -90,6 +90,13 @@ struct DisasContextBase {
      * indirect exits instead of at its entry (translator_edge_check).
      */
     bool edge_checks;
+    /*
+     * A multi-block region (translator_region_target), or NULL; whether
+     * this TB may become one; the goto_tb slots it has used.
+     */
+    struct TranslatorRegion *region;
+    bool region_capable;
+    unsigned goto_tb_used;
 
     /*
      * Record insn data that we cannot read directly from host memory.
@@ -141,6 +148,12 @@ typedef struct TranslatorOps {
      * check the exit request at their entry.
      */
     bool edge_checks;
+    /*
+     * Start translating another block of a multi-block region at
+     * db->pc_next: reset what the front end tracks across insns to the
+     * state of a TB entry.  Targets without it don't form regions.
+     */
+    void (*block_start)(DisasContextBase *db, CPUState *cpu);
 } TranslatorOps;
 
 /**
@@ -269,6 +282,81 @@ bool translator_use_inline_lookup(DisasContextBase *db);
 void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
                                     uint64_t cs_base, uint32_t flags,
                                     bool direct);
+
+/**
+ * translator_exit_check:
+ * @db: Disassembly context
+ * @exit: label to branch to if an exit is requested
+ *
+ * Emit the check of the exit request that a TB entry does, as a branch to
+ * @exit; marks the TB as one that loops.
+ */
+void translator_exit_check(DisasContextBase *db, struct TCGLabel *exit);
+
+/**
+ * translator_region_target:
+ * @db: Disassembly context
+ * @dest: the destination of a direct jump
+ * @backward: set if the jump goes back to a block already translated
+ *
+ * @state: the state the jump leaves that the front end may rely on in
+ *         @dest's block (tcg_region_entry), or -1
+ *
+ * In a multi-block region, the label of @dest's block, adding the block if
+ * it may join the region; NULL if @dest is outside (the jump leaves the TB
+ * as usual).  The caller has brought the guest state up to date as for a
+ * jump between TBs.  A backward jump must check the exit request first
+ * (translator_exit_check).  If @dest's block was started for another
+ * @state, the region is translated again with that block's state unknown.
+ */
+struct TCGLabel *translator_region_target(DisasContextBase *db, vaddr dest,
+                                          bool *backward, int state);
+
+/**
+ * translator_region_entry:
+ * @db: Disassembly context
+ *
+ * In the block_start hook: the @state every jump into the block leaves
+ * (translator_region_target), or -1 if they differ, if the block is the
+ * region's head, or without tcg_region_entry.
+ */
+int translator_region_entry(const DisasContextBase *db);
+
+/**
+ * @db: Disassembly context
+ *
+ */
+
+/**
+ * translator_region_backward:
+ * @db: Disassembly context
+ * @dest: the destination of a direct jump
+ *
+ * Whether translator_region_target(@db, @dest) would branch back to a block
+ * already translated; adds nothing.
+ */
+bool translator_region_backward(DisasContextBase *db, vaddr dest);
+
+/**
+ * translator_goto_tb_slot:
+ * @db: Disassembly context
+ * @slot: the goto_tb slot the front end would use (0 or 1)
+ *
+ * Set @slot to the goto_tb slot to use: the same, or in a multi-block
+ * region a slot that is still free.  Return false if none is (leave the TB
+ * by lookup instead).
+ */
+bool translator_goto_tb_slot(DisasContextBase *db, int *slot);
+
+/**
+ * translator_in_tb_pages:
+ * @db: Disassembly context
+ * @addr: guest address
+ *
+ * Whether @addr is on a page the TB may translate from without ending:
+ * the first page, or in a multi-block region its second page too.
+ */
+bool translator_in_tb_pages(const DisasContextBase *db, vaddr addr);
 
 /**
  * translator_io_start

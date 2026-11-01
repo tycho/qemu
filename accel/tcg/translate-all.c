@@ -382,6 +382,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     assert_memory_lock();
     qemu_thread_jit_write();
     TCG_HOST_FP_SUSPEND_GUARD(cpu);
+    translator_region_start();
 
     phys_pc = get_page_addr_code_hostp(env, s.pc, &host_pc);
 
@@ -465,7 +466,20 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
              *
              * Try again with half as many insns as we attempted this time.
              * If a single insn overflows, there's a bug somewhere...
+             * A multi-block region tries fewer blocks first.
              */
+            if (translator_region_overflow()) {
+                qemu_log_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT,
+                              "Restarting code generation with a smaller "
+                              "region\n");
+                max_insns = s.cflags & CF_COUNT_MASK ?: TCG_MAX_INSNS;
+                phys_p2 = tb_page_addr1(tb);
+                if (unlikely(phys_p2 != -1)) {
+                    tb_unlock_page1(phys_pc, phys_p2);
+                    tb_set_page_addr1(tb, -1);
+                }
+                goto restart_translate;
+            }
             assert(max_insns > 1);
             max_insns /= 2;
             qemu_log_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT,
@@ -506,6 +520,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
             g_assert_not_reached();
         }
     }
+    translator_region_reset();
     tcg_ctx->gen_tb = NULL;
 
     /*
@@ -624,17 +639,13 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     /* init jump list */
     qemu_spin_init(&tb->jmp_lock);
     tb->jmp_list_head = (uintptr_t)NULL;
-    tb->jmp_list_next[0] = (uintptr_t)NULL;
-    tb->jmp_list_next[1] = (uintptr_t)NULL;
-    tb->jmp_dest[0] = (uintptr_t)NULL;
-    tb->jmp_dest[1] = (uintptr_t)NULL;
-
-    /* init original jump addresses which have been set during tcg_gen_code() */
-    if (tb->jmp_reset_offset[0] != TB_JMP_OFFSET_INVALID) {
-        tb_reset_jump(tb, 0);
-    }
-    if (tb->jmp_reset_offset[1] != TB_JMP_OFFSET_INVALID) {
-        tb_reset_jump(tb, 1);
+    for (int n = 0; n < TB_JMP_SLOTS; n++) {
+        tb->jmp_list_next[n] = (uintptr_t)NULL;
+        tb->jmp_dest[n] = (uintptr_t)NULL;
+        /* original jump addresses, set during tcg_gen_code() */
+        if (tb->jmp_reset_offset[n] != TB_JMP_OFFSET_INVALID) {
+            tb_reset_jump(tb, n);
+        }
     }
 
     /*
@@ -802,6 +813,9 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
                   (void *)retaddr);
     }
     cpu_restore_state_from_tb(cpu, tb, retaddr);
+    if (translator_region_io(tb)) {
+        tb_phys_invalidate(tb, -1);
+    }
 
     /*
      * With tcg_iolast, the next translation ends a TB after this
