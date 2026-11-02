@@ -1,6 +1,6 @@
 /*
- * xtajit: runtime services the module owns rather than takes from the
- * frozen runtime: the engine's internal threads, mprotect and large
+ * xtajit: the POSIX and C runtime services the engine uses, on Windows'
+ * terms: the engine's internal threads, mmap and mprotect, and large
  * aligned allocations.
  *
  * Copyright (c) 2026 Steven Noonan
@@ -16,11 +16,6 @@
 NTSTATUS NTAPI NtCreateThreadEx(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
                                 HANDLE, PVOID, PVOID, ULONG, SIZE_T, SIZE_T,
                                 SIZE_T, PVOID);
-void NTAPI RtlExitUserThread(NTSTATUS);
-
-/* FEX::Windows::InitCRTThread(): rpmalloc's per-thread state. */
-void _ZN3FEX7Windows13InitCRTThreadEv(void);
-
 #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x01
 #define THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH 0x02
 #define THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER 0x04
@@ -37,7 +32,7 @@ static NTSTATUS NTAPI thread_start(void *p)
     ThreadStart s = *(ThreadStart *)p;
 
     xt_tls_attach();
-    _ZN3FEX7Windows13InitCRTThreadEv();
+    xt_crt_thread_init();
     g_free(p);
     xt_placement("internal thread stack", &s);
     RtlExitUserThread(s.fn(s.arg));
@@ -45,11 +40,10 @@ static NTSTATUS NTAPI thread_start(void *p)
 }
 
 /*
- * The engine's internal threads (QEMU's RCU thread, the region sampler):
- * native threads that skip the loader's initialization, as FEX's do.  In a
- * WOW64 process a thread the loader initializes becomes a WOW64 thread,
- * with a CPU and guest state; these get their TLS block from
- * xt_tls_attach instead.  Linked ahead of the frozen runtime's version.
+ * The engine's internal threads (QEMU's RCU thread): native threads that
+ * skip the loader's initialization.  In a WOW64 process a thread the
+ * loader initializes becomes a WOW64 thread, with a CPU and guest state;
+ * these get their TLS block from xt_tls_attach instead.
  */
 uintptr_t __cdecl _beginthreadex(void *security, unsigned stack,
                                  unsigned (__stdcall *fn)(void *),
@@ -82,16 +76,19 @@ uintptr_t __cdecl _beginthreadex(void *security, unsigned stack,
     return (uintptr_t)h;
 }
 
-uintptr_t (__cdecl *__imp__beginthreadex)(void *, unsigned,
-                                          unsigned (__stdcall *)(void *),
-                                          void *, unsigned,
-                                          unsigned *) = _beginthreadex;
+void __cdecl _endthreadex(unsigned code)
+{
+    RtlExitUserThread(code);
+    __builtin_unreachable();
+}
+
+XT_IMPORT_SLOT(_beginthreadex);
+XT_IMPORT_SLOT(_endthreadex);
 
 #define PROT_READ 0x1
 #define PROT_WRITE 0x2
 #define PROT_EXEC 0x4
 
-NTSTATUS NTAPI NtProtectVirtualMemory(HANDLE, PVOID *, PSIZE_T, ULONG, PULONG);
 NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, PVOID, int, PVOID, SIZE_T,
                                     PSIZE_T);
 
@@ -111,6 +108,37 @@ static ULONG nt_prot(int prot)
     default:
         return PAGE_EXECUTE_READWRITE;
     }
+}
+
+/*
+ * mmap: anonymous private mappings only (the return stack ring), and
+ * munmap of a whole mapping.
+ */
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
+{
+    PVOID base = addr;
+    SIZE_T size = len;
+
+    if (fd != -1 || NtAllocateVirtualMemory(GetCurrentProcess(), &base, 0,
+                                            &size, MEM_RESERVE | MEM_COMMIT,
+                                            nt_prot(prot)) < 0) {
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+    return base;
+}
+
+int munmap(void *addr, size_t len)
+{
+    PVOID base = addr;
+    SIZE_T size = 0;
+
+    if (NtFreeVirtualMemory(GetCurrentProcess(), &base, &size,
+                            MEM_RELEASE) < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
 }
 
 /*
@@ -230,15 +258,13 @@ int mprotect(void *addr, size_t len, int prot)
 #define BIG_MAGIC 0x786a7462616c6e67ull
 #define VM_GRANULE (64 * KiB)
 
-NTSTATUS NTAPI NtFreeVirtualMemory(HANDLE, PVOID *, PSIZE_T, ULONG);
-
 /*
  * Large aligned allocations (the per-CPU jump cache, 1 MiB at 16 KiB)
- * come from Windows directly: the frozen runtime's allocator commits 64
- * MiB for each.  A block starts one allocation granule (64 KiB, which
- * every alignment up to it needs no more than) after a header naming it;
- * smaller ones, and alignments past the granule, stay the runtime's
- * (rpmalloc, as its _aligned_malloc).  Above 4 GiB, as the runtime's.
+ * come from Windows directly: rpmalloc commits 64 MiB for each.  A block
+ * starts one allocation granule (64 KiB, which every alignment up to it
+ * needs no more than) after a header naming it; smaller ones, and
+ * alignments past the granule, stay the allocator's.  Above 4 GiB, as the
+ * allocator's.
  */
 
 void *__cdecl _aligned_malloc(size_t size, size_t align)
@@ -246,7 +272,7 @@ void *__cdecl _aligned_malloc(size_t size, size_t align)
     void *base;
 
     if (size < BIG_ALIGNED || align > VM_GRANULE) {
-        return rpaligned_alloc(align, size);
+        return xt_heap_aligned(size, align);
     }
     base = xt_alloc_high(size + VM_GRANULE);
     if (!base) {
@@ -272,8 +298,8 @@ void __cdecl _aligned_free(void *p)
         NtFreeVirtualMemory(GetCurrentProcess(), &b, &len, MEM_RELEASE);
         return;
     }
-    rpfree(p);
+    free(p);
 }
 
-void *(__cdecl *__imp__aligned_malloc)(size_t, size_t) = _aligned_malloc;
-void (__cdecl *__imp__aligned_free)(void *) = _aligned_free;
+XT_IMPORT_SLOT(_aligned_malloc);
+XT_IMPORT_SLOT(_aligned_free);
