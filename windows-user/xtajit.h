@@ -157,6 +157,7 @@ extern uint32_t xt_inject_point;    /* XTAJIT_INJECT: see xt_inject */
 extern CPUState *xt_spare_cpu;      /* made at init, for the first thread */
 int xt_engine_init(const char *settings, int *applied, int *rejected);
 CPUState *xt_cpu_new(void);
+extern const char *xt_cpu_model;   /* -cpu syntax; set before init */
 void *xt_alloc_low(size_t len);
 bool xt_mem_refresh(vaddr addr, MMUAccessType access);
 void xt_invalidate(vaddr start, vaddr len);
@@ -257,6 +258,7 @@ XTEXPORT void WINAPI BTCpuNotifyUnmapViewOfSection(void *addr, BOOL after,
 XTEXPORT void WINAPI BTCpuNotifyReadFile(HANDLE h, void *addr, SIZE_T len, BOOL after,
                                 NTSTATUS status);
 XTEXPORT BOOLEAN WINAPI BTCpuIsProcessorFeaturePresent(UINT feature);
+XTEXPORT void BTCpuUpdateProcessorInformation(void *info);
 
 /* test.c: the native harness's entry points */
 typedef struct XtTestExit XtTestExit;
