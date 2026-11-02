@@ -541,9 +541,10 @@ uint32_t xt_check(XtThread *t, XtState expect, int where)
  * The WOW64 context and CPUX86State.  The import honours ContextFlags:
  * the floating-point state comes from ExtendedRegisters (FXSAVE format,
  * x87 tags, TOP, status, MXCSR and XMM) when present, else from FloatSave
- * (FSAVE format).  The export writes both.  Debug registers are not
- * carried: DR0-DR7 stay as set in the WOW64 context and no hardware
- * breakpoint fires; a single-step trap reports DR6.BS, as x86 does.
+ * (FSAVE format).  The export writes both.  DR0-DR7 stay in the WOW64
+ * context; the import takes execute breakpoints from them
+ * (set_breakpoints), and the export reports in DR6 what trapped: a
+ * single step (BS) or a breakpoint (B0-B3).
  */
 static uint32_t seg_base(XtThread *t, int sel)
 {
@@ -576,6 +577,31 @@ static void load_seg(XtThread *t, X86Seg r, int sel)
                            (d >> 32) & 0x00f0ff00);
 }
 
+/*
+ * DR0-DR3 that DR7 enables with R/W 00 are execute breakpoints, QEMU's
+ * (BP_GDB: user mode ends cpu_exec with EXCP_DEBUG at one).  Data
+ * breakpoints aren't supported: QEMU's user mode has no watchpoints.
+ */
+static void set_breakpoints(XtThread *t, const WOW64_CONTEXT *c)
+{
+    const DWORD dr[4] = { c->Dr0, c->Dr1, c->Dr2, c->Dr3 };
+
+    for (int i = 0; i < 4; i++) {
+        bool on = ((c->Dr7 >> (2 * i)) & 3) &&
+                  !((c->Dr7 >> (16 + 4 * i)) & 3);
+
+        if (t->bp_on[i] && (!on || t->bp[i] != dr[i])) {
+            cpu_breakpoint_remove(t->cpu, t->bp[i], BP_GDB);
+            t->bp_on[i] = false;
+        }
+        if (on && !t->bp_on[i]) {
+            cpu_breakpoint_insert(t->cpu, dr[i], BP_GDB, NULL);
+            t->bp[i] = dr[i];
+            t->bp_on[i] = true;
+        }
+    }
+}
+
 void xt_import(XtThread *t, const WOW64_CONTEXT *c)
 {
     CPUX86State *env = t->env;
@@ -604,6 +630,14 @@ void xt_import(XtThread *t, const WOW64_CONTEXT *c)
     CC_SRC = c->EFlags & (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
     CC_OP = CC_OP_EFLAGS;
     env->df = 1 - (2 * ((c->EFlags >> 10) & 1));
+    set_breakpoints(t, c);
+    /*
+     * As x86's RF: resuming with it set, or at the breakpoint just
+     * reported, runs the instruction there without its breakpoint.
+     */
+    t->bp_skip = (c->EFlags & RF_MASK) ||
+                 (t->bp_hit && c->Eip == t->bp_hit);
+    t->bp_hit = 0;
 
     load_seg(t, R_CS, c->SegCs);
     load_seg(t, R_SS, c->SegSs);
@@ -642,9 +676,9 @@ void xt_export(XtThread *t, WOW64_CONTEXT *c)
     c->Edi = env->regs[R_EDI];
     c->Eip = env->eip;
     c->EFlags = cpu_compute_eflags(env);
-    if (env->dr[6] & DR6_BS) {
+    if (env->dr[6] & (DR6_BS | 0xf)) {
         c->ContextFlags |= WOW64_CONTEXT_DEBUG_REGISTERS;
-        c->Dr6 = 0xffff0ff0 | DR6_BS;
+        c->Dr6 = 0xffff0ff0 | (env->dr[6] & (DR6_BS | 0xf));
         env->dr[6] = 0;
     }
     c->SegCs = env->segs[R_CS].selector;
