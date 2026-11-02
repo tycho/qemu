@@ -65,13 +65,16 @@ target_dirs = config_host['TARGET_DIRS'].split()
 # type of binaries to build
 have_linux_user = false
 have_bsd_user = false
+have_windows_user = false
 have_system = false
 foreach target : target_dirs
   have_linux_user = have_linux_user or target.endswith('linux-user')
   have_bsd_user = have_bsd_user or target.endswith('bsd-user')
+  have_windows_user = have_windows_user or target.endswith('windows-user')
   have_system = have_system or target.endswith('-softmmu')
 endforeach
-have_user = have_linux_user or have_bsd_user
+have_posix_user = have_linux_user or have_bsd_user
+have_user = have_posix_user or have_windows_user
 
 ############
 # Programs #
@@ -710,6 +713,12 @@ endif
 
 qemu_common_flags += hardening_flags
 
+# The Windows user-mode module imports from ntdll alone: the linker drops
+# the code that calls other DLLs, function by function.
+if have_windows_user
+  qemu_common_flags += ['-ffunction-sections', '-fdata-sections']
+endif
+
 # Collect warning flags we want to set, sorted alphabetically
 warn_flags = [
   # First enable interesting warnings
@@ -1160,7 +1169,9 @@ if not get_option('pixman').auto() or have_system or have_tools
                       method: 'pkg-config')
 endif
 
-zlib = dependency('zlib', required: true)
+# The Windows user-mode module links nothing but ntdll; no target it
+# builds uses zlib.
+zlib = dependency('zlib', required: have_system or have_tools or have_posix_user)
 
 libaio = not_found
 if not get_option('linux_aio').auto() or have_block
@@ -3314,6 +3325,14 @@ foreach target : target_dirs
       error('Target @0@ is only available on a BSD host'.format(target))
     endif
     config_target += { 'CONFIG_BSD_USER': 'y' }
+  elif target.endswith('windows-user')
+    if host_os != 'windows' or cpu != 'aarch64'
+      if default_targets
+        continue
+      endif
+      error('Target @0@ is only available on an aarch64 Windows host'.format(target))
+    endif
+    config_target += { 'CONFIG_WINDOWS_USER': 'y' }
   elif target.endswith('softmmu')
     config_target += { 'CONFIG_SYSTEM_ONLY': 'y' }
     config_target += { 'CONFIG_SOFTMMU': 'y' }
@@ -3890,6 +3909,7 @@ common_user_inc = []
 subdir('common-user')
 subdir('bsd-user')
 subdir('linux-user')
+subdir('windows-user')
 
 # needed for fuzzing binaries
 subdir('tests/qtest/libqos')
@@ -4336,10 +4356,18 @@ foreach target : target_dirs
       dir = base_dir / abi
       arch_srcs += files(dir / 'signal.c', dir / 'target_arch_cpu.c')
     endif
-    target_inc += include_directories(
-      base_dir,
-      base_dir / abi,
-    )
+    if 'CONFIG_WINDOWS_USER' in config_target
+      base_dir = 'windows-user'
+      t = windows_user_ss.apply(config_target, strict: false)
+      arch_srcs += t.sources()
+      arch_deps += t.dependencies()
+      target_inc += include_directories(base_dir)
+    else
+      target_inc += include_directories(
+        base_dir,
+        base_dir / abi,
+      )
+    endif
     if 'CONFIG_LINUX_USER' in config_target
       dir = base_dir / abi
       arch_srcs += files(
@@ -4463,6 +4491,17 @@ foreach target : target_dirs
         'dependencies': specific_fuzz.dependencies(),
       }]
     endif
+  elif 'CONFIG_WINDOWS_USER' in config_target
+    # A DLL that wow64.dll loads, not an executable.
+    emulators += {'libwow64xtcg': shared_module('libwow64xtcg',
+                  name_prefix: '',
+                  install: true,
+                  c_args: c_args,
+                  dependencies: arch_deps + [target_stubs],
+                  objects: lib.extract_all_objects(recursive: true),
+                  link_args: windows_user_link_args,
+                  link_depends: windows_user_link_depends)}
+    execs = []
   else
     execs = [{
       'name': 'qemu-' + target_name,
