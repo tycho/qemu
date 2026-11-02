@@ -160,21 +160,18 @@ static int init_applied, init_rejected;
 
 extern IMAGE_DOS_HEADER __ImageBase;
 
-/* FEX::Windows::InitCRTProcess(): rpmalloc, constructors, TLS callbacks. */
-void _ZN3FEX7Windows14InitCRTProcessEv(void);
-
 /* Process-wide bring-up shared by WOW64 and the native harness. */
 int xt_process_init(bool wow64)
 {
     char *settings;
 
     /*
-     * The runtime first (rpmalloc, which allocates above the guest's
-     * address space once initialized; the constructors, QEMU's RCU thread
-     * among them), with this thread's TLS block already in place.
+     * The runtime first (the allocator, which allocates above the guest's
+     * address space; the constructors, QEMU's RCU thread among them), with
+     * this thread's TLS block already in place.
      */
     xt_tls_attach();
-    _ZN3FEX7Windows14InitCRTProcessEv();
+    xt_crt_process_init();
     settings = settings_string();
     xt_log_open();
     xt_engine_init(settings, &init_applied, &init_rejected);
@@ -358,12 +355,12 @@ XTEXPORT void WINAPI BTCpuThreadTerm(HANDLE thread, LONG code)
     }
     adapter_end(began);
     /*
-     * The thread's allocator heap goes back for the next thread to take,
-     * as FEX does; allocations after this one (ntdll's exit may notify)
-     * start a new one.
+     * The thread's allocator heap goes back for the next thread to take;
+     * allocations after this one (ntdll's exit may notify) start a new
+     * one.
      */
     if (t && tid == t->tid) {
-        _ZN3FEX7Windows15DeinitCRTThreadEv();
+        xt_crt_thread_fini();
     }
     if (tid && tid != GetCurrentThreadId()) {
         terminate_other(tid, teb);

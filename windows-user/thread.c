@@ -37,10 +37,6 @@ NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, PVOID, int, PVOID, SIZE_T,
 __thread XtThread *xt_self;
 uint32_t xt_inject_point;
 
-NTSTATUS NTAPI NtAllocateVirtualMemoryEx(HANDLE, PVOID *, PSIZE_T, ULONG,
-                                         ULONG, MEM_EXTENDED_PARAMETER *,
-                                         ULONG);
-
 /* The TEB's ThreadLocalStoragePointer (TEB + 0x58). */
 #define TEB_TLS_POINTER 0x58
 
@@ -52,20 +48,6 @@ extern uint64_t _tls_index;
  * process: Windows takes a missing upper bound in a WOW64 process to be
  * the 32-bit space's, so both bounds are given.
  */
-typedef struct XtBasicInfo {
-    ULONG Reserved;
-    ULONG TimerResolution;
-    ULONG PageSize;
-    ULONG NumberOfPhysicalPages;
-    ULONG LowestPhysicalPageNumber;
-    ULONG HighestPhysicalPageNumber;
-    ULONG AllocationGranularity;
-    ULONG_PTR MinimumUserModeAddress;
-    ULONG_PTR MaximumUserModeAddress;
-    ULONG_PTR ActiveProcessorsAffinityMask;
-    CCHAR NumberOfProcessors;
-} XtBasicInfo;
-
 void *xt_alloc_high(size_t len)
 {
     XtBasicInfo sbi;

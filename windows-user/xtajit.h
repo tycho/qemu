@@ -10,6 +10,7 @@
 #define WINDOWS_USER_XTAJIT_H
 
 #include <winternl.h>
+#include "runtime/runtime.h"
 #include "exec/cpu-common.h"
 #include "exec/mmu-access-type.h"
 #include "user/guest-host.h"
@@ -202,11 +203,6 @@ void xt_log_native(EXCEPTION_RECORD *er, CONTEXT *ctx);
 ULONG xt_guest_prot(uintptr_t page);
 void xt_guest_prot_forget(uintptr_t start, uintptr_t last);
 
-/* The frozen runtime's allocator (rpmalloc). */
-void *rpaligned_alloc(size_t align, size_t size);
-void rpfree(void *p);
-/* FEX::Windows::DeinitCRTThread(): TLS callbacks, rpmalloc's thread heap. */
-void _ZN3FEX7Windows15DeinitCRTThreadEv(void);
 
 /* Points where XTAJIT_INJECT waits for a suspension request. */
 enum {
