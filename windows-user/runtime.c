@@ -11,6 +11,7 @@
 #include "qemu/units.h"
 #include "exec/page-protection.h"
 #include "user/page-protection.h"
+#include "user/host-mman.h"
 #include "xtajit.h"
 
 NTSTATUS NTAPI NtCreateThreadEx(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
@@ -84,10 +85,6 @@ void __cdecl _endthreadex(unsigned code)
 
 XT_IMPORT_SLOT(_beginthreadex);
 XT_IMPORT_SLOT(_endthreadex);
-
-#define PROT_READ 0x1
-#define PROT_WRITE 0x2
-#define PROT_EXEC 0x4
 
 NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, PVOID, int, PVOID, SIZE_T,
                                     PSIZE_T);
