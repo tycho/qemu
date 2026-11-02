@@ -274,8 +274,17 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
         x->vector = trapnr;
         r->ExceptionCode = trapnr;
         break;
-    case EXCP01_DB:
     case EXCP_DEBUG:
+        /* An execute breakpoint, before the instruction. */
+        for (int i = 0; i < 4; i++) {
+            if (t->bp_on[i] && t->bp[i] == (uint32_t)env->eip) {
+                env->dr[6] |= 1 << i;
+            }
+        }
+        t->bp_hit = env->eip;
+        r->ExceptionCode = STATUS_WX86_SINGLE_STEP;
+        break;
+    case EXCP01_DB:
         r->ExceptionCode = STATUS_WX86_SINGLE_STEP;
         break;
     case EXCP00_DIVZ:
@@ -339,6 +348,7 @@ void xt_run(XtThread *t, XtExit *x)
 {
     CPUState *cs = t->cpu;
     CPUX86State *env = t->env;
+    bool stepping;
     int trapnr;
 
     for (;;) {
@@ -358,11 +368,23 @@ void xt_run(XtThread *t, XtExit *x)
         }
         t->after_suspend = false;
         t->gfault.code = 0;
+        /* Past a breakpoint (xt_import): one instruction, stepped. */
+        stepping = t->bp_skip;
+        t->bp_skip = false;
+        if (stepping) {
+            cpu_single_step(cs, SSTEP_ENABLE | SSTEP_NOIRQ | SSTEP_NOTIMER);
+        }
         t->active = XT_ACT_EXEC;
         cpu_exec_start(cs);
         trapnr = cpu_exec(cs);
         cpu_exec_end(cs);
         t->active = XT_ACT_NONE;
+        if (stepping) {
+            cpu_single_step(cs, 0);
+            if (trapnr == EXCP_DEBUG) {
+                continue;
+            }
+        }
         /* Clears exit_request and runs queued work, as linux-user's loop. */
         qemu_process_cpu_events(cs);
         xt_event(t, XT_EV_EXIT, trapnr, env->eip);

@@ -140,6 +140,10 @@ typedef struct XtThread {
     uint32_t activation;
     int suspend_req;        /* set by another thread (cpu_exit after) */
     int terminating;        /* another thread is terminating this one */
+    uint32_t bp[4];         /* DR0-DR3 as execute breakpoints, where bp_on */
+    bool bp_on[4];
+    uint32_t bp_hit;        /* the last breakpoint reported, else 0 */
+    bool bp_skip;           /* run one instruction past breakpoints */
     uint32_t suspensions;   /* suspension exits taken */
     bool after_suspend;     /* the last exit was a suspension */
     XtGuestFault gfault;
