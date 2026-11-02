@@ -25,6 +25,7 @@
 #include "qemu/atomic128.h"
 #include "tcg/tcg.h"
 #include "helper-tcg.h"
+#include "accel/tcg/probe.h"
 
 void helper_boundw(CPUX86State *env, target_ulong a0, int v)
 {
@@ -53,4 +54,11 @@ void helper_boundl(CPUX86State *env, target_ulong a0, int v)
         }
         raise_exception_ra(env, EXCP05_BOUND, GETPC());
     }
+}
+
+/* After a failed locked CMPXCHG: that its write could have happened. */
+void helper_cmpxchg_probe(CPUX86State *env, target_ulong a0, uint32_t size,
+                          uint32_t mmu_idx)
+{
+    probe_write(env, a0, size, mmu_idx, GETPC());
 }

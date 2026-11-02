@@ -61,6 +61,7 @@ DEF_HELPER_FLAGS_1(raise_gpf, TCG_CALL_NO_WG, noreturn, env)
 DEF_HELPER_FLAGS_1(icebp, TCG_CALL_NO_WG, noreturn, env)
 DEF_HELPER_3(boundw, void, env, tl, int)
 DEF_HELPER_3(boundl, void, env, tl, int)
+DEF_HELPER_4(cmpxchg_probe, void, env, tl, i32, i32)
 
 #ifndef CONFIG_USER_ONLY
 DEF_HELPER_1(rsm, void, env)
