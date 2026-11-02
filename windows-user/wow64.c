@@ -66,6 +66,7 @@ static void forget(int kind, ULONG prot, vaddr start, vaddr len);
 static uint32_t nr_query_vm = ~0u;    /* NtQueryVirtualMemory's number */
 static uint32_t nr_protect_vm = ~0u;  /* NtProtectVirtualMemory's */
 static void guard_added(uint32_t *args);
+static void bring_out(DWORD tid, void *teb, bool retire);
 
 static XtThread *thread_of_teb(void *teb)
 {
@@ -218,8 +219,55 @@ XTEXPORT NTSTATUS WINAPI BTCpuProcessInit(void)
     return STATUS_SUCCESS;
 }
 
+/*
+ * A process ends its other threads first (a null handle) and runs its
+ * DLLs' detach code, guest code among it, on the last one.  Windows kills
+ * those threads wherever they are; one killed inside the engine would
+ * still count as running, and the exclusive work of the last thread's
+ * guest code (start_exclusive) would wait for it forever, or would hold
+ * an engine lock.  So each leaves the engine first, and stays suspended
+ * outside it.
+ */
+typedef struct XtThreadRef {
+    DWORD tid;
+    void *teb;
+} XtThreadRef;
+
+static void bring_out_others(void)
+{
+    DWORD me = GetCurrentThreadId();
+    GArray *threads = g_array_sized_new(FALSE, FALSE, sizeof(XtThreadRef), 8);
+    bool began = adapter_begin();
+    CPUState *cs;
+
+    /* The records stay while held, though their threads may exit. */
+    xt_record_hold();
+    cpu_list_lock();
+    CPU_FOREACH(cs) {
+        XtThread *t = cs->opaque;
+
+        if (t && t->wow64 && t->tid != me) {
+            XtThreadRef r = { t->tid, t->teb };
+
+            g_array_append_val(threads, r);
+        }
+    }
+    cpu_list_unlock();
+    adapter_end(began);
+    for (guint i = 0; i < threads->len; i++) {
+        XtThreadRef *r = &g_array_index(threads, XtThreadRef, i);
+
+        bring_out(r->tid, r->teb, false);
+    }
+    xt_record_release();
+    g_array_free(threads, TRUE);
+}
+
 XTEXPORT void WINAPI BTCpuProcessTerm(HANDLE h, BOOL after, ULONG status)
 {
+    if (!after && !h && xt_tls_ready()) {
+        bring_out_others();
+    }
     /* A process ending itself never returns from the "before" call. */
     if (xt_log_handle() && xt_tls_ready()) {
         if (xt_self) {
@@ -264,17 +312,27 @@ static DWORD thread_id(HANDLE thread, void **teb)
  * wow64.dll's own critical regions.  These are what Windows' cooperative
  * suspension tests: slot 2 bits 0 (this module's: guest code, adapter
  * entries) and 1 (wow64.dll's, while it initializes a thread), and slot 6
- * (wow64.dll's, around its cross-process work list and its lock).  It
- * is told to stop there (terminating: it parks at its next acquire, or
- * at the end of the adapter entry it is in; an exit request gets it out
- * of guest code), then suspended until it is found so.  The
- * suspension is kept: if the termination succeeds the thread never runs
- * again.  Windows' cooperative suspension isn't used: another thread's
- * suspension of the same target would be in its way.  The record is read
- * only while the target is suspended, so its own exit, which waits for
- * the record's users, can't be waiting on this.
+ * (wow64.dll's, around its cross-process work list and its lock).  At the
+ * whole process's end slot 6 doesn't count: a thread waiting there for
+ * that lock waits for good once the process is ending (its holder may be
+ * the ending thread or a thread already stopped), and nothing needs the
+ * lock after.  It is told to stop there (terminating: it parks at its
+ * next acquire, or at the end of the adapter entry it is in; an exit
+ * request gets it out of guest code), then suspended until it is found
+ * so.  The suspension is kept: if the termination succeeds the thread
+ * never runs again.  Windows' cooperative suspension isn't used: another
+ * thread's suspension of the same target would be in its way.  The record
+ * is read only while the target is suspended, so its own exit, which
+ * waits for the record's users, can't be waiting on this.
  */
-static void terminate_other(DWORD tid, void *teb)
+/*
+ * Bring another thread out of the engine before Windows ends it: suspend
+ * it where it owns no engine state (outside simulation, not inside an
+ * adapter's locks or wow64.dll's), else ask it to leave and try again.
+ * Then retire its record (it is being terminated alone), or leave it
+ * suspended there (the whole process is ending).
+ */
+static void bring_out(DWORD tid, void *teb, bool retire)
 {
     OBJECT_ATTRIBUTES oa = { .Length = sizeof(oa) };
     CLIENT_ID cid = { .UniqueThread = (HANDLE)(uintptr_t)tid };
@@ -310,12 +368,17 @@ static void terminate_other(DWORD tid, void *teb)
             break;
         }
         if (t->state == XT_WINDOWS && !(qatomic_read(slot2) & 3) &&
-            !qatomic_read(slot6)) {
-            /* A scope: the reaper's lock, if this thread is terminated too. */
-            bool began = adapter_begin();
+            (!retire || !qatomic_read(slot6))) {
+            bool began;
 
             qatomic_set(&t->terminating, 1);
-            xt_gevent(XT_EV_THREAD_TERM, tid, 2 | tries << 8);
+            xt_gevent(XT_EV_THREAD_TERM, tid, 2 | tries << 8 | !retire << 4);
+            if (!retire) {
+                NtClose(h);
+                return;
+            }
+            /* A scope: the reaper's lock, if this thread is terminated too. */
+            began = adapter_begin();
             xt_thread_retire(t, h);
             adapter_end(began);
             return;
@@ -363,7 +426,7 @@ XTEXPORT void WINAPI BTCpuThreadTerm(HANDLE thread, LONG code)
         xt_crt_thread_fini();
     }
     if (tid && tid != GetCurrentThreadId()) {
-        terminate_other(tid, teb);
+        bring_out(tid, teb, true);
     }
 }
 

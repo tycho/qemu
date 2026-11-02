@@ -405,7 +405,7 @@ void xt_thread_free(XtThread *t)
 /*
  * Another thread's termination, before Windows terminates it: the thread
  * is suspended already, in Windows' hands and holding nothing of the
- * engine's (terminate_other).  Its record is
+ * engine's (bring_out).  Its record is
  * unlinked, so later suspensions find none, and freed with its TLS block
  * once the thread has ended.  If the termination fails, the thread stays
  * suspended and the record stays.
