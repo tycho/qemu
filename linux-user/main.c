@@ -119,8 +119,8 @@ static const char *last_log_filename;
 # endif
 #endif
 
-unsigned long reserved_va;
-unsigned long guest_addr_max;
+uintptr_t reserved_va;
+uintptr_t guest_addr_max;
 
 static void usage(int exitcode);
 
@@ -694,7 +694,7 @@ int main(int argc, char **argv, char **envp)
     int ret;
     int execfd;
     int host_page_size;
-    unsigned long max_reserved_va;
+    uintptr_t max_reserved_va;
     bool preserve_argv0;
 
     error_init(argv[0]);
@@ -849,7 +849,7 @@ int main(int argc, char **argv, char **envp)
     } else if (MIN(TARGET_VIRT_ADDR_SPACE_BITS, TARGET_ABI_BITS) <= 32) {
         guest_addr_max = UINT32_MAX;
     } else {
-        guest_addr_max = ~0ul;
+        guest_addr_max = UINTPTR_MAX;
     }
     guest_user_max = guest_addr_max;
     if (reserved_va == 0 && max_reserved_va != 0) {
