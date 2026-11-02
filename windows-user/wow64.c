@@ -494,18 +494,23 @@ XTEXPORT void WINAPI BTCpuNotifyReadFile(HANDLE h, void *addr, SIZE_T len,
     }
 }
 
-/* What CPUID says, for IsProcessorFeaturePresent in 32-bit code. */
+/*
+ * What CPUID says, for IsProcessorFeaturePresent in 32-bit code.  As
+ * Windows' own x86 emulator: no PAE, DAZ or fast-fail feature (int 0x29
+ * still ends the process).
+ */
 XTEXPORT BOOLEAN WINAPI BTCpuIsProcessorFeaturePresent(UINT feature)
 {
     CPUState *cs = first_cpu;
     CPUX86State *env = cs ? cpu_env(cs) : NULL;
-    uint32_t edx, ecx;
+    uint32_t edx, ecx, ext2;
 
     if (!env) {
         return FALSE;
     }
     edx = env->features[FEAT_1_EDX];
     ecx = env->features[FEAT_1_ECX];
+    ext2 = env->features[FEAT_8000_0001_EDX];
     switch (feature) {
     case PF_COMPARE_EXCHANGE_DOUBLE:
         return !!(edx & CPUID_CX8);
@@ -515,22 +520,52 @@ XTEXPORT BOOLEAN WINAPI BTCpuIsProcessorFeaturePresent(UINT feature)
         return !!(edx & CPUID_SSE);
     case PF_RDTSC_INSTRUCTION_AVAILABLE:
         return !!(edx & CPUID_TSC);
-    case PF_PAE_ENABLED:
-        return !!(edx & CPUID_PAE);
     case PF_XMMI64_INSTRUCTIONS_AVAILABLE:
         return !!(edx & CPUID_SSE2);
+    case PF_NX_ENABLED:
+        return !!(ext2 & CPUID_EXT2_NX);
     case PF_SSE3_INSTRUCTIONS_AVAILABLE:
         return !!(ecx & CPUID_EXT_SSE3);
+    case PF_COMPARE_EXCHANGE128:
+        return !!(ecx & CPUID_EXT_CX16);
+    case PF_RDTSCP_INSTRUCTION_AVAILABLE:
+        return !!(ext2 & CPUID_EXT2_RDTSCP);
     case PF_SSSE3_INSTRUCTIONS_AVAILABLE:
         return !!(ecx & CPUID_EXT_SSSE3);
     case PF_SSE4_1_INSTRUCTIONS_AVAILABLE:
         return !!(ecx & CPUID_EXT_SSE41);
     case PF_SSE4_2_INSTRUCTIONS_AVAILABLE:
         return !!(ecx & CPUID_EXT_SSE42);
-    case PF_NX_ENABLED:
-    case PF_FASTFAIL_AVAILABLE:
-        return TRUE;
     default:
         return FALSE;
     }
+}
+
+/*
+ * The processor's identity for 32-bit code (GetSystemInfo and
+ * NtQuerySystemInformation): x86, level the CPUID family, revision its
+ * model and stepping, as x86 Windows derives them.  Windows fills in the
+ * rest of SYSTEM_CPU_INFORMATION.
+ */
+XTEXPORT void BTCpuUpdateProcessorInformation(void *info)
+{
+    CPUState *cs = first_cpu;
+    uint32_t eax, ebx, ecx, edx, family, model;
+    USHORT *f = info;
+
+    if (!cs) {
+        return;
+    }
+    cpu_x86_cpuid(cpu_env(cs), 1, 0, &eax, &ebx, &ecx, &edx);
+    family = (eax >> 8) & 0xf;
+    model = (eax >> 4) & 0xf;
+    if (family == 0xf) {
+        family += (eax >> 20) & 0xff;
+    }
+    if (family == 6 || family >= 0xf) {
+        model |= ((eax >> 16) & 0xf) << 4;
+    }
+    f[0] = PROCESSOR_ARCHITECTURE_INTEL;
+    f[1] = family;
+    f[2] = model << 8 | (eax & 0xf);
 }

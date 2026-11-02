@@ -334,13 +334,23 @@ static void setup_mode(CPUX86State *env)
 
 static QemuMutex cpu_create_mutex;
 
+/*
+ * The guest's CPU: QEMU's qemu32 with the features Windows on Arm's own
+ * x86 emulator offers 32-bit code, all of which TCG implements.  No XSAVE
+ * or AVX: the WOW64 context has no place for the YMM state.
+ */
+const char *xt_cpu_model =
+    "qemu32,ssse3=on,sse4.1=on,sse4.2=on,popcnt=on,aes=on,pclmulqdq=on,"
+    "cx16=on,rdtscp=on,lahf-lm=on,3dnowprefetch=on,nx=on";
+static const char *cpu_type;
+
 /* A CPU for the calling thread, in parallel mode from the start. */
 CPUState *xt_cpu_new(void)
 {
     CPUState *cs;
 
     qemu_mutex_lock(&cpu_create_mutex);
-    cs = cpu_create(X86_CPU_TYPE_NAME("qemu32"));
+    cs = cpu_create(cpu_type);
     qemu_mutex_unlock(&cpu_create_mutex);
     cpu_reset(cs);
     setup_mode(cpu_env(cs));
@@ -424,6 +434,8 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
         *n_applied = applied;
         *n_rejected = rejected;
     }
+
+    cpu_type = parse_cpu_option(xt_cpu_model);
 
     set_preferred_target_page_bits(ctz32(qemu_real_host_page_size()));
     finalize_target_page_bits();
