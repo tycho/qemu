@@ -113,6 +113,7 @@ MMUAccessType adjust_signal_pc(uintptr_t *pc, bool is_write)
     return is_write ? MMU_DATA_STORE : MMU_DATA_LOAD;
 }
 
+#ifndef _WIN32
 /**
  * handle_sigsegv_accerr_write:
  * @cpu: the cpu context
@@ -159,6 +160,7 @@ bool handle_sigsegv_accerr_write(CPUState *cpu, sigset_t *old_set,
         g_assert_not_reached();
     }
 }
+#endif
 
 typedef struct PageFlagsNode {
     struct rcu_head rcu;
