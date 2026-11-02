@@ -30,6 +30,7 @@
 #include "accel/tcg/probe.h"
 #include "user/cpu_loop.h"
 #include "user/guest-host.h"
+#include "user/host-mman.h"
 #include "qemu/main-loop.h"
 #include "user/page-protection.h"
 #include "exec/page-protection.h"
