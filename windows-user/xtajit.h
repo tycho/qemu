@@ -198,6 +198,10 @@ void xt_park_if_terminating(XtThread *t);
 int xt_reap(void);
 void xt_log_native(EXCEPTION_RECORD *er, CONTEXT *ctx);
 
+/* runtime.c: the guest's protection of pages QEMU write-protected */
+ULONG xt_guest_prot(uintptr_t page);
+void xt_guest_prot_forget(uintptr_t start, uintptr_t last);
+
 /* The frozen runtime's allocator (rpmalloc). */
 void *rpaligned_alloc(size_t align, size_t size);
 void rpfree(void *p);
