@@ -123,6 +123,7 @@ typedef struct XtExit {
     int trapnr;
     uint32_t nr;            /* system call number */
     uint32_t args;          /* guest address of the arguments */
+    int vector;             /* a software interrupt's, else -1 */
     EXCEPTION_RECORD rec;
 } XtExit;
 
@@ -220,6 +221,9 @@ bool xt_fault_redirect(EXCEPTION_RECORD *er, CONTEXT *ctx);
 uint32_t xt_fault_count(void);
 
 /* Status codes winnt.h leaves to ntstatus.h. */
+#ifndef STATUS_WX86_SINGLE_STEP
+#define STATUS_WX86_SINGLE_STEP ((NTSTATUS)0x4000001E)
+#endif
 #ifndef STATUS_SUCCESS
 #define STATUS_SUCCESS ((NTSTATUS)0)
 #endif

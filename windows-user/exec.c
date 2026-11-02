@@ -226,6 +226,14 @@ static NTSTATUS x87_status(CPUX86State *env)
  * The exception record of a guest exception, and its continuation EIP,
  * as 32-bit Windows reports each.  Delivery clears TF, as the processor
  * does entering the handler.
+ *
+ * A software interrupt (int3, into, int n, also through a kernel gate,
+ * which #GPs) is wow64.dll's to describe: Wow64RaiseException(vector)
+ * builds the record from its table and the published context, EIP past
+ * the instruction, as Windows' own x86 emulator has it.  Its breakpoint
+ * is STATUS_WX86_BREAKPOINT, a debugger's x86 event.  A single step
+ * (TF, icebp) is STATUS_WX86_SINGLE_STEP for the same reason; wow64.dll
+ * hands the guest STATUS_BREAKPOINT and STATUS_SINGLE_STEP.
  */
 static void guest_exception(XtThread *t, int trapnr, XtExit *x)
 {
@@ -235,6 +243,7 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
     memset(r, 0, sizeof(*r));
     x->kind = XT_EXIT_EXCEPTION;
     x->trapnr = trapnr;
+    x->vector = -1;
     /* User mode's #DB leaves DR6 alone: a trap with TF set is a step. */
     if (trapnr == EXCP01_DB && (env->eflags & TF_MASK)) {
         env->dr[6] |= DR6_BS;
@@ -256,58 +265,29 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
         r->ExceptionCode = STATUS_DATATYPE_MISALIGNMENT;
         break;
     case EXCP03_INT3:
-        /* EIP is past the int3; wow64 adjusts the dispatched context. */
-        r->ExceptionCode = STATUS_BREAKPOINT;
-        r->ExceptionAddress = (void *)(uintptr_t)(uint32_t)(env->eip - 1);
-        r->NumberParameters = 1;
+    case EXCP04_INTO:
+    case 0x29:
+    case 0x2c:
+    case 0x2d:
+    case 0x2e:
+        /* EIP is past the instruction. */
+        x->vector = trapnr;
+        r->ExceptionCode = trapnr;
         break;
     case EXCP01_DB:
     case EXCP_DEBUG:
-        r->ExceptionCode = STATUS_SINGLE_STEP;
+        r->ExceptionCode = STATUS_WX86_SINGLE_STEP;
         break;
     case EXCP00_DIVZ:
         r->ExceptionCode = div_overflowed(t, env)
                            ? STATUS_INTEGER_OVERFLOW
                            : STATUS_INTEGER_DIVIDE_BY_ZERO;
         break;
-    case EXCP04_INTO:
-        r->ExceptionCode = STATUS_INTEGER_OVERFLOW;
-        break;
     case EXCP05_BOUND:
         r->ExceptionCode = STATUS_ARRAY_BOUNDS_EXCEEDED;
         break;
     case EXCP06_ILLOP:
         r->ExceptionCode = STATUS_ILLEGAL_INSTRUCTION;
-        break;
-    case 0x29:
-        /* __fastfail: not continuable; the code is in ECX. */
-        env->eip -= 2;
-        r->ExceptionAddress = (void *)(uintptr_t)env->eip;
-        r->ExceptionCode = STATUS_STACK_BUFFER_OVERRUN;
-        r->ExceptionFlags = EXCEPTION_NONCONTINUABLE;
-        r->NumberParameters = 1;
-        r->ExceptionInformation[0] = env->regs[R_ECX];
-        break;
-    case 0x2c:
-        env->eip -= 2;
-        r->ExceptionAddress = (void *)(uintptr_t)env->eip;
-        r->ExceptionCode = STATUS_ASSERTION_FAILURE;
-        break;
-    case 0x2d:
-        /* The debug service skips the byte after int 0x2d. */
-        env->eip += 1;
-        r->ExceptionAddress = (void *)(uintptr_t)env->eip;
-        r->ExceptionCode = STATUS_BREAKPOINT;
-        r->NumberParameters = 1;
-        r->ExceptionInformation[0] = env->regs[R_EAX];
-        break;
-    case 0x2e:
-        /* The system-call gate outside the stub: as a gate that #GPs. */
-        env->eip -= 2;
-        r->ExceptionAddress = (void *)(uintptr_t)env->eip;
-        r->ExceptionCode = STATUS_ACCESS_VIOLATION;
-        r->NumberParameters = 2;
-        r->ExceptionInformation[1] = 0xffffffff;
         break;
     case EXCP0B_NOSEG:
     case EXCP0C_STACK:
@@ -317,12 +297,17 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
         break;
     case EXCP0D_GPF:
         /*
-         * A selector or gate in the error code (segment loads, far
-         * transfers, int n through a kernel gate), or #GP(0) of anything
+         * A selector in the error code (segment loads, far transfers),
+         * or #GP(0) of anything
          * but a privileged instruction (misaligned SSE operands, for
          * instance): an access violation at an unknown address.
          */
-        if (env->error_code == 0 && insn_privileged(t, env)) {
+        if ((env->error_code & 7) == 2) {
+            /* int n through a kernel gate: past the instruction. */
+            x->vector = env->error_code >> 3;
+            env->eip += 2;
+            r->ExceptionCode = x->vector;
+        } else if (env->error_code == 0 && insn_privileged(t, env)) {
             r->ExceptionCode = STATUS_PRIVILEGED_INSTRUCTION;
         } else {
             r->ExceptionCode = STATUS_ACCESS_VIOLATION;

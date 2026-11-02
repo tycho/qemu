@@ -23,7 +23,6 @@
 
 NTSTATUS NTAPI RtlWow64GetCurrentCpuArea(USHORT *, void **, void **);
 NTSTATUS NTAPI NtContinue(PCONTEXT, BOOLEAN);
-NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
 NTSTATUS NTAPI NtSuspendThread(HANDLE, PULONG);
 NTSTATUS NTAPI NtOpenThread(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
                             PCLIENT_ID);
@@ -430,11 +429,15 @@ XTEXPORT void WINAPI BTCpuSimulate(void)
                      (uintptr_t)x.rec.ExceptionAddress |
                      (uint64_t)x.rec.ExceptionInformation[1] << 32);
             xt_log_flush(t);
-            if (x.rec.ExceptionFlags & EXCEPTION_NONCONTINUABLE) {
-                NtTerminateProcess(GetCurrentProcess(), x.rec.ExceptionCode);
+            /*
+             * Points the context at the guest's KiUserExceptionDispatcher;
+             * for a software interrupt wow64.dll makes the record.
+             */
+            if (x.vector >= 0) {
+                p_Wow64RaiseException(x.vector, NULL);
+            } else {
+                p_Wow64RaiseException(-1, &x.rec);
             }
-            /* Points the context at the guest's KiUserExceptionDispatcher. */
-            p_Wow64RaiseException(-1, &x.rec);
             c = cpu_area_context();
             xt_acquire(t, c);
             break;
