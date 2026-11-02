@@ -33,6 +33,7 @@
 #include "exec/cpu-interrupt.h"
 #include "exec/page-protection.h"
 #include "exec/mmap-lock.h"
+#include "user/host-mman.h"
 #include "exec/translation-block.h"
 #include "exec/cputlb.h"
 #include "tcg/tcg.h"
