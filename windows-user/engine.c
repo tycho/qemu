@@ -366,6 +366,19 @@ CPUState *xt_cpu_new(void)
     return cs;
 }
 
+/*
+ * A CPU leaves the CPU list and is freed.  QOM isn't thread-safe: this and
+ * creation both change the CPUs' container, so they're serialized, as
+ * linux-user's clone_lock does.  The caller has an RCU reader.
+ */
+void xt_cpu_free(CPUState *cs)
+{
+    qemu_mutex_lock(&cpu_create_mutex);
+    object_unparent(OBJECT(cs));
+    object_unref(OBJECT(cs));
+    qemu_mutex_unlock(&cpu_create_mutex);
+}
+
 /* Drop translations of [start, start + len), as for a host write. */
 void xt_invalidate(vaddr start, vaddr len)
 {

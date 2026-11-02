@@ -28,6 +28,11 @@ NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
                                            SIZE_T, PSIZE_T);
 NTSTATUS NTAPI NtDelayExecution(BOOLEAN, PLARGE_INTEGER);
 NTSTATUS NTAPI NtYieldExecution(void);
+NTSTATUS NTAPI NtOpenThread(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+                            PCLIENT_ID);
+NTSTATUS NTAPI NtFreeVirtualMemory(HANDLE, PVOID *, PSIZE_T, ULONG);
+NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, PVOID, int, PVOID, SIZE_T,
+                                    PSIZE_T);
 
 __thread XtThread *xt_self;
 uint32_t xt_inject_point;
@@ -103,6 +108,9 @@ bool xt_tls_ready(void)
  * WOW64 thread's native TEB, a thread started without loader
  * initialization).  Where the loader did it (a native process), nothing.
  */
+/* This thread's TLS allocation, where xt_tls_attach made it. */
+static __thread void *tls_mine;
+
 void xt_tls_attach(void)
 {
     void ***slot = (void ***)((char *)NtCurrentTeb() + TEB_TLS_POINTER);
@@ -124,6 +132,20 @@ void xt_tls_attach(void)
         ((void **)p)[_tls_index] = p + QEMU_ALIGN_UP(arr, 64);
         *slot = (void **)p;
     }
+    tls_mine = p;
+}
+
+/* The TLS allocation xt_tls_attach made for the thread of TEB, if any. */
+static void *tls_alloc_of(void *teb)
+{
+    void **tlsp = *(void ***)((char *)teb + TEB_TLS_POINTER);
+    void **own = *(void ***)((char *)NtCurrentTeb() + TEB_TLS_POINTER);
+    ptrdiff_t off = (char *)&tls_mine - (char *)own[_tls_index];
+
+    if (!tlsp || !tlsp[_tls_index]) {
+        return NULL;
+    }
+    return *(void **)((char *)tlsp[_tls_index] + off);
 }
 
 /* WOW64's TLS slots, in the 64-bit TEB's TlsSlots (TEB + 0x1480). */
@@ -227,28 +249,203 @@ XtThread *xt_thread_new(bool wow64)
 }
 
 /*
- * A thread's own exit: its CPU leaves the CPU list and is freed, as
- * linux-user's exit does, with an RCU reader for the duration (the thread
- * is in Windows' hands, so it has none otherwise).  The record goes too;
- * another thread suspending this one concurrently is not handled yet.
+ * Records found through a TEB by another thread (BTCpuSuspendLocalThread,
+ * which runs on a thread of Windows' own, without a TLS block) are used
+ * between xt_record_hold and xt_record_release.  A record is unlinked
+ * from its TEB first, and freed only once no user is left: a user that
+ * found it before the unlink is still counted.
  */
-void xt_thread_free(XtThread *t)
+static int record_users;
+
+void xt_record_hold(void)
+{
+    qatomic_inc(&record_users);
+    /* The count before the record's look-up (pairs with the unlink). */
+    smp_mb();
+}
+
+void xt_record_release(void)
+{
+    /* The record's last use before the count drops. */
+    smp_mb();
+    qatomic_dec(&record_users);
+}
+
+static void wait_record_users(void)
+{
+    /* The unlink before the count is read (pairs with the hold). */
+    smp_mb();
+    while (qatomic_read(&record_users)) {
+        NtYieldExecution();
+    }
+}
+
+static void unlink_record(XtThread *t)
+{
+    if (t->wow64) {
+        qatomic_set(&tls_slots(t->teb)[XT_TLS_THREAD], NULL);
+    }
+}
+
+/*
+ * The CPU leaves the CPU list and is freed (xt_cpu_free), as in
+ * linux-user's exit, with an RCU reader of the calling thread's for the
+ * duration (a thread Windows owns has none).  The thread T belonged to no
+ * longer runs it.
+ */
+static void free_record(XtThread *t)
 {
     CPUState *cs = t->cpu;
 
-    xt_event(t, XT_EV_THREAD_TERM, 0, 0);
     xt_log_flush(t);
-    if (t->wow64) {
-        tls_slots(t->teb)[XT_TLS_THREAD] = NULL;
-    }
     rcu_register_thread();
-    object_unparent(OBJECT(cs));
-    object_unref(OBJECT(cs));
+    xt_cpu_free(cs);
     rcu_unregister_thread();
+    g_free(t);
+}
+
+/*
+ * What threads leave behind for after they have ended: a TLS block, and
+ * for a thread another one terminated, its record.  A thread runs on after
+ * its own BTCpuThreadTerm (into ntdll's exit, which may call back here),
+ * and a termination can fail after BTCpuThreadTerm, so each is freed only
+ * once Windows reports the thread ended (its handle signalled), by the
+ * next thread to start or end.
+ */
+typedef struct XtReap {
+    HANDLE thread;
+    void *tls;
+    XtThread *t;
+    struct XtReap *next;
+} XtReap;
+
+static XtReap *reap_list;
+static int reap_lock;
+
+static void reap_add(HANDLE thread, void *tls, XtThread *t)
+{
+    XtReap *r = g_new0(XtReap, 1);
+
+    r->thread = thread;
+    r->tls = tls;
+    r->t = t;
+    while (qatomic_xchg(&reap_lock, 1)) {
+        NtYieldExecution();
+    }
+    r->next = reap_list;
+    reap_list = r;
+    qatomic_store_release(&reap_lock, 0);
+}
+
+int xt_reap(void)
+{
+    LARGE_INTEGER zero = { .QuadPart = 0 };
+    XtReap **pp, *dead = NULL, *r;
+    int n = 0, nrec = 0;
+
+    if (!qatomic_read(&reap_list)) {
+        return 0;
+    }
+    while (qatomic_xchg(&reap_lock, 1)) {
+        NtYieldExecution();
+    }
+    for (pp = &reap_list; (r = *pp);) {
+        if (NtWaitForSingleObject(r->thread, FALSE, &zero) == STATUS_SUCCESS) {
+            *pp = r->next;
+            r->next = dead;
+            dead = r;
+        } else {
+            pp = &r->next;
+        }
+    }
+    qatomic_store_release(&reap_lock, 0);
+    if (dead) {
+        wait_record_users();
+    }
+    while ((r = dead)) {
+        dead = r->next;
+        if (r->t) {
+            free_record(r->t);
+            nrec++;
+        }
+        if (r->tls) {
+            SIZE_T size = 0;
+            void *base = r->tls;
+
+            NtFreeVirtualMemory(GetCurrentProcess(), &base, &size,
+                                MEM_RELEASE);
+        }
+        NtClose(r->thread);
+        g_free(r);
+        n++;
+    }
+    if (n) {
+        xt_gevent(XT_EV_REAP, nrec, n);
+    }
+    return n;
+}
+
+static HANDLE open_thread(DWORD tid)
+{
+    OBJECT_ATTRIBUTES oa = { .Length = sizeof(oa) };
+    CLIENT_ID cid = { .UniqueThread = (HANDLE)(uintptr_t)tid };
+    HANDLE h = NULL;
+
+    if (NtOpenThread(&h, SYNCHRONIZE | THREAD_SUSPEND_RESUME |
+                     THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                     &oa, &cid) < 0) {
+        return NULL;
+    }
+    return h;
+}
+
+/*
+ * A thread's own exit: the record and CPU go now, the TLS block once the
+ * thread has ended.  A suspension that found the record first finishes
+ * before it is freed.
+ */
+void xt_thread_free(XtThread *t)
+{
+    HANDLE self = open_thread(t->tid);
+
+    xt_event(t, XT_EV_THREAD_TERM, 0, 0);
+    unlink_record(t);
+    wait_record_users();
     if (xt_self == t) {
         xt_self = NULL;
     }
-    g_free(t);
+    free_record(t);
+    if (self) {
+        reap_add(self, tls_mine, NULL);
+    }
+}
+
+/*
+ * Another thread's termination, before Windows terminates it: the thread
+ * is suspended already, in Windows' hands and holding nothing of the
+ * engine's (terminate_other).  Its record is
+ * unlinked, so later suspensions find none, and freed with its TLS block
+ * once the thread has ended.  If the termination fails, the thread stays
+ * suspended and the record stays.
+ */
+/*
+ * A thread another one is terminating stops here, where it holds nothing
+ * of the engine's and slot 2 bit 0 is clear, until Windows ends it.
+ */
+void xt_park_if_terminating(XtThread *t)
+{
+    LARGE_INTEGER tick = { .QuadPart = -100000 };
+
+    while (t && qatomic_read(&t->terminating)) {
+        NtDelayExecution(FALSE, &tick);
+    }
+}
+
+void xt_thread_retire(XtThread *t, void *thread_handle)
+{
+    xt_event(t, XT_EV_THREAD_TERM, 1, 0);
+    unlink_record(t);
+    reap_add(thread_handle, tls_alloc_of(t->teb), t);
 }
 
 /*
@@ -503,6 +700,7 @@ void xt_inject(XtThread *t, int point)
  */
 void xt_acquire(XtThread *t, const WOW64_CONTEXT *c)
 {
+    xt_park_if_terminating(t);
     xt_check(t, XT_WINDOWS, 1);
     t->state = XT_ACQUIRING;
     xt_set_slot2(t, true);
@@ -624,6 +822,7 @@ static const char *const ev_names[XT_EV__MAX] = {
     [XT_EV_PLACE] = "place",
     [XT_EV_MEMNOTE] = "memnote",
     [XT_EV_REFRESH] = "refresh",
+    [XT_EV_REAP] = "reap",
 };
 
 static void put(HANDLE h, const char *s, int n)
@@ -692,6 +891,43 @@ void xt_log_flush(XtThread *t)
                                          t->ring_pos - XT_RING : 0),
                t->ring_pos, who);
     t->logged = t->ring_pos;
+}
+
+/*
+ * With XTAJIT_LOG, a native exception that isn't the engine's, written at
+ * once (dispatch may end the process): its code, address, and the pc and
+ * lr as offsets into the allocations (modules) holding them.  Diagnostic
+ * only: it formats in the exception path.
+ */
+void xt_log_native(EXCEPTION_RECORD *er, CONTEXT *ctx)
+{
+    MEMORY_BASIC_INFORMATION pm, lm;
+    char line[200];
+    int n;
+
+    if (!log_handle) {
+        return;
+    }
+    if (NtQueryVirtualMemory(GetCurrentProcess(), (void *)ctx->Pc, 0, &pm,
+                             sizeof(pm), NULL) < 0) {
+        pm.AllocationBase = NULL;
+    }
+    if (NtQueryVirtualMemory(GetCurrentProcess(), (void *)ctx->Lr, 0, &lm,
+                             sizeof(lm), NULL) < 0) {
+        lm.AllocationBase = NULL;
+    }
+    n = snprintf(line, sizeof(line),
+                 "native t%lu code %08lx addr %llx info %llx %llx "
+                 "pc %llx (%p+%llx) lr %llx (%p+%llx) sp %llx\n",
+                 GetCurrentThreadId(), er->ExceptionCode,
+                 (unsigned long long)(uintptr_t)er->ExceptionAddress,
+                 (unsigned long long)er->ExceptionInformation[0],
+                 (unsigned long long)er->ExceptionInformation[1],
+                 ctx->Pc, pm.AllocationBase,
+                 ctx->Pc - (uintptr_t)pm.AllocationBase, ctx->Lr,
+                 lm.AllocationBase, ctx->Lr - (uintptr_t)lm.AllocationBase,
+                 ctx->Sp);
+    put(log_handle, line, n);
 }
 
 void xt_dump(XtThread *t, void *handle)
