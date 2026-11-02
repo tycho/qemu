@@ -25,6 +25,12 @@ NTSTATUS NTAPI RtlWow64GetCurrentCpuArea(USHORT *, void **, void **);
 NTSTATUS NTAPI NtContinue(PCONTEXT, BOOLEAN);
 NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
 NTSTATUS NTAPI NtSuspendThread(HANDLE, PULONG);
+NTSTATUS NTAPI NtOpenThread(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+                            PCLIENT_ID);
+NTSTATUS NTAPI NtGetContextThread(HANDLE, PCONTEXT);
+NTSTATUS NTAPI NtResumeThread(HANDLE, PULONG);
+NTSTATUS NTAPI NtDelayExecution(BOOLEAN, PLARGE_INTEGER);
+NTSTATUS NTAPI NtYieldExecution(void);
 NTSTATUS NTAPI NtAllocateVirtualMemory(HANDLE, PVOID *, ULONG_PTR, PSIZE_T,
                                        ULONG, ULONG);
 NTSTATUS NTAPI NtProtectVirtualMemory(HANDLE, PVOID *, PSIZE_T, ULONG,
@@ -57,7 +63,53 @@ static WOW64_CONTEXT *cpu_area_context(void)
 
 static XtThread *thread_of_teb(void *teb)
 {
-    return ((XtThread **)((char *)teb + TEB_TLS_SLOTS))[16];
+    return qatomic_read(&((XtThread **)((char *)teb + TEB_TLS_SLOTS))[16]);
+}
+
+/*
+ * An adapter entry on a WOW64 thread that Windows owns, which takes the
+ * engine's locks (the mmap lock, the CPU list): slot 2 bit 0 is set for its
+ * duration, so that a suspension, and a termination, which suspends first,
+ * takes the cooperative path and waits for the notification at the end
+ * instead of stopping the thread inside a lock.  Wow64NotifyUnsimulateComplete
+ * holds the thread there if a suspension is waiting, and does nothing
+ * otherwise.  WOW64 says it is the thread of a CPU area: a thread before its
+ * record exists (BTCpuThreadInit) or after (its own BTCpuThreadTerm) too.
+ */
+static uint64_t *own_slot2(void)
+{
+    USHORT machine;
+    void *area = NULL;
+
+    if (!p_Wow64NotifyUnsimulateComplete ||
+        RtlWow64GetCurrentCpuArea(&machine, &area, NULL) < 0 || !area) {
+        return NULL;
+    }
+    return (uint64_t *)((char *)NtCurrentTeb() + TEB_TLS_SLOTS + 2 * 8);
+}
+
+static bool adapter_begin(void)
+{
+    uint64_t *f = own_slot2();
+
+    if (!f || (qatomic_read(f) & 1)) {
+        return false;
+    }
+    qatomic_or(f, 1);
+    /* Bit 0 before the scope's first lock: a suspender sees it set. */
+    smp_mb();
+    return true;
+}
+
+static void adapter_end(bool began)
+{
+    if (began) {
+        qatomic_and(own_slot2(), ~(uint64_t)1);
+        /* Bit 0 clear before the notification looks for a suspender. */
+        smp_mb();
+        p_Wow64NotifyUnsimulateComplete();
+        xt_park_if_terminating(xt_tls_ready() ? xt_self : NULL);
+    }
 }
 
 /* Settings: the scaffold, then XTAJIT_SETTINGS, which may override it. */
@@ -175,35 +227,139 @@ XTEXPORT void WINAPI BTCpuProcessTerm(HANDLE h, BOOL after, ULONG status)
 
 XTEXPORT NTSTATUS WINAPI BTCpuThreadInit(void)
 {
+    bool began;
+
     xt_tls_attach();
+    began = adapter_begin();
+    xt_reap();
     xt_thread_new(true);
+    adapter_end(began);
     return STATUS_SUCCESS;
 }
 
-static DWORD thread_id(HANDLE thread)
+static DWORD thread_id(HANDLE thread, void **teb)
 {
     XtThreadBasicInfo tbi;
 
     /* wow64.dll names the calling thread with a null handle. */
     if (!thread || thread == GetCurrentThread()) {
+        *teb = NtCurrentTeb();
         return GetCurrentThreadId();
     }
     if (NtQueryInformationThread(thread, 0, &tbi, sizeof(tbi), NULL) < 0) {
         return 0;
     }
+    *teb = tbi.TebBaseAddress;
     return (DWORD)(uintptr_t)tbi.ClientId.UniqueThread;
 }
 
+/*
+ * Another thread is about to be terminated (NtTerminateThread follows).
+ * It must first stop where neither the engine nor wow64.dll has anything
+ * of its: in Windows' hands, outside an adapter entry and outside
+ * wow64.dll's own critical regions.  These are what Windows' cooperative
+ * suspension tests: slot 2 bits 0 (this module's: guest code, adapter
+ * entries) and 1 (wow64.dll's, while it initializes a thread), and slot 6
+ * (wow64.dll's, around its cross-process work list and its lock).  It
+ * is told to stop there (terminating: it parks at its next acquire, or
+ * at the end of the adapter entry it is in; an exit request gets it out
+ * of guest code), then suspended until it is found so.  The
+ * suspension is kept: if the termination succeeds the thread never runs
+ * again.  Windows' cooperative suspension isn't used: another thread's
+ * suspension of the same target would be in its way.  The record is read
+ * only while the target is suspended, so its own exit, which waits for
+ * the record's users, can't be waiting on this.
+ */
+static void terminate_other(DWORD tid, void *teb)
+{
+    OBJECT_ATTRIBUTES oa = { .Length = sizeof(oa) };
+    CLIENT_ID cid = { .UniqueThread = (HANDLE)(uintptr_t)tid };
+    CONTEXT ctx = { .ContextFlags = CONTEXT_CONTROL };
+    LARGE_INTEGER tick = { .QuadPart = -10000 };
+    uint64_t *slot2 = (uint64_t *)((char *)teb + TEB_TLS_SLOTS + 2 * 8);
+    uint64_t *slot6 = (uint64_t *)((char *)teb + TEB_TLS_SLOTS + 6 * 8);
+    HANDLE h;
+    XtThread *t;
+    int tries;
+
+    if (!thread_of_teb(teb)) {
+        /* Not ours, or a second notification for the same thread. */
+        xt_gevent(XT_EV_THREAD_TERM, tid, 0);
+        return;
+    }
+    if (NtOpenThread(&h, SYNCHRONIZE | THREAD_SUSPEND_RESUME |
+                     THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                     &oa, &cid) < 0) {
+        xt_gevent(XT_EV_THREAD_TERM, tid, 1);
+        return;
+    }
+    for (tries = 0;; tries++) {
+        if (NtSuspendThread(h, NULL) < 0) {
+            break;
+        }
+        /* The suspension takes effect by the time the context is read. */
+        NtGetContextThread(h, &ctx);
+        t = thread_of_teb(teb);
+        if (!t) {
+            /* Its own exit has begun: let it finish. */
+            NtResumeThread(h, NULL);
+            break;
+        }
+        if (t->state == XT_WINDOWS && !(qatomic_read(slot2) & 3) &&
+            !qatomic_read(slot6)) {
+            /* A scope: the reaper's lock, if this thread is terminated too. */
+            bool began = adapter_begin();
+
+            qatomic_set(&t->terminating, 1);
+            xt_gevent(XT_EV_THREAD_TERM, tid, 2 | tries << 8);
+            xt_thread_retire(t, h);
+            adapter_end(began);
+            return;
+        }
+        qatomic_set(&t->terminating, 1);
+        qatomic_set(&t->suspend_req, 1);
+        cpu_exit(t->cpu);
+        NtResumeThread(h, NULL);
+        /* A sleep lasts a timer tick (15.6 ms): yield first. */
+        if (tries < 64) {
+            NtYieldExecution();
+        } else {
+            NtDelayExecution(FALSE, &tick);
+        }
+    }
+    xt_gevent(XT_EV_THREAD_TERM, tid, 3);
+    NtClose(h);
+}
+
+/*
+ * The suspension of another thread is outside an adapter scope: two
+ * threads terminating each other would otherwise each wait for the
+ * other's notification.
+ */
 XTEXPORT void WINAPI BTCpuThreadTerm(HANDLE thread, LONG code)
 {
-    DWORD tid = thread_id(thread);
+    void *teb = NULL;
+    DWORD tid = thread_id(thread, &teb);
     XtThread *t = xt_tls_ready() ? xt_self : NULL;
+    bool began;
 
-    /* Remote termination is not handled yet: the record stays. */
+    xt_enter();
+    began = adapter_begin();
+    xt_reap();
     if (t && tid == t->tid) {
         xt_thread_free(t);
-    } else {
-        xt_gevent(XT_EV_THREAD_TERM, tid, code);
+    }
+    adapter_end(began);
+    /*
+     * The thread's allocator heap goes back for the next thread to take,
+     * as FEX does; allocations after this one (ntdll's exit may notify)
+     * start a new one.
+     */
+    if (t && tid == t->tid) {
+        _ZN3FEX7Windows15DeinitCRTThreadEv();
+    }
+    if (tid && tid != GetCurrentThreadId()) {
+        terminate_other(tid, teb);
     }
 }
 
@@ -289,12 +445,14 @@ XTEXPORT void WINAPI BTCpuSimulate(void)
 /*
  * Another thread suspends THREAD, which runs guest code (slot 2 bit 0
  * set): wow64.dll has suspended it already, and resumes it after this
- * returns, then waits for its Wow64NotifyUnsimulateComplete.  Ask it to
- * leave the engine at its next TB boundary: an exit request, release
- * stores only.
+ * returns, then waits for its Wow64NotifyUnsimulateComplete.  With
+ * REQUEST set (wow64.dll passes 1; Windows' own module acts only then),
+ * ask it to leave the engine at its next TB boundary: an exit request,
+ * release stores only.  A thread in an adapter entry (adapter_begin)
+ * notifies at its end without being asked.
  */
 XTEXPORT NTSTATUS WINAPI BTCpuSuspendLocalThread(HANDLE thread, void *info,
-                                                 void *unk1, ULONG unk2)
+                                                 void *unk1, ULONG request)
 {
     XtThreadBasicInfo tbi;
     XtThread *t;
@@ -307,13 +465,20 @@ XTEXPORT NTSTATUS WINAPI BTCpuSuspendLocalThread(HANDLE thread, void *info,
                                  sizeof(tbi), NULL) < 0) {
         return STATUS_SUCCESS;
     }
+    /*
+     * The target is suspended, so its record can't be freed under us by
+     * its own exit; a terminated thread's is freed by another, which
+     * waits for this use to end.
+     */
+    xt_record_hold();
     t = thread_of_teb(tbi.TebBaseAddress);
-    if (t) {
+    if (t && request) {
         qatomic_set(&t->suspend_req, 1);
         cpu_exit(t->cpu);
     }
     xt_gevent(XT_EV_SUSPEND_SEEN, (uintptr_t)tbi.ClientId.UniqueThread,
               t ? t->state : -1);
+    xt_record_release();
     return STATUS_SUCCESS;
 }
 
@@ -329,61 +494,8 @@ XTEXPORT NTSTATUS WINAPI BTCpuResetToConsistentState(EXCEPTION_POINTERS *p)
         xt_fault_redirect(p->ExceptionRecord, p->ContextRecord)) {
         NtContinue(p->ContextRecord, FALSE);
     }
+    xt_log_native(p->ExceptionRecord, p->ContextRecord);
     return STATUS_SUCCESS;
-}
-
-/*
- * Memory notifications.  After a successful change Windows' protection is
- * what the guest asked for, so QEMU's page flags for the range are dropped
- * (with the translations of executable pages) and refilled from Windows
- * when next probed (xt_mem_refresh).
- */
-static void forget(int kind, ULONG prot, vaddr start, vaddr len)
-{
-    vaddr last;
-
-    if (xt_tls_ready() && xt_self) {
-        xt_event(xt_self, XT_EV_MEMNOTE, (uint64_t)kind << 56 |
-                 (uint64_t)(prot & 0xffffff) << 32 | (len & 0xffffffff),
-                 start);
-    }
-    if (!len || start > guest_addr_max) {
-        return;
-    }
-    last = MIN(start + len - 1, (vaddr)guest_addr_max);
-    mmap_lock();
-    page_set_flags(start & TARGET_PAGE_MASK, last | ~TARGET_PAGE_MASK, 0,
-                   PAGE_VALID);
-    mmap_unlock();
-}
-
-XTEXPORT void WINAPI BTCpuFlushInstructionCache2(const void *addr, SIZE_T len)
-{
-    xt_enter();
-    xt_invalidate((uintptr_t)addr, len);
-}
-
-XTEXPORT void WINAPI BTCpuFlushInstructionCacheHeavy(const void *addr,
-                                                     SIZE_T len)
-{
-    xt_enter();
-    xt_invalidate((uintptr_t)addr, len);
-}
-
-XTEXPORT void WINAPI BTCpuNotifyMemoryDirty(void *addr, SIZE_T len)
-{
-    xt_enter();
-    xt_invalidate((uintptr_t)addr, len);
-}
-
-XTEXPORT void WINAPI BTCpuNotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type,
-                                            ULONG prot, BOOL after,
-                                            ULONG status)
-{
-    xt_enter();
-    if (after && !status && !(type & (MEM_RESET | MEM_RESET_UNDO))) {
-        forget(1, prot, (uintptr_t)addr, len);
-    }
 }
 
 typedef struct Unprotect {
@@ -405,6 +517,107 @@ static int find_protected(void *opaque, vaddr start, vaddr end, int flags)
 }
 
 /*
+ * Memory notifications.  QEMU's page flags for the range are dropped
+ * (with the translations of executable pages) and refilled from Windows
+ * when next probed (xt_mem_refresh):
+ * - after a change that keeps the range the caller's (an allocation, a
+ *   protection change, a view mapped): Windows' protection is then what
+ *   the caller asked for, except on pages QEMU write-protected since for
+ *   their new translations.  Those keep their flags: dropping them would
+ *   lose that the protection is QEMU's, and the next write would be the
+ *   guest's fault;
+ * - before a free or an unmap, while the range is still the caller's:
+ *   after it, another thread may have it already.
+ */
+static bool protected_since(vaddr page, ULONG prot)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+
+    return NtQueryVirtualMemory(GetCurrentProcess(), (void *)(uintptr_t)page,
+                                0, &mbi, sizeof(mbi), NULL) >= 0 &&
+           (mbi.Protect & 0xff) != (prot & 0xff);
+}
+
+static void forget(int kind, ULONG prot, vaddr start, vaddr len)
+{
+    vaddr from, last;
+    bool began, keep = kind == 1 || kind == 2 || kind == 4;
+
+    if (xt_tls_ready() && xt_self) {
+        xt_event(xt_self, XT_EV_MEMNOTE, (uint64_t)kind << 56 |
+                 (uint64_t)(prot & 0xffffff) << 32 | (len & 0xffffffff),
+                 start);
+    }
+    if (!len || start > guest_addr_max) {
+        return;
+    }
+    from = start & TARGET_PAGE_MASK;
+    last = MIN(start + len - 1, (vaddr)guest_addr_max) | ~TARGET_PAGE_MASK;
+    began = adapter_begin();
+    mmap_lock();
+    while (keep && from <= last) {
+        Unprotect u = { from, last };
+        vaddr page;
+
+        if (!walk_memory_regions(&u, find_protected)) {
+            break;
+        }
+        page = u.found & TARGET_PAGE_MASK;
+        if (protected_since(page, prot)) {
+            if (page > from) {
+                page_set_flags(from, page - 1, 0, PAGE_VALID);
+            }
+        } else {
+            page_set_flags(from, page | ~TARGET_PAGE_MASK, 0, PAGE_VALID);
+        }
+        from = page + TARGET_PAGE_SIZE;
+    }
+    if (from <= last) {
+        page_set_flags(from, last, 0, PAGE_VALID);
+    }
+    mmap_unlock();
+    adapter_end(began);
+}
+
+/* Translations of [start, start + len) go, as for a host write. */
+static void invalidate(vaddr start, vaddr len)
+{
+    bool began = adapter_begin();
+
+    xt_invalidate(start, len);
+    adapter_end(began);
+}
+
+XTEXPORT void WINAPI BTCpuFlushInstructionCache2(const void *addr, SIZE_T len)
+{
+    xt_enter();
+    invalidate((uintptr_t)addr, len);
+}
+
+XTEXPORT void WINAPI BTCpuFlushInstructionCacheHeavy(const void *addr,
+                                                     SIZE_T len)
+{
+    xt_enter();
+    invalidate((uintptr_t)addr, len);
+}
+
+XTEXPORT void WINAPI BTCpuNotifyMemoryDirty(void *addr, SIZE_T len)
+{
+    xt_enter();
+    invalidate((uintptr_t)addr, len);
+}
+
+XTEXPORT void WINAPI BTCpuNotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type,
+                                            ULONG prot, BOOL after,
+                                            ULONG status)
+{
+    xt_enter();
+    if (after && !status && !(type & (MEM_RESET | MEM_RESET_UNDO))) {
+        forget(1, prot, (uintptr_t)addr, len);
+    }
+}
+
+/*
  * Before the guest changes a protection, pages QEMU write-protected for
  * their translations get their write permission back (page_unprotect: the
  * translations go), so that the old protection Windows reports is the
@@ -414,14 +627,18 @@ static void unprotect_range(vaddr start, vaddr len)
 {
     Unprotect u = { start, MIN(start + len - 1, (vaddr)guest_addr_max) };
 
+    bool began;
+
     if (!len || start > guest_addr_max) {
         return;
     }
+    began = adapter_begin();
     mmap_lock();
     while (walk_memory_regions(&u, find_protected)) {
         page_unprotect(NULL, u.found, 0);
     }
     mmap_unlock();
+    adapter_end(began);
 }
 
 XTEXPORT void WINAPI BTCpuNotifyMemoryProtect(void *addr, SIZE_T len,
@@ -436,14 +653,44 @@ XTEXPORT void WINAPI BTCpuNotifyMemoryProtect(void *addr, SIZE_T len,
     }
 }
 
+/* The allocation ADDR is in: its base and extent. */
+static vaddr allocation_extent(void *addr, vaddr *len)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    uintptr_t base, p;
+
+    *len = 0;
+    if (NtQueryVirtualMemory(GetCurrentProcess(), addr, 0, &mbi,
+                             sizeof(mbi), NULL) < 0) {
+        return 0;
+    }
+    base = (uintptr_t)mbi.AllocationBase;
+    for (p = base;; p += mbi.RegionSize) {
+        if (NtQueryVirtualMemory(GetCurrentProcess(), (void *)p, 0, &mbi,
+                                 sizeof(mbi), NULL) < 0 ||
+            (uintptr_t)mbi.AllocationBase != base) {
+            break;
+        }
+    }
+    *len = p - base;
+    return base;
+}
+
+/* Before: a released allocation with no size given goes whole. */
 XTEXPORT void WINAPI BTCpuNotifyMemoryFree(void *addr, SIZE_T len,
                                            ULONG type, BOOL after,
                                            ULONG status)
 {
+    vaddr start = (uintptr_t)addr, n = len;
+
     xt_enter();
-    if (after && !status) {
-        forget(3, 0, (uintptr_t)addr, len);
+    if (after) {
+        return;
     }
+    if (!n && (type & MEM_RELEASE)) {
+        start = allocation_extent(addr, &n);
+    }
+    forget(3, 0, start, n);
 }
 
 XTEXPORT NTSTATUS WINAPI BTCpuNotifyMapViewOfSection(void *unk1, void *addr,
@@ -455,33 +702,16 @@ XTEXPORT NTSTATUS WINAPI BTCpuNotifyMapViewOfSection(void *unk1, void *addr,
     return STATUS_SUCCESS;
 }
 
-/* The view's extent, found before the unmap. */
-static __thread vaddr unmap_start, unmap_len;
-
+/* Before: the whole view. */
 XTEXPORT void WINAPI BTCpuNotifyUnmapViewOfSection(void *addr, BOOL after,
                                                    ULONG status)
 {
-    xt_enter();
-    MEMORY_BASIC_INFORMATION mbi;
-    uintptr_t p;
+    vaddr start, len;
 
+    xt_enter();
     if (!after) {
-        unmap_start = unmap_len = 0;
-        if (NtQueryVirtualMemory(GetCurrentProcess(), addr, 0, &mbi,
-                                 sizeof(mbi), NULL) < 0) {
-            return;
-        }
-        unmap_start = (uintptr_t)mbi.AllocationBase;
-        for (p = unmap_start;; p += mbi.RegionSize) {
-            if (NtQueryVirtualMemory(GetCurrentProcess(), (void *)p, 0, &mbi,
-                                     sizeof(mbi), NULL) < 0 ||
-                (uintptr_t)mbi.AllocationBase != unmap_start) {
-                break;
-            }
-        }
-        unmap_len = p - unmap_start;
-    } else if (!status) {
-        forget(5, 0, unmap_start, unmap_len);
+        start = allocation_extent(addr, &len);
+        forget(5, 0, start, len);
     }
 }
 
@@ -490,7 +720,7 @@ XTEXPORT void WINAPI BTCpuNotifyReadFile(HANDLE h, void *addr, SIZE_T len,
 {
     xt_enter();
     if (after && !status) {
-        xt_invalidate((uintptr_t)addr, len);
+        invalidate((uintptr_t)addr, len);
     }
 }
 

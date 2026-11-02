@@ -69,6 +69,7 @@ typedef enum XtEv {
     XT_EV_PLACE,            /* a = what (string), b = address */
     XT_EV_MEMNOTE,          /* a = kind << 56 | prot << 32 | length, b = address */
     XT_EV_REFRESH,          /* a = old flags << 16 | new flags, b = address */
+    XT_EV_REAP,             /* a = records freed, b = TLS blocks freed */
     XT_EV__MAX,
 } XtEv;
 
@@ -137,6 +138,7 @@ typedef struct XtThread {
     bool rcu_registered;
     uint32_t activation;
     int suspend_req;        /* set by another thread (cpu_exit after) */
+    int terminating;        /* another thread is terminating this one */
     uint32_t suspensions;   /* suspension exits taken */
     bool after_suspend;     /* the last exit was a suspension */
     XtGuestFault gfault;
@@ -157,6 +159,7 @@ extern uint32_t xt_inject_point;    /* XTAJIT_INJECT: see xt_inject */
 extern CPUState *xt_spare_cpu;      /* made at init, for the first thread */
 int xt_engine_init(const char *settings, int *applied, int *rejected);
 CPUState *xt_cpu_new(void);
+void xt_cpu_free(CPUState *cs);
 extern const char *xt_cpu_model;   /* -cpu syntax; set before init */
 void *xt_alloc_low(size_t len);
 bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed);
@@ -183,10 +186,18 @@ void xt_log_flush(XtThread *t);
 void xt_log_open(void);
 void *xt_log_handle(void);
 bool xt_guest_read(XtThread *t, vaddr addr, void *buf, size_t len);
+void xt_record_hold(void);
+void xt_record_release(void);
+void xt_thread_retire(XtThread *t, void *thread_handle);
+void xt_park_if_terminating(XtThread *t);
+int xt_reap(void);
+void xt_log_native(EXCEPTION_RECORD *er, CONTEXT *ctx);
 
 /* The frozen runtime's allocator (rpmalloc). */
 void *rpaligned_alloc(size_t align, size_t size);
 void rpfree(void *p);
+/* FEX::Windows::DeinitCRTThread(): TLS callbacks, rpmalloc's thread heap. */
+void _ZN3FEX7Windows15DeinitCRTThreadEv(void);
 
 /* Points where XTAJIT_INJECT waits for a suspension request. */
 enum {
@@ -243,7 +254,7 @@ XTEXPORT void WINAPI BTCpuThreadTerm(HANDLE thread, LONG code);
 XTEXPORT void *WINAPI BTCpuGetBopCode(void);
 XTEXPORT void WINAPI BTCpuSimulate(void);
 XTEXPORT NTSTATUS WINAPI BTCpuSuspendLocalThread(HANDLE thread, void *info,
-                                        void *unk1, ULONG unk2);
+                                        void *unk1, ULONG request);
 XTEXPORT NTSTATUS WINAPI BTCpuResetToConsistentState(EXCEPTION_POINTERS *p);
 XTEXPORT void WINAPI BTCpuFlushInstructionCache2(const void *addr, SIZE_T len);
 XTEXPORT void WINAPI BTCpuFlushInstructionCacheHeavy(const void *addr, SIZE_T len);
