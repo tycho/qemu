@@ -23,9 +23,209 @@ static uint64_t read_cntvct(void)
     return v;
 }
 
+/* The bytes at ADDR, as many of up to 15 as are readable. */
+static int fetch_insn(XtThread *t, vaddr addr, uint8_t *buf)
+{
+    int n = 0;
+
+    while (n < 15 && xt_guest_read(t, addr + n, &buf[n], 1)) {
+        n++;
+    }
+    return n;
+}
+
+/* Past the legacy prefixes; the segment override in *SEG, else -1. */
+static int skip_prefixes(const uint8_t *b, int n, int *seg)
+{
+    int i;
+
+    *seg = -1;
+    for (i = 0; i < n; i++) {
+        switch (b[i]) {
+        case 0x26:
+            *seg = R_ES;
+            break;
+        case 0x2e:
+            *seg = R_CS;
+            break;
+        case 0x36:
+            *seg = R_SS;
+            break;
+        case 0x3e:
+            *seg = R_DS;
+            break;
+        case 0x64:
+            *seg = R_FS;
+            break;
+        case 0x65:
+            *seg = R_GS;
+            break;
+        case 0x66: case 0x67: case 0xf0: case 0xf2: case 0xf3:
+            break;
+        default:
+            return i;
+        }
+    }
+    return i;
+}
+
+/*
+ * Whether the instruction at EIP is one that #GP(0)s at CPL 3 for being
+ * privileged, which Windows reports as STATUS_PRIVILEGED_INSTRUCTION; any
+ * other #GP is an access violation.
+ */
+static bool insn_privileged(XtThread *t, CPUX86State *env)
+{
+    uint8_t b[15];
+    int n = fetch_insn(t, env->eip, b), seg, i = skip_prefixes(b, n, &seg);
+    int reg = i + 2 < n ? (b[i + 2] >> 3) & 7 : -1;
+
+    if (i >= n) {
+        return false;
+    }
+    switch (b[i]) {
+    case 0xf4:                          /* hlt */
+    case 0xfa: case 0xfb:               /* cli, sti */
+    case 0x6c ... 0x6f:                 /* ins, outs */
+    case 0xe4 ... 0xe7:                 /* in, out imm8 */
+    case 0xec ... 0xef:                 /* in, out dx */
+        return true;
+    case 0x0f:
+        if (i + 1 >= n) {
+            return false;
+        }
+        switch (b[i + 1]) {
+        case 0x06:                      /* clts */
+        case 0x08: case 0x09:           /* invd, wbinvd */
+        case 0x20 ... 0x23:             /* mov to/from cr, dr */
+        case 0x30: case 0x32:           /* wrmsr, rdmsr */
+        case 0x33:                      /* rdpmc */
+        case 0x35:                      /* sysexit */
+            return true;
+        case 0x00:                      /* lldt, ltr */
+            return reg == 2 || reg == 3;
+        case 0x01:                      /* lgdt, lidt, lmsw, invlpg */
+            return reg == 2 || reg == 3 || reg == 6 ||
+                   (reg == 7 && (b[i + 2] >> 6) != 3);
+        }
+        return false;
+    }
+    return false;
+}
+
+/*
+ * For #DE: whether the divide at EIP has a nonzero divisor, so that the
+ * quotient overflowed.  Windows tells the two apart this way, reporting
+ * STATUS_INTEGER_OVERFLOW for the second.  32-bit addressing only.
+ */
+static bool div_overflowed(XtThread *t, CPUX86State *env)
+{
+    uint8_t b[15];
+    int n = fetch_insn(t, env->eip, b), seg, i = skip_prefixes(b, n, &seg);
+    bool opsize16 = false, addr16 = false;
+    int size, mod, reg, rm, p;
+    uint32_t ea = 0, v = 0;
+
+    for (int k = 0; k < i; k++) {
+        opsize16 |= b[k] == 0x66;
+        addr16 |= b[k] == 0x67;
+    }
+    if (i + 1 >= n || (b[i] != 0xf6 && b[i] != 0xf7) || addr16) {
+        return false;
+    }
+    size = b[i] == 0xf6 ? 1 : opsize16 ? 2 : 4;
+    mod = b[i + 1] >> 6;
+    reg = (b[i + 1] >> 3) & 7;
+    rm = b[i + 1] & 7;
+    if (reg != 6 && reg != 7) {
+        return false;
+    }
+    if (mod == 3) {
+        v = size == 1 ? env->regs[rm & 3] >> (rm & 4 ? 8 : 0)
+                      : env->regs[rm];
+    } else {
+        p = i + 2;
+        if (rm == 4) {
+            int sib, base, index;
+
+            if (p >= n) {
+                return false;
+            }
+            sib = b[p++];
+            base = sib & 7;
+            index = (sib >> 3) & 7;
+            if (index != 4) {
+                ea += env->regs[index] << (sib >> 6);
+            }
+            if (base == 5 && mod == 0) {
+                mod = 2;            /* disp32, no base */
+            } else {
+                ea += env->regs[base];
+            }
+            if (seg < 0 && (base == R_ESP || (base == R_EBP && mod))) {
+                seg = R_SS;
+            }
+        } else if (rm == 5 && mod == 0) {
+            mod = 2;
+        } else {
+            ea += env->regs[rm];
+        }
+        if (mod == 1) {
+            if (p >= n) {
+                return false;
+            }
+            ea += (int8_t)b[p];
+        } else if (mod == 2) {
+            uint32_t d;
+
+            if (p + 4 > n) {
+                return false;
+            }
+            memcpy(&d, &b[p], 4);
+            ea += d;
+        }
+        if (seg >= 0) {
+            ea += env->segs[seg].base;
+        }
+        if (!xt_guest_read(t, ea, &v, size)) {
+            return false;
+        }
+    }
+    v &= size == 4 ? 0xffffffff : (1u << (size * 8)) - 1;
+    return v != 0;
+}
+
+/* The status of an unmasked x87 exception, as Windows picks it. */
+static NTSTATUS x87_status(CPUX86State *env)
+{
+    int pending = env->fpus & ~env->fpuc & 0x3f;
+
+    if (pending & 0x01) {
+        return env->fpus & 0x40 ? STATUS_FLOAT_STACK_CHECK
+                                : STATUS_FLOAT_INVALID_OPERATION;
+    }
+    if (pending & 0x02) {
+        return STATUS_FLOAT_DENORMAL_OPERAND;
+    }
+    if (pending & 0x04) {
+        return STATUS_FLOAT_DIVIDE_BY_ZERO;
+    }
+    if (pending & 0x08) {
+        return STATUS_FLOAT_OVERFLOW;
+    }
+    if (pending & 0x10) {
+        return STATUS_FLOAT_UNDERFLOW;
+    }
+    if (pending & 0x20) {
+        return STATUS_FLOAT_INEXACT_RESULT;
+    }
+    return STATUS_FLOAT_INVALID_OPERATION;
+}
+
 /*
  * The exception record of a guest exception, and its continuation EIP,
- * as 32-bit Windows reports each (FEX's Common/Exception.h table).
+ * as 32-bit Windows reports each.  Delivery clears TF, as the processor
+ * does entering the handler.
  */
 static void guest_exception(XtThread *t, int trapnr, XtExit *x)
 {
@@ -35,6 +235,11 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
     memset(r, 0, sizeof(*r));
     x->kind = XT_EXIT_EXCEPTION;
     x->trapnr = trapnr;
+    /* User mode's #DB leaves DR6 alone: a trap with TF set is a step. */
+    if (trapnr == EXCP01_DB && (env->eflags & TF_MASK)) {
+        env->dr[6] |= DR6_BS;
+    }
+    env->eflags &= ~TF_MASK;
     r->ExceptionAddress = (void *)(uintptr_t)env->eip;
 
     switch (trapnr) {
@@ -61,7 +266,9 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
         r->ExceptionCode = STATUS_SINGLE_STEP;
         break;
     case EXCP00_DIVZ:
-        r->ExceptionCode = STATUS_INTEGER_DIVIDE_BY_ZERO;
+        r->ExceptionCode = div_overflowed(t, env)
+                           ? STATUS_INTEGER_OVERFLOW
+                           : STATUS_INTEGER_DIVIDE_BY_ZERO;
         break;
     case EXCP04_INTO:
         r->ExceptionCode = STATUS_INTEGER_OVERFLOW;
@@ -71,12 +278,6 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
         break;
     case EXCP06_ILLOP:
         r->ExceptionCode = STATUS_ILLEGAL_INSTRUCTION;
-        break;
-    case EXCP0B_NOSEG:
-    case EXCP0C_STACK:
-        r->ExceptionCode = STATUS_ACCESS_VIOLATION;
-        r->NumberParameters = 2;
-        r->ExceptionInformation[1] = 0xffffffff;
         break;
     case 0x29:
         /* __fastfail: not continuable; the code is in ECX. */
@@ -100,11 +301,37 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
         r->NumberParameters = 1;
         r->ExceptionInformation[0] = env->regs[R_EAX];
         break;
+    case 0x2e:
+        /* The system-call gate outside the stub: as a gate that #GPs. */
+        env->eip -= 2;
+        r->ExceptionAddress = (void *)(uintptr_t)env->eip;
+        r->ExceptionCode = STATUS_ACCESS_VIOLATION;
+        r->NumberParameters = 2;
+        r->ExceptionInformation[1] = 0xffffffff;
+        break;
+    case EXCP0B_NOSEG:
+    case EXCP0C_STACK:
+        r->ExceptionCode = STATUS_ACCESS_VIOLATION;
+        r->NumberParameters = 2;
+        r->ExceptionInformation[1] = 0xffffffff;
+        break;
     case EXCP0D_GPF:
-        r->ExceptionCode = STATUS_PRIVILEGED_INSTRUCTION;
+        /*
+         * A selector or gate in the error code (segment loads, far
+         * transfers, int n through a kernel gate), or #GP(0) of anything
+         * but a privileged instruction (misaligned SSE operands, for
+         * instance): an access violation at an unknown address.
+         */
+        if (env->error_code == 0 && insn_privileged(t, env)) {
+            r->ExceptionCode = STATUS_PRIVILEGED_INSTRUCTION;
+        } else {
+            r->ExceptionCode = STATUS_ACCESS_VIOLATION;
+            r->NumberParameters = 2;
+            r->ExceptionInformation[1] = 0xffffffff;
+        }
         break;
     case EXCP10_COPR:
-        r->ExceptionCode = STATUS_FLOAT_INVALID_OPERATION;
+        r->ExceptionCode = x87_status(env);
         break;
     case 19:            /* #XM */
         r->ExceptionCode = STATUS_FLOAT_MULTIPLE_TRAPS;

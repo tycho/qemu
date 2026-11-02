@@ -185,7 +185,14 @@ void cpu_loop_exit_sigsegv(CPUState *cs, vaddr addr,
     if (have_mmap_lock() && tcg_ctx->gen_tb) {
         tcg_ctx->gen_tb = NULL;
     }
-    if (xt_mem_refresh(addr, access_type)) {
+    /*
+     * Windows removes a guard page's protection as it raises the fault:
+     * the refreshed flags then allow the access, but the guest must see
+     * the fault.  An in-page error isn't a protection either.
+     */
+    if (xt_mem_refresh(addr, access_type) &&
+        !(t && (t->gfault.code == STATUS_GUARD_PAGE_VIOLATION ||
+                t->gfault.code == STATUS_IN_PAGE_ERROR))) {
         if (t) {
             xt_event(t, XT_EV_RETRY, addr, access_type);
             t->gfault.code = 0;
