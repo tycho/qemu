@@ -60,6 +60,13 @@ static WOW64_CONTEXT *cpu_area_context(void)
     return c;
 }
 
+static void find_query_nr(void);
+static void fix_query(uint32_t *args);
+static void forget(int kind, ULONG prot, vaddr start, vaddr len);
+static uint32_t nr_query_vm = ~0u;    /* NtQueryVirtualMemory's number */
+static uint32_t nr_protect_vm = ~0u;  /* NtProtectVirtualMemory's */
+static void guard_added(uint32_t *args);
+
 static XtThread *thread_of_teb(void *teb)
 {
     return qatomic_read(&((XtThread **)((char *)teb + TEB_TLS_SLOTS))[16]);
@@ -205,6 +212,7 @@ XTEXPORT NTSTATUS WINAPI BTCpuProcessInit(void)
         return STATUS_ENTRYPOINT_NOT_FOUND;
     }
     xt_process_init(true);
+    find_query_nr();
     /*
      * A software CPU: wow64.dll then sets up the cross-process work list
      * and suspends this process's threads cooperatively (slot 2).
@@ -406,6 +414,11 @@ XTEXPORT void WINAPI BTCpuSimulate(void)
                 p_Wow64ProcessPendingCrossProcessItems();
             }
             st = p_Wow64SystemServiceEx(x.nr, (UINT *)(uintptr_t)x.args);
+            if (x.nr == nr_query_vm && st >= 0) {
+                fix_query((uint32_t *)(uintptr_t)x.args);
+            } else if (x.nr == nr_protect_vm && st >= 0) {
+                guard_added((uint32_t *)(uintptr_t)x.args);
+            }
             c = cpu_area_context();
             xt_acquire(t, c);
             t->env->regs[R_EAX] = st;
@@ -520,6 +533,112 @@ static int find_protected(void *opaque, vaddr start, vaddr end, int flags)
 }
 
 /*
+ * The guest's NtQueryVirtualMemory goes to Windows, which reports QEMU's
+ * write protection of translated pages.  For MemoryBasicInformation of
+ * this process the result is corrected: the queried page's protection is
+ * the one QEMU replaced (xt_guest_prot), and the region the run of pages
+ * around it with the same answer, the same allocation, state and type.
+ * Native ntdll's stub gives the system call's number (the x86 one uses
+ * the same).
+ *
+ * wow64.dll doesn't notify a protection change that adds PAGE_GUARD to
+ * executable memory, so translations would run on without touching the
+ * page and the guard would never fault; such a change is forgotten here.
+ */
+static uint32_t syscall_nr(const char *name)
+{
+    uint32_t *f = (void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                                         name);
+
+    return f && (*f & 0xffe0001f) == 0xd4000001 ? (*f >> 5) & 0xffff : ~0u;
+}
+
+static void find_query_nr(void)
+{
+    nr_query_vm = syscall_nr("NtQueryVirtualMemory");
+    nr_protect_vm = syscall_nr("NtProtectVirtualMemory");
+}
+
+typedef struct Mbi32 {
+    uint32_t base, alloc_base, alloc_prot, size, state, prot, type;
+} Mbi32;
+
+/* The guest's view of PAGE: Windows' answer, QEMU's protection undone. */
+static bool page_view(vaddr page, Mbi32 *v)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    ULONG saved;
+
+    if (NtQueryVirtualMemory(GetCurrentProcess(), (void *)(uintptr_t)page, 0,
+                             &mbi, sizeof(mbi), NULL) < 0) {
+        return false;
+    }
+    saved = xt_guest_prot(page);
+    v->alloc_base = (uintptr_t)mbi.AllocationBase;
+    v->state = mbi.State;
+    v->type = mbi.Type;
+    v->prot = saved ? saved : mbi.Protect;
+    return true;
+}
+
+static bool same_view(const Mbi32 *a, const Mbi32 *b)
+{
+    return a->alloc_base == b->alloc_base && a->state == b->state &&
+           a->type == b->type && a->prot == b->prot;
+}
+
+static void fix_query(uint32_t *args)
+{
+    Mbi32 *m = (Mbi32 *)(uintptr_t)args[3], q, v;
+    vaddr page = args[1] & ~(vaddr)0xfff, start, end;
+    Unprotect u;
+    bool began;
+
+    if (args[0] != 0xffffffff || args[2] != 0 || args[4] < sizeof(Mbi32) ||
+        !m) {
+        return;
+    }
+    began = adapter_begin();
+    mmap_lock();
+    u = (Unprotect){ m->base, m->base + m->size - 1 };
+    if ((walk_memory_regions(&u, find_protected) || xt_guest_prot(page)) &&
+        page_view(page, &q)) {
+        start = page;
+        for (int i = 0; i < 0x10000 && start > q.alloc_base; i++) {
+            if (!page_view(start - 0x1000, &v) || !same_view(&q, &v)) {
+                break;
+            }
+            start -= 0x1000;
+        }
+        end = page + 0x1000;
+        for (int i = 0; i < 0x10000 && end <= guest_addr_max; i++) {
+            if (!page_view(end, &v) || !same_view(&q, &v)) {
+                break;
+            }
+            end += 0x1000;
+        }
+        m->base = start;
+        m->size = end - start;
+        m->prot = q.prot;
+    }
+    mmap_unlock();
+    adapter_end(began);
+}
+
+static void guard_added(uint32_t *args)
+{
+    uint32_t base, size;
+
+    if (args[0] != 0xffffffff || !(args[3] & PAGE_GUARD) ||
+        !args[1] || !args[2]) {
+        return;
+    }
+    base = *(uint32_t *)(uintptr_t)args[1];
+    size = *(uint32_t *)(uintptr_t)args[2];
+    forget(2, args[3], base, size);
+}
+
+/*
  * Memory notifications.  QEMU's page flags for the range are dropped
  * (with the translations of executable pages) and refilled from Windows
  * when next probed (xt_mem_refresh):
@@ -569,14 +688,17 @@ static void forget(int kind, ULONG prot, vaddr start, vaddr len)
         if (protected_since(page, prot)) {
             if (page > from) {
                 page_set_flags(from, page - 1, 0, PAGE_VALID);
+                xt_guest_prot_forget(from, page - 1);
             }
         } else {
             page_set_flags(from, page | ~TARGET_PAGE_MASK, 0, PAGE_VALID);
+            xt_guest_prot_forget(from, page | ~TARGET_PAGE_MASK);
         }
         from = page + TARGET_PAGE_SIZE;
     }
     if (from <= last) {
         page_set_flags(from, last, 0, PAGE_VALID);
+        xt_guest_prot_forget(from, last);
     }
     mmap_unlock();
     adapter_end(began);
@@ -586,6 +708,11 @@ static void forget(int kind, ULONG prot, vaddr start, vaddr len)
 static void invalidate(vaddr start, vaddr len)
 {
     bool began = adapter_begin();
+
+    if (xt_tls_ready() && xt_self) {
+        xt_event(xt_self, XT_EV_MEMNOTE, (uint64_t)6 << 56 |
+                 (len & 0xffffffff), start);
+    }
 
     xt_invalidate(start, len);
     adapter_end(began);
@@ -718,11 +845,17 @@ XTEXPORT void WINAPI BTCpuNotifyUnmapViewOfSection(void *addr, BOOL after,
     }
 }
 
+/*
+ * Before: pages QEMU write-protected in the buffer get write back (their
+ * translations go), or the kernel's write into them fails the read.
+ */
 XTEXPORT void WINAPI BTCpuNotifyReadFile(HANDLE h, void *addr, SIZE_T len,
                                          BOOL after, NTSTATUS status)
 {
     xt_enter();
-    if (after && !status) {
+    if (!after) {
+        unprotect_range((uintptr_t)addr, len);
+    } else if (!status) {
         invalidate((uintptr_t)addr, len);
     }
 }
