@@ -232,7 +232,7 @@ bool qemu_cpu_is_self(CPUState *cs)
     return current_cpu == cs;
 }
 
-/* Cut: the gdbstub and the disassemblers (logging only). */
+/* The user-mode gdbstub needs POSIX sockets and signals: none. */
 void gdb_init_cpu(CPUState *cs)
 {
 }
@@ -240,33 +240,6 @@ void gdb_init_cpu(CPUState *cs)
 bool gdb_may_set_breakpoints(void)
 {
     return false;
-}
-
-void x86_cpu_gdb_init(CPUState *cs)
-{
-}
-
-int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *buf, int reg)
-{
-    return 0;
-}
-
-int x86_cpu_gdb_write_register(CPUState *cs, uint8_t *buf, int reg)
-{
-    return 0;
-}
-
-void disas(FILE *out, const void *code, size_t size)
-{
-}
-
-void target_disas(FILE *out, CPUState *cs, const DisasContextBase *db)
-{
-}
-
-const char *lookup_symbol(uint64_t orig_addr)
-{
-    return "";
 }
 
 /*

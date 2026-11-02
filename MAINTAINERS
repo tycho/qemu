@@ -4271,6 +4271,13 @@ F: scripts/update-syscalltbl.sh
 F: scripts/update-mips-syscall-args.sh
 F: tests/functional/arm/test_bflt.py
 
+Windows user
+M: Steven Noonan <steven@uplinklabs.net>
+S: Maintained
+F: windows-user/
+F: configs/targets/*windows-user.mak
+F: include/user/host-mman.h
+
 Tiny Code Generator (TCG)
 -------------------------
 Common TCG code

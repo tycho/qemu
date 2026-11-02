@@ -1,4 +1,4 @@
-if not have_user
+if not have_posix_user
    subdir_done()
 endif
 
