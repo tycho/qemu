@@ -8,6 +8,7 @@
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "qemu/accel.h"
 #include "qapi/error.h"
 #include "qom/object.h"
@@ -405,6 +406,13 @@ static void set_settings(Object *accel, const char *settings)
         g_autofree char *name = NULL;
 
         if (!eq) {
+            /* nochain: no direct jumps between TBs, as -d nochain. */
+            if (!strcmp(kv[i], "nochain")) {
+                qemu_loglevel |= CPU_LOG_TB_NOCHAIN;
+                applied++;
+            } else {
+                rejected++;
+            }
             continue;
         }
         /* QEMU's own accelerator properties go as they are, the rest as x-. */
