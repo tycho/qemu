@@ -108,21 +108,24 @@ static int prot_flags(ULONG prot)
 
 /*
  * Bring QEMU's page flags for ADDR's page up to date with Windows; true if
- * that changed them and the access is allowed now.  QEMU's flags are
+ * the access is allowed now, by the flags as they stand under the mmap
+ * lock, and *CHANGED if this refresh changed them.  QEMU's flags are
  * filled lazily: a page gets them when a probe first misses
  * (cpu_loop_exit_sigsegv below), and a refused access refreshes them
  * before it faults, so mappings and protections made without a
  * notification (the loader's, natively; another thread's) are seen.  A
  * page QEMU write-protects for its translations keeps PAGE_WRITE_ORG.
- * An unchanged answer means the fault is real: no retry loops.
  */
-bool xt_mem_refresh(vaddr addr, MMUAccessType access)
+bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
 {
     MEMORY_BASIC_INFORMATION mbi;
     vaddr start, last;
     int flags, old, want;
-    bool changed = false;
+    bool changed = false, allowed;
 
+    want = access == MMU_INST_FETCH ? PAGE_EXEC
+         : access == MMU_DATA_STORE ? PAGE_WRITE_ORG : PAGE_READ;
+    *changed_out = false;
     if (addr > guest_addr_max ||
         NtQueryVirtualMemory(GetCurrentProcess(), (void *)(uintptr_t)addr,
                              0, &mbi, sizeof(mbi), NULL) < 0) {
@@ -162,35 +165,40 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access)
             page_set_flags(start, last, 0, PAGE_VALID);
         }
     }
+    allowed = page_get_flags(addr) & want;
     mmap_unlock();
 
-    want = access == MMU_INST_FETCH ? PAGE_EXEC
-         : access == MMU_DATA_STORE ? PAGE_WRITE_ORG : PAGE_READ;
-    return changed && (flags & want);
+    *changed_out = changed;
+    return allowed;
 }
 
 /*
  * A guest fault: #PF (x86_cpu_record_sigsegv), the access refused by
  * QEMU's page flags or faulting natively.  Before it is raised the page's
- * flags are refreshed from Windows (xt_mem_refresh); if that allows the
- * access, it is retried.
+ * flags are refreshed from Windows (xt_mem_refresh), and it is retried if
+ * they allow it:
+ * - refused by the flags: whenever they allow it now.  They may never
+ *   have been filled, or another thread may have been changing them as
+ *   this one looked (a lookup can miss a node being updated);
+ * - native: only if the refresh changed them, so a fault Windows keeps
+ *   raising isn't retried for ever.  Windows removes a guard page's
+ *   protection as it raises the fault, and an in-page error isn't a
+ *   protection: those always reach the guest.
  */
 void cpu_loop_exit_sigsegv(CPUState *cs, vaddr addr,
                            MMUAccessType access_type, bool maperr,
                            uintptr_t ra)
 {
     XtThread *t = xt_self;
+    bool native = t && t->gfault.code;
+    bool changed;
 
     /* A fault while translating abandons the translation. */
     if (have_mmap_lock() && tcg_ctx->gen_tb) {
         tcg_ctx->gen_tb = NULL;
     }
-    /*
-     * Windows removes a guard page's protection as it raises the fault:
-     * the refreshed flags then allow the access, but the guest must see
-     * the fault.  An in-page error isn't a protection either.
-     */
-    if (xt_mem_refresh(addr, access_type) &&
+    if (xt_mem_refresh(addr, access_type, &changed) &&
+        (changed || !native) &&
         !(t && (t->gfault.code == STATUS_GUARD_PAGE_VIOLATION ||
                 t->gfault.code == STATUS_IN_PAGE_ERROR))) {
         if (t) {

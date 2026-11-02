@@ -159,7 +159,7 @@ int xt_engine_init(const char *settings, int *applied, int *rejected);
 CPUState *xt_cpu_new(void);
 extern const char *xt_cpu_model;   /* -cpu syntax; set before init */
 void *xt_alloc_low(size_t len);
-bool xt_mem_refresh(vaddr addr, MMUAccessType access);
+bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed);
 void xt_invalidate(vaddr start, vaddr len);
 
 /* thread.c */
