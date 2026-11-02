@@ -469,16 +469,21 @@ void xt_export(XtThread *t, WOW64_CONTEXT *c)
 /*
  * XTAJIT_INJECT: at the chosen transition, wait (up to 50 ms) for a
  * suspension request, so that a test suspending a thread in a loop lands
- * one there.  Only around a suspension exit's publish and the acquire
- * after it, where a test suspending in a loop asks next; not at every
- * system call.  Where Windows owns the thread the suspension is plain and
- * the wait just times out.
+ * one there.  Around a suspension exit's publish and the acquire after
+ * it, where a test suspending in a loop asks next; publish and notify
+ * also on any exit of a thread that has been suspended before, since
+ * Windows serializes the suspensions of a thread and a second request
+ * never arrives during a suspension's own handshake.  Not on other
+ * threads' system calls.  Where Windows owns the thread the suspension is
+ * plain and the wait just times out.
  */
 void xt_inject(XtThread *t, int point)
 {
     uint64_t freq, end;
+    bool exit_point = point == XT_INJ_PUBLISH || point == XT_INJ_CALLBACK;
 
-    if (xt_inject_point != point || !t->after_suspend) {
+    if (xt_inject_point != point ||
+        !(t->after_suspend || (exit_point && t->suspensions))) {
         return;
     }
     asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
