@@ -184,6 +184,10 @@ void xt_log_open(void);
 void *xt_log_handle(void);
 bool xt_guest_read(XtThread *t, vaddr addr, void *buf, size_t len);
 
+/* The frozen runtime's allocator (rpmalloc). */
+void *rpaligned_alloc(size_t align, size_t size);
+void rpfree(void *p);
+
 /* Points where XTAJIT_INJECT waits for a suspension request. */
 enum {
     XT_INJ_ACQUIRE = 1,

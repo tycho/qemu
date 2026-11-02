@@ -1,12 +1,14 @@
 /*
  * xtajit: runtime services the module owns rather than takes from the
- * frozen runtime: the engine's internal threads and mprotect.
+ * frozen runtime: the engine's internal threads, mprotect and large
+ * aligned allocations.
  *
  * Copyright (c) 2026 Steven Noonan
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "exec/page-protection.h"
 #include "user/page-protection.h"
 #include "xtajit.h"
@@ -162,3 +164,55 @@ int mprotect(void *addr, size_t len, int prot)
     }
     return ret;
 }
+
+#define BIG_ALIGNED (256 * KiB)
+#define BIG_MAGIC 0x786a7462616c6e67ull
+#define VM_GRANULE (64 * KiB)
+
+NTSTATUS NTAPI NtFreeVirtualMemory(HANDLE, PVOID *, PSIZE_T, ULONG);
+
+/*
+ * Large aligned allocations (the per-CPU jump cache, 1 MiB at 16 KiB)
+ * come from Windows directly: the frozen runtime's allocator commits 64
+ * MiB for each.  A block starts one allocation granule (64 KiB, which
+ * every alignment up to it needs no more than) after a header naming it;
+ * smaller ones, and alignments past the granule, stay the runtime's
+ * (rpmalloc, as its _aligned_malloc).  Above 4 GiB, as the runtime's.
+ */
+
+void *__cdecl _aligned_malloc(size_t size, size_t align)
+{
+    void *base;
+
+    if (size < BIG_ALIGNED || align > VM_GRANULE) {
+        return rpaligned_alloc(align, size);
+    }
+    base = xt_alloc_high(size + VM_GRANULE);
+    if (!base) {
+        return NULL;
+    }
+    *(uint64_t *)base = BIG_MAGIC;
+    return (char *)base + VM_GRANULE;
+}
+
+void __cdecl _aligned_free(void *p)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    char *base = (char *)p - VM_GRANULE;
+
+    if (p && !((uintptr_t)p & (VM_GRANULE - 1)) &&
+        NtQueryVirtualMemory(GetCurrentProcess(), base, 0, &mbi,
+                             sizeof(mbi), NULL) >= 0 &&
+        mbi.AllocationBase == base && *(uint64_t *)base == BIG_MAGIC) {
+        SIZE_T len = 0;
+        void *b = base;
+
+        *(uint64_t *)base = 0;
+        NtFreeVirtualMemory(GetCurrentProcess(), &b, &len, MEM_RELEASE);
+        return;
+    }
+    rpfree(p);
+}
+
+void *(__cdecl *__imp__aligned_malloc)(size_t, size_t) = _aligned_malloc;
+void (__cdecl *__imp__aligned_free)(void *) = _aligned_free;
