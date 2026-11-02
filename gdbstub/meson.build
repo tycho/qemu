@@ -27,12 +27,15 @@ else
 endif
 common_ss.add(gdbstub_xml)
 
-# We build two versions of gdbstub, one for each mode
-user_ss.add(files(
-  'gdbstub.c',
-  'syscalls.c',
-  'user.c'
-))
+# We build two versions of gdbstub, one for each mode; user mode's needs
+# POSIX signals and sockets.
+if have_posix_user
+  user_ss.add(files(
+    'gdbstub.c',
+    'syscalls.c',
+    'user.c'
+  ))
+endif
 
 system_ss.add(files(
   'gdbstub.c',
@@ -41,4 +44,6 @@ system_ss.add(files(
 ))
 
 # The user-target is specialised by the guest
-specific_ss.add(when: 'CONFIG_USER_ONLY', if_true: files('user-target.c'))
+if have_posix_user
+  specific_ss.add(when: 'CONFIG_USER_ONLY', if_true: files('user-target.c'))
+endif
