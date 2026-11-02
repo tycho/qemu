@@ -71,7 +71,7 @@ void cpu_abort(CPUState *cpu, const char *fmt, ...)
     va_end(ap2);
     va_end(ap);
     replay_finish();
-#if defined(CONFIG_USER_ONLY)
+#if defined(CONFIG_USER_ONLY) && !defined(_WIN32)
     {
         struct sigaction act;
         sigfillset(&act.sa_mask);

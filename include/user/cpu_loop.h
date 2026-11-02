@@ -34,6 +34,7 @@
  */
 MMUAccessType adjust_signal_pc(uintptr_t *pc, bool is_write);
 
+#ifndef _WIN32
 /**
  * handle_sigsegv_accerr_write:
  * @cpu: the cpu context
@@ -45,6 +46,7 @@ MMUAccessType adjust_signal_pc(uintptr_t *pc, bool is_write);
  */
 bool handle_sigsegv_accerr_write(CPUState *cpu, sigset_t *old_set,
                                  uintptr_t host_pc, vaddr guest_addr);
+#endif
 
 /**
  * cpu_loop_exit_sigsegv:
