@@ -845,6 +845,7 @@ extern int64_t clock_start;
    also used by simpletrace backend and tracepoints would cause
    an infinite recursion! */
 #ifdef _WIN32
+#define QEMU_CLOCK_RAW_SUPPORTED 0
 extern int64_t clock_freq;
 
 static inline int64_t get_clock(void)
