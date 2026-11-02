@@ -345,7 +345,8 @@ uint32_t xt_check(XtThread *t, XtState expect, int where)
  * the floating-point state comes from ExtendedRegisters (FXSAVE format,
  * x87 tags, TOP, status, MXCSR and XMM) when present, else from FloatSave
  * (FSAVE format).  The export writes both.  Debug registers are not
- * carried (the scaffold has no hardware breakpoints).
+ * carried: DR0-DR7 stay as set in the WOW64 context and no hardware
+ * breakpoint fires; a single-step trap reports DR6.BS, as x86 does.
  */
 static uint32_t seg_base(XtThread *t, int sel)
 {
@@ -444,6 +445,11 @@ void xt_export(XtThread *t, WOW64_CONTEXT *c)
     c->Edi = env->regs[R_EDI];
     c->Eip = env->eip;
     c->EFlags = cpu_compute_eflags(env);
+    if (env->dr[6] & DR6_BS) {
+        c->ContextFlags |= WOW64_CONTEXT_DEBUG_REGISTERS;
+        c->Dr6 = 0xffff0ff0 | DR6_BS;
+        env->dr[6] = 0;
+    }
     c->SegCs = env->segs[R_CS].selector;
     c->SegSs = env->segs[R_SS].selector;
     c->SegDs = env->segs[R_DS].selector;
