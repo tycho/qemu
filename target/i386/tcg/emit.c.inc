@@ -3726,6 +3726,31 @@ static bool gen_cmpxchg_retry(DisasContext *s)
     return (tb_cflags(s->base.tb) & CF_PARALLEL) && tcg_mo_needed(TCG_MO_ALL);
 }
 
+/*
+ * A locked CMPXCHG writes its destination even when the compare fails.
+ * User mode's parallel compare-and-swap is the host's own, which may not
+ * (a load- and store-exclusive loop stores nothing), and then doesn't
+ * fault on a page that isn't writable: after a failed compare, probe for
+ * the write.  The serial one stores unconditionally, and system mode's
+ * probes for a write first.  A misaligned operand leaves for the serial
+ * step before this.
+ */
+static bool cmpxchg_needs_probe(DisasContext *s)
+{
+#ifdef CONFIG_USER_ONLY
+    return tb_cflags(s->base.tb) & CF_PARALLEL;
+#else
+    return false;
+#endif
+}
+
+static void gen_cmpxchg_probe(DisasContext *s, MemOp mop)
+{
+    gen_helper_cmpxchg_probe(tcg_env, s->A0,
+                             tcg_constant_i32(memop_size(mop)),
+                             tcg_constant_i32(s->mem_index));
+}
+
 static void gen_cmpxchg_locked_tl(DisasContext *s, TCGv oldv, TCGv cmpv,
                                   TCGv newv, MemOp mop)
 {
@@ -3737,6 +3762,13 @@ static void gen_cmpxchg_locked_tl(DisasContext *s, TCGv oldv, TCGv cmpv,
         tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
         tcg_gen_atomic_cmpxchg_tl(oldv, s->A0, cmpv, newv, s->mem_index, mop);
         gen_set_label(done);
+    }
+    if (cmpxchg_needs_probe(s)) {
+        TCGLabel *ok = gen_new_label();
+
+        tcg_gen_brcond_tl(TCG_COND_EQ, oldv, cmpv, ok);
+        gen_cmpxchg_probe(s, mop);
+        gen_set_label(ok);
     }
 }
 
@@ -3751,6 +3783,13 @@ static void gen_cmpxchg_locked_i64(DisasContext *s, TCGv_i64 oldv,
         tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
         tcg_gen_atomic_cmpxchg_i64(oldv, s->A0, cmpv, newv, s->mem_index, mop);
         gen_set_label(done);
+    }
+    if (cmpxchg_needs_probe(s)) {
+        TCGLabel *ok = gen_new_label();
+
+        tcg_gen_brcond_i64(TCG_COND_EQ, oldv, cmpv, ok);
+        gen_cmpxchg_probe(s, mop);
+        gen_set_label(ok);
     }
 }
 
@@ -3776,6 +3815,22 @@ static void gen_cmpxchg_locked_i128(DisasContext *s, TCGv_i128 oldv,
         tcg_gen_atomic_cmpxchg_i128(oldv, s->A0, cmpv, newv,
                                     s->mem_index, mop);
         gen_set_label(done);
+    }
+    if (cmpxchg_needs_probe(s)) {
+        TCGLabel *ok = gen_new_label();
+        TCGv_i64 lo = tcg_temp_new_i64();
+        TCGv_i64 hi = tcg_temp_new_i64();
+        TCGv_i64 cmp_lo = tcg_temp_new_i64();
+        TCGv_i64 cmp_hi = tcg_temp_new_i64();
+
+        tcg_gen_extr_i128_i64(lo, hi, oldv);
+        tcg_gen_extr_i128_i64(cmp_lo, cmp_hi, cmpv);
+        tcg_gen_xor_i64(lo, lo, cmp_lo);
+        tcg_gen_xor_i64(hi, hi, cmp_hi);
+        tcg_gen_or_i64(lo, lo, hi);
+        tcg_gen_brcondi_i64(TCG_COND_EQ, lo, 0, ok);
+        gen_cmpxchg_probe(s, mop);
+        gen_set_label(ok);
     }
 }
 #endif
