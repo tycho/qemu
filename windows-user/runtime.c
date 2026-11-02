@@ -123,44 +123,105 @@ static ULONG nt_prot(int prot)
  *   (VirtualQuery, and QEMU's page flags refilled from Windows), so a
  *   page QEMU's flags give PAGE_EXEC keeps it.
  * - NtProtectVirtualMemory takes one allocation at a time, and an image's
- *   pages may need the write-copy form of a writable protection.
+ *   pages may need the write-copy form of a writable protection: the work
+ *   is page by page, and giving write back restores exactly the protection
+ *   QEMU's took away.
  *
  * The result is reported, though QEMU's callers don't look at it yet.
  */
+/*
+ * The protection Windows had on each page QEMU write-protected for its
+ * translations (mprotect without PROT_WRITE), restored exactly when QEMU
+ * gives write back, and what the guest's queries see (xt_guest_prot).
+ * Under the mmap lock, as QEMU's calls are.
+ */
+static GHashTable *saved_prot;
+
+static bool writable(ULONG p)
+{
+    switch (p & 0xff) {
+    case PAGE_READWRITE:
+    case PAGE_WRITECOPY:
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY:
+        return true;
+    }
+    return false;
+}
+
+ULONG xt_guest_prot(uintptr_t page)
+{
+    return saved_prot ? GPOINTER_TO_UINT(g_hash_table_lookup(
+                            saved_prot, GUINT_TO_POINTER(page))) : 0;
+}
+
+void xt_guest_prot_forget(uintptr_t start, uintptr_t last)
+{
+    if (!saved_prot || !g_hash_table_size(saved_prot)) {
+        return;
+    }
+    for (uintptr_t p = start & ~(uintptr_t)0xfff; p <= last; p += 0x1000) {
+        g_hash_table_remove(saved_prot, GUINT_TO_POINTER(p));
+        if (p + 0x1000 < p) {
+            break;
+        }
+    }
+}
+
 int mprotect(void *addr, size_t len, int prot)
 {
-    uintptr_t p = (uintptr_t)addr, end = p + len;
+    uintptr_t p = (uintptr_t)addr & ~(uintptr_t)0xfff;
+    uintptr_t end = (uintptr_t)addr + len;
     int ret = 0;
 
+    if (!saved_prot) {
+        saved_prot = g_hash_table_new(NULL, NULL);
+    }
     if (prot && (page_get_flags(p) & PAGE_EXEC)) {
         prot |= PROT_EXEC;
     }
-    while (p < end) {
+    for (; p < end; p += 0x1000) {
         MEMORY_BASIC_INFORMATION mbi;
         PVOID base = (PVOID)p;
-        SIZE_T size;
-        ULONG old, np = nt_prot(prot);
+        SIZE_T size = 0x1000;
+        ULONG old, saved = xt_guest_prot(p), np = nt_prot(prot), mods = 0;
         NTSTATUS st;
 
-        if (NtQueryVirtualMemory(GetCurrentProcess(), base, 0, &mbi,
-                                 sizeof(mbi), NULL) < 0) {
-            return -1;
+        if ((prot & PROT_WRITE) && saved) {
+            np = saved;
         }
-        size = MIN(end, (uintptr_t)mbi.BaseAddress + mbi.RegionSize) - p;
+        /*
+         * The page's modifiers stay: QEMU protects a page before it reads
+         * the code there, and a guard must still fault that read.
+         */
+        if (NtQueryVirtualMemory(GetCurrentProcess(), base, 0, &mbi,
+                                 sizeof(mbi), NULL) >= 0) {
+            mods = mbi.Protect & (PAGE_GUARD | PAGE_NOCACHE |
+                                  PAGE_WRITECOMBINE);
+        }
+        np |= mods;
         st = NtProtectVirtualMemory(GetCurrentProcess(), &base, &size, np,
                                     &old);
-        if (st < 0 && (np == PAGE_READWRITE || np == PAGE_EXECUTE_READWRITE)) {
+        if (st < 0 && ((np & 0xff) == PAGE_READWRITE ||
+                       (np & 0xff) == PAGE_EXECUTE_READWRITE)) {
             base = (PVOID)p;
-            size = MIN(end, (uintptr_t)mbi.BaseAddress + mbi.RegionSize) - p;
+            size = 0x1000;
             st = NtProtectVirtualMemory(GetCurrentProcess(), &base, &size,
-                                        np == PAGE_READWRITE ?
-                                        PAGE_WRITECOPY :
-                                        PAGE_EXECUTE_WRITECOPY, &old);
+                                        ((np & 0xff) == PAGE_READWRITE ?
+                                         PAGE_WRITECOPY :
+                                         PAGE_EXECUTE_WRITECOPY) | mods,
+                                        &old);
         }
         if (st < 0) {
             ret = -1;
+        } else if (!(prot & PROT_WRITE)) {
+            if (writable(old) && !saved) {
+                g_hash_table_insert(saved_prot, GUINT_TO_POINTER(p),
+                                    GUINT_TO_POINTER(old & 0xff));
+            }
+        } else {
+            g_hash_table_remove(saved_prot, GUINT_TO_POINTER(p));
         }
-        p = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
     }
     return ret;
 }
