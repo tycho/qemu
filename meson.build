@@ -717,6 +717,13 @@ qemu_common_flags += hardening_flags
 # The compiler defines __x86_64__ as well as __arm64ec__.
 host_arm64ec = host_os == 'windows' and cc.get_define('__arm64ec__') != ''
 
+# ARM64EC's module runs in an x64 process, on threads the loader doesn't
+# count among those with PE TLS: its thread-local variables are emulated,
+# in storage of its own (windows-user/runtime/emutls.c).
+if host_arm64ec and have_windows_user
+  qemu_common_flags += ['-femulated-tls']
+endif
+
 # The Windows user-mode module imports from ntdll alone: the linker drops
 # the code that calls other DLLs, function by function.
 if have_windows_user
