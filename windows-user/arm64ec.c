@@ -426,6 +426,19 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
 }
 
 /*
+ * The memory service's work (memory.c), from any thread.  Before the engine
+ * is up there are no translations or page flags to keep current.
+ */
+static bool note_ready(void)
+{
+    if (qatomic_load_acquire(&engine_state) != 2) {
+        return false;
+    }
+    xt_enter();
+    return true;
+}
+
+/*
  * ntdll's call at any exception in an ARM64EC thread, before its
  * dispatch, with the full native context (x13, x14, x23, x24, x28 and
  * v16-v31 included).  Continued here, with that context:
@@ -433,7 +446,10 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
  *   exit stub is consistent there, so continuing it completes the
  *   suspension;
  * - a fault the engine recovers (xt_fault_redirect: generated code,
- *   helpers, translation), while it owns the thread.
+ *   helpers, translation), while it owns the thread;
+ * - otherwise, native code's store into a page QEMU write-protected for
+ *   its translations, such as a runtime patching its own x64 code: the
+ *   page gets its write permission back and the store is retried.
  * Anything else goes on to the dispatch.
  */
 XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
@@ -465,21 +481,13 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
                  er->ExceptionInformation[1]);
         xt_log_native(er, native);
         xt_log_flush(t);
+    } else if (er->ExceptionCode == STATUS_ACCESS_VIOLATION &&
+               er->NumberParameters >= 2 && er->ExceptionInformation[0] == 1 &&
+               note_ready() &&
+               xt_unprotect_for_native(er->ExceptionInformation[1])) {
+        xt_continue_native(native);
     }
     return STATUS_SUCCESS;
-}
-
-/*
- * Memory notifications, from any thread (memory.c).  Before the engine
- * is up there are no translations or page flags to keep current.
- */
-static bool note_ready(void)
-{
-    if (qatomic_load_acquire(&engine_state) != 2) {
-        return false;
-    }
-    xt_enter();
-    return true;
 }
 
 /*
@@ -574,13 +582,14 @@ XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
 }
 
 /*
- * The processor as x64 code sees it.  These come before the engine is up
- * too: the CPU model's features need a CPU, which the first entry makes.
+ * The processor as x64 code sees it.  Windows asks for the features while
+ * the process starts, before the engine is up: they are the CPU model's
+ * until the first entry makes a CPU.  The processor information needs
+ * that CPU.
  */
 XTEXPORT BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT feature)
 {
-    return qatomic_load_acquire(&engine_state) == 2 &&
-           xt_feature_present(feature);
+    return xt_feature_present(feature);
 }
 
 XTEXPORT void UpdateProcessorInformation(void *info)
@@ -776,6 +785,7 @@ static G_NORETURN void leave_exception(XtThread *t, XtExit *x)
         first = FALSE;
         break;
     case 0x2c:
+        t->env->eip -= 2;
         r->ExceptionCode = STATUS_ASSERTION_FAILURE;
         break;
     default:
