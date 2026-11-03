@@ -49,6 +49,13 @@ static int64_t nr_continue = -1, nr_raise = -1, nr_alloc = -1,
 /* ntdll's native KiUserExceptionDispatcher, for the guest's system calls. */
 static uintptr_t ki_exception_dispatcher;
 
+/*
+ * Work other processes queued for this one's emulator (a flush of code
+ * they wrote): ntdll delivers it through the notification exports, when
+ * asked at each entry and system call.
+ */
+static void (*cross_process_work)(void);
+
 /* An x64 ret instruction, for native callees on an unaligned stack. */
 uintptr_t xt_x64_ret;
 
@@ -175,6 +182,8 @@ static bool init_syscalls(void)
     nr_alloc = find_syscall_nr(md, "NtAllocateVirtualMemory");
     nr_protect = find_syscall_nr(md, "NtProtectVirtualMemory");
     ki_exception_dispatcher = ntdll_native(md, "KiUserExceptionDispatcher");
+    cross_process_work = (void (*)(void))
+        ntdll_native(md, "ProcessPendingCrossProcessEmulatorWork");
     if (nr_continue < 0 || nr_raise < 0 || nr_alloc < 0 || nr_protect < 0 ||
         !ki_exception_dispatcher) {
         return false;
@@ -397,55 +406,125 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
     return STATUS_SUCCESS;
 }
 
+/*
+ * Memory notifications, from any thread (memory.c).  Before the engine
+ * is up there are no translations or page flags to keep current.
+ */
+static bool note_ready(void)
+{
+    if (qatomic_load_acquire(&engine_state) != 2) {
+        return false;
+    }
+    xt_enter();
+    return true;
+}
+
+/*
+ * The engine's own work outside simulation (memory.c's): with
+ * InSyscallCallback set, as FEX's module sets it around its own.
+ */
+bool xt_adapter_begin(void)
+{
+    XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+
+    if (!area || area->InSyscallCallback) {
+        return false;
+    }
+    area->InSyscallCallback = 1;
+    return true;
+}
+
+void xt_adapter_end(bool began)
+{
+    if (began) {
+        xt_cpu_area(NtCurrentTeb())->InSyscallCallback = 0;
+    }
+}
+
 XTEXPORT void NotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type, ULONG prot,
                                 BOOL after, NTSTATUS status)
 {
+    if (note_ready()) {
+        xt_note_alloc(addr, len, type, prot, after, status);
+    }
 }
 
 XTEXPORT void NotifyMemoryFree(void *addr, SIZE_T len, ULONG type, BOOL after,
                                NTSTATUS status)
 {
+    if (note_ready()) {
+        xt_note_free(addr, len, type, after, status);
+    }
 }
 
 XTEXPORT void NotifyMemoryProtect(void *addr, SIZE_T len, ULONG prot,
                                   BOOL after, NTSTATUS status)
 {
+    if (note_ready()) {
+        xt_note_protect(addr, len, prot, after, status);
+    }
 }
 
 XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
                                          SIZE_T len, ULONG type, ULONG prot)
 {
+    if (note_ready()) {
+        xt_note_map(addr, len, prot);
+    }
     return STATUS_SUCCESS;
 }
 
 XTEXPORT void NotifyUnmapViewOfSection(void *addr, BOOL after, NTSTATUS status)
 {
+    if (note_ready()) {
+        xt_note_unmap(addr, after);
+    }
 }
 
 XTEXPORT void FlushInstructionCacheHeavy(const void *addr, SIZE_T len)
 {
+    if (note_ready()) {
+        xt_note_flush(addr, len);
+    }
 }
 
 XTEXPORT void BTCpu64FlushInstructionCache(const void *addr, SIZE_T len)
 {
+    if (note_ready()) {
+        xt_note_flush(addr, len);
+    }
 }
 
 XTEXPORT void BTCpu64NotifyMemoryDirty(void *addr, SIZE_T len)
 {
+    if (note_ready()) {
+        xt_note_flush(addr, len);
+    }
 }
 
 XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
                                     BOOL after, NTSTATUS status)
 {
+    if (note_ready()) {
+        xt_note_read_file(addr, len, after, status);
+    }
 }
 
+/*
+ * The processor as x64 code sees it.  These come before the engine is up
+ * too: the CPU model's features need a CPU, which the first entry makes.
+ */
 XTEXPORT BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT feature)
 {
-    return FALSE;
+    return qatomic_load_acquire(&engine_state) == 2 &&
+           xt_feature_present(feature);
 }
 
 XTEXPORT void UpdateProcessorInformation(void *info)
 {
+    if (qatomic_load_acquire(&engine_state) == 2) {
+        xt_processor_info(info, PROCESSOR_ARCHITECTURE_AMD64);
+    }
 }
 
 NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
@@ -547,6 +626,9 @@ static G_NORETURN void leave_syscall(XtThread *t)
 
     memset(&k.rec, 0, sizeof(k.rec));
     leave(t, &k.ctx);
+    if (cross_process_work) {
+        cross_process_work();
+    }
     k.rec.ExceptionCode = STATUS_EMULATION_SYSCALL;
     xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
     xt_ec_jump_set_stack(ki_exception_dispatcher, (uintptr_t)&k);
@@ -658,6 +740,9 @@ void xt_ec_enter(XtEcFrame *f)
     XtThread *t = ec_thread();
     CONTEXT c;
 
+    if (cross_process_work) {
+        cross_process_work();
+    }
     t->aux_valid = false;
     xt_ec_call_context(t, &f->ctx, &c);
     xt_acquire(t, &c);
@@ -677,6 +762,10 @@ void xt_ec_begin(void)
     const CONTEXT *w = (const CONTEXT *)area->ContextAmd64;
     const uint32_t nzcv = CC_S | CC_Z | CC_C | CC_O | TF_MASK;
     CONTEXT c;
+
+    if (cross_process_work) {
+        cross_process_work();
+    }
 
     memset(&c, 0, sizeof(c));
     xt_export(t, &c);

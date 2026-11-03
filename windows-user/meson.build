@@ -8,6 +8,7 @@ windows_user_ss.add(files(
   'engine.c',
   'exec.c',
   'fault.c',
+  'memory.c',
   'runtime.c',
   'thread.c',
   'runtime/crt.c',

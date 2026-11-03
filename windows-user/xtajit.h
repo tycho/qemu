@@ -243,6 +243,32 @@ void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n);
 void xt_ec_call_context(XtThread *t, ARM64_NT_CONTEXT *n, CONTEXT *c);
 #endif
 
+/* memory.c: Windows' memory notifications, the processor's identity */
+typedef struct XtUnprotect {
+    vaddr start, last;
+    vaddr found;
+} XtUnprotect;
+int xt_find_protected(void *opaque, vaddr start, vaddr end, int flags);
+void xt_mem_forget(int kind, ULONG prot, vaddr start, vaddr len);
+void xt_note_flush(const void *addr, SIZE_T len);
+void xt_note_alloc(void *addr, SIZE_T len, ULONG type, ULONG prot, BOOL after,
+                   NTSTATUS status);
+void xt_note_protect(void *addr, SIZE_T len, ULONG prot, BOOL after,
+                     NTSTATUS status);
+void xt_note_free(void *addr, SIZE_T len, ULONG type, BOOL after,
+                  NTSTATUS status);
+void xt_note_map(void *addr, SIZE_T len, ULONG prot);
+void xt_note_unmap(void *addr, BOOL after);
+void xt_note_read_file(void *addr, SIZE_T len, BOOL after, NTSTATUS status);
+BOOLEAN xt_feature_present(UINT feature);
+void xt_processor_info(void *info, USHORT arch);
+/*
+ * wow64.c, arm64ec.c: a scope of the engine's own work outside
+ * simulation, during which a suspension must wait.
+ */
+bool xt_adapter_begin(void);
+void xt_adapter_end(bool began);
+
 /* runtime.c: the guest's protection of pages QEMU write-protected */
 ULONG xt_guest_prot(uintptr_t page);
 void xt_guest_prot_forget(uintptr_t start, uintptr_t last);
