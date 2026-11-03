@@ -17,15 +17,18 @@
 #include "runtime.h"
 
 /*
- * The PE TLS directory.  The loader gives the module a TLS index from it;
+ * The TLS callbacks, run by the runtime itself; and the PE TLS directory
+ * of the WOW64 module.  The loader gives that module a TLS index from it;
  * in a WOW64 process it sets up no blocks for the CPU module, so
- * xt_tls_attach installs them (thread.c).
+ * xt_tls_attach installs them (thread.c).  The x64 module has no PE TLS:
+ * its thread-local variables are emulated (emutls.c).
  */
+__attribute__((section(".CRT$XLA"))) PIMAGE_TLS_CALLBACK __xl_a;
+__attribute__((section(".CRT$XLZ"))) PIMAGE_TLS_CALLBACK __xl_z;
+#ifndef TARGET_X86_64
 uint64_t _tls_index;
 __attribute__((section(".tls"))) char _tls_start;
 __attribute__((section(".tls$ZZZ"))) char _tls_end;
-__attribute__((section(".CRT$XLA"))) PIMAGE_TLS_CALLBACK __xl_a;
-__attribute__((section(".CRT$XLZ"))) PIMAGE_TLS_CALLBACK __xl_z;
 const IMAGE_TLS_DIRECTORY64 _tls_used = {
     (uintptr_t)&_tls_start,
     (uintptr_t)&_tls_end,
@@ -34,6 +37,7 @@ const IMAGE_TLS_DIRECTORY64 _tls_used = {
     0,
     0,
 };
+#endif
 
 /*
  * Initializers: the C ones the compiler puts in .CRT$XI* and .CRT$XC*,

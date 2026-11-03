@@ -132,6 +132,27 @@ static NTSTATUS alloc_direct(void **base, SIZE_T *size, ULONG type, ULONG prot)
                       (uintptr_t)size, type, prot, nr_alloc);
 }
 
+/* Whether ProcessInit has found the system calls the module makes itself. */
+bool xt_syscalls_ready(void)
+{
+    return nr_alloc >= 0;
+}
+
+/*
+ * Memory through the system call itself, no code of ntdll's on the way:
+ * nothing reaches the module's callbacks (emutls.c's cold path).
+ */
+void *xt_alloc_direct(size_t len)
+{
+    void *p = NULL;
+    SIZE_T size = len;
+
+    if (alloc_direct(&p, &size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) < 0) {
+        return NULL;
+    }
+    return p;
+}
+
 static NTSTATUS protect_direct(void **base, SIZE_T *size, ULONG prot,
                                ULONG *old)
 {
@@ -306,6 +327,7 @@ XTEXPORT NTSTATUS ProcessInit(void)
     if (!init_syscalls()) {
         return STATUS_NOT_SUPPORTED;
     }
+    xt_emutls_init();
     {
         void *p = NULL;
         SIZE_T size = 0x1000;
