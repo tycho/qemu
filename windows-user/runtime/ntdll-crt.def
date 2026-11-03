@@ -1,0 +1,61 @@
+; SPDX-License-Identifier: GPL-2.0-or-later
+;
+; The C runtime functions the module imports from ntdll.dll, which
+; exports them alongside the native API.  mingw-w64's ntdll import
+; library leaves them out, so that they don't shadow a C runtime DLL's;
+; a WOW64 process's native side has no other.
+LIBRARY ntdll.dll
+EXPORTS
+memchr
+memcmp
+memcpy
+memmove
+memset
+strcat
+strchr
+strcmp
+strcpy
+strcspn
+strlen
+strncat
+strncmp
+strncpy
+strnlen
+strpbrk
+strrchr
+strspn
+strstr
+tolower
+toupper
+isalnum
+isalpha
+iscntrl
+isdigit
+isgraph
+islower
+isprint
+ispunct
+isspace
+isupper
+isxdigit
+qsort
+bsearch
+abs
+labs
+wcslen
+wcsnlen
+wcschr
+wcscmp
+wcscpy
+wcsncpy
+ceil
+floor
+fabs
+sqrt
+sin
+cos
+tan
+atan
+atan2
+log
+pow

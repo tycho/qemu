@@ -88,8 +88,8 @@ static unsigned long opt_tb_size;
 # endif
 #endif
 
-unsigned long reserved_va;
-unsigned long guest_addr_max;
+uintptr_t reserved_va;
+uintptr_t guest_addr_max;
 
 const char *interp_prefix = CONFIG_QEMU_INTERP_PREFIX;
 const char *qemu_uname_release;
@@ -299,7 +299,7 @@ int main(int argc, char **argv)
     envlist_t *envlist = NULL;
     char *argv0 = NULL;
     int host_page_size;
-    unsigned long max_reserved_va;
+    uintptr_t max_reserved_va;
 
     adjust_ssize();
 
@@ -532,7 +532,7 @@ int main(int argc, char **argv)
     } else if (MIN(TARGET_VIRT_ADDR_SPACE_BITS, TARGET_ABI_BITS) <= 32) {
         guest_addr_max = UINT32_MAX;
     } else {
-        guest_addr_max = ~0ul;
+        guest_addr_max = UINTPTR_MAX;
     }
 
     if (getenv("QEMU_STRACE")) {

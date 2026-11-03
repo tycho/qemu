@@ -241,6 +241,7 @@ EXESUF=""
 system="yes"
 linux_user=""
 bsd_user=""
+windows_user=""
 plugins="$default_feature"
 subdirs=""
 ninja=""
@@ -698,6 +699,7 @@ for opt do
   --disable-user)
       linux_user="no" ;
       bsd_user="no" ;
+      windows_user="no" ;
   ;;
   --enable-user) ;;
   --disable-linux-user) linux_user="no"
@@ -707,6 +709,10 @@ for opt do
   --disable-bsd-user) bsd_user="no"
   ;;
   --enable-bsd-user) bsd_user="yes"
+  ;;
+  --disable-windows-user) windows_user="no"
+  ;;
+  --enable-windows-user) windows_user="yes"
   ;;
   --enable-pie) pie="yes"
   ;;
@@ -811,8 +817,20 @@ if [ -n "$host_arch" ] && [ -d "$source_path/common-user/host/$host_arch" ]; the
             mak_wilds="${mak_wilds} $source_path/configs/targets/*-bsd-user.mak"
         fi
     fi
+    if [ "$windows_user" != no ]; then
+        # A WOW64 CPU module: 32-bit x86 code on Windows on Arm.
+        if [ "$host_os" = windows ] && [ "$host_arch" = aarch64 ]; then
+            windows_user=yes
+        elif [ "$windows_user" = yes ]; then
+            error_exit "windows-user is only supported on aarch64 Windows hosts"
+        fi
+        if [ "$windows_user" = "yes" ]; then
+            mak_wilds="${mak_wilds} $source_path/configs/targets/*-windows-user.mak"
+        fi
+    fi
 else
-    if [ "$linux_user" = yes ] || [ "$bsd_user" = yes ]; then
+    if [ "$linux_user" = yes ] || [ "$bsd_user" = yes ] ||
+       [ "$windows_user" = yes ]; then
         error_exit "user mode emulation not supported on this architecture"
     fi
 fi
@@ -880,6 +898,7 @@ cat << EOF
   user            supported user emulation targets
   linux-user      all linux usermode emulation targets
   bsd-user        all BSD usermode emulation targets
+  windows-user    all Windows usermode emulation targets
   pie             Position Independent Executables
 
 NOTE: The object files are built at the place where configure is launched

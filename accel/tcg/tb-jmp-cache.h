@@ -23,9 +23,14 @@
 /*
  * The entries' alignment: system mode groups them by guest page
  * (tb-hash.h), and a group of 1024 16-byte entries aligned so is one
- * host page where pages are 16 KiB (four where they are 4 KiB).
+ * host page where pages are 16 KiB (four where they are 4 KiB).  COFF
+ * can't align to more than 8 KiB; Windows' pages are 4 KiB.
  */
+#ifdef _WIN32
+#define TB_JMP_CACHE_ALIGN (8 * KiB)
+#else
 #define TB_JMP_CACHE_ALIGN (16 * KiB)
+#endif
 
 /*
  * Invalidated in parallel; all accesses to 'tb' must be atomic.

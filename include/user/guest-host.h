@@ -21,14 +21,14 @@
  *
  * If zero, the host and guest virtual address spaces are intermingled.
  */
-extern unsigned long reserved_va;
+extern uintptr_t reserved_va;
 
 /*
  * The last byte of the guest address space.
  * If reserved_va is non-zero, guest_addr_max matches.
  * If reserved_va is zero, guest_addr_max equals the full guest space.
  */
-extern unsigned long guest_addr_max;
+extern uintptr_t guest_addr_max;
 
 /*
  * These functions take the guest virtual address as a vaddr,
