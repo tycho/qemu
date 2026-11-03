@@ -180,6 +180,7 @@ typedef struct XtThread {
     XtFault fault;
     vaddr native_target;    /* set with XT_EXCP_NATIVE */
     ULONG *ec_doorbell;     /* the x64 module's SuspendDoorbell word */
+    bool ec_suspended;      /* left through a suspension's continuation */
     /*
      * EFLAGS the packed context can't carry, kept at each exit that
      * re-enters through a context (a system call, an exception, a
