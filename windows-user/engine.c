@@ -140,7 +140,7 @@ static void set_region_flags(vaddr start, vaddr last, int flags)
             if (end || next_ec != ec) {
                 page_set_flags(run, end ? last : p + TARGET_PAGE_SIZE - 1,
                                ec ? flags & ~PAGE_EXEC : flags,
-                               PAGE_RWX | PAGE_WRITE_ORG);
+                               PAGE_RWX | PAGE_WRITE_ORG | PAGE_FIXED_CODE);
                 if (end) {
                     return;
                 }
@@ -151,7 +151,8 @@ static void set_region_flags(vaddr start, vaddr last, int flags)
         }
     }
 #endif
-    page_set_flags(start, last, flags, PAGE_RWX | PAGE_WRITE_ORG);
+    page_set_flags(start, last, flags,
+                   PAGE_RWX | PAGE_WRITE_ORG | PAGE_FIXED_CODE);
 }
 
 /*
@@ -168,7 +169,7 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
 {
     MEMORY_BASIC_INFORMATION mbi;
     vaddr start, last;
-    int flags, old, want, page;
+    int flags, old, want, page, fixed = 0;
     bool changed = false, allowed;
 
     want = access == MMU_INST_FETCH ? PAGE_EXEC
@@ -193,11 +194,15 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
         flags = PAGE_VALID | prot_flags(mbi.Protect);
         if (flags & PAGE_WRITE) {
             flags |= PAGE_WRITE_ORG;
+        } else if (mbi.Type == MEM_IMAGE) {
+            /* An image's code changes only through a protection change. */
+            fixed = PAGE_FIXED_CODE;
         }
     }
 
     mmap_lock();
-    old = page_get_flags(addr) & (PAGE_VALID | PAGE_RWX | PAGE_WRITE_ORG);
+    old = page_get_flags(addr) &
+          (PAGE_VALID | PAGE_RWX | PAGE_WRITE_ORG | PAGE_FIXED_CODE);
     page = flags;
 #ifdef TARGET_X86_64
     if (xt_is_ec_code(addr)) {
@@ -208,13 +213,13 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
         page == (old & (PAGE_VALID | PAGE_READ | PAGE_EXEC))) {
         /* Write-protected by tb_lock_page0, not by the guest. */
         flags = old;
-    } else if (page != old) {
+    } else if ((page | fixed) != old) {
         changed = true;
         if (xt_self) {
-            xt_event(xt_self, XT_EV_REFRESH, old << 16 | page, addr);
+            xt_event(xt_self, XT_EV_REFRESH, old << 16 | page | fixed, addr);
         }
         if (flags) {
-            set_region_flags(start, last, flags);
+            set_region_flags(start, last, flags | fixed);
         } else {
             page_set_flags(start, last, 0, PAGE_VALID);
         }

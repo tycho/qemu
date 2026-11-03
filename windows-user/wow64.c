@@ -40,7 +40,7 @@ NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
                                            SIZE_T, PSIZE_T);
 
 #ifndef XT_SCAFFOLD
-#define XT_SCAFFOLD "one-insn-per-tb=on"
+#define XT_SCAFFOLD "one-insn-per-tb=on,smc=check"
 #endif
 
 /*
