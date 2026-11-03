@@ -241,6 +241,7 @@ bool xt_guest_read(XtThread *t, vaddr addr, void *buf, size_t len);
 void xt_record_hold(void);
 void xt_record_release(void);
 void xt_thread_retire(XtThread *t, void *thread_handle);
+bool xt_terminates(HANDLE thread);
 void xt_reap_later(void *thread_handle, void *alloc);
 void xt_park_if_terminating(XtThread *t);
 int xt_reap(void);

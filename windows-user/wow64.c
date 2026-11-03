@@ -405,15 +405,21 @@ static void bring_out(DWORD tid, void *teb, bool retire)
 /*
  * The suspension of another thread is outside an adapter scope: two
  * threads terminating each other would otherwise each wait for the
- * other's notification.
+ * other's notification.  A thread Windows won't end (xt_terminates) is
+ * left alone.
  */
 XTEXPORT void WINAPI BTCpuThreadTerm(HANDLE thread, LONG code)
 {
     void *teb = NULL;
-    DWORD tid = thread_id(thread, &teb);
-    XtThread *t = xt_tls_ready() ? xt_self : NULL;
+    DWORD tid;
+    XtThread *t;
     bool began;
 
+    if (!xt_terminates(thread)) {
+        return;
+    }
+    tid = thread_id(thread, &teb);
+    t = xt_tls_ready() ? xt_self : NULL;
     xt_enter();
     began = xt_adapter_begin();
     xt_reap();
