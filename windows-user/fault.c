@@ -19,8 +19,6 @@
 #include "user/page-protection.h"
 #include "xtajit.h"
 
-NTSTATUS NTAPI NtContinue(PCONTEXT, BOOLEAN);
-
 extern IMAGE_DOS_HEADER __ImageBase;
 
 static uint32_t n_faults;
@@ -68,7 +66,7 @@ static void G_NORETURN xt_fault_continue(XtThread *t, XtActive prev)
         if (r == 1) {
             t->active = prev;
             f->busy = 0;
-            NtContinue(&f->ctx, FALSE);
+            xt_continue_native(&f->ctx);
         } else if (r == 2) {
             t->active = prev;
             f->busy = 0;
@@ -107,7 +105,7 @@ static void G_NORETURN xt_fault_entry(XtThread *t, uint64_t prev)
  * change under them, and the adapter's own guarded reads.  Anything else
  * is not ours, and dispatch continues.
  */
-bool xt_fault_redirect(EXCEPTION_RECORD *er, CONTEXT *ctx)
+bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx)
 {
     XtThread *t = xt_self;
     XtFault *f;

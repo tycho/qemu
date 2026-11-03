@@ -158,6 +158,11 @@ static void make_bop(void)
 
 static int init_applied, init_rejected;
 
+NTSTATUS xt_continue_native(XtNativeContext *ctx)
+{
+    return NtContinue(ctx, FALSE);
+}
+
 
 extern IMAGE_DOS_HEADER __ImageBase;
 
