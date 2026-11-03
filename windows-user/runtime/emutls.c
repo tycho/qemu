@@ -239,6 +239,17 @@ static void free_region(void *p)
     NtFreeVirtualMemory(GetCurrentProcess(), &p, &size, MEM_RELEASE);
 }
 
+/* How many roots there are, for the test harness, while none are reaped. */
+size_t xt_emutls_roots(void)
+{
+    size_t n = 0;
+
+    for (TlsRoot *r = qatomic_read(&roots); r; r = r->next) {
+        n++;
+    }
+    return n;
+}
+
 /* The roots of threads that have ended go, with their storage. */
 void xt_emutls_reap(void)
 {
