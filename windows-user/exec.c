@@ -78,11 +78,15 @@ static bool insn_privileged(XtThread *t, CPUX86State *env)
 {
     uint8_t b[15];
     int n = fetch_insn(t, env->eip, b), seg, i = skip_prefixes(b, n, &seg);
-    int reg = i + 2 < n ? (b[i + 2] >> 3) & 7 : -1;
+    int reg;
 
+    if (i < n && (env->hflags & HF_CS64_MASK) && (b[i] & 0xf0) == 0x40) {
+        i++;                            /* REX */
+    }
     if (i >= n) {
         return false;
     }
+    reg = i + 2 < n ? (b[i + 2] >> 3) & 7 : -1;
     switch (b[i]) {
     case 0xf4:                          /* hlt */
     case 0xfa: case 0xfb:               /* cli, sti */
@@ -104,9 +108,9 @@ static bool insn_privileged(XtThread *t, CPUX86State *env)
             return true;
         case 0x00:                      /* lldt, ltr */
             return reg == 2 || reg == 3;
-        case 0x01:                      /* lgdt, lidt, lmsw, invlpg */
+        case 0x01:              /* lgdt, lidt, lmsw, invlpg, swapgs */
             return reg == 2 || reg == 3 || reg == 6 ||
-                   (reg == 7 && (b[i + 2] >> 6) != 3);
+                   (reg == 7 && ((b[i + 2] >> 6) != 3 || b[i + 2] == 0xf8));
         }
         return false;
     }
@@ -116,24 +120,29 @@ static bool insn_privileged(XtThread *t, CPUX86State *env)
 /*
  * For #DE: whether the divide at EIP has a nonzero divisor, so that the
  * quotient overflowed.  Windows tells the two apart this way, reporting
- * STATUS_INTEGER_OVERFLOW for the second.  32-bit addressing only.
+ * STATUS_INTEGER_OVERFLOW for the second.  32- and 64-bit addressing.
  */
 static bool div_overflowed(XtThread *t, CPUX86State *env)
 {
     uint8_t b[15];
     int n = fetch_insn(t, env->eip, b), seg, i = skip_prefixes(b, n, &seg);
-    bool opsize16 = false, addr16 = false;
-    int size, mod, reg, rm, p;
-    uint32_t ea = 0, v = 0;
+    bool code64 = env->hflags & HF_CS64_MASK;
+    bool opsize16 = false, addrsize = false, riprel = false;
+    int rex = 0, size, mod, reg, rm, p;
+    target_ulong ea = 0;
+    uint64_t v = 0;
 
     for (int k = 0; k < i; k++) {
         opsize16 |= b[k] == 0x66;
-        addr16 |= b[k] == 0x67;
+        addrsize |= b[k] == 0x67;
     }
-    if (i + 1 >= n || (b[i] != 0xf6 && b[i] != 0xf7) || addr16) {
+    if (code64 && i < n && (b[i] & 0xf0) == 0x40) {
+        rex = b[i++];
+    }
+    if (i + 1 >= n || (b[i] != 0xf6 && b[i] != 0xf7) || (addrsize && !code64)) {
         return false;
     }
-    size = b[i] == 0xf6 ? 1 : opsize16 ? 2 : 4;
+    size = b[i] == 0xf6 ? 1 : rex & 8 ? 8 : opsize16 ? 2 : 4;
     mod = b[i + 1] >> 6;
     reg = (b[i + 1] >> 3) & 7;
     rm = b[i + 1] & 7;
@@ -141,8 +150,10 @@ static bool div_overflowed(XtThread *t, CPUX86State *env)
         return false;
     }
     if (mod == 3) {
-        v = size == 1 ? env->regs[rm & 3] >> (rm & 4 ? 8 : 0)
-                      : env->regs[rm];
+        rm |= (rex & 1) << 3;
+        /* Without REX, byte registers 4-7 are AH, CH, DH, BH. */
+        v = size == 1 && !rex && rm >= 4 ? env->regs[rm & 3] >> 8
+                                         : env->regs[rm];
     } else {
         p = i + 2;
         if (rm == 4) {
@@ -152,23 +163,25 @@ static bool div_overflowed(XtThread *t, CPUX86State *env)
                 return false;
             }
             sib = b[p++];
-            base = sib & 7;
-            index = (sib >> 3) & 7;
+            base = (sib & 7) | (rex & 1) << 3;
+            index = ((sib >> 3) & 7) | (rex & 2) << 2;
             if (index != 4) {
                 ea += env->regs[index] << (sib >> 6);
             }
-            if (base == 5 && mod == 0) {
+            if ((base & 7) == 5 && mod == 0) {
                 mod = 2;            /* disp32, no base */
             } else {
                 ea += env->regs[base];
             }
-            if (seg < 0 && (base == R_ESP || (base == R_EBP && mod))) {
+            if (seg < 0 &&
+                ((base & 7) == R_ESP || ((base & 7) == R_EBP && mod))) {
                 seg = R_SS;
             }
         } else if (rm == 5 && mod == 0) {
             mod = 2;
+            riprel = code64;
         } else {
-            ea += env->regs[rm];
+            ea += env->regs[rm | (rex & 1) << 3];
         }
         if (mod == 1) {
             if (p >= n) {
@@ -176,22 +189,32 @@ static bool div_overflowed(XtThread *t, CPUX86State *env)
             }
             ea += (int8_t)b[p];
         } else if (mod == 2) {
-            uint32_t d;
+            int32_t d;
 
             if (p + 4 > n) {
                 return false;
             }
             memcpy(&d, &b[p], 4);
             ea += d;
+            /* RIP-relative: from the end, as the divide has no immediate. */
+            if (riprel) {
+                ea += env->eip + p + 4;
+            }
         }
-        if (seg >= 0) {
+        if (!code64 || addrsize) {
+            ea = (uint32_t)ea;
+        }
+        /* In 64-bit code only FS and GS have bases. */
+        if (seg >= 0 && (!code64 || seg == R_FS || seg == R_GS)) {
             ea += env->segs[seg].base;
         }
         if (!xt_guest_read(t, ea, &v, size)) {
             return false;
         }
     }
-    v &= size == 4 ? 0xffffffff : (1u << (size * 8)) - 1;
+    if (size < 8) {
+        v &= (1ull << (size * 8)) - 1;
+    }
     return v != 0;
 }
 
@@ -260,6 +283,16 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
             env->error_code & PG_ERROR_W_MASK ? 1 :
             env->error_code & PG_ERROR_I_D_MASK ? 8 : 0;
         r->ExceptionInformation[1] = env->cr[2];
+#ifdef TARGET_X86_64
+        /*
+         * A non-canonical address #GPs on x86 rather than faulting: the
+         * access and address are unknown, as Windows reports any #GP.
+         */
+        if ((int64_t)(env->cr[2] << 16) >> 16 != env->cr[2]) {
+            r->ExceptionInformation[0] = 0;
+            r->ExceptionInformation[1] = -1;
+        }
+#endif
         break;
     case EXCP11_ALGN:
         r->ExceptionCode = STATUS_DATATYPE_MISALIGNMENT;
@@ -302,7 +335,7 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
     case EXCP0C_STACK:
         r->ExceptionCode = STATUS_ACCESS_VIOLATION;
         r->NumberParameters = 2;
-        r->ExceptionInformation[1] = 0xffffffff;
+        r->ExceptionInformation[1] = (target_ulong)-1;
         break;
     case EXCP0D_GPF:
         /*
@@ -321,7 +354,7 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
         } else {
             r->ExceptionCode = STATUS_ACCESS_VIOLATION;
             r->NumberParameters = 2;
-            r->ExceptionInformation[1] = 0xffffffff;
+            r->ExceptionInformation[1] = (target_ulong)-1;
         }
         break;
     case EXCP10_COPR:
