@@ -290,20 +290,28 @@ XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
 }
 
 #define XT_EMULATOR_STACK (256 * 1024)
+#define XT_EC_THREAD_PAGE 0x1000
 
+/*
+ * A thread's emulator stack, above a page of its own: the doorbell word
+ * Windows sets to ask a simulating thread to stop (SuspendDoorbell).
+ */
 XTEXPORT NTSTATUS ThreadInit(void)
 {
     XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
-    PVOID stack = NULL;
-    SIZE_T size = XT_EMULATOR_STACK;
+    PVOID mem = NULL;
+    SIZE_T size = XT_EC_THREAD_PAGE + XT_EMULATOR_STACK;
+    uintptr_t stack;
 
     reached |= 0x100;
-    if (!area || alloc_direct(&stack, &size, MEM_RESERVE | MEM_COMMIT,
+    if (!area || alloc_direct(&mem, &size, MEM_RESERVE | MEM_COMMIT,
                               PAGE_READWRITE) < 0) {
         return STATUS_NO_MEMORY;
     }
-    area->EmulatorStackLimit = (uintptr_t)stack;
-    area->EmulatorStackBase = (uintptr_t)stack + XT_EMULATOR_STACK;
+    stack = (uintptr_t)mem + XT_EC_THREAD_PAGE;
+    area->SuspendDoorbell = mem;
+    area->EmulatorStackLimit = stack;
+    area->EmulatorStackBase = stack + XT_EMULATOR_STACK;
     area->EmulatorData[0] = NULL;
     return STATUS_SUCCESS;
 }
