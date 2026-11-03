@@ -111,6 +111,7 @@ typedef enum XtFaultKind {
     XT_FK_HELPER,       /* a helper: helper_retaddr */
     XT_FK_FETCH,        /* instruction fetch through cpu_ld*_code_mmu */
     XT_FK_TRANSLATE,    /* the translator reading guest code */
+    XT_FK_SMC,          /* a TB's entry check reading its guest code */
     XT_FK_ADAPTER,      /* xt_guest_read */
 } XtFaultKind;
 
@@ -274,6 +275,7 @@ void xt_note_map(void *addr, SIZE_T len, ULONG prot);
 void xt_note_unmap(void *addr, BOOL after);
 void xt_note_read_file(void *addr, SIZE_T len, BOOL after, NTSTATUS status);
 bool xt_unprotect_for_native(vaddr addr);
+bool xt_guard_restore(vaddr addr);
 BOOLEAN xt_feature_present(UINT feature);
 void xt_processor_info(void *info, USHORT arch);
 /*
