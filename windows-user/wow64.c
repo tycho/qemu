@@ -316,15 +316,18 @@ static DWORD thread_id(HANDLE thread, void **teb)
  * wow64.dll's own critical regions.  These are what Windows' cooperative
  * suspension tests: slot 2 bits 0 (this module's: guest code, adapter
  * entries) and 1 (wow64.dll's, while it initializes a thread), and slot 6
- * (wow64.dll's, around its cross-process work list and its lock).  It
- * is told to stop there (terminating: it parks at its next acquire, or
- * at the end of the adapter entry it is in; an exit request gets it out
- * of guest code), then suspended until it is found so.  The
- * suspension is kept: if the termination succeeds the thread never runs
- * again.  Windows' cooperative suspension isn't used: another thread's
- * suspension of the same target would be in its way.  The record is read
- * only while the target is suspended, so its own exit, which waits for
- * the record's users, can't be waiting on this.
+ * (wow64.dll's, around its cross-process work list and its lock).  At the
+ * whole process's end slot 6 doesn't count: a thread waiting there for
+ * that lock waits for good once the process is ending (its holder may be
+ * the ending thread or a thread already stopped), and nothing needs the
+ * lock after.  It is told to stop there (terminating: it parks at its
+ * next acquire, or at the end of the adapter entry it is in; an exit
+ * request gets it out of guest code), then suspended until it is found
+ * so.  The suspension is kept: if the termination succeeds the thread
+ * never runs again.  Windows' cooperative suspension isn't used: another
+ * thread's suspension of the same target would be in its way.  The record
+ * is read only while the target is suspended, so its own exit, which
+ * waits for the record's users, can't be waiting on this.
  */
 /*
  * Bring another thread out of the engine before Windows ends it: suspend
@@ -369,7 +372,7 @@ static void bring_out(DWORD tid, void *teb, bool retire)
             break;
         }
         if (t->state == XT_WINDOWS && !(qatomic_read(slot2) & 3) &&
-            !qatomic_read(slot6)) {
+            (!retire || !qatomic_read(slot6))) {
             bool began;
 
             qatomic_set(&t->terminating, 1);
