@@ -1640,6 +1640,8 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
             !mprotect(p + page, TCG_RETSTACK_SIZE, PROT_READ | PROT_WRITE)) {
             cpu->tb_jmp_cache->retring = p + page;
             tcg_retstack_reset(cpu);
+        } else if (p != MAP_FAILED) {
+            munmap(p, TCG_RETSTACK_SIZE + 2 * page);
         }
     }
     if (tcg_jcgen) {
@@ -1660,6 +1662,11 @@ static void tb_jmp_cache_free(CPUJumpCache *jc)
 {
     if (tcg_retstack_env) {
         qemu_vfree(jc->retring);
+    } else if (jc->retring) {
+        /* Mapped with a guard page at each end. */
+        size_t page = qemu_real_host_page_size();
+
+        munmap((char *)jc->retring - page, TCG_RETSTACK_SIZE + 2 * page);
     }
     qemu_vfree(jc);
 }
