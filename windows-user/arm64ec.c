@@ -593,29 +593,62 @@ typedef struct QEMU_ALIGNED(16) XtKiFrame {
 #endif
 
 /*
- * The end of an activation: the engine gives the thread back (publish),
- * the guest state goes into the packed context, and EFLAGS it can't carry
- * are kept for the re-entry that continues it.
+ * EFLAGS kept for a re-entry through a context at RSP: records deeper
+ * than a new one are dead (the stack has unwound past them), and taking
+ * one drops the deeper ones too.
  */
-static void leave(XtThread *t, ARM64_NT_CONTEXT *n)
+static void aux_push(XtThread *t, vaddr rsp, uint32_t eflags)
+{
+    int n = 0;
+
+    for (int i = 0; i < t->naux; i++) {
+        if (t->aux[i].rsp > rsp) {
+            t->aux[n++] = t->aux[i];
+        }
+    }
+    if (n == ARRAY_SIZE(t->aux)) {
+        memmove(&t->aux[0], &t->aux[1], --n * sizeof(t->aux[0]));
+    }
+    t->aux[n].rsp = rsp;
+    t->aux[n].eflags = eflags;
+    t->naux = n + 1;
+}
+
+static bool aux_take(XtThread *t, vaddr rsp, uint32_t *eflags)
+{
+    for (int i = t->naux - 1; i >= 0; i--) {
+        if (t->aux[i].rsp == rsp) {
+            *eflags = t->aux[i].eflags;
+            t->naux = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * The end of an activation: the engine gives the thread back (publish)
+ * and the guest state goes into the packed context; for an exit that
+ * re-enters through a context (CONTEXT_EXIT), EFLAGS it can't carry are
+ * kept.
+ */
+static void leave(XtThread *t, ARM64_NT_CONTEXT *n, bool context_exit)
 {
     XtGuestContext c;
 
     memset(&c, 0, sizeof(c));
     xt_publish(t, &c);
     xt_ec_pack(t, n);
-    t->aux_valid = true;
-    t->aux_rip = n->Pc;
-    t->aux_rsp = n->Sp;
-    t->aux_eflags = cpu_compute_eflags(t->env);
+    if (context_exit) {
+        aux_push(t, n->Sp, cpu_compute_eflags(t->env));
+    }
     xt_log_flush(t);
 }
 
 static G_NORETURN void leave_native(XtThread *t, XtEcFrame *f,
                                        vaddr target)
 {
-    leave(t, &f->ctx);
-    t->aux_valid = false;
+    leave(t, &f->ctx, false);
     f->ctx.Pc = target;
     xt_ec_exit_native(&f->ctx);
 }
@@ -625,7 +658,7 @@ static G_NORETURN void leave_syscall(XtThread *t)
     XtKiFrame k;
 
     memset(&k.rec, 0, sizeof(k.rec));
-    leave(t, &k.ctx);
+    leave(t, &k.ctx, true);
     if (cross_process_work) {
         cross_process_work();
     }
@@ -673,7 +706,7 @@ static G_NORETURN void leave_exception(XtThread *t, XtExit *x)
         r->ExceptionCode = STATUS_SINGLE_STEP;
     }
     r->ExceptionAddress = (void *)(uintptr_t)t->env->eip;
-    leave(t, &n);
+    leave(t, &n, true);
     xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
     xt_syscall((uintptr_t)r, (uintptr_t)&n, first, 0, 0, 0, nr_raise);
     NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
@@ -689,7 +722,7 @@ static G_NORETURN void leave_suspend(XtThread *t, XtEcFrame *f)
 {
     ARM64_NT_CONTEXT n;
 
-    leave(t, &n);
+    leave(t, &n, true);
     qatomic_set(&f->doorbell, 0);
     xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
     xt_continue_native(&n);
@@ -743,7 +776,6 @@ void xt_ec_enter(XtEcFrame *f)
     if (cross_process_work) {
         cross_process_work();
     }
-    t->aux_valid = false;
     xt_ec_call_context(t, &f->ctx, &c);
     xt_acquire(t, &c);
     ec_run(t, f);
@@ -752,15 +784,19 @@ void xt_ec_enter(XtEcFrame *f)
 /*
  * KiUserEmulationDispatcher's entry, after a continuation at x64 code:
  * the CPU area's AMD64 context is authoritative, with what the packed
- * form couldn't carry from the exit it continues (the same RIP, RSP and
- * NZCV).  The x87 state and MXCSR stay the engine's.
+ * form couldn't carry from the exit it continues (the one at the same
+ * RSP; a handler may move RIP past a faulting instruction): EFLAGS but
+ * NZCV and TF.  The x87 state stays the engine's: Windows
+ * carries no control, status or tag word.
  */
+#define MXCSR_CARRIED 0xe03f
 void xt_ec_begin(void)
 {
     XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
     XtThread *t = ec_thread();
     const CONTEXT *w = (const CONTEXT *)area->ContextAmd64;
     const uint32_t nzcv = CC_S | CC_Z | CC_C | CC_O | TF_MASK;
+    uint32_t kept;
     CONTEXT c;
 
     if (cross_process_work) {
@@ -779,9 +815,8 @@ void xt_ec_begin(void)
         c.SegCs = w->SegCs;
         c.SegSs = w->SegSs;
         c.EFlags = w->EFlags;
-        if (t->aux_valid && w->Rip == t->aux_rip && w->Rsp == t->aux_rsp &&
-            (w->EFlags & nzcv) == (t->aux_eflags & nzcv)) {
-            c.EFlags = (t->aux_eflags & ~nzcv) | (w->EFlags & nzcv);
+        if (aux_take(t, w->Rsp, &kept)) {
+            c.EFlags = (kept & ~nzcv) | (w->EFlags & nzcv);
         }
     }
     if ((w->ContextFlags & CONTEXT_SEGMENTS) == CONTEXT_SEGMENTS) {
@@ -792,10 +827,21 @@ void xt_ec_begin(void)
     }
     if ((w->ContextFlags & CONTEXT_FLOATING_POINT) ==
         CONTEXT_FLOATING_POINT) {
+        /*
+         * MXCSR's rounding, flush-to-zero and flags travel (as FPCR and
+         * FPSR); changed there, they are an edit.  Its exception masks
+         * and DAZ don't, and stay the engine's.
+         */
+        uint32_t edited = MXCSR_CARRIED & (w->MxCsr ^ c.MxCsr);
+
         memcpy(c.FltSave.XmmRegisters, w->FltSave.XmmRegisters,
                sizeof(c.FltSave.XmmRegisters));
+        if (edited) {
+            c.MxCsr = (c.MxCsr & ~MXCSR_CARRIED) |
+                      (w->MxCsr & MXCSR_CARRIED);
+            c.FltSave.MxCsr = c.MxCsr;
+        }
     }
-    t->aux_valid = false;
     c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS |
                      CONTEXT_FLOATING_POINT;
     if ((w->ContextFlags & CONTEXT_DEBUG_REGISTERS) ==
