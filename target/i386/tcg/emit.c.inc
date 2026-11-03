@@ -2079,6 +2079,16 @@ static void gen_CPUID(DisasContext *s, X86DecodedInsn *decode)
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
     gen_helper_cpuid(tcg_env);
+    /*
+     * CPUID serializes instruction fetch: code stored before it, by this
+     * thread or another, runs after it.  When TBs check their code at
+     * entry, the next instruction starts a TB, which checks it, and the
+     * barrier orders that check after the guest's earlier loads.
+     */
+    if (translator_smc_check()) {
+        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+        s->base.is_jmp = DISAS_EOB_NEXT;
+    }
 }
 
 static void gen_CRC32(DisasContext *s, X86DecodedInsn *decode)
