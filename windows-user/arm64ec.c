@@ -29,7 +29,7 @@ NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
 extern IMAGE_DOS_HEADER __ImageBase;
 
 #ifndef XT_SCAFFOLD
-#define XT_SCAFFOLD "one-insn-per-tb=on"
+#define XT_SCAFFOLD "one-insn-per-tb=on,smc=check"
 #endif
 
 /*

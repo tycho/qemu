@@ -966,6 +966,7 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
 
 #ifdef CONFIG_USER_ONLY
     clear_helper_retaddr();
+    cpu->smc_check_tb = NULL;
     if (have_mmap_lock()) {
         mmap_unlock();
     }

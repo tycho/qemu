@@ -122,6 +122,15 @@ struct TranslationBlock {
      */
 #ifdef CONFIG_USER_ONLY
     IntervalTreeNode itree;
+    /*
+     * x-smc=check: whether the TB checks its guest bytes at entry; the
+     * bytes its translation read, from its start (smc_len), and their
+     * CRC32C then; smc_reject if they changed while it was translated.
+     */
+    bool smc_check;
+    bool smc_reject;
+    uint16_t smc_len;
+    uint32_t smc_crc;
 #else
     uintptr_t page_next[2];
     tb_page_addr_t page_addr[2];

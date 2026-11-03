@@ -17,6 +17,27 @@
 NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, PVOID, int, PVOID, SIZE_T,
                                     PSIZE_T);
 
+/*
+ * Put back the guard on ADDR's page, which a read by the engine itself
+ * took (Windows removes it as it raises the fault).  Not atomic: a
+ * protection change by another thread or process between the query and
+ * the change is overwritten, and another access in between finds no
+ * guard.  False if the guard couldn't be put back.
+ */
+bool xt_guard_restore(vaddr addr)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    PVOID base = (PVOID)(uintptr_t)(addr & TARGET_PAGE_MASK);
+    SIZE_T size = TARGET_PAGE_SIZE;
+    ULONG old;
+
+    return NtQueryVirtualMemory(GetCurrentProcess(), base, 0, &mbi,
+                                sizeof(mbi), NULL) >= 0 &&
+           mbi.State == MEM_COMMIT &&
+           NtProtectVirtualMemory(GetCurrentProcess(), &base, &size,
+                                  mbi.Protect | PAGE_GUARD, &old) >= 0;
+}
+
 /* The first page in the range that QEMU write-protected. */
 int xt_find_protected(void *opaque, vaddr start, vaddr end, int flags)
 {

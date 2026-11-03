@@ -543,6 +543,8 @@ struct CPUState {
     int64_t icount_extra;
     uint64_t random_seed;
     sigjmp_buf jmp_env;
+    /* x-smc=check: the TB whose guest bytes this CPU is reading */
+    void *smc_check_tb;
 
     /* See accel/tcg/host-fp.h. */
     bool host_fp_guest;
