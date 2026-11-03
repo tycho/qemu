@@ -574,13 +574,14 @@ XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
 }
 
 /*
- * The processor as x64 code sees it.  These come before the engine is up
- * too: the CPU model's features need a CPU, which the first entry makes.
+ * The processor as x64 code sees it.  Windows asks for the features while
+ * the process starts, before the engine is up: they are the CPU model's
+ * until the first entry makes a CPU.  The processor information needs
+ * that CPU.
  */
 XTEXPORT BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT feature)
 {
-    return qatomic_load_acquire(&engine_state) == 2 &&
-           xt_feature_present(feature);
+    return xt_feature_present(feature);
 }
 
 XTEXPORT void UpdateProcessorInformation(void *info)

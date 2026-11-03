@@ -229,50 +229,73 @@ void xt_note_read_file(void *addr, SIZE_T len, BOOL after, NTSTATUS status)
 }
 
 /*
- * What CPUID says, for IsProcessorFeaturePresent in the guest's code.  As
- * Windows' own x86 emulator: no PAE, DAZ or fast-fail feature (int 0x29
- * still ends the process).
+ * What CPUID says, for IsProcessorFeaturePresent in the guest's code, as
+ * a mask of PF_ numbers.  As Windows' own x86 emulator: no PAE, DAZ or
+ * fast-fail feature (int 0x29 still ends the process).
  */
+static uint64_t cpuid_features(CPUX86State *env)
+{
+    uint32_t edx = env->features[FEAT_1_EDX];
+    uint32_t ecx = env->features[FEAT_1_ECX];
+    uint32_t ext2 = env->features[FEAT_8000_0001_EDX];
+    static const struct {
+        uint8_t pf;
+        uint8_t word;
+        uint32_t bit;
+    } map[] = {
+        { PF_COMPARE_EXCHANGE_DOUBLE, 0, CPUID_CX8 },
+        { PF_MMX_INSTRUCTIONS_AVAILABLE, 0, CPUID_MMX },
+        { PF_XMMI_INSTRUCTIONS_AVAILABLE, 0, CPUID_SSE },
+        { PF_RDTSC_INSTRUCTION_AVAILABLE, 0, CPUID_TSC },
+        { PF_XMMI64_INSTRUCTIONS_AVAILABLE, 0, CPUID_SSE2 },
+        { PF_NX_ENABLED, 2, CPUID_EXT2_NX },
+        { PF_SSE3_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSE3 },
+        { PF_COMPARE_EXCHANGE128, 1, CPUID_EXT_CX16 },
+        { PF_RDTSCP_INSTRUCTION_AVAILABLE, 2, CPUID_EXT2_RDTSCP },
+        { PF_SSSE3_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSSE3 },
+        { PF_SSE4_1_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSE41 },
+        { PF_SSE4_2_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSE42 },
+    };
+    uint32_t words[3] = { edx, ecx, ext2 };
+    uint64_t m = 0;
+
+    for (int i = 0; i < ARRAY_SIZE(map); i++) {
+        if (words[map[i].word] & map[i].bit) {
+            m |= 1ull << map[i].pf;
+        }
+    }
+    return m;
+}
+
+/*
+ * The CPU model's features (xt_cpu_model), for the questions asked before
+ * the first CPU exists: Windows asks x64 code's while the process starts,
+ * and keeps the answers.  The first CPU's CPUID must say the same.
+ */
+#define MODEL_FEATURES                                                   \
+    (1ull << PF_COMPARE_EXCHANGE_DOUBLE |                                \
+     1ull << PF_MMX_INSTRUCTIONS_AVAILABLE |                             \
+     1ull << PF_XMMI_INSTRUCTIONS_AVAILABLE |                            \
+     1ull << PF_RDTSC_INSTRUCTION_AVAILABLE |                            \
+     1ull << PF_XMMI64_INSTRUCTIONS_AVAILABLE |                          \
+     1ull << PF_NX_ENABLED |                                             \
+     1ull << PF_SSE3_INSTRUCTIONS_AVAILABLE |                            \
+     1ull << PF_COMPARE_EXCHANGE128 |                                    \
+     1ull << PF_RDTSCP_INSTRUCTION_AVAILABLE |                           \
+     1ull << PF_SSSE3_INSTRUCTIONS_AVAILABLE |                           \
+     1ull << PF_SSE4_1_INSTRUCTIONS_AVAILABLE |                          \
+     1ull << PF_SSE4_2_INSTRUCTIONS_AVAILABLE)
+
 BOOLEAN xt_feature_present(UINT feature)
 {
     CPUState *cs = first_cpu;
-    CPUX86State *env = cs ? cpu_env(cs) : NULL;
-    uint32_t edx, ecx, ext2;
+    uint64_t m = MODEL_FEATURES;
 
-    if (!env) {
-        return FALSE;
+    if (cs) {
+        m = cpuid_features(cpu_env(cs));
+        assert(m == MODEL_FEATURES);
     }
-    edx = env->features[FEAT_1_EDX];
-    ecx = env->features[FEAT_1_ECX];
-    ext2 = env->features[FEAT_8000_0001_EDX];
-    switch (feature) {
-    case PF_COMPARE_EXCHANGE_DOUBLE:
-        return !!(edx & CPUID_CX8);
-    case PF_MMX_INSTRUCTIONS_AVAILABLE:
-        return !!(edx & CPUID_MMX);
-    case PF_XMMI_INSTRUCTIONS_AVAILABLE:
-        return !!(edx & CPUID_SSE);
-    case PF_RDTSC_INSTRUCTION_AVAILABLE:
-        return !!(edx & CPUID_TSC);
-    case PF_XMMI64_INSTRUCTIONS_AVAILABLE:
-        return !!(edx & CPUID_SSE2);
-    case PF_NX_ENABLED:
-        return !!(ext2 & CPUID_EXT2_NX);
-    case PF_SSE3_INSTRUCTIONS_AVAILABLE:
-        return !!(ecx & CPUID_EXT_SSE3);
-    case PF_COMPARE_EXCHANGE128:
-        return !!(ecx & CPUID_EXT_CX16);
-    case PF_RDTSCP_INSTRUCTION_AVAILABLE:
-        return !!(ext2 & CPUID_EXT2_RDTSCP);
-    case PF_SSSE3_INSTRUCTIONS_AVAILABLE:
-        return !!(ecx & CPUID_EXT_SSSE3);
-    case PF_SSE4_1_INSTRUCTIONS_AVAILABLE:
-        return !!(ecx & CPUID_EXT_SSE41);
-    case PF_SSE4_2_INSTRUCTIONS_AVAILABLE:
-        return !!(ecx & CPUID_EXT_SSE42);
-    default:
-        return FALSE;
-    }
+    return feature < 64 && (m >> feature) & 1;
 }
 
 /*
