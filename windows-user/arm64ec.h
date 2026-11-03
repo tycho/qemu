@@ -82,4 +82,11 @@ void xt_check_call(void);
 /* arm64ec.c: an entry not built yet, WHICH 1-4, on the emulator stack. */
 void xt_ec_entry_stub(int which, uint64_t target);
 
+/* test-ec.S: the capture probe's loop and its labels; its entry path. */
+extern const char xt_cap_loop[], xt_cap_loop_top[], xt_cap_trap[],
+                  xt_cap_fault[], xt_cap_cont[], xt_cap_loop_end[];
+extern uint32_t xt_cap_entry_mode;
+extern uint64_t xt_cap_entry_rec[6];
+void xt_cap_entry_end(uint64_t which);
+
 #endif

@@ -362,6 +362,18 @@ XTEXPORT void xt_ec_test_invalidate(void *addr, size_t len);
 XTEXPORT void xt_ec_test_load(void *dst, const void *src, size_t len);
 XTEXPORT void xt_ec_test_counts(uint32_t *faults, uint32_t *flushes);
 XTEXPORT void xt_ec_test_syscalls(int64_t nr[4], uint32_t *lut_size);
+XTEXPORT uint32_t xt_ec_test_reached(void);
+
+/* test-ec.c: the capture probe */
+typedef struct XtCapRun XtCapRun;
+typedef struct XtCapEvent XtCapEvent;
+bool xt_ec_probe_rtcs(EXCEPTION_RECORD *er, CONTEXT *guest,
+                      ARM64_NT_CONTEXT *native);
+void xt_ec_probe_process_init(void);
+XTEXPORT void *xt_ec_cap_prepare(int where);
+XTEXPORT void xt_ec_cap_arm(XtCapRun *r, int clear_sim);
+XTEXPORT uint32_t xt_ec_cap_events(XtCapEvent *out, uint32_t max);
+XTEXPORT void xt_ec_cap_entry(int mode, uint64_t rec[6]);
 #endif /* !TARGET_X86_64 */
 
 #endif
