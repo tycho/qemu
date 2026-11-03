@@ -855,7 +855,7 @@ void ulshift(uint64_t *plow, uint64_t *phigh, int32_t shift, bool *overflow);
 static inline uint64_t udiv_qrnnd(uint64_t *r, uint64_t n1,
                                   uint64_t n0, uint64_t d)
 {
-#if defined(__x86_64__)
+#if defined(HOST_X86_64)
     uint64_t q;
     asm("divq %4" : "=a"(q), "=d"(*r) : "0"(n0), "1"(n1), "rm"(d));
     return q;

@@ -926,7 +926,7 @@ static inline int64_t cpu_get_host_ticks(void)
     return retval;
 }
 
-#elif defined(__x86_64__)
+#elif defined(HOST_X86_64)
 
 static inline int64_t cpu_get_host_ticks(void)
 {

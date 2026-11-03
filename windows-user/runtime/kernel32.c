@@ -251,6 +251,25 @@ LPVOID WINAPI VirtualAlloc(LPVOID addr, SIZE_T len, DWORD type, DWORD prot)
     PVOID base = addr;
     SIZE_T size = len;
 
+#ifdef __arm64ec__
+    /*
+     * In an ARM64EC process, the module's executable memory (TCG's code
+     * buffer) holds native code: Windows must see it as EC code, not x64.
+     */
+    if (prot & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                PAGE_EXECUTE_WRITECOPY)) {
+        MEM_EXTENDED_PARAMETER ec = {
+            .Type = MemExtendedParameterAttributeFlags,
+            .ULong64 = MEM_EXTENDED_PARAMETER_EC_CODE,
+        };
+
+        if (NtAllocateVirtualMemoryEx(GetCurrentProcess(), &base, &size,
+                                      nt_alloc_type(type), prot, &ec, 1) < 0) {
+            return NULL;
+        }
+        return base;
+    }
+#endif
     if (NtAllocateVirtualMemory(GetCurrentProcess(), &base, 0, &size,
                                 nt_alloc_type(type), prot) < 0) {
         return NULL;
