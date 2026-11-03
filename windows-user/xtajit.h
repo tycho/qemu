@@ -180,12 +180,16 @@ typedef struct XtThread {
     vaddr native_target;    /* set with XT_EXCP_NATIVE */
     ULONG *ec_doorbell;     /* the x64 module's SuspendDoorbell word */
     /*
-     * EFLAGS the packed context can't carry, kept at an exit for the
-     * re-entry that continues it (the same RIP, RSP and NZCV).
+     * EFLAGS the packed context can't carry, kept at each exit that
+     * re-enters through a context (a system call, an exception, a
+     * suspension) for the re-entry at its RSP; nested activations push
+     * their own, deeper (xt_ec_aux_*).
      */
-    bool aux_valid;
-    vaddr aux_rip, aux_rsp;
-    uint32_t aux_eflags;
+    struct {
+        vaddr rsp;
+        uint32_t eflags;
+    } aux[8];
+    int naux;
     sigjmp_buf adapter_jmp;
     uint32_t violations;
     uint64_t counts[XT_EV__MAX];
