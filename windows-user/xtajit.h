@@ -1,6 +1,7 @@
 /*
- * xtajit: QEMU's user-mode engine as the 32-bit x86 CPU module of
- * Windows on Arm's WOW64 layer.
+ * xtajit: QEMU's user-mode engine as a CPU module of Windows on Arm: the
+ * 32-bit x86 one of the WOW64 layer (i386), or the x64 one of ARM64EC
+ * processes (x86_64).
  *
  * Copyright (c) 2026 Steven Noonan
  *
@@ -15,6 +16,24 @@
 #include "exec/mmu-access-type.h"
 #include "user/guest-host.h"
 #include "cpu.h"
+
+/*
+ * A thread's full native context, for fault recovery: CONTEXT on AArch64.
+ * In ARM64EC code CONTEXT is the AMD64 context; the native one is
+ * ARM64_NT_CONTEXT.
+ */
+#ifdef __arm64ec__
+typedef ARM64_NT_CONTEXT XtNativeContext;
+#else
+typedef CONTEXT XtNativeContext;
+#endif
+
+/* The guest context Windows keeps for a thread: x86's WOW64 one, or x64's. */
+#ifdef TARGET_X86_64
+typedef CONTEXT XtGuestContext;
+#else
+typedef WOW64_CONTEXT XtGuestContext;
+#endif
 
 /*
  * Who owns a thread's guest state.  Windows owns it outside simulation:
@@ -103,7 +122,7 @@ typedef struct XtFault {
     MMUAccessType access;
     vaddr addr;
     uintptr_t host_pc;      /* for cpu_restore_state, 0 for none */
-    CONTEXT ctx;            /* the native context, for a retry */
+    XtNativeContext ctx;    /* the native context, for a retry */
 } XtFault;
 
 /* What a guest #PF carries to Wow64RaiseException besides CR2. */
@@ -117,13 +136,22 @@ typedef enum XtExitKind {
     XT_EXIT_EXCEPTION,
     XT_EXIT_SUSPEND,
     XT_EXIT_STOP,           /* the harness asked to stop (int3 in tests) */
+    XT_EXIT_NATIVE,         /* a transfer to native code at target */
 } XtExitKind;
+
+/*
+ * cpu_exec's exit for a transfer to native code (ARM64EC code): above
+ * EXCP_INTERRUPT, so that cpu_exec returns it as it is rather than as an
+ * x86 interrupt vector.
+ */
+#define XT_EXCP_NATIVE 0x10100
 
 typedef struct XtExit {
     XtExitKind kind;
     int trapnr;
     uint32_t nr;            /* system call number */
-    uint32_t args;          /* guest address of the arguments */
+    vaddr args;             /* guest address of the arguments */
+    vaddr target;           /* XT_EXIT_NATIVE's */
     int vector;             /* a software interrupt's, else -1 */
     EXCEPTION_RECORD rec;
 } XtExit;
@@ -131,6 +159,7 @@ typedef struct XtExit {
 typedef struct XtThread {
     CPUState *cpu;
     CPUX86State *env;
+    void *heap;             /* its allocator heap, given back with it */
     DWORD tid;
     void *teb;
     bool wow64;             /* under wow64.dll: slot 2, the CPU area */
@@ -141,14 +170,28 @@ typedef struct XtThread {
     uint32_t activation;
     int suspend_req;        /* set by another thread (cpu_exit after) */
     int terminating;        /* another thread is terminating this one */
-    uint32_t bp[4];         /* DR0-DR3 as execute breakpoints, where bp_on */
+    vaddr bp[4];            /* DR0-DR3 as execute breakpoints, where bp_on */
     bool bp_on[4];
-    uint32_t bp_hit;        /* the last breakpoint reported, else 0 */
+    vaddr bp_hit;           /* the last breakpoint reported, else 0 */
     bool bp_skip;           /* run one instruction past breakpoints */
     uint32_t suspensions;   /* suspension exits taken */
     bool after_suspend;     /* the last exit was a suspension */
     XtGuestFault gfault;
     XtFault fault;
+    vaddr native_target;    /* set with XT_EXCP_NATIVE */
+    ULONG *ec_doorbell;     /* the x64 module's SuspendDoorbell word */
+    bool ec_suspended;      /* left through a suspension's continuation */
+    /*
+     * EFLAGS the packed context can't carry, kept at each exit that
+     * re-enters through a context (a system call, an exception, a
+     * suspension) for the re-entry at its RSP; nested activations push
+     * their own, deeper (xt_ec_aux_*).
+     */
+    struct {
+        vaddr rsp;
+        uint32_t eflags;
+    } aux[8];
+    int naux;
     sigjmp_buf adapter_jmp;
     uint32_t violations;
     uint64_t counts[XT_EV__MAX];
@@ -182,11 +225,9 @@ void xt_thread_free(XtThread *t);
 void xt_event(XtThread *t, XtEv kind, uint64_t a, uint64_t b);
 void xt_gevent(XtEv kind, uint64_t a, uint64_t b);
 uint32_t xt_check(XtThread *t, XtState expect, int where);
-void xt_import(XtThread *t, const WOW64_CONTEXT *c);
-void xt_export(XtThread *t, WOW64_CONTEXT *c);
 void xt_set_slot2(XtThread *t, bool running);
-void xt_acquire(XtThread *t, const WOW64_CONTEXT *c);
-void xt_publish(XtThread *t, WOW64_CONTEXT *c);
+void xt_acquire(XtThread *t, const XtGuestContext *c);
+void xt_publish(XtThread *t, XtGuestContext *c);
 void xt_dump(XtThread *t, void *handle);
 void xt_log_flush(XtThread *t);
 void xt_log_open(void);
@@ -195,9 +236,45 @@ bool xt_guest_read(XtThread *t, vaddr addr, void *buf, size_t len);
 void xt_record_hold(void);
 void xt_record_release(void);
 void xt_thread_retire(XtThread *t, void *thread_handle);
+void xt_reap_later(void *thread_handle, void *alloc);
 void xt_park_if_terminating(XtThread *t);
 int xt_reap(void);
-void xt_log_native(EXCEPTION_RECORD *er, CONTEXT *ctx);
+void xt_log_native(EXCEPTION_RECORD *er, XtNativeContext *ctx);
+extern NTSTATUS xt_log_status;      /* the event log's opening */
+
+/* context-wow64.c, context-amd64.c: the guest context and CPUX86State */
+void xt_import(XtThread *t, const XtGuestContext *c);
+void xt_export(XtThread *t, XtGuestContext *c);
+#ifdef __arm64ec__
+void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n);
+void xt_ec_call_context(XtThread *t, ARM64_NT_CONTEXT *n, CONTEXT *c);
+#endif
+
+/* memory.c: Windows' memory notifications, the processor's identity */
+typedef struct XtUnprotect {
+    vaddr start, last;
+    vaddr found;
+} XtUnprotect;
+int xt_find_protected(void *opaque, vaddr start, vaddr end, int flags);
+void xt_mem_forget(int kind, ULONG prot, vaddr start, vaddr len);
+void xt_note_flush(const void *addr, SIZE_T len);
+void xt_note_alloc(void *addr, SIZE_T len, ULONG type, ULONG prot, BOOL after,
+                   NTSTATUS status);
+void xt_note_protect(void *addr, SIZE_T len, ULONG prot, BOOL after,
+                     NTSTATUS status);
+void xt_note_free(void *addr, SIZE_T len, ULONG type, BOOL after,
+                  NTSTATUS status);
+void xt_note_map(void *addr, SIZE_T len, ULONG prot);
+void xt_note_unmap(void *addr, BOOL after);
+void xt_note_read_file(void *addr, SIZE_T len, BOOL after, NTSTATUS status);
+BOOLEAN xt_feature_present(UINT feature);
+void xt_processor_info(void *info, USHORT arch);
+/*
+ * wow64.c, arm64ec.c: a scope of the engine's own work outside
+ * simulation, during which a suspension must wait.
+ */
+bool xt_adapter_begin(void);
+void xt_adapter_end(bool began);
 
 /* runtime.c: the guest's protection of pages QEMU write-protected */
 ULONG xt_guest_prot(uintptr_t page);
@@ -221,8 +298,10 @@ void xt_inject(XtThread *t, int point);
 void xt_run(XtThread *t, XtExit *x);
 
 /* fault.c */
-bool xt_fault_redirect(EXCEPTION_RECORD *er, CONTEXT *ctx);
+bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx);
 uint32_t xt_fault_count(void);
+/* Resume at CTX, all of it (wow64.c, arm64ec.c); returns only on failure. */
+NTSTATUS xt_continue_native(XtNativeContext *ctx);
 
 /* Status codes winnt.h leaves to ntstatus.h. */
 #ifndef STATUS_WX86_SINGLE_STEP
@@ -236,6 +315,9 @@ uint32_t xt_fault_count(void);
 #endif
 #ifndef STATUS_ASSERTION_FAILURE
 #define STATUS_ASSERTION_FAILURE ((NTSTATUS)0xC0000420)
+#endif
+#ifndef STATUS_NOT_SUPPORTED
+#define STATUS_NOT_SUPPORTED ((NTSTATUS)0xC00000BB)
 #endif
 #ifndef STATUS_STACK_BUFFER_OVERRUN
 #define STATUS_STACK_BUFFER_OVERRUN ((NTSTATUS)0xC0000409)
@@ -252,6 +334,7 @@ typedef struct XtThreadBasicInfo {
 
 #define XTEXPORT __declspec(dllexport)
 
+#ifndef TARGET_X86_64
 /* wow64.c: the module's interface to wow64.dll */
 int xt_process_init(bool wow64);
 int xt_settings_applied(int *rejected);
@@ -299,5 +382,53 @@ XTEXPORT int xt_test_suspend(DWORD tid);
 XTEXPORT int xt_test_flush(DWORD tid);
 XTEXPORT int xt_test_guest_read(uint32_t addr, void *buf, uint32_t len);
 XTEXPORT uintptr_t xt_test_bop(void);
+#else
+/* arm64ec.c: the module's interface to ntdll in an ARM64EC process */
+XTEXPORT NTSTATUS ProcessInit(void);
+XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status);
+XTEXPORT NTSTATUS ThreadInit(void);
+XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code);
+XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
+                                         ARM64_NT_CONTEXT *native);
+XTEXPORT void NotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type, ULONG prot,
+                                BOOL after, NTSTATUS status);
+XTEXPORT void NotifyMemoryFree(void *addr, SIZE_T len, ULONG type, BOOL after,
+                               NTSTATUS status);
+XTEXPORT void NotifyMemoryProtect(void *addr, SIZE_T len, ULONG prot,
+                                  BOOL after, NTSTATUS status);
+XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
+                                         SIZE_T len, ULONG type, ULONG prot);
+XTEXPORT void NotifyUnmapViewOfSection(void *addr, BOOL after, NTSTATUS status);
+XTEXPORT void FlushInstructionCacheHeavy(const void *addr, SIZE_T len);
+XTEXPORT void BTCpu64FlushInstructionCache(const void *addr, SIZE_T len);
+XTEXPORT void BTCpu64NotifyMemoryDirty(void *addr, SIZE_T len);
+XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
+                                    BOOL after, NTSTATUS status);
+XTEXPORT BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT feature);
+XTEXPORT void UpdateProcessorInformation(void *info);
+
+/* arm64ec.c: the ARM64EC test harness's entry points */
+typedef struct XtEcTestExit XtEcTestExit;
+XTEXPORT int xt_ec_test_init(int *rejected);
+XTEXPORT void *xt_ec_test_thread(void);
+XTEXPORT int xt_ec_test_run(CONTEXT *ctx, XtEcTestExit *out);
+XTEXPORT void *xt_ec_test_code_buffer(void);
+XTEXPORT void xt_ec_test_invalidate(void *addr, size_t len);
+XTEXPORT void xt_ec_test_load(void *dst, const void *src, size_t len);
+XTEXPORT void xt_ec_test_counts(uint32_t *faults, uint32_t *flushes);
+XTEXPORT void xt_ec_test_syscalls(int64_t nr[4], uint32_t *lut_size);
+XTEXPORT uint32_t xt_ec_test_reached(void);
+
+/* test-ec.c: the capture probe */
+typedef struct XtCapRun XtCapRun;
+typedef struct XtCapEvent XtCapEvent;
+bool xt_ec_probe_rtcs(EXCEPTION_RECORD *er, CONTEXT *guest,
+                      ARM64_NT_CONTEXT *native);
+void xt_ec_probe_process_init(void);
+XTEXPORT void *xt_ec_cap_prepare(int where);
+XTEXPORT void xt_ec_cap_arm(XtCapRun *r, int clear_sim);
+XTEXPORT uint32_t xt_ec_cap_events(XtCapEvent *out, uint32_t max);
+XTEXPORT void xt_ec_cap_entry(int mode, uint64_t rec[6]);
+#endif /* !TARGET_X86_64 */
 
 #endif

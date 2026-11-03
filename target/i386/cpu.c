@@ -2291,7 +2291,7 @@ void host_cpuid(uint32_t function, uint32_t count,
 {
     uint32_t vec[4];
 
-#ifdef __x86_64__
+#ifdef HOST_X86_64
     asm volatile("cpuid"
                  : "=a"(vec[0]), "=b"(vec[1]),
                    "=c"(vec[2]), "=d"(vec[3])

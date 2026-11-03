@@ -187,7 +187,7 @@ GEN_INPUT_FLUSH3(float64_input_flush3, float64)
  * hardfloat functions. Each combination of number of inputs and float size
  * gets its own value.
  */
-#if defined(__x86_64__)
+#if defined(HOST_X86_64)
 # define QEMU_HARDFLOAT_1F32_USE_FP 0
 # define QEMU_HARDFLOAT_1F64_USE_FP 1
 # define QEMU_HARDFLOAT_2F32_USE_FP 0
