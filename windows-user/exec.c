@@ -15,6 +15,7 @@
 
 uintptr_t xt_bop;
 
+#ifndef TARGET_X86_64
 static uint64_t read_cntvct(void)
 {
     uint64_t v;
@@ -22,6 +23,7 @@ static uint64_t read_cntvct(void)
     asm volatile("mrs %0, cntvct_el0" : "=r"(v));
     return v;
 }
+#endif
 
 /* The bytes at ADDR, as many of up to 15 as are readable. */
 static int fetch_insn(XtThread *t, vaddr addr, uint8_t *buf)
@@ -259,7 +261,7 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
         r->ExceptionInformation[0] =
             env->error_code & PG_ERROR_W_MASK ? 1 :
             env->error_code & PG_ERROR_I_D_MASK ? 8 : 0;
-        r->ExceptionInformation[1] = (uint32_t)env->cr[2];
+        r->ExceptionInformation[1] = env->cr[2];
         break;
     case EXCP11_ALGN:
         r->ExceptionCode = STATUS_DATATYPE_MISALIGNMENT;
@@ -277,7 +279,7 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
     case EXCP_DEBUG:
         /* An execute breakpoint, before the instruction. */
         for (int i = 0; i < 4; i++) {
-            if (t->bp_on[i] && t->bp[i] == (uint32_t)env->eip) {
+            if (t->bp_on[i] && t->bp[i] == env->eip) {
                 env->dr[6] |= 1 << i;
             }
         }
@@ -400,6 +402,7 @@ void xt_run(XtThread *t, XtExit *x)
             cpu_exec_step_atomic(cs);
             t->active = XT_ACT_NONE;
             continue;
+#ifndef TARGET_X86_64
         case 0x81: {
             uint64_t v = read_cntvct();
 
@@ -429,6 +432,7 @@ void xt_run(XtThread *t, XtExit *x)
                 return;
             }
             break;
+#endif
         case EXCP03_INT3:
             if (t->stop_at_int3) {
                 x->kind = XT_EXIT_STOP;

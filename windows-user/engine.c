@@ -242,6 +242,20 @@ bool gdb_may_set_breakpoints(void)
     return false;
 }
 
+#ifdef TARGET_X86_64
+/* x86_cpu_gdb_init's APX registers: nothing to register them with. */
+void gdb_register_coprocessor(CPUState *cpu, gdb_get_reg_cb get_reg,
+                              gdb_set_reg_cb set_reg,
+                              const GDBFeature *feature)
+{
+}
+
+const GDBFeature *gdb_find_static_feature(const char *xmlname)
+{
+    return NULL;
+}
+#endif
+
 /*
  * The descriptor tables, below 4 GiB, shared by every CPU.  The GDT has
  * the selectors 32-bit code sees on Windows on Arm, x86 Windows' own: flat
@@ -266,13 +280,63 @@ static uint64_t make_desc(uint32_t base, uint32_t limit, uint32_t flags)
     return e1 | ((uint64_t)e2 << 32);
 }
 
+#ifndef TARGET_X86_64
 static const uint32_t code32_flags =
     DESC_G_MASK | DESC_B_MASK | DESC_P_MASK | DESC_S_MASK |
     (3 << DESC_DPL_SHIFT) | (0xb << DESC_TYPE_SHIFT);
+#endif
 static const uint32_t data32_flags =
     DESC_G_MASK | DESC_B_MASK | DESC_P_MASK | DESC_S_MASK |
     (3 << DESC_DPL_SHIFT) | (0x3 << DESC_TYPE_SHIFT);
 
+#ifdef TARGET_X86_64
+/*
+ * x64 Windows' selectors: 64-bit code 0x33, data 0x2b (GS based at the
+ * TEB per thread), FS 0x53.  In long mode the IDT's gates are 16 bytes,
+ * and the vectors x64 code may raise with int are 3, 0x29, 0x2c, 0x2d and
+ * 0x2e.
+ */
+static const uint32_t code64_flags =
+    DESC_G_MASK | DESC_L_MASK | DESC_P_MASK | DESC_S_MASK |
+    (3 << DESC_DPL_SHIFT) | (0xb << DESC_TYPE_SHIFT);
+
+static void setup_tables(void)
+{
+    gdt = xt_alloc_low(4096);
+    gdt[0x2b >> 3] = make_desc(0, 0xfffff, data32_flags);
+    gdt[0x33 >> 3] = make_desc(0, 0xfffff, code64_flags);
+    gdt[0x53 >> 3] = make_desc(0, 0xfff, data32_flags & ~DESC_G_MASK);
+
+    idt = xt_alloc_low(256 * 16);
+    for (int n = 0; n < 256; n++) {
+        int dpl = n == 3 || n == 0x29 || n == 0x2c || n == 0x2d ||
+                  n == 0x2e ? 3 : 0;
+
+        if (n >= 20 && !dpl) {
+            continue;
+        }
+        idt[n * 4] = 0;
+        idt[n * 4 + 1] = 0x8e00 | (dpl << 13);
+    }
+}
+
+/* Long mode at CPL 3, as linux-user's target_cpu_copy_regs sets it up. */
+static void setup_mode(CPUX86State *env)
+{
+    env->cr[0] = CR0_PG_MASK | CR0_WP_MASK | CR0_PE_MASK | CR0_ET_MASK |
+                 CR0_NE_MASK;
+    env->hflags |= HF_PE_MASK | HF_CPL_MASK;
+    env->cr[4] |= CR4_OSFXSR_MASK | CR4_OSXMMEXCPT_MASK | CR4_PAE_MASK;
+    env->hflags |= HF_OSFXSR_MASK;
+    env->efer |= MSR_EFER_LMA | MSR_EFER_LME | MSR_EFER_NXE;
+    env->hflags |= HF_LMA_MASK;
+    env->eflags |= IF_MASK;
+    env->gdt.base = (uintptr_t)gdt;
+    env->gdt.limit = GDT_ENTRIES * 8 - 1;
+    env->idt.base = (uintptr_t)idt;
+    env->idt.limit = 256 * 16 - 1;
+}
+#else
 static void setup_tables(void)
 {
     gdt = xt_alloc_low(4096);
@@ -313,6 +377,7 @@ static void setup_mode(CPUX86State *env)
     env->idt.base = (uintptr_t)idt;
     env->idt.limit = 256 * 8 - 1;
 }
+#endif
 
 static QemuMutex cpu_create_mutex;
 
@@ -321,9 +386,15 @@ static QemuMutex cpu_create_mutex;
  * x86 emulator offers 32-bit code, all of which TCG implements.  No XSAVE
  * or AVX: the WOW64 context has no place for the YMM state.
  */
+#ifdef TARGET_X86_64
+const char *xt_cpu_model =
+    "qemu64,ssse3=on,sse4.1=on,sse4.2=on,popcnt=on,aes=on,pclmulqdq=on,"
+    "cx16=on,rdtscp=on,lahf-lm=on,3dnowprefetch=on,nx=on";
+#else
 const char *xt_cpu_model =
     "qemu32,ssse3=on,sse4.1=on,sse4.2=on,popcnt=on,aes=on,pclmulqdq=on,"
     "cx16=on,rdtscp=on,lahf-lm=on,3dnowprefetch=on,nx=on";
+#endif
 static const char *cpu_type;
 
 /* A CPU for the calling thread, in parallel mode from the start. */
@@ -419,7 +490,12 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
 
     qemu_mutex_init(&mmap_mutex);
     qemu_mutex_init(&cpu_create_mutex);
+#ifdef TARGET_X86_64
+    /* x64 user mode: the lower half of a 48-bit address space. */
+    guest_addr_max = (1ull << 47) - 1;
+#else
     guest_addr_max = UINT32_MAX;
+#endif
 
     module_call_init(MODULE_INIT_TRACE);
     qemu_init_cpu_list();

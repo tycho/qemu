@@ -713,6 +713,10 @@ endif
 
 qemu_common_flags += hardening_flags
 
+# ARM64EC: AArch64 code with an x64-compatible ABI, for an x64 process.
+# The compiler defines __x86_64__ as well as __arm64ec__.
+host_arm64ec = host_os == 'windows' and cc.get_define('__arm64ec__') != ''
+
 # The Windows user-mode module imports from ntdll alone: the linker drops
 # the code that calls other DLLs, function by function.
 if have_windows_user
@@ -3212,7 +3216,8 @@ if host_os == 'windows'
     }
   ''', name: 'mingw setjmp and longjmp')
 
-  if cpu == 'aarch64' and not mingw_has_setjmp_longjmp
+  # For ARM64EC, mingw doesn't build them: windows-user provides its own.
+  if cpu == 'aarch64' and not host_arm64ec and not mingw_has_setjmp_longjmp
     error('mingw must provide setjmp/longjmp for windows-arm64')
   endif
 endif
@@ -3318,11 +3323,16 @@ foreach target : target_dirs
     endif
     config_target += { 'CONFIG_BSD_USER': 'y' }
   elif target.endswith('windows-user')
-    if host_os != 'windows' or cpu != 'aarch64'
+    # The i386 module runs in WOW64's native (AArch64) half; the x86_64
+    # one in an x64 process, whose native code is ARM64EC.
+    windows_user_host = target.startswith('x86_64-') ? 'ARM64EC' : 'AArch64'
+    if host_os != 'windows' or cpu != 'aarch64' or \
+       (windows_user_host == 'ARM64EC') != host_arm64ec
       if default_targets
         continue
       endif
-      error('Target @0@ is only available on an aarch64 Windows host'.format(target))
+      error('Target @0@ is only available on an @1@ Windows host'.format(
+            target, windows_user_host))
     endif
     config_target += { 'CONFIG_WINDOWS_USER': 'y' }
   elif target.endswith('softmmu')
@@ -4484,8 +4494,10 @@ foreach target : target_dirs
       }]
     endif
   elif 'CONFIG_WINDOWS_USER' in config_target
-    # A DLL that wow64.dll loads, not an executable.
-    emulators += {'libwow64xtcg': shared_module('libwow64xtcg',
+    # A DLL that Windows loads as a process's x86 or x64 emulator, not an
+    # executable: wow64.dll's for i386, ntdll's for x86_64.
+    module_name = target_name == 'x86_64' ? 'libarm64ecxtcg' : 'libwow64xtcg'
+    emulators += {module_name: shared_module(module_name,
                   name_prefix: '',
                   install: true,
                   c_args: c_args,
