@@ -108,15 +108,18 @@ static void tb_record(TranslationBlock *tb)
     assert_memory_lock();
     tb->itree.last = tb->itree.start + tb->size - 1;
 
-    /* translator_loop() must have made all TB pages non-writable */
+    /*
+     * translator_loop() must have made all TB pages non-writable, unless
+     * the TB checks its bytes at entry (x-smc=check).
+     */
     addr = tb_page_addr0(tb);
     flags = page_get_flags(addr);
-    assert(!(flags & PAGE_WRITE));
+    assert(!(flags & PAGE_WRITE) || tb->smc_check);
 
     addr = tb_page_addr1(tb);
     if (addr != -1) {
         flags = page_get_flags(addr);
-        assert(!(flags & PAGE_WRITE));
+        assert(!(flags & PAGE_WRITE) || tb->smc_check);
     }
 
     interval_tree_insert(&tb->itree, &tb_root);

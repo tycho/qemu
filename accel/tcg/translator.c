@@ -20,9 +20,15 @@
 #endif
 #include "exec/plugin-gen.h"
 #include "tcg/tcg-op-common.h"
+#include "exec/helper-gen-common.h"
 #include "internal-common.h"
+#include "qemu/crc32c.h"
 #include "disas/disas.h"
 #include "tb-internal.h"
+#ifdef CONFIG_USER_ONLY
+#include "exec/page-protection.h"
+#include "user/page-protection.h"
+#endif
 
 #ifndef CONFIG_USER_ONLY
 static void set_can_do_io(DisasContextBase *db, bool val)
@@ -152,6 +158,77 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
     return use_cross_page_goto_tb() || translator_is_same_page(db, dest);
 }
 
+#ifdef CONFIG_USER_ONLY
+/*
+ * x-smc=check: whether TB's code may change without QEMU hearing of it:
+ * unless every page it reads is fixed (PAGE_FIXED_CODE: the OS layer
+ * vouches that only mapping and protection changes, which reach the page
+ * flags and drop the TBs, change it) and not writable.  The pages are
+ * those of the TB's extent: tb_page_addr1() isn't valid until tb_record.
+ */
+static bool smc_needs_check(const DisasContextBase *db,
+                            const TranslationBlock *tb)
+{
+    vaddr page[2] = { db->pc_first & TARGET_PAGE_MASK,
+                      (db->pc_first + tb->size - 1) & TARGET_PAGE_MASK };
+
+    for (int i = 0; i < 2; i++) {
+        if ((page_get_flags(page[i]) & (PAGE_FIXED_CODE | PAGE_WRITE)) !=
+            PAGE_FIXED_CODE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * x-smc=check, a TB whose code may change: the CRC32C of the guest bytes
+ * its translation read, and a check of it at the TB's start, after
+ * gen_tb_start's ops (MARK, the last of them, or none) and before
+ * everything else.  Emitted last, so that the TB's pages are known.  The
+ * bytes checked run from the TB's start to its end, or to the last byte
+ * read if that is before it (an overlength instruction's): no others went
+ * into it.  Bytes in between that weren't read (between the blocks of a
+ * TB made of several) are taken from memory now; a change there only
+ * costs a translation.  If a byte read changed during translation, the TB
+ * is rejected at its first entry and translated again.  A TB that read no
+ * guest bytes (a target's synthetic code) has nothing to check.
+ */
+static void smc_gen_check(DisasContextBase *db, TranslationBlock *tb,
+                          TCGOp *mark)
+{
+    TCGContext *s = tcg_ctx;
+    uint32_t len = MIN(s->smc_len, tb->size);
+    bool reject = s->smc_torn_at < len;
+
+    if (len == 0) {
+        return;
+    }
+    for (uint32_t off = 0, end; off < len; off = end) {
+        if (s->smc_have[off]) {
+            end = off + 1;
+            continue;
+        }
+        for (end = off; end < len && !s->smc_have[end]; end++) {
+            continue;
+        }
+        if (!translator_st(db, s->smc_buf + off, db->pc_first + off,
+                           end - off)) {
+            reject = true;
+        }
+    }
+    tb->smc_len = len;
+    tb->smc_crc = crc32c_fast(0xffffffff, s->smc_buf, len);
+    tb->smc_reject = reject;
+    tb->smc_check = true;
+
+    s->emit_before_op = mark ? QTAILQ_NEXT(mark, link)
+                             : QTAILQ_FIRST(&s->ops);
+    gen_helper_tb_smc_check(tcg_env, tcg_constant_ptr(tb));
+    s->emit_before_op = NULL;
+}
+#endif
+
 void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
                      vaddr pc, void *host_pc, const TranslatorOps *ops,
                      DisasContextBase *db, TCGType addr_type)
@@ -159,7 +236,9 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     uint32_t cflags = tb_cflags(tb);
     TCGOp *icount_start_insn;
     bool plugin_enabled;
-#ifndef CONFIG_USER_ONLY
+#ifdef CONFIG_USER_ONLY
+    TCGOp *smc_mark;
+#else
     TCGOp *first_insn_start = NULL;
 #endif
 
@@ -184,8 +263,20 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     ops->init_disas_context(db, cpu);
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
 
+#ifdef CONFIG_USER_ONLY
+    tb->smc_check = false;
+    if (tcg_ctx->smc_have) {
+        memset(tcg_ctx->smc_have, 0, tcg_ctx->smc_len);
+    }
+    tcg_ctx->smc_len = 0;
+    tcg_ctx->smc_torn_at = UINT32_MAX;
+#endif
+
     /* Start translating.  */
     icount_start_insn = gen_tb_start(db, cflags);
+#ifdef CONFIG_USER_ONLY
+    smc_mark = tcg_last_op();
+#endif
     ops->tb_start(db, cpu);
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
 
@@ -270,6 +361,12 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     tb->size = db->pc_next - db->pc_first;
     tb->icount = db->num_insns;
 
+#ifdef CONFIG_USER_ONLY
+    if (tcg_smc_check && smc_needs_check(db, tb)) {
+        smc_gen_check(db, tb, smc_mark);
+    }
+#endif
+
     if (plugin_enabled) {
         plugin_gen_tb_end(cpu, db->num_insns);
     }
@@ -291,8 +388,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     }
 }
 
-static bool translator_ld(CPUArchState *env, DisasContextBase *db,
-                          void *dest, vaddr pc, size_t len)
+static bool translator_ld_1(CPUArchState *env, DisasContextBase *db,
+                            void *dest, vaddr pc, size_t len)
 {
     TranslationBlock *tb = db->tb;
     vaddr last = pc + len - 1;
@@ -413,6 +510,75 @@ static bool translator_ld(CPUArchState *env, DisasContextBase *db,
     return true;
 }
 
+#ifdef CONFIG_USER_ONLY
+static void smc_grow(TCGContext *s, size_t size)
+{
+    if (size > s->smc_buf_size) {
+        size_t old = s->smc_buf_size;
+
+        s->smc_buf_size = MAX(old * 2, size + 256);
+        s->smc_buf = g_realloc(s->smc_buf, s->smc_buf_size);
+        s->smc_have = g_realloc(s->smc_have, s->smc_buf_size);
+        memset(s->smc_have + old, 0, s->smc_buf_size - old);
+    }
+}
+
+/*
+ * x-smc=check: keep the guest bytes the translator reads, at their
+ * offsets from the TB's start, for the CRC its entry check compares with.
+ * The first read of a byte wins; the first offset where a later read
+ * differs is kept (a byte changed during translation).
+ */
+static void smc_capture(DisasContextBase *db, vaddr pc, const void *src,
+                        size_t len)
+{
+    TCGContext *s = tcg_ctx;
+    const uint8_t *b = src;
+    size_t off;
+
+    if (pc < db->pc_first) {
+        return;
+    }
+    off = pc - db->pc_first;
+    smc_grow(s, off + len);
+    for (size_t i = 0; i < len; i++) {
+        if (!s->smc_have[off + i]) {
+            s->smc_buf[off + i] = b[i];
+            s->smc_have[off + i] = 1;
+        } else if (s->smc_buf[off + i] != b[i]) {
+            s->smc_torn_at = MIN(s->smc_torn_at, off + i);
+        }
+    }
+    s->smc_len = MAX(s->smc_len, off + len);
+}
+
+bool translator_smc_check(void)
+{
+    return tcg_smc_check;
+}
+#else
+static void smc_capture(DisasContextBase *db, vaddr pc, const void *src,
+                        size_t len)
+{
+}
+
+bool translator_smc_check(void)
+{
+    return false;
+}
+#endif
+
+static bool translator_ld(CPUArchState *env, DisasContextBase *db,
+                          void *dest, vaddr pc, size_t len)
+{
+    bool ok = translator_ld_1(env, db, dest, pc, len);
+
+    if (ok && translator_smc_check()) {
+        smc_capture(db, pc, dest, len);
+    }
+    return ok;
+}
+
 static void record_save(DisasContextBase *db, vaddr pc,
                         const void *from, int size)
 {
@@ -525,6 +691,9 @@ uint8_t translator_ldub(CPUArchState *env, DisasContextBase *db, vaddr pc)
         MemOpIdx oi = make_memop_idx(MO_UB, db->code_mmuidx);
         val = cpu_ldb_code_mmu(env, pc, oi, 0);
         record_save(db, pc, &val, sizeof(val));
+        if (translator_smc_check()) {
+            smc_capture(db, pc, &val, sizeof(val));
+        }
     }
     return val;
 }
@@ -538,6 +707,9 @@ uint16_t translator_lduw_end(CPUArchState *env, DisasContextBase *db,
         MemOpIdx oi = make_memop_idx(MO_UW, db->code_mmuidx);
         val = cpu_ldw_code_mmu(env, pc, oi, 0);
         record_save(db, pc, &val, sizeof(val));
+        if (translator_smc_check()) {
+            smc_capture(db, pc, &val, sizeof(val));
+        }
     }
     if (endian & MO_BSWAP) {
         val = bswap16(val);
@@ -554,6 +726,9 @@ uint32_t translator_ldl_end(CPUArchState *env, DisasContextBase *db,
         MemOpIdx oi = make_memop_idx(MO_UL, db->code_mmuidx);
         val = cpu_ldl_code_mmu(env, pc, oi, 0);
         record_save(db, pc, &val, sizeof(val));
+        if (translator_smc_check()) {
+            smc_capture(db, pc, &val, sizeof(val));
+        }
     }
     if (endian & MO_BSWAP) {
         val = bswap32(val);
@@ -570,6 +745,9 @@ uint64_t translator_ldq_end(CPUArchState *env, DisasContextBase *db,
         MemOpIdx oi = make_memop_idx(MO_UQ, db->code_mmuidx);
         val = cpu_ldq_code_mmu(env, pc, oi, 0);
         record_save(db, pc, &val, sizeof(val));
+        if (translator_smc_check()) {
+            smc_capture(db, pc, &val, sizeof(val));
+        }
     }
     if (endian & MO_BSWAP) {
         val = bswap64(val);

@@ -518,6 +518,8 @@ struct CPUState {
     int64_t icount_extra;
     uint64_t random_seed;
     sigjmp_buf jmp_env;
+    /* x-smc=check: the TB whose guest bytes this CPU is reading */
+    void *smc_check_tb;
 
     QemuMutex work_mutex;
     QSIMPLEQ_HEAD(, qemu_work_item) work_list;
