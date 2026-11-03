@@ -15,7 +15,6 @@
 
 uintptr_t xt_bop;
 
-#ifndef TARGET_X86_64
 static uint64_t read_cntvct(void)
 {
     uint64_t v;
@@ -23,7 +22,6 @@ static uint64_t read_cntvct(void)
     asm volatile("mrs %0, cntvct_el0" : "=r"(v));
     return v;
 }
-#endif
 
 /* The bytes at ADDR, as many of up to 15 as are readable. */
 static int fetch_insn(XtThread *t, vaddr addr, uint8_t *buf)
@@ -434,6 +432,14 @@ void xt_run(XtThread *t, XtExit *x)
             break;
 #endif
 #ifdef TARGET_X86_64
+        case 0x81: {
+            /* The host counter, in RAX. */
+            uint64_t v = read_cntvct();
+
+            env->regs[R_EAX] = v;
+            xt_event(t, XT_EV_INT81, v, env->eip);
+            continue;
+        }
         case XT_EXCP_NATIVE:
             x->kind = XT_EXIT_NATIVE;
             x->trapnr = trapnr;

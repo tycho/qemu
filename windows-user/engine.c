@@ -355,8 +355,8 @@ static const uint32_t data32_flags =
 /*
  * x64 Windows' selectors: 64-bit code 0x33, data 0x2b (GS based at the
  * TEB per thread), FS 0x53.  In long mode the IDT's gates are 16 bytes,
- * and the vectors x64 code may raise with int are 3, 0x29, 0x2c, 0x2d and
- * 0x2e.
+ * and the vectors x64 code may raise with int are 3, 0x29, 0x2c, 0x2d,
+ * 0x2e and 0x81 (the host counter, which kernel32's x64 code reads).
  */
 static const uint32_t code64_flags =
     DESC_G_MASK | DESC_L_MASK | DESC_P_MASK | DESC_S_MASK |
@@ -372,7 +372,7 @@ static void setup_tables(void)
     idt = xt_alloc_low(256 * 16);
     for (int n = 0; n < 256; n++) {
         int dpl = n == 3 || n == 0x29 || n == 0x2c || n == 0x2d ||
-                  n == 0x2e ? 3 : 0;
+                  n == 0x2e || n == 0x81 ? 3 : 0;
 
         if (n >= 20 && !dpl) {
             continue;

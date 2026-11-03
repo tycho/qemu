@@ -139,8 +139,12 @@ typedef enum XtExitKind {
     XT_EXIT_NATIVE,         /* a transfer to native code at target */
 } XtExitKind;
 
-/* cpu_exec's exit for a transfer to native code (ARM64EC code). */
-#define XT_EXCP_NATIVE 0x1fe
+/*
+ * cpu_exec's exit for a transfer to native code (ARM64EC code): above
+ * EXCP_INTERRUPT, so that cpu_exec returns it as it is rather than as an
+ * x86 interrupt vector.
+ */
+#define XT_EXCP_NATIVE 0x10100
 
 typedef struct XtExit {
     XtExitKind kind;

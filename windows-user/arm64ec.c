@@ -388,6 +388,11 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
         if (handled) {
             xt_continue_native(native);
         }
+        /* An exception in the engine it doesn't recover: logged. */
+        xt_event(t, XT_EV_FAULT, (uint64_t)t->fault.busy << 32 | t->active,
+                 er->ExceptionInformation[1]);
+        xt_log_native(er, native);
+        xt_log_flush(t);
     }
     return STATUS_SUCCESS;
 }
