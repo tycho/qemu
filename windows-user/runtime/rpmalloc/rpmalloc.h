@@ -221,6 +221,16 @@ rpmalloc_thread_initialize(void);
 RPMALLOC_EXPORT void
 rpmalloc_thread_finalize(void);
 
+//! Get the calling thread's heap, or null if it has none
+RPMALLOC_EXPORT void*
+rpmalloc_thread_heap(void);
+
+//! Give back a heap a thread was using (from any thread): the heap of a
+//  thread that has ended, or the calling thread's own (as
+//  rpmalloc_thread_finalize)
+RPMALLOC_EXPORT void
+rpmalloc_thread_heap_release(void* heap);
+
 //! Perform deferred deallocations pending for the calling thread heap
 RPMALLOC_EXPORT void
 rpmalloc_thread_collect(void);

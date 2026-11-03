@@ -2288,6 +2288,24 @@ rpmalloc_thread_finalize(void) {
 	}
 }
 
+extern void*
+rpmalloc_thread_heap(void) {
+	heap_t* heap = get_thread_heap();
+	return (heap != global_heap_default) ? heap : 0;
+}
+
+extern void
+rpmalloc_thread_heap_release(void* heap_ptr) {
+	heap_t* heap = (heap_t*)heap_ptr;
+	if (!heap || (heap == global_heap_default))
+		return;
+	if (heap == get_thread_heap()) {
+		rpmalloc_thread_finalize();
+		return;
+	}
+	heap_release(heap);
+}
+
 extern void
 rpmalloc_thread_collect(void) {
 }
