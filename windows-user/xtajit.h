@@ -159,6 +159,7 @@ typedef struct XtExit {
 typedef struct XtThread {
     CPUState *cpu;
     CPUX86State *env;
+    void *heap;             /* its allocator heap, given back with it */
     DWORD tid;
     void *teb;
     bool wow64;             /* under wow64.dll: slot 2, the CPU area */
