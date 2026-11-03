@@ -19,6 +19,12 @@ extern int64_t max_advance;
 
 extern bool one_insn_per_tb;
 
+/*
+ * x-smc=check (user mode): self-modifying code is detected by a CRC32C of
+ * each TB's guest bytes at its entry, not by write-protecting its pages.
+ */
+extern bool tcg_smc_check;
+
 extern bool icount_align_option;
 
 /*

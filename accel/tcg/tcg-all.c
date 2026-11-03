@@ -83,6 +83,7 @@ static void tcg_accel_instance_init(Object *obj)
 }
 
 bool one_insn_per_tb;
+bool tcg_smc_check;
 
 #ifndef CONFIG_USER_ONLY
 static void tcg_vm_change_state(void *opaque, bool running, RunState state)
@@ -256,6 +257,26 @@ static void tcg_set_one_insn_per_tb(Object *obj, bool value, Error **errp)
     qatomic_set(&one_insn_per_tb, value);
 }
 
+static char *tcg_get_smc(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_smc_check ? "check" : "protect");
+}
+
+static void tcg_set_smc(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "protect")) {
+        tcg_smc_check = false;
+    } else if (!strcmp(value, "check")) {
+#ifdef CONFIG_USER_ONLY
+        tcg_smc_check = true;
+#else
+        error_setg(errp, "x-smc=check is only available in user mode");
+#endif
+    } else {
+        error_setg(errp, "x-smc must be protect or check");
+    }
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -286,6 +307,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
                                    tcg_set_one_insn_per_tb);
     object_class_property_set_description(oc, "one-insn-per-tb",
         "Only put one guest insn in each translation block");
+
+    object_class_property_add_str(oc, "x-smc", tcg_get_smc, tcg_set_smc);
+    object_class_property_set_description(oc, "x-smc",
+        "How self-modifying code is detected: protect (write-protect "
+        "translated pages) or check (a CRC of each TB's code at its entry; "
+        "user mode only)");
 }
 
 static const TypeInfo tcg_accel_type = {

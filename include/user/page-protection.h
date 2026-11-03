@@ -17,6 +17,13 @@
 
 int page_unprotect(CPUState *cpu, tb_page_addr_t address, uintptr_t pc);
 
+/*
+ * A host fault while cpu->smc_check_tb is set, from reading that TB's
+ * guest bytes at its entry (x-smc=check): the TB has gone stale.  Leaves
+ * through the CPU loop with execution at the TB's start.
+ */
+G_NORETURN void tb_smc_check_fault(CPUState *cpu);
+
 int page_get_flags(vaddr address);
 
 /**
