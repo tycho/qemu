@@ -155,6 +155,9 @@ static bool init_syscalls(void)
     const XtEcRedirection *r;
     SIZE_T size;
 
+    if (xt_ntdll_lut) {
+        return true;
+    }
     xt_ntdll_base = (uintptr_t)GetModuleHandleW(L"ntdll.dll");
     md = xt_ntdll_base ? ec_metadata(xt_ntdll_base) : NULL;
     own = ec_metadata((uintptr_t)&__ImageBase);
