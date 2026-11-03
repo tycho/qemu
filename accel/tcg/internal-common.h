@@ -108,6 +108,12 @@ extern unsigned tcg_tlb_grow;
  */
 extern bool tcg_jc_global;
 
+/*
+ * x-smc=check (user mode): self-modifying code is detected by a CRC32C of
+ * each TB's guest bytes at its entry, not by write-protecting its pages.
+ */
+extern bool tcg_smc_check;
+
 extern bool icount_align_option;
 
 /*

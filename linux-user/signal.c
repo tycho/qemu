@@ -1008,9 +1008,15 @@ static void host_sigsegv_handler(CPUState *cpu, siginfo_t *info,
     abi_ptr guest_addr = h2g_nocheck(host_addr);
     uintptr_t pc = host_signal_pc(uc);
     bool is_write = host_signal_write(info, uc);
-    MMUAccessType access_type = adjust_signal_pc(&pc, is_write);
+    MMUAccessType access_type;
     bool maperr;
 
+    /* Reading a TB's guest bytes at its entry: the TB has gone stale. */
+    if (cpu->smc_check_tb) {
+        sigprocmask(SIG_SETMASK, host_signal_mask(uc), NULL);
+        tb_smc_check_fault(cpu);
+    }
+    access_type = adjust_signal_pc(&pc, is_write);
     host_signal_lazysync(uc);
 
     /* If this was a write to a TB protected page, restart. */
@@ -1054,7 +1060,14 @@ static uintptr_t host_sigbus_handler(CPUState *cpu, siginfo_t *info,
     uintptr_t fault_pc = host_signal_pc(uc);
     uintptr_t pc = fault_pc;
     bool is_write = host_signal_write(info, uc);
-    MMUAccessType access_type = adjust_signal_pc(&pc, is_write);
+    MMUAccessType access_type;
+
+    /* Reading a TB's guest bytes at its entry: the TB has gone stale. */
+    if (cpu->smc_check_tb) {
+        sigprocmask(SIG_SETMASK, host_signal_mask(uc), NULL);
+        tb_smc_check_fault(cpu);
+    }
+    access_type = adjust_signal_pc(&pc, is_write);
 
     host_signal_lazysync(uc);
 
