@@ -183,6 +183,11 @@ static vaddr allocation_extent(void *addr, vaddr *len)
  */
 void xt_note_flush(const void *addr, SIZE_T len)
 {
+    /* No address: the whole process, as FlushInstructionCache's NULL. */
+    if (!addr) {
+        invalidate(0, (vaddr)guest_addr_max + 1);
+        return;
+    }
     invalidate((uintptr_t)addr, len);
 }
 

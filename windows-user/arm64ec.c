@@ -394,7 +394,8 @@ static void ec_unregister(XtThread *t);
  * is outside the engine, holding none of its locks; it stays suspended
  * for Windows to end.  Then the record leaves the watcher's list and goes:
  * the thread's own at once, another's once its handle is signalled
- * (xt_reap), as the emulator stack and its page.
+ * (xt_reap), as the emulator stack and its page.  A thread Windows won't
+ * end (xt_terminates) is left alone.
  */
 XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
 {
@@ -404,7 +405,7 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
     HANDLE h, dup;
     bool self;
 
-    if (qatomic_load_acquire(&engine_state) != 2) {
+    if (qatomic_load_acquire(&engine_state) != 2 || !xt_terminates(thread)) {
         return STATUS_SUCCESS;
     }
     xt_enter();

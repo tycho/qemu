@@ -37,8 +37,9 @@ NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, PVOID, int, PVOID, SIZE_T,
 __thread XtThread *xt_self;
 uint32_t xt_inject_point;
 
-/* The TEB's ThreadLocalStoragePointer (TEB + 0x58). */
+/* The TEB's ThreadLocalStoragePointer (TEB + 0x58); its process id. */
 #define TEB_TLS_POINTER 0x58
+#define TEB_CLIENT_ID 0x40
 
 #ifndef TARGET_X86_64
 extern char _tls_start, _tls_end;
@@ -460,6 +461,30 @@ void xt_park_if_terminating(XtThread *t)
     while (t && qatomic_read(&t->terminating)) {
         NtDelayExecution(FALSE, &tick);
     }
+}
+
+/*
+ * Whether Windows will end THREAD for its caller: this thread, or one of
+ * this process through a handle with THREAD_TERMINATE.  ThreadTerm and
+ * BTCpuThreadTerm run before Windows checks the handle, and a thread whose
+ * termination fails must be left as it was.
+ */
+bool xt_terminates(HANDLE thread)
+{
+    PUBLIC_OBJECT_BASIC_INFORMATION obi;
+    XtThreadBasicInfo tbi;
+    HANDLE pid = *(HANDLE *)((char *)NtCurrentTeb() + TEB_CLIENT_ID);
+
+    if (!thread || thread == GetCurrentThread()) {
+        return true;
+    }
+    if (NtQueryObject(thread, ObjectBasicInformation, &obi, sizeof(obi),
+                      NULL) < 0 ||
+        !(obi.GrantedAccess & THREAD_TERMINATE)) {
+        return false;
+    }
+    return NtQueryInformationThread(thread, 0, &tbi, sizeof(tbi), NULL) >= 0 &&
+           tbi.ClientId.UniqueProcess == pid;
 }
 
 /* An allocation of a thread's (MEM_RELEASE), freed once the thread ended. */
