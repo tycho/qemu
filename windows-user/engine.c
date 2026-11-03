@@ -33,6 +33,9 @@
 #include "exec/gdbstub.h"
 #include "disas/disas.h"
 #include "xtajit.h"
+#ifdef TARGET_X86_64
+#include "arm64ec.h"
+#endif
 
 extern IMAGE_DOS_HEADER __ImageBase;
 
@@ -108,6 +111,50 @@ static int prot_flags(ULONG prot)
 }
 
 /*
+ * In an x64 process, native (ARM64EC) code shares executable regions with
+ * x64 code, page by page (the PEB's bitmap): its pages are not executable
+ * to QEMU, so that a transfer to one leaves the engine
+ * (cpu_loop_exit_sigsegv).
+ */
+static void set_region_flags(vaddr start, vaddr last, int flags)
+{
+#ifdef TARGET_X86_64
+    if (flags & PAGE_EXEC) {
+        vaddr p = start, run = start, wbase = start >> 18;
+        uint64_t w = xt_ec_bitmap_word(start);
+        bool ec = (w >> ((start >> 12) & 63)) & 1;
+
+        for (;;) {
+            bool end = p + TARGET_PAGE_SIZE - 1 >= last;
+            vaddr q = p + TARGET_PAGE_SIZE;
+            bool next_ec = false;
+
+            if (!end) {
+                if (q >> 18 != wbase) {
+                    wbase = q >> 18;
+                    w = xt_ec_bitmap_word(q);
+                }
+                next_ec = (w >> ((q >> 12) & 63)) & 1;
+            }
+
+            if (end || next_ec != ec) {
+                page_set_flags(run, end ? last : p + TARGET_PAGE_SIZE - 1,
+                               ec ? flags & ~PAGE_EXEC : flags,
+                               PAGE_RWX | PAGE_WRITE_ORG);
+                if (end) {
+                    return;
+                }
+                run = p + TARGET_PAGE_SIZE;
+                ec = next_ec;
+            }
+            p += TARGET_PAGE_SIZE;
+        }
+    }
+#endif
+    page_set_flags(start, last, flags, PAGE_RWX | PAGE_WRITE_ORG);
+}
+
+/*
  * Bring QEMU's page flags for ADDR's page up to date with Windows; true if
  * the access is allowed now, by the flags as they stand under the mmap
  * lock, and *CHANGED if this refresh changed them.  QEMU's flags are
@@ -121,7 +168,7 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
 {
     MEMORY_BASIC_INFORMATION mbi;
     vaddr start, last;
-    int flags, old, want;
+    int flags, old, want, page;
     bool changed = false, allowed;
 
     want = access == MMU_INST_FETCH ? PAGE_EXEC
@@ -151,17 +198,23 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
 
     mmap_lock();
     old = page_get_flags(addr) & (PAGE_VALID | PAGE_RWX | PAGE_WRITE_ORG);
+    page = flags;
+#ifdef TARGET_X86_64
+    if (xt_is_ec_code(addr)) {
+        page &= ~PAGE_EXEC;
+    }
+#endif
     if ((old & PAGE_WRITE_ORG) && !(old & PAGE_WRITE) &&
-        flags == (old & (PAGE_VALID | PAGE_READ | PAGE_EXEC))) {
+        page == (old & (PAGE_VALID | PAGE_READ | PAGE_EXEC))) {
         /* Write-protected by tb_lock_page0, not by the guest. */
         flags = old;
-    } else if (flags != old) {
+    } else if (page != old) {
         changed = true;
         if (xt_self) {
-            xt_event(xt_self, XT_EV_REFRESH, old << 16 | flags, addr);
+            xt_event(xt_self, XT_EV_REFRESH, old << 16 | page, addr);
         }
         if (flags) {
-            page_set_flags(start, last, flags, PAGE_RWX | PAGE_WRITE_ORG);
+            set_region_flags(start, last, flags);
         } else {
             page_set_flags(start, last, 0, PAGE_VALID);
         }
@@ -198,6 +251,15 @@ void cpu_loop_exit_sigsegv(CPUState *cs, vaddr addr,
     if (have_mmap_lock() && tcg_ctx->gen_tb) {
         tcg_ctx->gen_tb = NULL;
     }
+#ifdef TARGET_X86_64
+    /* A transfer to native code: fetching the first byte of a native page. */
+    if (access_type == MMU_INST_FETCH && t && addr == t->env->eip &&
+        xt_is_ec_code(addr)) {
+        t->native_target = addr;
+        cs->exception_index = XT_EXCP_NATIVE;
+        cpu_loop_exit(cs);
+    }
+#endif
     if (xt_mem_refresh(addr, access_type, &changed) &&
         (changed || !native) &&
         !(t && (t->gfault.code == STATUS_GUARD_PAGE_VIOLATION ||

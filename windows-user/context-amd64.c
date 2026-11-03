@@ -162,3 +162,103 @@ void xt_export(XtThread *t, CONTEXT *c)
     memcpy(&c->FltSave, fx, sizeof(fx));
     c->MxCsr = env->mxcsr;
 }
+
+#ifdef __arm64ec__
+/*
+ * ARM64EC's register mapping: where native code keeps each x64 register
+ * (RAX x8, RCX x0, RDX x1, RBX x27, RSP sp, RBP fp, RSI x25, RDI x26,
+ * R8-R11 x2-x5, R12-R15 x19-x22, XMM0-15 v0-v15).
+ */
+static uint64_t *ec_gpr(ARM64_NT_CONTEXT *n, int reg)
+{
+    static const int8_t map[16] = {
+        8, 0, 1, 27, -1, 29, 25, 26, 2, 3, 4, 5, 19, 20, 21, 22,
+    };
+
+    return reg == R_ESP ? &n->Sp : &n->X[map[reg]];
+}
+
+/* EFLAGS' SF, ZF, CF, OF and TF as NZCV and PSTATE.SS, as Windows maps them. */
+static uint32_t ec_cpsr(uint32_t eflags)
+{
+    return (eflags & CC_S ? 1u << 31 : 0) | (eflags & CC_Z ? 1u << 30 : 0) |
+           (eflags & CC_C ? 1u << 29 : 0) | (eflags & CC_O ? 1u << 28 : 0) |
+           (eflags & TF_MASK ? 1u << 21 : 0);
+}
+
+static uint32_t ec_eflags(uint32_t cpsr)
+{
+    return (cpsr & (1u << 31) ? CC_S : 0) | (cpsr & (1u << 30) ? CC_Z : 0) |
+           (cpsr & (1u << 29) ? CC_C : 0) | (cpsr & (1u << 28) ? CC_O : 0) |
+           (cpsr & (1u << 21) ? TF_MASK : 0);
+}
+
+/*
+ * The guest's state as native code keeps it (the packed form): x64
+ * registers in their ARM64EC places, the MMX registers where Windows
+ * looks for them (FEX's ARM64EC module packs them the same way), NZCV and
+ * SS from EFLAGS, FPCR and FPSR from MXCSR; nothing in x13, x14, x18,
+ * x23, x24 or x28.  The rest of EFLAGS and the x87 control state have no
+ * place here.
+ */
+void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
+{
+    static const int8_t mm_lo[8] = { 30, 6, 7, 9, 10, 11, 12, 15 };
+    CPUX86State *env = t->env;
+    uint32_t mx = env->mxcsr;
+    uint64_t hi16 = 0, hi17 = 0;
+    CONTEXT c;
+
+    memset(&c, 0, sizeof(c));
+    xt_export(t, &c);
+    memset(n, 0, sizeof(*n));
+    n->ContextFlags = CONTEXT_ARM64_FULL;
+    for (int i = 0; i < 16; i++) {
+        *ec_gpr(n, i) = (&c.Rax)[i];
+    }
+    n->Pc = c.Rip;
+    n->Cpsr = ec_cpsr(c.EFlags);
+    memcpy(n->V, c.FltSave.XmmRegisters, 16 * sizeof(n->V[0]));
+    for (int i = 0; i < 8; i++) {
+        const M128A *mm = &c.FltSave.FloatRegisters[i];
+
+        n->X[mm_lo[i]] = mm->Low;
+        if (i < 4) {
+            hi16 |= (uint64_t)(mm->High & 0xffff) << (16 * i);
+        } else {
+            hi17 |= (uint64_t)(mm->High & 0xffff) << (16 * (i - 4));
+        }
+    }
+    n->X16 = hi16;
+    n->X17 = hi17;
+    /* RC: x86 down 1, up 2; Arm RP (up) 1, RM (down) 2. */
+    n->Fpcr = ((((mx >> 13) & 3) == 1 ? 2 : ((mx >> 13) & 3) == 2 ? 1 :
+                (mx >> 13) & 3) << 22) | (mx & 0x8000 ? 1u << 24 : 0);
+    n->Fpsr = (mx & 1 ? 1 : 0) | (mx & 4 ? 2 : 0) | (mx & 8 ? 4 : 0) |
+              (mx & 0x10 ? 8 : 0) | (mx & 0x20 ? 0x10 : 0) |
+              (mx & 2 ? 0x80 : 0);
+}
+
+/*
+ * A call or jump into x64 code from native code: the x64 registers from
+ * their ARM64EC places, RIP the target, x64 Windows' selectors.  EFLAGS'
+ * arithmetic flags come from NZCV, DF is clear (the ABI's); the x87 state
+ * and MXCSR stay the engine's.  Into C for xt_acquire.
+ */
+void xt_ec_call_context(XtThread *t, ARM64_NT_CONTEXT *n, CONTEXT *c)
+{
+    memset(c, 0, sizeof(*c));
+    xt_export(t, c);
+    for (int i = 0; i < 16; i++) {
+        (&c->Rax)[i] = *ec_gpr(n, i);
+    }
+    c->Rip = n->Pc;
+    c->EFlags = 0x202 | ec_eflags(n->Cpsr);
+    memcpy(c->FltSave.XmmRegisters, n->V, 16 * sizeof(n->V[0]));
+    c->SegCs = 0x33;
+    c->SegDs = c->SegEs = c->SegSs = c->SegGs = 0x2b;
+    c->SegFs = 0x53;
+    c->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS |
+                      CONTEXT_FLOATING_POINT;
+}
+#endif

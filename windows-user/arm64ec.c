@@ -46,6 +46,12 @@ NTSTATUS xt_syscall(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 static int64_t nr_continue = -1, nr_raise = -1, nr_alloc = -1,
                nr_protect = -1;
 
+/* ntdll's native KiUserExceptionDispatcher, for the guest's system calls. */
+static uintptr_t ki_exception_dispatcher;
+
+/* An x64 ret instruction, for native callees on an unaligned stack. */
+uintptr_t xt_x64_ret;
+
 /* For the call checker (arm64ec.S): ntdll's x64 entries to native code. */
 uintptr_t xt_ntdll_base;
 uint32_t *xt_ntdll_lut;
@@ -168,7 +174,9 @@ static bool init_syscalls(void)
     nr_raise = find_syscall_nr(md, "NtRaiseException");
     nr_alloc = find_syscall_nr(md, "NtAllocateVirtualMemory");
     nr_protect = find_syscall_nr(md, "NtProtectVirtualMemory");
-    if (nr_continue < 0 || nr_raise < 0 || nr_alloc < 0 || nr_protect < 0) {
+    ki_exception_dispatcher = ntdll_native(md, "KiUserExceptionDispatcher");
+    if (nr_continue < 0 || nr_raise < 0 || nr_alloc < 0 || nr_protect < 0 ||
+        !ki_exception_dispatcher) {
         return false;
     }
 
@@ -209,6 +217,9 @@ static char *settings_string(void)
 
 static int init_applied, init_rejected;
 
+static void ec_register(XtThread *t);
+static unsigned __stdcall doorbell_watcher(void *arg);
+
 /*
  * The engine's process-wide bring-up.  It needs the module's thread-local
  * variables (QEMU's, the allocator's), which in an x64 process the loader
@@ -230,6 +241,9 @@ static int process_init(void)
     xt_gevent(XT_EV_THREAD_INIT, init_applied, init_rejected);
     xt_placement("module", &__ImageBase);
     xt_placement("code buffer", tcg_ctx->code_gen_buffer);
+    if (!_beginthreadex(NULL, 0, doorbell_watcher, NULL, 0, NULL)) {
+        return -1;
+    }
     return 0;
 }
 
@@ -261,17 +275,19 @@ static XtThread *enter_engine(void)
     if (!t) {
         t = xt_thread_new(false);
         t->cpu->opaque = t;
+        t->ec_doorbell = area->SuspendDoorbell;
         area->EmulatorData[0] = t;
+        ec_register(t);
     }
     return t;
 }
 
 /*
  * ntdll's calls.  ProcessInit and ThreadInit do what needs no thread-local
- * variables (enter_engine does the rest).  For now the entries
- * (DispatchJump, RetToEntryThunk, ExitToX64, BeginSimulation in
- * arm64ec.S) bring the engine up and end the process, recording which was
- * reached first.
+ * variables (enter_engine does the rest, at a thread's first entry).
+ * The entries are in arm64ec.S (DispatchJump, RetToEntryThunk, ExitToX64,
+ * BeginSimulation), and xt_ec_enter and xt_ec_begin below; REACHED
+ * records which of ProcessInit and ThreadInit ran, for the harness.
  */
 static uint32_t reached;
 
@@ -280,6 +296,19 @@ XTEXPORT NTSTATUS ProcessInit(void)
     reached |= 0x40;
     if (!init_syscalls()) {
         return STATUS_NOT_SUPPORTED;
+    }
+    {
+        void *p = NULL;
+        SIZE_T size = 0x1000;
+        ULONG old;
+
+        if (alloc_direct(&p, &size, MEM_RESERVE | MEM_COMMIT,
+                         PAGE_READWRITE) < 0) {
+            return STATUS_NO_MEMORY;
+        }
+        *(uint8_t *)p = 0xc3;
+        protect_direct(&p, &size, PAGE_EXECUTE_READ, &old);
+        xt_x64_ret = (uintptr_t)p;
     }
     reached |= 0x80;
     xt_ec_probe_process_init();
@@ -294,8 +323,9 @@ XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
 #define XT_EC_THREAD_PAGE 0x1000
 
 /*
- * A thread's emulator stack, above a page of its own: the doorbell word
- * Windows sets to ask a simulating thread to stop (SuspendDoorbell).
+ * A thread's emulator stack, above a page of its own (XtEcFrame): the
+ * doorbell word Windows sets to ask a simulating thread to stop
+ * (SuspendDoorbell), and the native registers of an entry or exit.
  */
 XTEXPORT NTSTATUS ThreadInit(void)
 {
@@ -310,10 +340,11 @@ XTEXPORT NTSTATUS ThreadInit(void)
         return STATUS_NO_MEMORY;
     }
     stack = (uintptr_t)mem + XT_EC_THREAD_PAGE;
-    area->SuspendDoorbell = mem;
+    area->SuspendDoorbell = &((XtEcFrame *)mem)->doorbell;
     area->EmulatorStackLimit = stack;
     area->EmulatorStackBase = stack + XT_EMULATOR_STACK;
     area->EmulatorData[0] = NULL;
+    area->EmulatorData[1] = mem;
     return STATUS_SUCCESS;
 }
 
@@ -323,15 +354,40 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
 }
 
 /*
- * ntdll's call at an exception, with the full native context.  For now
- * only the capture probe's (test-ec.c), which logs it and continues its
- * own trap and fault.
+ * ntdll's call at any exception in an ARM64EC thread, before its
+ * dispatch, with the full native context (x13, x14, x23, x24, x28 and
+ * v16-v31 included).  Continued here, with that context:
+ * - the doorbell found set at an exit to native code (arm64ec.S): the
+ *   exit stub is consistent there, so continuing it completes the
+ *   suspension;
+ * - a fault the engine recovers (xt_fault_redirect: generated code,
+ *   helpers, translation), while it owns the thread.
+ * Anything else goes on to the dispatch.
  */
 XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
                                          ARM64_NT_CONTEXT *native)
 {
+    XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+    XtThread *t = area ? area->EmulatorData[0] : NULL;
+
     if (xt_ec_probe_rtcs(er, guest, native)) {
         xt_continue_native(native);
+    }
+    if (native->Pc == (uintptr_t)xt_ec_exit_suspend_point) {
+        qatomic_set(area->SuspendDoorbell, 0);
+        native->Pc = (uintptr_t)xt_ec_exit_resume_point;
+        xt_continue_native(native);
+    }
+    if (t && t == xt_self && t->state != XT_WINDOWS) {
+        bool prev = area->InSyscallCallback;
+        bool handled;
+
+        area->InSyscallCallback = 1;
+        handled = xt_fault_redirect(er, native);
+        area->InSyscallCallback = prev;
+        if (handled) {
+            xt_continue_native(native);
+        }
     }
     return STATUS_SUCCESS;
 }
@@ -389,23 +445,277 @@ XTEXPORT void UpdateProcessorInformation(void *info)
 
 NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
 
-void xt_ec_entry_stub(int which, uint64_t target)
+/*
+ * The doorbell: Windows rings it to stop a thread that is simulating or
+ * on its emulator stack, and waits (up to about 10 s) until the thread is
+ * consistent: off that stack, InSimulation clear, its guest state in its
+ * native context.  Generated code doesn't look at the word; this thread
+ * does, and asks the engine to stop (cpu_exit), which then leaves with
+ * the guest's context (leave_suspend).
+ */
+#define XT_EC_MAX_THREADS 4096
+static XtThread *ec_threads[XT_EC_MAX_THREADS];
+static int ec_nthreads;
+
+static unsigned __stdcall doorbell_watcher(void *arg)
+{
+    LARGE_INTEGER tick = { .QuadPart = -10000 };
+
+    for (;;) {
+        int n = MIN(qatomic_read(&ec_nthreads), XT_EC_MAX_THREADS);
+
+        NtDelayExecution(FALSE, &tick);
+        xt_record_hold();
+        for (int i = 0; i < n; i++) {
+            XtThread *t = qatomic_read(&ec_threads[i]);
+
+            if (t && qatomic_read(&t->state) == XT_ENGINE &&
+                qatomic_read(t->ec_doorbell) &&
+                !qatomic_read(&t->suspend_req)) {
+                qatomic_set(&t->suspend_req, 1);
+                cpu_exit(t->cpu);
+            }
+        }
+        xt_record_release();
+    }
+    return 0;
+}
+
+static void ec_register(XtThread *t)
+{
+    int i = qatomic_fetch_inc(&ec_nthreads);
+
+    if (i < XT_EC_MAX_THREADS) {
+        qatomic_set(&ec_threads[i], t);
+    }
+}
+
+/*
+ * The guest's system call (syscall, int 0x2e): ntdll's native
+ * KiUserExceptionDispatcher performs it from the packed context, with
+ * STATUS_EMULATION_SYSCALL, then continues at RIP, which is past the
+ * instruction already.  The frame is its stack, as an exception's.
+ */
+typedef struct QEMU_ALIGNED(16) XtKiFrame {
+    ARM64_NT_CONTEXT ctx;
+    uint64_t pad[4];
+    EXCEPTION_RECORD rec;
+    uint64_t align;
+    uint64_t redzone[2];
+} XtKiFrame;
+
+#ifndef STATUS_EMULATION_SYSCALL
+#define STATUS_EMULATION_SYSCALL ((NTSTATUS)0x40000039)
+#endif
+
+/*
+ * The end of an activation: the engine gives the thread back (publish),
+ * the guest state goes into the packed context, and EFLAGS it can't carry
+ * are kept for the re-entry that continues it.
+ */
+static void leave(XtThread *t, ARM64_NT_CONTEXT *n)
+{
+    XtGuestContext c;
+
+    memset(&c, 0, sizeof(c));
+    xt_publish(t, &c);
+    xt_ec_pack(t, n);
+    t->aux_valid = true;
+    t->aux_rip = n->Pc;
+    t->aux_rsp = n->Sp;
+    t->aux_eflags = cpu_compute_eflags(t->env);
+    xt_log_flush(t);
+}
+
+static G_NORETURN void leave_native(XtThread *t, XtEcFrame *f,
+                                       vaddr target)
+{
+    leave(t, &f->ctx);
+    t->aux_valid = false;
+    f->ctx.Pc = target;
+    xt_ec_exit_native(&f->ctx);
+}
+
+static G_NORETURN void leave_syscall(XtThread *t)
+{
+    XtKiFrame k;
+
+    memset(&k.rec, 0, sizeof(k.rec));
+    leave(t, &k.ctx);
+    k.rec.ExceptionCode = STATUS_EMULATION_SYSCALL;
+    xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
+    xt_ec_jump_set_stack(ki_exception_dispatcher, (uintptr_t)&k);
+}
+
+/*
+ * A guest exception, raised with the packed context as x64 Windows
+ * reports it: a breakpoint at the int3, a fast fail second chance.
+ */
+static G_NORETURN void leave_exception(XtThread *t, XtExit *x)
+{
+    EXCEPTION_RECORD *r = &x->rec;
+    ARM64_NT_CONTEXT n;
+    BOOLEAN first = TRUE;
+
+    switch (x->vector) {
+    case -1:
+        break;
+    case EXCP03_INT3:
+    case 0x2d:
+        t->env->eip -= x->vector == EXCP03_INT3 ? 1 : 0;
+        r->ExceptionCode = STATUS_BREAKPOINT;
+        r->NumberParameters = 1;
+        break;
+    case 0x29:
+        r->ExceptionCode = STATUS_STACK_BUFFER_OVERRUN;
+        r->ExceptionFlags = EXCEPTION_NONCONTINUABLE;
+        r->NumberParameters = 1;
+        r->ExceptionInformation[0] = t->env->regs[R_ECX];
+        first = FALSE;
+        break;
+    case 0x2c:
+        r->ExceptionCode = STATUS_ASSERTION_FAILURE;
+        break;
+    default:
+        r->ExceptionCode = STATUS_ACCESS_VIOLATION;
+        r->NumberParameters = 2;
+        r->ExceptionInformation[1] = ~0ull;
+        break;
+    }
+    if (r->ExceptionCode == STATUS_WX86_SINGLE_STEP) {
+        r->ExceptionCode = STATUS_SINGLE_STEP;
+    }
+    r->ExceptionAddress = (void *)(uintptr_t)t->env->eip;
+    leave(t, &n);
+    xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
+    xt_syscall((uintptr_t)r, (uintptr_t)&n, first, 0, 0, 0, nr_raise);
+    NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
+    __builtin_unreachable();
+}
+
+/*
+ * A suspension: continue at the guest's own context, consistent, where
+ * Windows completes the suspension; resuming re-enters through
+ * BeginSimulation.
+ */
+static G_NORETURN void leave_suspend(XtThread *t, XtEcFrame *f)
+{
+    ARM64_NT_CONTEXT n;
+
+    leave(t, &n);
+    qatomic_set(&f->doorbell, 0);
+    xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
+    xt_continue_native(&n);
+    NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
+    __builtin_unreachable();
+}
+
+static G_NORETURN void ec_run(XtThread *t, XtEcFrame *f)
+{
+    XtExit x;
+
+    for (;;) {
+        xt_run(t, &x);
+        switch (x.kind) {
+        case XT_EXIT_NATIVE:
+            leave_native(t, f, x.target);
+        case XT_EXIT_SYSCALL:
+            xt_event(t, XT_EV_SYSCALL, x.nr, 0);
+            leave_syscall(t);
+        case XT_EXIT_SUSPEND:
+            leave_suspend(t, f);
+        default:
+            leave_exception(t, &x);
+        }
+    }
+}
+
+static XtThread *ec_thread(void)
 {
     XtThread *t = enter_engine();
 
-    if (t) {
-        xt_event(t, XT_EV_PLACE, (uintptr_t)"entry", target);
-        xt_log_flush(t);
+    if (!t) {
+        NtTerminateProcess(GetCurrentProcess(),
+                           !xt_log_handle() && xt_log_status < 0 ?
+                           xt_log_status : STATUS_NOT_SUPPORTED);
     }
-    /*
-     * Bits 6, 7: ProcessInit entered, succeeded; 8: ThreadInit entered;
-     * 4: the engine and this thread's record are up; 5: the event log is
-     * open.
-     */
-    NtTerminateProcess(GetCurrentProcess(),
-                       !xt_log_handle() && xt_log_status < 0 ? xt_log_status :
-                       0xEC000000 | which | reached | (t ? 0x10 : 0) |
-                       (xt_log_handle() ? 0x20 : 0));
+    t->activation++;
+    return t;
+}
+
+/*
+ * A call, jump or return into x64 code (ExitToX64, DispatchJump,
+ * RetToEntryThunk in arm64ec.S): the x64 registers are in their ARM64EC
+ * places in F, the return address on the stack already.
+ */
+void xt_ec_enter(XtEcFrame *f)
+{
+    XtThread *t = ec_thread();
+    CONTEXT c;
+
+    t->aux_valid = false;
+    xt_ec_call_context(t, &f->ctx, &c);
+    xt_acquire(t, &c);
+    ec_run(t, f);
+}
+
+/*
+ * KiUserEmulationDispatcher's entry, after a continuation at x64 code:
+ * the CPU area's AMD64 context is authoritative, with what the packed
+ * form couldn't carry from the exit it continues (the same RIP, RSP and
+ * NZCV).  The x87 state and MXCSR stay the engine's.
+ */
+void xt_ec_begin(void)
+{
+    XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+    XtThread *t = ec_thread();
+    const CONTEXT *w = (const CONTEXT *)area->ContextAmd64;
+    const uint32_t nzcv = CC_S | CC_Z | CC_C | CC_O | TF_MASK;
+    CONTEXT c;
+
+    memset(&c, 0, sizeof(c));
+    xt_export(t, &c);
+    if ((w->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER) {
+        memcpy(&c.Rax, &w->Rax, 16 * sizeof(c.Rax));
+    }
+    if ((w->ContextFlags & CONTEXT_CONTROL) == CONTEXT_CONTROL) {
+        c.Rip = w->Rip;
+        c.Rsp = w->Rsp;
+        c.Rbp = w->Rbp;
+        c.SegCs = w->SegCs;
+        c.SegSs = w->SegSs;
+        c.EFlags = w->EFlags;
+        if (t->aux_valid && w->Rip == t->aux_rip && w->Rsp == t->aux_rsp &&
+            (w->EFlags & nzcv) == (t->aux_eflags & nzcv)) {
+            c.EFlags = (t->aux_eflags & ~nzcv) | (w->EFlags & nzcv);
+        }
+    }
+    if ((w->ContextFlags & CONTEXT_SEGMENTS) == CONTEXT_SEGMENTS) {
+        c.SegDs = w->SegDs;
+        c.SegEs = w->SegEs;
+        c.SegFs = w->SegFs;
+        c.SegGs = w->SegGs;
+    }
+    if ((w->ContextFlags & CONTEXT_FLOATING_POINT) ==
+        CONTEXT_FLOATING_POINT) {
+        memcpy(c.FltSave.XmmRegisters, w->FltSave.XmmRegisters,
+               sizeof(c.FltSave.XmmRegisters));
+    }
+    t->aux_valid = false;
+    c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS |
+                     CONTEXT_FLOATING_POINT;
+    if ((w->ContextFlags & CONTEXT_DEBUG_REGISTERS) ==
+        CONTEXT_DEBUG_REGISTERS) {
+        c.ContextFlags |= CONTEXT_DEBUG_REGISTERS;
+        c.Dr0 = w->Dr0;
+        c.Dr1 = w->Dr1;
+        c.Dr2 = w->Dr2;
+        c.Dr3 = w->Dr3;
+        c.Dr7 = w->Dr7;
+    }
+    area->InSimulation = 1;
+    xt_acquire(t, &c);
+    ec_run(t, (XtEcFrame *)area->EmulatorData[1]);
 }
 
 /*

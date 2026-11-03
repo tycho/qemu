@@ -136,13 +136,18 @@ typedef enum XtExitKind {
     XT_EXIT_EXCEPTION,
     XT_EXIT_SUSPEND,
     XT_EXIT_STOP,           /* the harness asked to stop (int3 in tests) */
+    XT_EXIT_NATIVE,         /* a transfer to native code at target */
 } XtExitKind;
+
+/* cpu_exec's exit for a transfer to native code (ARM64EC code). */
+#define XT_EXCP_NATIVE 0x1fe
 
 typedef struct XtExit {
     XtExitKind kind;
     int trapnr;
     uint32_t nr;            /* system call number */
     vaddr args;             /* guest address of the arguments */
+    vaddr target;           /* XT_EXIT_NATIVE's */
     int vector;             /* a software interrupt's, else -1 */
     EXCEPTION_RECORD rec;
 } XtExit;
@@ -168,6 +173,15 @@ typedef struct XtThread {
     bool after_suspend;     /* the last exit was a suspension */
     XtGuestFault gfault;
     XtFault fault;
+    vaddr native_target;    /* set with XT_EXCP_NATIVE */
+    ULONG *ec_doorbell;     /* the x64 module's SuspendDoorbell word */
+    /*
+     * EFLAGS the packed context can't carry, kept at an exit for the
+     * re-entry that continues it (the same RIP, RSP and NZCV).
+     */
+    bool aux_valid;
+    vaddr aux_rip, aux_rsp;
+    uint32_t aux_eflags;
     sigjmp_buf adapter_jmp;
     uint32_t violations;
     uint64_t counts[XT_EV__MAX];
@@ -220,6 +234,10 @@ extern NTSTATUS xt_log_status;      /* the event log's opening */
 /* context-wow64.c, context-amd64.c: the guest context and CPUX86State */
 void xt_import(XtThread *t, const XtGuestContext *c);
 void xt_export(XtThread *t, XtGuestContext *c);
+#ifdef __arm64ec__
+void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n);
+void xt_ec_call_context(XtThread *t, ARM64_NT_CONTEXT *n, CONTEXT *c);
+#endif
 
 /* runtime.c: the guest's protection of pages QEMU write-protected */
 ULONG xt_guest_prot(uintptr_t page);

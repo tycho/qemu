@@ -433,6 +433,20 @@ void xt_run(XtThread *t, XtExit *x)
             }
             break;
 #endif
+#ifdef TARGET_X86_64
+        case XT_EXCP_NATIVE:
+            x->kind = XT_EXIT_NATIVE;
+            x->trapnr = trapnr;
+            x->target = t->native_target;
+            return;
+        case EXCP_SYSCALL:
+        case 0x2e:
+            /* syscall, or int 0x2e: RIP is past the instruction. */
+            x->kind = XT_EXIT_SYSCALL;
+            x->trapnr = trapnr;
+            x->nr = env->regs[R_EAX];
+            return;
+#endif
         case EXCP03_INT3:
             if (t->stop_at_int3) {
                 x->kind = XT_EXIT_STOP;
