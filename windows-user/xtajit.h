@@ -267,6 +267,7 @@ void xt_note_free(void *addr, SIZE_T len, ULONG type, BOOL after,
 void xt_note_map(void *addr, SIZE_T len, ULONG prot);
 void xt_note_unmap(void *addr, BOOL after);
 void xt_note_read_file(void *addr, SIZE_T len, BOOL after, NTSTATUS status);
+bool xt_unprotect_for_native(vaddr addr);
 BOOLEAN xt_feature_present(UINT feature);
 void xt_processor_info(void *info, USHORT arch);
 /*
