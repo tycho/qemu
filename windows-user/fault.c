@@ -131,7 +131,12 @@ bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx)
     }
     is_write = er->ExceptionInformation[0] == 1;
     addr = er->ExceptionInformation[1];
-    if (addr > guest_addr_max) {
+    /*
+     * A 32-bit guest's accesses are below 4 GiB.  x64 code reaches the
+     * whole 64-bit space, the kernel's half and non-canonical addresses
+     * included, and its faults there are its own.
+     */
+    if (TARGET_LONG_BITS == 32 && addr > guest_addr_max) {
         return false;
     }
     pc = ctx->Pc;

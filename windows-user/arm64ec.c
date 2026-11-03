@@ -776,6 +776,7 @@ static G_NORETURN void leave_exception(XtThread *t, XtExit *x)
         first = FALSE;
         break;
     case 0x2c:
+        t->env->eip -= 2;
         r->ExceptionCode = STATUS_ASSERTION_FAILURE;
         break;
     default:
