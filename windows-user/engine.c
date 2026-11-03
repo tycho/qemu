@@ -466,8 +466,9 @@ CPUState *xt_cpu_new(void)
 
     qemu_mutex_lock(&cpu_create_mutex);
     cs = cpu_create(cpu_type);
-    qemu_mutex_unlock(&cpu_create_mutex);
+    /* Resettable keeps the phase of a reset in progress in a global. */
     cpu_reset(cs);
+    qemu_mutex_unlock(&cpu_create_mutex);
     setup_mode(cpu_env(cs));
     cs->tcg_cflags |= CF_PARALLEL;
     return cs;
