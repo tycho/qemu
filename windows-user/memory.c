@@ -134,6 +134,26 @@ static void unprotect_range(vaddr start, vaddr len)
     xt_adapter_end(began);
 }
 
+/*
+ * A store by native code, outside the engine, into a page QEMU
+ * write-protected for its translations: the page gets its write
+ * permission back and its translations go (page_unprotect, as for a
+ * guest write), so that the store can be retried.  False if QEMU hadn't
+ * protected the page.
+ */
+bool xt_unprotect_for_native(vaddr addr)
+{
+    bool began, done;
+
+    if (addr > guest_addr_max) {
+        return false;
+    }
+    began = xt_adapter_begin();
+    done = page_unprotect(NULL, addr, 0) != 0;
+    xt_adapter_end(began);
+    return done;
+}
+
 /* The allocation ADDR is in: its base and extent. */
 static vaddr allocation_extent(void *addr, vaddr *len)
 {
