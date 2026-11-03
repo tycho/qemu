@@ -242,8 +242,9 @@ void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
 /*
  * A call or jump into x64 code from native code: the x64 registers from
  * their ARM64EC places, RIP the target, x64 Windows' selectors.  EFLAGS'
- * arithmetic flags come from NZCV, DF is clear (the ABI's); the x87 state
- * and MXCSR stay the engine's.  Into C for xt_acquire.
+ * SF, ZF, CF, OF and TF come from NZCV and SS, the rest (DF, PF, AF) is
+ * the engine's, as it was at the last exit; the x87 state and MXCSR stay
+ * the engine's.  Into C for xt_acquire.
  */
 void xt_ec_call_context(XtThread *t, ARM64_NT_CONTEXT *n, CONTEXT *c)
 {
@@ -253,7 +254,8 @@ void xt_ec_call_context(XtThread *t, ARM64_NT_CONTEXT *n, CONTEXT *c)
         (&c->Rax)[i] = *ec_gpr(n, i);
     }
     c->Rip = n->Pc;
-    c->EFlags = 0x202 | ec_eflags(n->Cpsr);
+    c->EFlags = (c->EFlags & ~(CC_S | CC_Z | CC_C | CC_O | TF_MASK)) |
+                ec_eflags(n->Cpsr);
     memcpy(c->FltSave.XmmRegisters, n->V, 16 * sizeof(n->V[0]));
     c->SegCs = 0x33;
     c->SegDs = c->SegEs = c->SegSs = c->SegGs = 0x2b;
