@@ -31,6 +31,7 @@ rpmalloc = static_library('rpmalloc', files('runtime/rpmalloc/rpmalloc.c'),
                                    '-DENABLE_STATISTICS=0',
                                    '-DENABLE_DECOMMIT=1',
                                    '-DENABLE_ASSERTS=0',
+                                   '-DRPMALLOC_FIRST_CLASS_HEAPS=1',
                                    '-fms-extensions', '-w'],
                           build_by_default: false)
 windows_user_ss.add(declare_dependency(link_whole: rpmalloc))

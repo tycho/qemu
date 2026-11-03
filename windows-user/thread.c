@@ -219,6 +219,7 @@ XtThread *xt_thread_new(bool wow64)
     }
     t->env = cpu_env(t->cpu);
     t->cpu->opaque = t;
+    t->heap = xt_heap_current();
     tcg_register_thread();
     xt_self = t;
     if (wow64) {
@@ -273,17 +274,20 @@ static void unlink_record(XtThread *t)
  * The CPU leaves the CPU list and is freed (xt_cpu_free), as in
  * linux-user's exit, with an RCU reader of the calling thread's for the
  * duration (a thread Windows owns has none).  The thread T belonged to no
- * longer runs it.
+ * longer runs it; its allocator heap goes back, from whatever thread this
+ * is (the loader may have freed T's TLS, or T may have been terminated).
  */
 static void free_record(XtThread *t)
 {
     CPUState *cs = t->cpu;
+    void *heap = t->heap;
 
     xt_log_flush(t);
     rcu_register_thread();
     xt_cpu_free(cs);
     rcu_unregister_thread();
     g_free(t);
+    xt_heap_release(heap);
 }
 
 /*

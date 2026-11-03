@@ -108,6 +108,8 @@ typedef struct XtBasicInfo {
 BOOL WINAPI DllMainCRTStartup(HINSTANCE inst, DWORD reason, LPVOID reserved);
 void xt_crt_process_init(void);
 void xt_crt_thread_init(void);
+void *xt_heap_current(void);
+void xt_heap_release(void *heap);
 void xt_crt_thread_fini(void);
 
 /* heap.c */
