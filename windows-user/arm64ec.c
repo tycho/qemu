@@ -357,8 +357,71 @@ XTEXPORT NTSTATUS ThreadInit(void)
     return STATUS_SUCCESS;
 }
 
+NTSTATUS NTAPI NtSuspendThread(HANDLE, PULONG);
+NTSTATUS NTAPI NtGetContextThread(HANDLE, PCONTEXT);
+NTSTATUS NTAPI NtDuplicateObject(HANDLE, HANDLE, HANDLE, PHANDLE,
+                                 ACCESS_MASK, ULONG, ULONG);
+
+static void ec_unregister(XtThread *t);
+
+/*
+ * A thread's end, by itself or by another thread (THREAD), before Windows
+ * terminates it.  Another thread is suspended and its context read first,
+ * as FEX's module does: that waits for it to answer the doorbell, so it
+ * is outside the engine, holding none of its locks; it stays suspended
+ * for Windows to end.  Then the record leaves the watcher's list and goes:
+ * the thread's own at once, another's once its handle is signalled
+ * (xt_reap), as the emulator stack and its page.
+ */
 XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
 {
+    XtThreadBasicInfo tbi;
+    XtCpuArea *area;
+    XtThread *t;
+    HANDLE h, dup;
+    bool self;
+
+    if (qatomic_load_acquire(&engine_state) != 2) {
+        return STATUS_SUCCESS;
+    }
+    xt_enter();
+    xt_reap();
+    if (!thread || thread == GetCurrentThread()) {
+        tbi.TebBaseAddress = NtCurrentTeb();
+        self = true;
+    } else if (NtQueryInformationThread(thread, 0, &tbi, sizeof(tbi),
+                                        NULL) < 0) {
+        return STATUS_SUCCESS;
+    } else {
+        self = tbi.TebBaseAddress == NtCurrentTeb();
+    }
+    area = xt_cpu_area(tbi.TebBaseAddress);
+    if (!area || !qatomic_read(&area->EmulatorData[0])) {
+        return STATUS_SUCCESS;
+    }
+    h = self ? GetCurrentThread() : thread;
+    if (!self) {
+        CONTEXT c = { .ContextFlags = CONTEXT_CONTROL };
+
+        NtSuspendThread(h, NULL);
+        NtGetContextThread(h, &c);
+    }
+    t = qatomic_xchg(&area->EmulatorData[0], NULL);
+    if (!t) {
+        return STATUS_SUCCESS;
+    }
+    ec_unregister(t);
+    if (NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(), &dup,
+                          0, 0, DUPLICATE_SAME_ACCESS) >= 0) {
+        xt_reap_later(dup, area->EmulatorData[1]);
+    }
+    if (self) {
+        xt_thread_free(t);
+        xt_crt_thread_fini();
+    } else if (NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
+                                 &dup, 0, 0, DUPLICATE_SAME_ACCESS) >= 0) {
+        xt_thread_retire(t, dup);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -565,12 +628,31 @@ static unsigned __stdcall doorbell_watcher(void *arg)
     return 0;
 }
 
+/* A free slot, else a new one. */
 static void ec_register(XtThread *t)
 {
-    int i = qatomic_fetch_inc(&ec_nthreads);
+    int n = MIN(qatomic_read(&ec_nthreads), XT_EC_MAX_THREADS), i;
 
+    for (i = 0; i < n; i++) {
+        if (qatomic_cmpxchg(&ec_threads[i], NULL, t) == NULL) {
+            return;
+        }
+    }
+    i = qatomic_fetch_inc(&ec_nthreads);
     if (i < XT_EC_MAX_THREADS) {
         qatomic_set(&ec_threads[i], t);
+    }
+}
+
+/* Out of the watcher's list; it may have it still until the next hold. */
+static void ec_unregister(XtThread *t)
+{
+    int n = MIN(qatomic_read(&ec_nthreads), XT_EC_MAX_THREADS);
+
+    for (int i = 0; i < n; i++) {
+        if (qatomic_read(&ec_threads[i]) == t) {
+            qatomic_set(&ec_threads[i], NULL);
+        }
     }
 }
 

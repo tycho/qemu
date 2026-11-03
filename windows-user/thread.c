@@ -423,6 +423,12 @@ void xt_park_if_terminating(XtThread *t)
     }
 }
 
+/* An allocation of a thread's (MEM_RELEASE), freed once the thread ended. */
+void xt_reap_later(void *thread_handle, void *alloc)
+{
+    reap_add(thread_handle, alloc, NULL);
+}
+
 void xt_thread_retire(XtThread *t, void *thread_handle)
 {
     xt_event(t, XT_EV_THREAD_TERM, 1, 0);
