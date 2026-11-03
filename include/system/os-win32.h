@@ -52,12 +52,14 @@ typedef struct sockaddr_un {
 extern "C" {
 #endif
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__arm64ec__)
 /*
  * On windows-arm64, setjmp is available in only one variant, and longjmp always
  * does stack unwinding. This crash with generated code.
  * Thus, we use another implementation of setjmp (not windows one), coming from
  * mingw, which never performs stack unwinding.
+ * ARM64EC code is AArch64 code too, but mingw doesn't build these for it:
+ * there the program provides them.
  */
 #undef setjmp
 #undef longjmp
@@ -79,7 +81,19 @@ void __attribute__((noreturn)) __mingw_longjmp(jmp_buf, int);
  */
 # undef setjmp
 # define setjmp(env) _setjmp(env, NULL)
-#endif /* __aarch64__ */
+#endif /* __aarch64__ || __arm64ec__ */
+
+#ifdef __arm64ec__
+/*
+ * mingw-w64's __try1 and __except1 emit x64 SEH directives whenever
+ * __x86_64 is defined, which ARM64EC code can't hold; as on ARM64, they
+ * install nothing.
+ */
+#undef __try1
+#undef __except1
+#define __try1(handler)
+#define __except1
+#endif
 /* QEMU uses sigsetjmp()/siglongjmp() as the portable way to specify
  * "longjmp and don't touch the signal masks". Since we know that the
  * savemask parameter will always be zero we can safely define these

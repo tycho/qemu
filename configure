@@ -369,6 +369,10 @@ fi
 if test ! -z "$cpu" ; then
   # command line argument
   :
+elif check_define __arm64ec__ ; then
+  # ARM64EC code is AArch64 code with an x64-compatible ABI; the compiler
+  # also defines __x86_64__.
+  cpu="aarch64"
 elif check_define __x86_64__ ; then
   if check_define __ILP32__ ; then
     cpu="x32"
