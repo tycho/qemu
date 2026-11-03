@@ -43,6 +43,13 @@ NTSTATUS NTAPI NtDelayExecution(BOOLEAN, PLARGE_INTEGER);
 NTSTATUS NTAPI NtYieldExecution(void);
 NTSTATUS NTAPI NtFlushInstructionCache(HANDLE, PVOID, SIZE_T);
 NTSTATUS NTAPI NtQueryPerformanceCounter(PLARGE_INTEGER, PLARGE_INTEGER);
+NTSTATUS NTAPI NtDuplicateObject(HANDLE, HANDLE, HANDLE, PHANDLE,
+                                 ACCESS_MASK, ULONG, ULONG);
+NTSTATUS NTAPI NtWaitForSingleObject(HANDLE, BOOLEAN, PLARGE_INTEGER);
+NTSTATUS NTAPI NtClose(HANDLE);
+NTSTATUS NTAPI RtlAcquirePebLock(void);
+NTSTATUS NTAPI RtlReleasePebLock(void);
+ULONG NTAPI RtlFindClearBitsAndSet(PVOID, ULONG, ULONG);
 NTSTATUS NTAPI RtlCreateUserThread(HANDLE, PSECURITY_DESCRIPTOR, BOOLEAN,
                                    ULONG, SIZE_T, SIZE_T, PVOID, PVOID,
                                    PHANDLE, CLIENT_ID *);

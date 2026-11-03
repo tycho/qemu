@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
 #include "hw/core/cpu.h"
@@ -130,6 +131,27 @@ static NTSTATUS alloc_direct(void **base, SIZE_T *size, ULONG type, ULONG prot)
 {
     return xt_syscall((uintptr_t)GetCurrentProcess(), (uintptr_t)base, 0,
                       (uintptr_t)size, type, prot, nr_alloc);
+}
+
+/* Whether ProcessInit has found the system calls the module makes itself. */
+bool xt_syscalls_ready(void)
+{
+    return nr_alloc >= 0;
+}
+
+/*
+ * Memory through the system call itself, no code of ntdll's on the way:
+ * nothing reaches the module's callbacks (emutls.c's cold path).
+ */
+void *xt_alloc_direct(size_t len)
+{
+    void *p = NULL;
+    SIZE_T size = len;
+
+    if (alloc_direct(&p, &size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) < 0) {
+        return NULL;
+    }
+    return p;
 }
 
 static NTSTATUS protect_direct(void **base, SIZE_T *size, ULONG prot,
@@ -306,6 +328,7 @@ XTEXPORT NTSTATUS ProcessInit(void)
     if (!init_syscalls()) {
         return STATUS_NOT_SUPPORTED;
     }
+    xt_emutls_init();
     {
         void *p = NULL;
         SIZE_T size = 0x1000;
@@ -1130,6 +1153,43 @@ XTEXPORT void xt_ec_test_load(void *dst, const void *src, size_t len)
     memcpy(dst, src, len);
     mmap_unlock();
     xt_invalidate((uintptr_t)dst, len);
+}
+
+/*
+ * A thread-local variable larger than a root's storage, page-aligned and
+ * with an initial value, for the harness to check from many threads at
+ * once (emutls.c): 1 if this thread's copy is aligned, holds the initial
+ * value at its first use and stays the thread's own.  With REAP: the
+ * roots left after a sweep of the ended threads' instead.
+ */
+static __thread uint8_t test_tls[80 * KiB] __attribute__((aligned(4096))) = {
+    0x5a, 0xa5,
+};
+
+XTEXPORT int xt_ec_test_tls(int reap)
+{
+    /* The TEB's own address tells threads apart. */
+    uintptr_t tid = (uintptr_t)NtCurrentTeb();
+    uint8_t *p;
+
+    if (reap) {
+        xt_emutls_reap();
+        return xt_emutls_roots();
+    }
+    /* The variable's first use, by the harness's threads at once. */
+    p = test_tls;
+    if ((uintptr_t)p & 4095) {
+        return -1;
+    }
+    if (p[0] != 0x5a || p[1] != 0xa5 || p[2] || p[sizeof(test_tls) - 1]) {
+        return -2;
+    }
+    memcpy(p + 2, &tid, sizeof(tid));
+    NtYieldExecution();
+    if (test_tls != p || memcmp(p + 2, &tid, sizeof(tid))) {
+        return -3;
+    }
+    return 1;
 }
 
 /* Drop translations of a range the harness rewrote. */

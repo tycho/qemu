@@ -40,8 +40,10 @@ uint32_t xt_inject_point;
 /* The TEB's ThreadLocalStoragePointer (TEB + 0x58). */
 #define TEB_TLS_POINTER 0x58
 
+#ifndef TARGET_X86_64
 extern char _tls_start, _tls_end;
 extern uint64_t _tls_index;
+#endif
 
 /*
  * Memory above 4 GiB, outside the guest's address space, whatever the
@@ -72,6 +74,27 @@ void *xt_alloc_high(size_t len)
     return base;
 }
 
+#ifdef TARGET_X86_64
+/*
+ * The x64 module's thread-local variables are emulated, in storage of its
+ * own (runtime/emutls.c): usable on any thread, at any time.
+ */
+bool xt_tls_ready(void)
+{
+    return true;
+}
+
+void xt_tls_attach(void)
+{
+    xt_emutls_init();
+}
+
+/* A thread's storage goes with xt_emutls_reap, record or not. */
+static void *tls_alloc_of(void *teb)
+{
+    return NULL;
+}
+#else
 /*
  * Whether this thread can use the module's thread-local variables: in a
  * WOW64 process the native loader sets up no PE TLS for the CPU module, so
@@ -129,6 +152,8 @@ static void *tls_alloc_of(void *teb)
     }
     return *(void **)((char *)tlsp[_tls_index] + off);
 }
+
+#endif
 
 /* WOW64's TLS slots, in the 64-bit TEB's TlsSlots (TEB + 0x1480). */
 #define TEB_TLS_SLOTS 0x1480
@@ -329,6 +354,10 @@ int xt_reap(void)
     XtReap **pp, *dead = NULL, *r;
     int n = 0, nrec = 0;
 
+#ifdef TARGET_X86_64
+    xt_emutls_reap();
+#endif
+
     if (!qatomic_read(&reap_list)) {
         return 0;
     }
@@ -371,6 +400,7 @@ int xt_reap(void)
     return n;
 }
 
+#ifndef TARGET_X86_64
 static HANDLE open_thread(DWORD tid)
 {
     OBJECT_ATTRIBUTES oa = { .Length = sizeof(oa) };
@@ -384,6 +414,7 @@ static HANDLE open_thread(DWORD tid)
     }
     return h;
 }
+#endif
 
 /*
  * A thread's own exit: the record and CPU go now, the TLS block once the
@@ -392,7 +423,9 @@ static HANDLE open_thread(DWORD tid)
  */
 void xt_thread_free(XtThread *t)
 {
+#ifndef TARGET_X86_64
     HANDLE self = open_thread(t->tid);
+#endif
 
     xt_event(t, XT_EV_THREAD_TERM, 0, 0);
     unlink_record(t);
@@ -401,9 +434,11 @@ void xt_thread_free(XtThread *t)
         xt_self = NULL;
     }
     free_record(t);
+#ifndef TARGET_X86_64
     if (self) {
         reap_add(self, tls_mine, NULL);
     }
+#endif
 }
 
 /*
