@@ -115,6 +115,8 @@ void xt_ec_begin(void);
 /* arm64ec.S: transfers out of the engine; neither returns */
 G_NORETURN void xt_ec_exit_native(ARM64_NT_CONTEXT *n);
 G_NORETURN void xt_ec_jump_set_stack(uintptr_t pc, uintptr_t sp);
+/* NtContinue, keeping registers for BeginSimulation; returns on failure */
+void xt_ec_continue_kept(ARM64_NT_CONTEXT *n, int64_t nr_continue);
 extern uintptr_t xt_x64_ret;
 extern const char xt_ec_exit_suspend_point[], xt_ec_exit_resume_point[];
 

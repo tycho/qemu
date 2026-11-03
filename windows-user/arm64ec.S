@@ -163,7 +163,13 @@ ExitToX64:
     .globl BeginSimulation
 BeginSimulation:
     cap_check 4
+    /* The registers the dispatcher keeps, for xt_ec_begin. */
     ldr     x17, [x18, #TEB_CPU_AREA]
+    ldr     x16, [x17, #AREA_FRAME]
+    stp     x19, x20, [x16, #F_X(19)]
+    stp     x21, x22, [x16, #F_X(21)]
+    stp     x25, x26, [x16, #F_X(25)]
+    str     x27, [x16, #F_X(27)]
     ldr     x16, [x17, #AREA_STACK_BASE]
     mov     sp, x16
     bl      "#xt_ec_begin"
@@ -250,6 +256,23 @@ xt_ec_exit_resume_point:
     .globl xt_ec_exit_suspend_point
 xt_ec_exit_suspend_point:
     brk     #0xcafe
+
+/*
+ * void xt_ec_continue_kept(ARM64_NT_CONTEXT *n, nr): NtContinue at N with
+ * x19-x22 and x25-x27 holding N's values already, so they hold them at
+ * whatever native code runs before the continuation reaches x64 code.
+ * Returns only if NtContinue fails, with those registers lost.
+ */
+    .globl "#xt_ec_continue_kept"
+    .def "#xt_ec_continue_kept"; .scl 2; .type 32; .endef
+"#xt_ec_continue_kept":
+    ldp     x19, x20, [x0, #C_X(19)]
+    ldp     x21, x22, [x0, #C_X(21)]
+    ldp     x25, x26, [x0, #C_X(25)]
+    ldr     x27, [x0, #C_X(27)]
+    mov     x6, x1
+    mov     x1, #0
+    b       "#xt_syscall"
 
 /* void xt_ec_jump_set_stack(pc, sp) */
     .globl "#xt_ec_jump_set_stack"

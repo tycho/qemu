@@ -806,8 +806,9 @@ static G_NORETURN void leave_suspend(XtThread *t, XtEcFrame *f)
 
     leave(t, &n, true);
     qatomic_set(&f->doorbell, 0);
+    t->ec_suspended = true;
     xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
-    xt_continue_native(&n);
+    xt_ec_continue_kept(&n, nr_continue);
     NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
     __builtin_unreachable();
 }
@@ -855,12 +856,37 @@ void xt_ec_enter(XtEcFrame *f)
     XtThread *t = ec_thread();
     CONTEXT c;
 
+    t->ec_suspended = false;
     if (cross_process_work) {
         cross_process_work();
     }
     xt_ec_call_context(t, &f->ctx, &c);
     xt_acquire(t, &c);
     ec_run(t, f);
+}
+
+/*
+ * Windows treats a thread as consistent from KiUserEmulationDispatcher's
+ * entry until CpuDispatchEmulation sets InSimulation: on the guest stack,
+ * the x64 state still in the native context there, from which the AMD64
+ * context is converted.  A suspension in that window reads and writes the
+ * native registers, so an edit made then reaches BeginSimulation only in
+ * the registers the dispatcher keeps (saved in the frame by
+ * BeginSimulation): R12-R15, RBX, RSI and RDI.  A suspension's
+ * continuation loads them from its context (xt_ec_continue_kept), and
+ * native code keeps them up to BeginSimulation, so they differ from the
+ * AMD64 context only by such an edit, and are taken from there.  An edit
+ * to any other register in the window is lost (under Prism too).
+ */
+static void ec_window_edits(const ARM64_NT_CONTEXT *kept, CONTEXT *c)
+{
+    c->R12 = kept->X19;
+    c->R13 = kept->X20;
+    c->R14 = kept->X21;
+    c->R15 = kept->X22;
+    c->Rsi = kept->X25;
+    c->Rdi = kept->X26;
+    c->Rbx = kept->X27;
 }
 
 /*
@@ -889,7 +915,11 @@ void xt_ec_begin(void)
     xt_export(t, &c);
     if ((w->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER) {
         memcpy(&c.Rax, &w->Rax, 16 * sizeof(c.Rax));
+        if (t->ec_suspended) {
+            ec_window_edits(&((XtEcFrame *)area->EmulatorData[1])->ctx, &c);
+        }
     }
+    t->ec_suspended = false;
     if ((w->ContextFlags & CONTEXT_CONTROL) == CONTEXT_CONTROL) {
         c.Rip = w->Rip;
         c.Rsp = w->Rsp;
