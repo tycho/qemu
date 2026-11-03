@@ -58,6 +58,20 @@ static void G_NORETURN xt_fault_continue(XtThread *t, XtActive prev)
         f->busy = 0;
         siglongjmp(t->adapter_jmp, 1);
     }
+    /*
+     * A TB's entry check read a page gone since: the TB is stale, and
+     * translating it again meets the guest's own fetch fault, if any.  A
+     * guard page's guard, which the read took, is put back for that.
+     */
+    if (f->kind == XT_FK_SMC) {
+        if (f->code == STATUS_GUARD_PAGE_VIOLATION &&
+            !xt_guard_restore(f->addr)) {
+            xt_event(t, XT_EV_CHECK, 1, f->addr);
+        }
+        t->active = prev;
+        f->busy = 0;
+        tb_smc_check_fault(cs);
+    }
     if (f->is_write && f->code == STATUS_ACCESS_VIOLATION &&
         f->kind != XT_FK_TRANSLATE) {
         int r = page_unprotect(cs, f->addr, f->host_pc);
@@ -149,6 +163,12 @@ bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx)
         break;
     case XT_ACT_EXEC:
     case XT_ACT_ATOMIC:
+        if (t->cpu && t->cpu->smc_check_tb) {
+            kind = XT_FK_SMC;
+            hpc = 0;
+            access = MMU_INST_FETCH;
+            break;
+        }
         if (helper_retaddr == 0 &&
             !in_code_gen_buffer((void *)(pc - tcg_splitwx_diff))) {
             if (have_mmap_lock() && tcg_ctx->gen_tb &&
