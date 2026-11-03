@@ -282,6 +282,7 @@ XTEXPORT NTSTATUS ProcessInit(void)
         return STATUS_NOT_SUPPORTED;
     }
     reached |= 0x80;
+    xt_ec_probe_process_init();
     return STATUS_SUCCESS;
 }
 
@@ -321,9 +322,17 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
     return STATUS_SUCCESS;
 }
 
+/*
+ * ntdll's call at an exception, with the full native context.  For now
+ * only the capture probe's (test-ec.c), which logs it and continues its
+ * own trap and fault.
+ */
 XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
                                          ARM64_NT_CONTEXT *native)
 {
+    if (xt_ec_probe_rtcs(er, guest, native)) {
+        xt_continue_native(native);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -489,6 +498,7 @@ XTEXPORT int xt_ec_test_init(int *rejected)
     if (!init_syscalls() || process_init() < 0) {
         return -1;
     }
+    qatomic_set(&engine_state, 2);
     RtlAddVectoredExceptionHandler(1, xt_ec_veh);
     *rejected = init_rejected;
     return init_applied;
@@ -571,4 +581,10 @@ XTEXPORT void xt_ec_test_syscalls(int64_t nr[4], uint32_t *lut_size)
     nr[2] = nr_alloc;
     nr[3] = nr_protect;
     *lut_size = xt_ntdll_lut_size;
+}
+
+/* The entries ntdll made: bits 6-8 as xt_ec_entry_stub reports them. */
+XTEXPORT uint32_t xt_ec_test_reached(void)
+{
+    return reached;
 }

@@ -67,11 +67,19 @@ xt_check_call:
  * (__os_arm64x_x64_jump, _dispatch_ret, _dispatch_call_no_redirect, and
  * KiUserEmulationDispatcher's BeginSimulation).  Not built yet: each moves
  * to the thread's emulator stack and ends the process (xt_ec_entry_stub)
- * with its number; x9 holds the target where there is one.
+ * with its number; x9 holds the target where there is one.  While the
+ * capture probe sets xt_cap_entry_mode, xt_cap_entry (test-ec.S) takes
+ * them instead.
  */
 .macro ec_entry name, which
     .globl \name
 \name:
+    adrp    x17, xt_cap_entry_mode
+    ldr     w17, [x17, :lo12:xt_cap_entry_mode]
+    cbz     w17, 1f
+    mov     x16, #\which
+    b       xt_cap_entry
+1:
     ldr     x17, [x18, #0x1788]     /* TEB->ChpeV2CpuAreaInfo */
     ldr     x16, [x17, #0x8]        /* EmulatorStackBase */
     mov     sp, x16
