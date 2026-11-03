@@ -64,23 +64,59 @@ static inline XtCpuArea *xt_cpu_area(void *teb)
     return *(XtCpuArea **)((char *)teb + XT_TEB_CPU_AREA);
 }
 
-/* Whether ADDR is EC code (native), by the PEB's bitmap. */
-static inline bool xt_is_ec_code(uint64_t addr)
+NTSTATUS NTAPI NtReadVirtualMemory(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+
+/*
+ * The PEB's bitmap word for ADDR's 64 pages (256 KiB), bit n for page n;
+ * 0 where Windows has committed no bitmap (no EC code there).
+ */
+static inline uint64_t xt_ec_bitmap_word(uint64_t addr)
 {
     const uint64_t *bitmap;
+    uint64_t w = 0;
+    SIZE_T n;
 
     if (addr >= XT_EC_BITMAP_LIMIT) {
-        return false;
+        return 0;
     }
     bitmap = *(const uint64_t **)
         ((char *)NtCurrentTeb()->ProcessEnvironmentBlock + XT_PEB_EC_BITMAP);
-    return (bitmap[addr >> 18] >> ((addr >> 12) & 63)) & 1;
+    if (NtReadVirtualMemory(GetCurrentProcess(), (void *)&bitmap[addr >> 18], &w,
+                            sizeof(w), &n) < 0) {
+        return 0;
+    }
+    return w;
+}
+
+/* Whether ADDR is EC code (native), by the PEB's bitmap. */
+static inline bool xt_is_ec_code(uint64_t addr)
+{
+    return (xt_ec_bitmap_word(addr) >> ((addr >> 12) & 63)) & 1;
 }
 
 /* arm64ec.S */
 void xt_check_call(void);
-/* arm64ec.c: an entry not built yet, WHICH 1-4, on the emulator stack. */
-void xt_ec_entry_stub(int which, uint64_t target);
+
+/*
+ * The page below a thread's emulator stack (ThreadInit): its doorbell, and
+ * the native registers of an entry (arm64ec.S stores them) or of an exit
+ * to native code (xt_ec_exit_native loads them).
+ */
+typedef struct XtEcFrame {
+    ULONG doorbell;
+    uint32_t pad[3];
+    ARM64_NT_CONTEXT ctx;
+} XtEcFrame;
+
+/* arm64ec.c: the entries' C halves, on the emulator stack */
+void xt_ec_enter(XtEcFrame *f);
+void xt_ec_begin(void);
+
+/* arm64ec.S: transfers out of the engine; neither returns */
+G_NORETURN void xt_ec_exit_native(ARM64_NT_CONTEXT *n);
+G_NORETURN void xt_ec_jump_set_stack(uintptr_t pc, uintptr_t sp);
+extern uintptr_t xt_x64_ret;
+extern const char xt_ec_exit_suspend_point[], xt_ec_exit_resume_point[];
 
 /* test-ec.S: the capture probe's loop and its labels; its entry path. */
 extern const char xt_cap_loop[], xt_cap_loop_top[], xt_cap_trap[],
