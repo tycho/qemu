@@ -165,6 +165,7 @@ typedef struct XtThread {
     void *teb;
     bool wow64;             /* under wow64.dll: slot 2, the CPU area */
     bool stop_at_int3;      /* the native harness: int3 ends a run */
+    uint64_t int3_rip;      /* a raised int3's RIP, past it, until dispatch */
     XtState state;
     XtActive active;
     bool rcu_registered;
