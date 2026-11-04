@@ -10,6 +10,8 @@
 #define ACCEL_TCG_INTERNAL_COMMON_H
 
 #include "exec/cpu-common.h"
+#include "qemu/bswap.h"
+#include "qemu/crc32c.h"
 #include "exec/translation-block.h"
 #include "exec/mmap-lock.h"
 #include "accel/tcg/tb-cpu-state.h"
@@ -24,6 +26,44 @@ extern bool one_insn_per_tb;
  * each TB's guest bytes at its entry, not by write-protecting its pages.
  */
 extern bool tcg_smc_check;
+
+/*
+ * x-smc=check: the checksum of a TB's guest code bytes, taken when it is
+ * translated and again at its entry.  It reads exactly LEN bytes from P,
+ * no more (the code may end at an unmapped page), in overlapping
+ * little-endian words: two CRC32C steps for up to 16 bytes, and for
+ * longer code three independent chains over interleaved 8-byte words,
+ * folded into one at the end.  Any change confined to one chain changes
+ * the result.
+ */
+static inline uint32_t tb_code_sum(const uint8_t *p, uint32_t len)
+{
+    uint32_t c0 = 0xffffffff, c1 = 0xffffffff, c2 = 0xffffffff;
+    const uint8_t *last;
+
+    if (len < 4) {
+        if (len & 2) {
+            c0 = crc32c_u16(c0, lduw_le_p(p));
+            p += 2;
+        }
+        return len & 1 ? crc32c_u8(c0, *p) : c0;
+    }
+    if (len <= 8) {
+        c0 = crc32c_u32(c0, ldl_le_p(p));
+        return crc32c_u32(c0, ldl_le_p(p + len - 4));
+    }
+    last = p + len - 8;
+    for (; p + 24 <= last; p += 24) {
+        c0 = crc32c_u64(c0, ldq_le_p(p));
+        c1 = crc32c_u64(c1, ldq_le_p(p + 8));
+        c2 = crc32c_u64(c2, ldq_le_p(p + 16));
+    }
+    for (; p < last; p += 8) {
+        c0 = crc32c_u64(c0, ldq_le_p(p));
+    }
+    c0 = crc32c_u64(c0, ldq_le_p(last));
+    return len < 32 ? c0 : crc32c_u32(crc32c_u32(c0, c1), c2);
+}
 
 extern bool icount_align_option;
 
