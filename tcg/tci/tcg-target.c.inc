@@ -585,6 +585,10 @@ static const TCGOutOpBinary outop_ctz = {
     .out_rrr = tgen_ctz,
 };
 
+static const TCGOutOpCrc32c outop_crc32c = {
+    .base.static_constraint = C_NotImplemented,
+};
+
 static void tgen_deposit(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
                          TCGReg a2, unsigned ofs, unsigned len)
 {

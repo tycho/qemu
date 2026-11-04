@@ -25,8 +25,10 @@
 #include "qemu/crc32c.h"
 #include "disas/disas.h"
 #include "tb-internal.h"
+#include "tcg/tcg-temp-internal.h"
 #ifdef CONFIG_USER_ONLY
 #include "exec/page-protection.h"
+#include "user/guest-host.h"
 #include "user/page-protection.h"
 #endif
 
@@ -194,6 +196,86 @@ static bool smc_needs_check(const DisasContextBase *db,
  * is rejected at its first entry and translated again.  A TB that read no
  * guest bytes (a target's synthetic code) has nothing to check.
  */
+/*
+ * The check emitted in the TB, where the backend has crc32c, for code of
+ * up to SMC_INLINE_MAX bytes: tb_code_sum of the bytes, read by host loads
+ * at their host address (a constant in user mode), not as guest accesses.
+ * A mismatch branches to the TB's stale path, at its end, which discards
+ * the TB with every global stored, as the helper does.  So does a fault
+ * of these reads, before any guest insn (tb_smc_inline_fault).  The three
+ * chains are emitted one after another, each folded as soon as it is
+ * complete, so that few registers are live at the TB's entry.
+ */
+#define SMC_INLINE_MAX 256
+
+static void smc_gen_crc(TCGv_i64 sum, TCGv_ptr base, uint32_t off,
+                        MemOp size)
+{
+    TCGv_i64 w = tcg_temp_ebb_new_i64();
+
+    switch (size) {
+    case MO_8:
+        tcg_gen_ld8u_i64(w, base, off);
+        break;
+    case MO_16:
+        tcg_gen_ld16u_i64(w, base, off);
+        break;
+    case MO_32:
+        tcg_gen_ld32u_i64(w, base, off);
+        break;
+    default:
+        tcg_gen_ld_i64(w, base, off);
+        break;
+    }
+    tcg_gen_crc32c_i64(sum, sum, w, size);
+    tcg_temp_free_i64(w);
+}
+
+/* As tb_code_sum, with its chains in sequence. */
+static void smc_gen_sum(TCGv_i64 c0, TCGv_ptr base, uint32_t len)
+{
+    uint32_t last, steps;
+
+    tcg_gen_movi_i64(c0, 0xffffffff);
+    if (len < 4) {
+        if (len & 2) {
+            smc_gen_crc(c0, base, 0, MO_16);
+        }
+        if (len & 1) {
+            smc_gen_crc(c0, base, len & 2, MO_8);
+        }
+        return;
+    }
+    if (len <= 8) {
+        smc_gen_crc(c0, base, 0, MO_32);
+        smc_gen_crc(c0, base, len - 4, MO_32);
+        return;
+    }
+
+    last = len - 8;
+    steps = last / 24;
+    for (uint32_t i = 0; i < steps; i++) {
+        smc_gen_crc(c0, base, i * 24, MO_64);
+    }
+    for (uint32_t off = steps * 24; off < last; off += 8) {
+        smc_gen_crc(c0, base, off, MO_64);
+    }
+    smc_gen_crc(c0, base, last, MO_64);
+    if (len < 32) {
+        return;
+    }
+    for (int k = 1; k <= 2; k++) {
+        TCGv_i64 c = tcg_temp_ebb_new_i64();
+
+        tcg_gen_movi_i64(c, 0xffffffff);
+        for (uint32_t i = 0; i < steps; i++) {
+            smc_gen_crc(c, base, i * 24 + k * 8, MO_64);
+        }
+        tcg_gen_crc32c_i64(c0, c0, c, MO_32);
+        tcg_temp_free_i64(c);
+    }
+}
+
 static void smc_gen_check(DisasContextBase *db, TranslationBlock *tb,
                           TCGOp *mark)
 {
@@ -224,8 +306,27 @@ static void smc_gen_check(DisasContextBase *db, TranslationBlock *tb,
 
     s->emit_before_op = mark ? QTAILQ_NEXT(mark, link)
                              : QTAILQ_FIRST(&s->ops);
-    gen_helper_tb_smc_check(tcg_env, tcg_constant_ptr(tb));
+    if (reject || tcg_smc_call || len > SMC_INLINE_MAX ||
+        !tcg_op_supported(INDEX_op_crc32c, TCG_TYPE_I64, 0)) {
+        gen_helper_tb_smc_check(tcg_env, tcg_constant_ptr(tb));
+        s->emit_before_op = NULL;
+        return;
+    }
+
+    TCGLabel *stale = gen_new_label();
+    TCGv_ptr base = tcg_constant_ptr(g2h_untagged_vaddr(db->pc_first));
+    TCGv_i64 sum = tcg_temp_ebb_new_i64();
+
+    smc_gen_sum(sum, base, len);
+    tcg_gen_brcondi_i64(TCG_COND_NE, sum, tb->smc_crc, stale);
+    tcg_temp_free_i64(sum);
     s->emit_before_op = NULL;
+
+    /* At the TB's end: a mismatch, or a fault of the reads above. */
+    gen_set_label(stale);
+    gen_helper_tb_smc_stale(tcg_env, tcg_constant_ptr(tb));
+    s->smc_stale = stale;
+    tb->smc_inline = true;
 }
 #endif
 
@@ -265,6 +366,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
 #ifdef CONFIG_USER_ONLY
     tb->smc_check = false;
+    tb->smc_inline = false;
+    tcg_ctx->smc_stale = NULL;
     if (tcg_ctx->smc_have) {
         memset(tcg_ctx->smc_have, 0, tcg_ctx->smc_len);
     }

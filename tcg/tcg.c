@@ -1007,6 +1007,12 @@ typedef struct TCGOutOpBswap {
                    TCGReg a0, TCGReg a1, unsigned flags);
 } TCGOutOpBswap;
 
+typedef struct TCGOutOpCrc32c {
+    TCGOutOp base;
+    void (*out_rrr)(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                    TCGReg a2, MemOp size);
+} TCGOutOpCrc32c;
+
 typedef struct TCGOutOpDeposit {
     TCGOutOp base;
     void (*out_rrr)(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
@@ -1170,6 +1176,7 @@ static const TCGOutOp * const all_outop[NB_OPS] = {
     OUTOP(INDEX_op_bswap32, TCGOutOpBswap, outop_bswap32),
     OUTOP(INDEX_op_bswap64, TCGOutOpUnary, outop_bswap64),
     OUTOP(INDEX_op_clz, TCGOutOpBinary, outop_clz),
+    OUTOP(INDEX_op_crc32c, TCGOutOpCrc32c, outop_crc32c),
     OUTOP(INDEX_op_ctpop, TCGOutOpUnary, outop_ctpop),
     OUTOP(INDEX_op_ctz, TCGOutOpBinary, outop_ctz),
     OUTOP(INDEX_op_deposit, TCGOutOpDeposit, outop_deposit),
@@ -5657,6 +5664,16 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         }
         break;
 
+    case INDEX_op_crc32c:
+        {
+            const TCGOutOpCrc32c *out = &outop_crc32c;
+
+            tcg_debug_assert(!const_args[1] && !const_args[2]);
+            out->out_rrr(s, type, new_args[0], new_args[1],
+                         new_args[2], new_args[3]);
+        }
+        break;
+
     case INDEX_op_extract:
     case INDEX_op_sextract:
         {
@@ -6712,6 +6729,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
                 s->gen_insn_end_off[num_insns] = off;
                 /* Assert that we do not overflow our stored offset.  */
                 assert(s->gen_insn_end_off[num_insns] == off);
+            } else {
+                s->insn0_off = tcg_current_code_size(s);
             }
             num_insns++;
             for (i = 0; i < INSN_START_WORDS; ++i) {
