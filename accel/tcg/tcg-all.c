@@ -315,8 +315,10 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "x-smc", tcg_get_smc, tcg_set_smc);
     object_class_property_set_description(oc, "x-smc",
         "How self-modifying code is detected: protect (write-protect "
-        "translated pages), check (a CRC of each TB's code at its entry; "
-        "user mode only) or check-call (the same, always by a helper call)");
+        "translated pages), check (a CRC of each TB's code at its entry, "
+        "and TBs of code that may change end after each insn that may "
+        "store; user mode only) or check-call (the same, the CRC always "
+        "by a helper call)");
 }
 
 static const TypeInfo tcg_accel_type = {
