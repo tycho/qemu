@@ -50,6 +50,9 @@
 #ifdef CONFIG_DARWIN
 # include <sys/sysctl.h>
 #endif
+#ifdef _WIN32
+# include <winternl.h>
+#endif
 #if defined(__OpenBSD__) && !defined(CONFIG_ELF_AUX_INFO)
 # include <machine/armreg.h>
 # include <machine/cpu.h>
@@ -76,6 +79,58 @@ static bool sysctl_for_bool(const char *name)
      */
     assert(errno == ENOENT);
     return false;
+}
+#endif
+
+#ifdef _WIN32
+NTSTATUS NTAPI NtOpenKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+NTSTATUS NTAPI NtQueryValueKey(HANDLE, PUNICODE_STRING, int, PVOID, ULONG,
+                               PULONG);
+
+/* An unsigned 4-bit field of an ID register. */
+#define ID_FIELD(reg, lsb)  (((reg) >> (lsb)) & 0xf)
+
+/*
+ * Windows has no hwcaps or sysctl, but records each processor's ID
+ * registers in the registry: REG_QWORD values named "CP " and the
+ * register's MRS encoding in hex (op0 bit 0, op1, CRn, CRm, op2), so
+ * ID_AA64ISAR0_EL1 is "CP 4030".  Processor 0's are read, through ntdll
+ * alone, so that code loaded before kernel32 and advapi32 can run this.
+ */
+static HANDLE win32_cpu_key(void)
+{
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE key;
+
+    RtlInitUnicodeString(&name, L"\\Registry\\Machine\\HARDWARE\\DESCRIPTION"
+                         L"\\System\\CentralProcessor\\0");
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    return NtOpenKey(&key, KEY_QUERY_VALUE, &oa) < 0 ? NULL : key;
+}
+
+/* An ID register's value, or 0 (no features) if Windows doesn't list it. */
+static uint64_t win32_id_reg(HANDLE key, const wchar_t *value)
+{
+    /* KEY_VALUE_PARTIAL_INFORMATION, with room for a REG_QWORD. */
+    struct {
+        ULONG title_index;
+        ULONG type;
+        ULONG length;
+        UCHAR data[8];
+    } info;
+    UNICODE_STRING name;
+    ULONG len;
+    uint64_t reg;
+
+    RtlInitUnicodeString(&name, value);
+    if (NtQueryValueKey(key, &name, 2 /* KeyValuePartialInformation */,
+                        &info, sizeof(info), &len) < 0 ||
+        info.type != REG_QWORD || info.length != sizeof(reg)) {
+        return 0;
+    }
+    memcpy(&reg, info.data, sizeof(reg));
+    return reg;
 }
 #endif
 
@@ -133,13 +188,37 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
 #endif
 #ifdef _WIN32
     {
-        /*
-         * KUSER_SHARED_DATA.ProcessorFeatures, which IsProcessorFeaturePresent
-         * reads, read directly: code loaded before kernel32 can't import it.
-         */
-        const volatile uint8_t *pf = (const volatile uint8_t *)0x7ffe0274;
+        HANDLE key = win32_cpu_key();
 
-        info |= pf[PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE] ? CPUINFO_CRC32 : 0;
+        if (key) {
+            uint64_t isar0 = win32_id_reg(key, L"CP 4030");
+            uint64_t isar2 = win32_id_reg(key, L"CP 4032");
+            uint64_t pfr1 = win32_id_reg(key, L"CP 4021");
+            uint64_t mmfr2 = win32_id_reg(key, L"CP 403A");
+
+            NtClose(key);
+            info |= ID_FIELD(isar0, 20) >= 2 ? CPUINFO_LSE : 0;
+            info |= ID_FIELD(mmfr2, 32) >= 1 ? CPUINFO_LSE2 : 0;
+            info |= ID_FIELD(isar0, 4) >= 1 ? CPUINFO_AES : 0;
+            info |= ID_FIELD(isar0, 4) >= 2 ? CPUINFO_PMULL : 0;
+            info |= ID_FIELD(isar0, 16) >= 1 ? CPUINFO_CRC32 : 0;
+            info |= ID_FIELD(pfr1, 0) >= 1 ? CPUINFO_BTI : 0;
+            info |= ID_FIELD(isar2, 52) >= 1 ? CPUINFO_CSSC : 0;
+        } else {
+            /*
+             * The processor features the kernel publishes in
+             * KUSER_SHARED_DATA, which IsProcessorFeaturePresent returns
+             * for indexes below 64.
+             */
+            const volatile uint8_t *pf = (const volatile uint8_t *)0x7ffe0274;
+
+            info |= pf[PF_ARM_V81_ATOMIC_INSTRUCTIONS_AVAILABLE] ?
+                    CPUINFO_LSE : 0;
+            info |= pf[PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE] ?
+                    CPUINFO_AES | CPUINFO_PMULL : 0;
+            info |= pf[PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE] ?
+                    CPUINFO_CRC32 : 0;
+        }
     }
 #endif
 #if defined(__OpenBSD__) && !defined(CONFIG_ELF_AUX_INFO)
