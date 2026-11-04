@@ -996,6 +996,28 @@ static void host_signal_lazysync(host_sigcontext *uc)
 #endif
 }
 
+/*
+ * x-smc=check: a fault of the check a TB emits of its own guest bytes, at
+ * its entry: the TB is stale.  Resume at its path that discards it, which
+ * stores the guest state as a helper call does.
+ */
+static bool host_signal_smc_inline(siginfo_t *info, host_sigcontext *uc)
+{
+    uintptr_t pc = host_signal_pc(uc);
+    uintptr_t stale;
+
+    if (!in_code_gen_buffer((void *)(pc - tcg_splitwx_diff)) ||
+        host_signal_write(info, uc)) {
+        return false;
+    }
+    stale = tb_smc_inline_fault(pc, (uintptr_t)info->si_addr);
+    if (!stale) {
+        return false;
+    }
+    host_signal_set_pc(uc, stale);
+    return true;
+}
+
 static void host_sigsegv_handler(CPUState *cpu, siginfo_t *info,
                                  host_sigcontext *uc)
 {
@@ -1119,6 +1141,10 @@ static void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
      * SIGFPE, SIGTRAP are always host bugs.
      */
     if (info->si_code > 0) {
+        if ((host_sig == SIGSEGV || host_sig == SIGBUS) &&
+            host_signal_smc_inline(info, uc)) {
+            return;
+        }
         switch (host_sig) {
         case SIGSEGV:
 #ifdef HOST_SIGNAL_SET_XREG
