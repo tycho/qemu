@@ -1094,6 +1094,10 @@ static bool smc_ops_may_store(TCGOp *op)
         switch (op->opc) {
         case INDEX_op_qemu_st:
         case INDEX_op_qemu_st2:
+        case INDEX_op_qemu_st_x:
+        case INDEX_op_qemu_st_vec:
+        case INDEX_op_qemu_st_vec_x:
+        case INDEX_op_qemu_atomic:
             return true;
         case INDEX_op_call:
             if (!(tcg_call_flags(op) & TCG_CALL_NO_SIDE_EFFECTS)) {
@@ -1412,6 +1416,10 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         region_tried = 1;
         region_head_key = tb_page_addr0(tb);
     }
+#ifdef CONFIG_USER_ONLY
+    /* A TB of several blocks holds no checked code: none needs ending. */
+    smc_split = smc_split && !db->region;
+#endif
 
  next_block:
     while (!(db->region && db->region->stubbing)) {
