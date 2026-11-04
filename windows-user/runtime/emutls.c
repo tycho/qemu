@@ -56,12 +56,19 @@ typedef struct TlsRoot {
     void *slot[ROOT_SLOTS]; /* each variable's copy, by index - 1 */
 } TlsRoot;
 
-/* The PEB's TLS slot bitmap, and the TEB's slots (64-bit layouts). */
+/*
+ * The PEB's TLS slot bitmap; the TEB's ClientId (process, thread) and
+ * slots (64-bit layouts).
+ */
 #define PEB_TLS_BITMAP 0x78
 #define TEB_PEB 0x60
 #define TEB_TLS_SLOTS 0x1480
 #define TLS_MINIMUM_SLOTS 64
+#define TEB_CLIENT_ID 0x40
 #define ThreadZeroTlsCell 10
+#ifndef STATUS_INVALID_CID
+#define STATUS_INVALID_CID ((NTSTATUS)0xC000000B)
+#endif
 
 /*
  * The test harness's hooks (xt_ec_test_tls_hook): a one-shot failure, a
@@ -78,6 +85,7 @@ static LONG slot_state;     /* 0 none, 1 being allocated, 2 slot_index */
 static ULONG slot_index;
 static EmutlsObject *registered[ROOT_SLOTS]; /* by index - 1 */
 static TlsRoot *roots;
+static uint64_t sweeper;    /* the sweeping thread's token, 0 none */
 
 static bool test_failing(int what)
 {
@@ -174,7 +182,10 @@ static void copy_bytes(uint8_t *d, const uint8_t *s, size_t n)
     }
 }
 
-/* Onto the list of roots; R is the reaper's once there. */
+/*
+ * Onto the head of the list of roots; R is the reaper's once there.  Only
+ * the head changes: R's link is set before R is listed.
+ */
 static void push_root(TlsRoot *r, int step)
 {
     TlsRoot *head;
@@ -325,27 +336,101 @@ size_t xt_emutls_roots(void)
     return xt_emutls_test(XT_EMUTLS_ROOTS, 0);
 }
 
-/* The roots of threads that have ended go, with their storage. */
-void xt_emutls_reap(void)
+static bool thread_ended(HANDLE h)
 {
     LARGE_INTEGER zero = { .QuadPart = 0 };
-    TlsRoot *r = qatomic_xchg(&roots, NULL), *next;
 
-    test_step(XT_EMUTLS_STEP_SWEEP);
-    for (; r; r = next) {
-        next = r->next;
-        if (NtWaitForSingleObject(r->thread, FALSE, &zero) == STATUS_SUCCESS) {
-            NtClose(r->thread);
-            while (r->chunks) {
-                TlsChunk *c = r->chunks;
+    return NtWaitForSingleObject(h, FALSE, &zero) == STATUS_SUCCESS;
+}
 
-                r->chunks = c->next;
-                free_region(c);
-            }
-            free_region(r);
-            qatomic_inc(&roots_freed);
-            continue;
-        }
-        push_root(r, 0);
+/* A thread's ID, and the low half of its creation time: who sweeps. */
+static uint64_t sweeper_token(HANDLE h, ULONG id)
+{
+    KERNEL_USER_TIMES t = { 0 };
+
+    NtQueryInformationThread(h, ThreadTimes, &t, sizeof(t),
+                             NULL);
+    return (uint64_t)id << 32 | t.CreateTime.dwLowDateTime;
+}
+
+/*
+ * Whether the sweeper TOKEN names has gone: no thread has its ID, one
+ * that does was made at another time, or it has ended.  A thread that
+ * can't be opened for another reason is taken to be there.
+ */
+static bool sweeper_gone(uint64_t token)
+{
+    CLIENT_ID cid = { .UniqueThread = (HANDLE)(uintptr_t)(token >> 32) };
+    OBJECT_ATTRIBUTES oa = { .Length = sizeof(oa) };
+    HANDLE h;
+    NTSTATUS st;
+    bool gone;
+
+    st = NtOpenThread(&h, SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION,
+                      &oa, &cid);
+    if (st < 0) {
+        return st == STATUS_INVALID_CID;
     }
+    gone = sweeper_token(h, token >> 32) != token || thread_ended(h);
+    NtClose(h);
+    return gone;
+}
+
+static void free_root(TlsRoot *r)
+{
+    NtClose(r->thread);
+    while (r->chunks) {
+        TlsChunk *c = r->chunks;
+
+        r->chunks = c->next;
+        free_region(c);
+    }
+    free_region(r);
+    qatomic_inc(&roots_freed);
+}
+
+/*
+ * The roots of threads that have ended go, with their storage.  One
+ * thread sweeps at a time; a sweep that finds another thread sweeping
+ * leaves the work to it, unless that thread has gone (terminated
+ * mid-sweep), when the sweep takes over.  The list is swept in place:
+ * new roots go on at the head, and only the sweeper changes a listed
+ * root's link, so a sweeper that stops anywhere leaves the list whole,
+ * and loses at most the one root it had unlinked.  The head itself is
+ * taken off by a compare-and-swap, which fails if a root has gone on
+ * since; the sweeper alone takes roots off, so the head it saw is still
+ * listed then.
+ */
+void xt_emutls_reap(void)
+{
+    ULONG id = *(ULONG *)((char *)NtCurrentTeb() + TEB_CLIENT_ID + 8);
+    uint64_t me = sweeper_token(GetCurrentThread(), id), held;
+    TlsRoot *prev, *r;
+
+    held = qatomic_cmpxchg(&sweeper, 0, me);
+    if (held && (!sweeper_gone(held) ||
+                 qatomic_cmpxchg(&sweeper, held, me) != held)) {
+        return;
+    }
+    test_step(XT_EMUTLS_STEP_SWEEP);
+    for (;;) {
+        prev = qatomic_load_acquire(&roots);
+        if (!prev || !thread_ended(prev->thread)) {
+            break;
+        }
+        if (qatomic_cmpxchg(&roots, prev, qatomic_read(&prev->next)) == prev) {
+            test_step(XT_EMUTLS_STEP_UNLINK);
+            free_root(prev);
+        }
+    }
+    while (prev && (r = qatomic_read(&prev->next))) {
+        if (thread_ended(r->thread)) {
+            qatomic_set(&prev->next, qatomic_read(&r->next));
+            test_step(XT_EMUTLS_STEP_UNLINK);
+            free_root(r);
+        } else {
+            prev = r;
+        }
+    }
+    qatomic_store_release(&sweeper, 0);
 }

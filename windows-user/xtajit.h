@@ -237,11 +237,12 @@ enum {
 /*
  * Stalls: in a root's construction after its storage, after it is in the
  * thread's slot, after its handle, between its link and its publication;
- * in a sweep, after it has taken the list.
+ * in a sweep, once it is the sweeper, and between unlinking a root and
+ * freeing it.
  */
 enum {
     XT_EMUTLS_STEP_STORAGE = 1, XT_EMUTLS_STEP_CELL, XT_EMUTLS_STEP_HANDLE,
-    XT_EMUTLS_STEP_LINK, XT_EMUTLS_STEP_SWEEP,
+    XT_EMUTLS_STEP_LINK, XT_EMUTLS_STEP_SWEEP, XT_EMUTLS_STEP_UNLINK,
 };
 long xt_emutls_test(int what, long arg);
 void xt_emutls_reap(void);
