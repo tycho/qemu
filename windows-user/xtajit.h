@@ -223,6 +223,27 @@ void xt_emutls_init(void);
 bool xt_syscalls_ready(void);
 void *xt_alloc_direct(size_t len);
 size_t xt_emutls_roots(void);
+
+/* The emulated TLS's test hooks (xt_emutls_test). */
+enum {
+    XT_EMUTLS_FAIL, XT_EMUTLS_STALL, XT_EMUTLS_STALLED, XT_EMUTLS_RELEASE,
+    XT_EMUTLS_MADE, XT_EMUTLS_FREED, XT_EMUTLS_ROOTS,
+};
+/* Failures: the root's storage, a further chunk, its handle, the slot. */
+enum {
+    XT_EMUTLS_FAIL_ALLOC = 1, XT_EMUTLS_FAIL_CHUNK, XT_EMUTLS_FAIL_DUP,
+    XT_EMUTLS_FAIL_SLOT, XT_EMUTLS_FAIL_STICKY = 0x100,
+};
+/*
+ * Stalls: in a root's construction after its storage, after it is in the
+ * thread's slot, after its handle, between its link and its publication;
+ * in a sweep, after it has taken the list.
+ */
+enum {
+    XT_EMUTLS_STEP_STORAGE = 1, XT_EMUTLS_STEP_CELL, XT_EMUTLS_STEP_HANDLE,
+    XT_EMUTLS_STEP_LINK, XT_EMUTLS_STEP_SWEEP,
+};
+long xt_emutls_test(int what, long arg);
 void xt_emutls_reap(void);
 void xt_enter(void);
 void xt_placement(const char *what, const void *p);
@@ -425,6 +446,8 @@ XTEXPORT void *xt_ec_test_code_buffer(void);
 XTEXPORT void xt_ec_test_invalidate(void *addr, size_t len);
 XTEXPORT void xt_ec_test_load(void *dst, const void *src, size_t len);
 XTEXPORT int xt_ec_test_tls(int reap);
+XTEXPORT long xt_ec_test_tls_hook(int what, long arg);
+XTEXPORT long xt_ec_test_tls_cost(int tls, long n);
 XTEXPORT void xt_ec_test_counts(uint32_t *faults, uint32_t *flushes);
 XTEXPORT void xt_ec_test_syscalls(int64_t nr[4], uint32_t *lut_size);
 XTEXPORT uint32_t xt_ec_test_reached(void);

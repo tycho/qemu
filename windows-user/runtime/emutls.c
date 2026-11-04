@@ -63,10 +63,46 @@ typedef struct TlsRoot {
 #define TLS_MINIMUM_SLOTS 64
 #define ThreadZeroTlsCell 10
 
+/*
+ * The test harness's hooks (xt_ec_test_tls_hook): a one-shot failure, a
+ * stall of one thread at a step of a root's construction or of a sweep,
+ * and counts of roots made and freed.  Read on the cold paths only.
+ */
+/* XT_EMUTLS_FAIL_*, cleared when taken unless XT_EMUTLS_FAIL_STICKY */
+static int test_fail;
+static int test_stall;      /* XT_EMUTLS_STEP_*, cleared when taken */
+static LONG test_stalled, test_release;
+static LONG roots_made, roots_freed;
+
 static LONG slot_state;     /* 0 none, 1 being allocated, 2 slot_index */
 static ULONG slot_index;
 static EmutlsObject *registered[ROOT_SLOTS]; /* by index - 1 */
 static TlsRoot *roots;
+
+static bool test_failing(int what)
+{
+    int f = qatomic_read(&test_fail);
+
+    if ((f & ~XT_EMUTLS_FAIL_STICKY) != what) {
+        return false;
+    }
+    return (f & XT_EMUTLS_FAIL_STICKY) ||
+           qatomic_cmpxchg(&test_fail, f, 0) == f;
+}
+
+/* The thread that takes an armed stall waits there for the harness. */
+static void test_step(int step)
+{
+    if (!step || qatomic_read(&test_stall) != step ||
+        qatomic_cmpxchg(&test_stall, step, 0) != step) {
+        return;
+    }
+    qatomic_store_release(&test_stalled, 1);
+    while (!qatomic_load_acquire(&test_release)) {
+        NtYieldExecution();
+    }
+    qatomic_set(&test_release, 0);
+}
 
 static G_NORETURN void emutls_fail(const char *why)
 {
@@ -101,7 +137,8 @@ void xt_emutls_init(void)
         emutls_fail("libarm64ecxtcg: no TEB TLS slot\n");
     }
     /* A cell left set by an earlier owner of the slot would be a root. */
-    if (NtSetInformationThread(GetCurrentThread(),
+    if (test_failing(XT_EMUTLS_FAIL_SLOT) ||
+        NtSetInformationThread(GetCurrentThread(),
                                (THREADINFOCLASS)ThreadZeroTlsCell, &i,
                                sizeof(i)) < 0) {
         emutls_fail("libarm64ecxtcg: TEB TLS slot not cleared\n");
@@ -117,9 +154,10 @@ static TlsRoot **root_cell(void)
 }
 
 /* Storage, through the system call once ProcessInit has made that possible. */
-static void *alloc_storage(size_t len)
+static void *alloc_storage(size_t len, int fail)
 {
-    void *p = xt_syscalls_ready() ? xt_alloc_direct(len) : xt_alloc_high(len);
+    void *p = test_failing(fail) ? NULL :
+              xt_syscalls_ready() ? xt_alloc_direct(len) : xt_alloc_high(len);
 
     if (!p) {
         emutls_fail("libarm64ecxtcg: no memory for thread-local storage\n");
@@ -137,30 +175,36 @@ static void copy_bytes(uint8_t *d, const uint8_t *s, size_t n)
 }
 
 /* Onto the list of roots; R is the reaper's once there. */
-static void push_root(TlsRoot *r)
+static void push_root(TlsRoot *r, int step)
 {
     TlsRoot *head;
 
     do {
         head = qatomic_read(&roots);
         r->next = head;
+        test_step(step);
     } while (qatomic_cmpxchg(&roots, head, r) != head);
 }
 
 static TlsRoot *new_root(void)
 {
-    TlsRoot *r = alloc_storage(ROOT_SIZE);
+    TlsRoot *r = alloc_storage(ROOT_SIZE, XT_EMUTLS_FAIL_ALLOC);
 
+    qatomic_inc(&roots_made);
+    test_step(XT_EMUTLS_STEP_STORAGE);
     r->free = (char *)(r + 1);
     r->end = (char *)r + ROOT_SIZE;
     *root_cell() = r;
+    test_step(XT_EMUTLS_STEP_CELL);
     /* A root the reaper can't see end would never go. */
-    if (NtDuplicateObject(GetCurrentProcess(), GetCurrentThread(),
+    if (test_failing(XT_EMUTLS_FAIL_DUP) ||
+        NtDuplicateObject(GetCurrentProcess(), GetCurrentThread(),
                           GetCurrentProcess(), &r->thread, SYNCHRONIZE, 0,
                           0) < 0) {
         emutls_fail("libarm64ecxtcg: no handle for thread-local storage\n");
     }
-    push_root(r);
+    test_step(XT_EMUTLS_STEP_HANDLE);
+    push_root(r, XT_EMUTLS_STEP_LINK);
     return r;
 }
 
@@ -171,7 +215,7 @@ static void *new_copy(TlsRoot *r, const EmutlsObject *o)
 
     if (p + o->size > (uintptr_t)r->end) {
         size_t len = ROUND_UP(sizeof(TlsChunk) + align + o->size, ROOT_SIZE);
-        TlsChunk *c = alloc_storage(len);
+        TlsChunk *c = alloc_storage(len, XT_EMUTLS_FAIL_CHUNK);
 
         c->next = r->chunks;
         r->chunks = c;
@@ -239,15 +283,46 @@ static void free_region(void *p)
     NtFreeVirtualMemory(GetCurrentProcess(), &p, &size, MEM_RELEASE);
 }
 
+/*
+ * The test harness's hooks.  XT_EMUTLS_ROOTS counts the listed roots: only
+ * while nothing else sweeps them.
+ */
+long xt_emutls_test(int what, long arg)
+{
+    long n = 0;
+
+    switch (what) {
+    case XT_EMUTLS_FAIL:
+        qatomic_set(&test_fail, arg);
+        return qatomic_load_acquire(&slot_state) == 2;
+    case XT_EMUTLS_STALL:
+        qatomic_set(&test_stalled, 0);
+        qatomic_set(&test_release, 0);
+        qatomic_store_release(&test_stall, arg);
+        return 0;
+    case XT_EMUTLS_STALLED:
+        return qatomic_load_acquire(&test_stalled);
+    case XT_EMUTLS_RELEASE:
+        qatomic_set(&test_stalled, 0);
+        qatomic_store_release(&test_release, 1);
+        return 0;
+    case XT_EMUTLS_MADE:
+        return qatomic_read(&roots_made);
+    case XT_EMUTLS_FREED:
+        return qatomic_read(&roots_freed);
+    case XT_EMUTLS_ROOTS:
+        for (TlsRoot *r = qatomic_read(&roots); r; r = r->next) {
+            n++;
+        }
+        return n;
+    }
+    return -1;
+}
+
 /* How many roots there are, for the test harness, while none are reaped. */
 size_t xt_emutls_roots(void)
 {
-    size_t n = 0;
-
-    for (TlsRoot *r = qatomic_read(&roots); r; r = r->next) {
-        n++;
-    }
-    return n;
+    return xt_emutls_test(XT_EMUTLS_ROOTS, 0);
 }
 
 /* The roots of threads that have ended go, with their storage. */
@@ -256,6 +331,7 @@ void xt_emutls_reap(void)
     LARGE_INTEGER zero = { .QuadPart = 0 };
     TlsRoot *r = qatomic_xchg(&roots, NULL), *next;
 
+    test_step(XT_EMUTLS_STEP_SWEEP);
     for (; r; r = next) {
         next = r->next;
         if (NtWaitForSingleObject(r->thread, FALSE, &zero) == STATUS_SUCCESS) {
@@ -267,8 +343,9 @@ void xt_emutls_reap(void)
                 free_region(c);
             }
             free_region(r);
+            qatomic_inc(&roots_freed);
             continue;
         }
-        push_root(r);
+        push_root(r, 0);
     }
 }
