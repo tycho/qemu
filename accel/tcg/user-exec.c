@@ -710,7 +710,7 @@ void HELPER(tb_smc_check)(CPUArchState *env, void *ptr)
     }
     cpu->smc_check_tb = tb;
     signal_barrier();
-    crc = crc32c_fast(0xffffffff, g2h_untagged_vaddr(tb->pc), tb->smc_len);
+    crc = tb_code_sum(g2h_untagged_vaddr(tb->pc), tb->smc_len);
     signal_barrier();
     cpu->smc_check_tb = NULL;
     if (unlikely(crc != tb->smc_crc)) {
