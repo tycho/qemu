@@ -45,35 +45,59 @@ uint32_t iov_crc32c(uint32_t crc, const struct iovec *iov, size_t iov_cnt);
 #endif
 
 /*
- * crc32c_fast: crc32c(), the same result, with the host's CRC32C
- * instructions when the compiler may use them (aarch64 FEAT_CRC32, x86
- * SSE4.2), the table otherwise.
+ * One CRC32C update step of 1, 2, 4 or 8 little-endian bytes, without the
+ * initial or final complement: the hardware instruction where the
+ * compiler targets it, the table otherwise.
  */
-static inline uint32_t crc32c_fast(uint32_t crc, const void *data,
-                                   unsigned int length)
+static inline uint32_t crc32c_sw(uint32_t crc, uint64_t v, int bytes)
 {
-#if defined(QEMU_CRC32C_ARM) || defined(QEMU_CRC32C_X86)
-    const uint8_t *p = data;
-
-    for (; length >= 8; p += 8, length -= 8) {
-        uint64_t v = ldq_le_p(p);
-
-#ifdef QEMU_CRC32C_ARM
-        crc = __crc32cd(crc, v);
-#else
-        crc = _mm_crc32_u64(crc, v);
-#endif
+    for (int i = 0; i < bytes; i++, v >>= 8) {
+        crc = crc32c_table[(crc ^ v) & 0xff] ^ (crc >> 8);
     }
-    for (; length; p++, length--) {
-#ifdef QEMU_CRC32C_ARM
-        crc = __crc32cb(crc, *p);
+    return crc;
+}
+
+static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v)
+{
+#if defined(QEMU_CRC32C_ARM)
+    return __crc32cb(crc, v);
+#elif defined(QEMU_CRC32C_X86)
+    return _mm_crc32_u8(crc, v);
 #else
-        crc = _mm_crc32_u8(crc, *p);
+    return crc32c_sw(crc, v, 1);
 #endif
-    }
-    return crc ^ 0xffffffff;
+}
+
+static inline uint32_t crc32c_u16(uint32_t crc, uint16_t v)
+{
+#if defined(QEMU_CRC32C_ARM)
+    return __crc32ch(crc, v);
+#elif defined(QEMU_CRC32C_X86)
+    return _mm_crc32_u16(crc, v);
 #else
-    return crc32c(crc, data, length);
+    return crc32c_sw(crc, v, 2);
+#endif
+}
+
+static inline uint32_t crc32c_u32(uint32_t crc, uint32_t v)
+{
+#if defined(QEMU_CRC32C_ARM)
+    return __crc32cw(crc, v);
+#elif defined(QEMU_CRC32C_X86)
+    return _mm_crc32_u32(crc, v);
+#else
+    return crc32c_sw(crc, v, 4);
+#endif
+}
+
+static inline uint32_t crc32c_u64(uint32_t crc, uint64_t v)
+{
+#if defined(QEMU_CRC32C_ARM)
+    return __crc32cd(crc, v);
+#elif defined(QEMU_CRC32C_X86)
+    return _mm_crc32_u64(crc, v);
+#else
+    return crc32c_sw(crc, v, 8);
 #endif
 }
 
