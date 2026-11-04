@@ -1160,8 +1160,9 @@ XTEXPORT void xt_ec_test_load(void *dst, const void *src, size_t len)
  * A thread-local variable larger than a root's storage, page-aligned and
  * with an initial value, for the harness to check from many threads at
  * once (emutls.c): 1 if this thread's copy is aligned, holds the initial
- * value at its first use and stays the thread's own.  With REAP: the
- * roots left after a sweep of the ended threads' instead.
+ * value at its first use and stays the thread's own.  With REAP 1: the
+ * roots left after a sweep of the ended threads' instead; 2: the sweep
+ * alone (the count is safe only while nothing else sweeps).
  */
 static __thread uint8_t test_tls[80 * KiB] __attribute__((aligned(4096))) = {
     0x5a, 0xa5,
@@ -1175,7 +1176,7 @@ XTEXPORT int xt_ec_test_tls(int reap)
 
     if (reap) {
         xt_emutls_reap();
-        return xt_emutls_roots();
+        return reap == 1 ? xt_emutls_roots() : 0;
     }
     /* The variable's first use, by the harness's threads at once. */
     p = test_tls;
@@ -1191,6 +1192,39 @@ XTEXPORT int xt_ec_test_tls(int reap)
         return -3;
     }
     return 1;
+}
+
+/* The emulated TLS's test hooks (xt_emutls_test). */
+XTEXPORT long xt_ec_test_tls_hook(int what, long arg)
+{
+    return xt_emutls_test(what, arg);
+}
+
+/* A thread-local variable's access, ARG times, for its cost. */
+static __thread long test_tls_count;
+
+static __attribute__((noinline)) void test_tls_touch(void)
+{
+    test_tls_count++;
+}
+
+static long test_global_count;
+
+static __attribute__((noinline)) void test_global_touch(void)
+{
+    qatomic_set(&test_global_count, test_global_count + 1);
+}
+
+XTEXPORT long xt_ec_test_tls_cost(int tls, long n)
+{
+    for (long i = 0; i < n; i++) {
+        if (tls) {
+            test_tls_touch();
+        } else {
+            test_global_touch();
+        }
+    }
+    return tls ? test_tls_count : test_global_count;
 }
 
 /* Drop translations of a range the harness rewrote. */
