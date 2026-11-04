@@ -59,6 +59,27 @@ static void G_NORETURN xt_fault_continue(XtThread *t, XtActive prev)
         siglongjmp(t->adapter_jmp, 1);
     }
     /*
+     * The check a TB emits of its own code, at its entry, read a page gone
+     * since: resume at the TB's path that discards it, with the registers
+     * of the fault.  A guard page's guard, which the read took, is put
+     * back for the guest's own fetch.
+     */
+    if (f->kind == XT_FK_GEN && !f->is_write) {
+        uintptr_t stale = tb_smc_inline_fault(f->ctx.Pc, f->addr);
+
+        if (stale) {
+            if (f->code == STATUS_GUARD_PAGE_VIOLATION &&
+                !xt_guard_restore(f->addr)) {
+                xt_event(t, XT_EV_CHECK, 1, f->addr);
+            }
+            xt_event(t, XT_EV_SMC, 3, f->addr);
+            t->active = prev;
+            f->busy = 0;
+            f->ctx.Pc = stale;
+            xt_continue_native(&f->ctx);
+        }
+    }
+    /*
      * A TB's entry check read a page gone since: the TB is stale, and
      * translating it again meets the guest's own fetch fault, if any.  A
      * guard page's guard, which the read took, is put back for that.
