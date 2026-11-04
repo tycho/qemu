@@ -32,6 +32,7 @@
 #include "gdbstub/user.h"
 #include "exec/gdbstub.h"
 #include "disas/disas.h"
+#include "host/cpuinfo.h"
 #include "xtajit.h"
 #ifdef TARGET_X86_64
 #include "arm64ec.h"
@@ -544,6 +545,30 @@ static void set_settings(Object *accel, const char *settings)
     g_strfreev(kv);
 }
 
+/* With XTAJIT_LOG, the host's features and every setting as resolved. */
+static void log_settings(Object *accel)
+{
+    g_autofree char *head = g_strdup_printf("cpuinfo 0x%x\n", cpuinfo);
+    ObjectPropertyIterator iter;
+    ObjectProperty *prop;
+
+    if (!xt_log_handle()) {
+        return;
+    }
+    xt_log_text(head);
+    object_property_iter_init(&iter, accel);
+    while ((prop = object_property_iter_next(&iter))) {
+        if (prop->get) {
+            g_autofree char *v = object_property_print(accel, prop->name,
+                                                       true, NULL);
+            g_autofree char *line = g_strdup_printf("setting %s=%s\n",
+                                                    prop->name, v ? v : "?");
+
+            xt_log_text(line);
+        }
+    }
+}
+
 /*
  * The process-wide bring-up, as linux-user's main() without a loader:
  * QOM, the TCG accelerator with SETTINGS (comma-separated
@@ -576,6 +601,7 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
         set_settings(OBJECT(accel), settings);
     }
     ac->init_machine(accel, NULL);
+    log_settings(OBJECT(accel));
     if (n_applied) {
         *n_applied = applied;
         *n_rejected = rejected;
