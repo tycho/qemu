@@ -6722,6 +6722,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
                 s->gen_insn_end_off[num_insns] = off;
                 /* Assert that we do not overflow our stored offset.  */
                 assert(s->gen_insn_end_off[num_insns] == off);
+            } else {
+                s->insn0_off = tcg_current_code_size(s);
             }
             num_insns++;
             for (i = 0; i < INSN_START_WORDS; ++i) {

@@ -395,6 +395,12 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
         goto buffer_overflow;
     }
     tb->tc.size = gen_code_size;
+#ifdef CONFIG_USER_ONLY
+    if (tb->smc_inline) {
+        tb->smc_check_end = tcg_ctx->insn0_off;
+        tb->smc_stale = tcg_ctx->smc_stale->u.value_ptr;
+    }
+#endif
 
     /*
      * For CF_PCREL, attribute all executions of the generated code

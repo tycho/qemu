@@ -315,4 +315,5 @@ DEF_HELPER_FLAGS_5(gvec_bitsel, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, ptr, i32)
 
 #ifdef CONFIG_USER_ONLY
 DEF_HELPER_2(tb_smc_check, void, env, ptr)
+DEF_HELPER_2(tb_smc_stale, noreturn, env, ptr)
 #endif

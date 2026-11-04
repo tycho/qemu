@@ -452,6 +452,13 @@ struct TCGContext {
     uint32_t smc_buf_size;
     uint8_t *smc_buf;
     uint8_t *smc_have;
+    /*
+     * x-smc=check emitted in the TB: the label of its path discarding the
+     * TB, or NULL.  insn0_off: the size of the code before the first guest
+     * insn's, set by tcg_gen_code.
+     */
+    TCGLabel *smc_stale;
+    uint16_t insn0_off;
 
     /* Tells which temporary holds a given register.
        It does not take into account fixed registers */
