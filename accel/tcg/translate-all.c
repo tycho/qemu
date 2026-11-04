@@ -553,6 +553,12 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     }
     tb->tc.size = gen_code_size;
     tb->tc.search = tcg_splitwx_to_rx(search);
+#ifdef CONFIG_USER_ONLY
+    if (tb->smc_inline) {
+        tb->smc_check_end = tcg_ctx->insn0_off;
+        tb->smc_stale = tcg_ctx->smc_stale->u.value_ptr;
+    }
+#endif
     if (tcg_ctx->lay_on) {
         tcg_ctx->lay_cold = (void *)ROUND_UP((uintptr_t)search + search_size,
                                              CODE_GEN_ALIGN);

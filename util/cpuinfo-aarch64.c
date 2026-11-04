@@ -131,6 +131,17 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
     info |= sysctl_for_bool("hw.optional.arm.FEAT_AFP") * CPUINFO_AFP;
     info |= sysctl_for_bool("hw.optional.arm.FEAT_RPRES") * CPUINFO_RPRES;
 #endif
+#ifdef _WIN32
+    {
+        /*
+         * KUSER_SHARED_DATA.ProcessorFeatures, which IsProcessorFeaturePresent
+         * reads, read directly: code loaded before kernel32 can't import it.
+         */
+        const volatile uint8_t *pf = (const volatile uint8_t *)0x7ffe0274;
+
+        info |= pf[PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE] ? CPUINFO_CRC32 : 0;
+    }
+#endif
 #if defined(__OpenBSD__) && !defined(CONFIG_ELF_AUX_INFO)
     int mib[2];
     uint64_t isar0;
