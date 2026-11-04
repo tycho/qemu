@@ -766,6 +766,14 @@ static void put(HANDLE h, const char *s, int n)
     }
 }
 
+/* With XTAJIT_LOG, a line of text as it is. */
+void xt_log_text(const char *s)
+{
+    if (log_handle) {
+        put(log_handle, s, strlen(s));
+    }
+}
+
 static void dump_range(HANDLE h, const XtEvent *ring, unsigned start,
                        unsigned pos, const char *who)
 {
