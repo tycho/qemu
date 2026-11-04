@@ -192,8 +192,10 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
 
         if (key) {
             uint64_t isar0 = win32_id_reg(key, L"CP 4030");
+            uint64_t isar1 = win32_id_reg(key, L"CP 4031");
             uint64_t isar2 = win32_id_reg(key, L"CP 4032");
             uint64_t pfr1 = win32_id_reg(key, L"CP 4021");
+            uint64_t mmfr1 = win32_id_reg(key, L"CP 4039");
             uint64_t mmfr2 = win32_id_reg(key, L"CP 403A");
 
             NtClose(key);
@@ -204,6 +206,16 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
             info |= ID_FIELD(isar0, 16) >= 1 ? CPUINFO_CRC32 : 0;
             info |= ID_FIELD(pfr1, 0) >= 1 ? CPUINFO_BTI : 0;
             info |= ID_FIELD(isar2, 52) >= 1 ? CPUINFO_CSSC : 0;
+            info |= ID_FIELD(isar1, 20) >= 1 ? CPUINFO_LRCPC : 0;
+            info |= ID_FIELD(isar1, 20) >= 2 ? CPUINFO_LRCPC2 : 0;
+            info |= ID_FIELD(isar1, 20) >= 3 ? CPUINFO_LRCPC3 : 0;
+            info |= ID_FIELD(mmfr1, 44) >= 1 ? CPUINFO_AFP : 0;
+            info |= ID_FIELD(isar2, 4) >= 1 ? CPUINFO_RPRES : 0;
+            info |= ID_FIELD(isar1, 32) >= 1 ? CPUINFO_FRINTTS : 0;
+            info |= ID_FIELD(isar0, 8) >= 1 ? CPUINFO_SHA1 : 0;
+            info |= ID_FIELD(isar0, 12) >= 1 ? CPUINFO_SHA2 : 0;
+            info |= ID_FIELD(isar0, 44) >= 1 ? CPUINFO_DOTPROD : 0;
+            info |= ID_FIELD(isar1, 52) >= 1 ? CPUINFO_I8MM : 0;
         } else {
             /*
              * The processor features the kernel publishes in
@@ -215,7 +227,12 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
             info |= pf[PF_ARM_V81_ATOMIC_INSTRUCTIONS_AVAILABLE] ?
                     CPUINFO_LSE : 0;
             info |= pf[PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE] ?
-                    CPUINFO_AES | CPUINFO_PMULL : 0;
+                    CPUINFO_AES | CPUINFO_PMULL | CPUINFO_SHA1 | CPUINFO_SHA2 :
+                    0;
+            info |= pf[PF_ARM_V83_LRCPC_INSTRUCTIONS_AVAILABLE] ?
+                    CPUINFO_LRCPC : 0;
+            info |= pf[PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE] ?
+                    CPUINFO_DOTPROD : 0;
             info |= pf[PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE] ?
                     CPUINFO_CRC32 : 0;
         }
