@@ -24,6 +24,15 @@ int page_unprotect(CPUState *cpu, tb_page_addr_t address, uintptr_t pc);
  */
 G_NORETURN void tb_smc_check_fault(CPUState *cpu);
 
+/*
+ * A host fault at HOST_PC in generated code, a read of HOST_ADDR: if it is
+ * a TB's own check of its guest bytes at entry, emitted in the TB (before
+ * any guest insn, reading those bytes), the TB has gone stale: returns
+ * the code to resume at with the context of the fault, which discards the
+ * TB.  Otherwise 0.
+ */
+uintptr_t tb_smc_inline_fault(uintptr_t host_pc, uintptr_t host_addr);
+
 int page_get_flags(vaddr address);
 
 /**

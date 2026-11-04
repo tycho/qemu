@@ -28,6 +28,12 @@ extern bool one_insn_per_tb;
 extern bool tcg_smc_check;
 
 /*
+ * x-smc=check-call: the check at a TB's entry is always a helper call,
+ * not the checksum emitted in the TB (where the backend has crc32c).
+ */
+extern bool tcg_smc_call;
+
+/*
  * x-smc=check: the checksum of a TB's guest code bytes, taken when it is
  * translated and again at its entry.  It reads exactly LEN bytes from P,
  * no more (the code may end at an unmapped page), in overlapping

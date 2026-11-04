@@ -112,11 +112,17 @@ struct TranslationBlock {
      * x-smc=check: whether the TB checks its guest bytes at entry; the
      * bytes its translation read, from its start (smc_len), and their
      * CRC32C then; smc_reject if they changed while it was translated.
+     * smc_inline: the check is emitted in the TB, ending smc_check_end
+     * bytes from tc.ptr; a fault of its reads resumes at smc_stale, its
+     * path that discards the TB.
      */
     bool smc_check;
     bool smc_reject;
+    bool smc_inline;
     uint16_t smc_len;
+    uint16_t smc_check_end;
     uint32_t smc_crc;
+    const void *smc_stale;
 #else
     uintptr_t page_next[2];
     tb_page_addr_t page_addr[2];

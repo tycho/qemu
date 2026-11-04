@@ -715,6 +715,28 @@ void HELPER(tb_smc_check)(CPUArchState *env, void *ptr)
     }
 }
 
+/* x-smc=check emitted in the TB: its check failed, or faulted. */
+void HELPER(tb_smc_stale)(CPUArchState *env, void *ptr)
+{
+    tb_smc_stale(env_cpu(env), ptr);
+}
+
+uintptr_t tb_smc_inline_fault(uintptr_t host_pc, uintptr_t host_addr)
+{
+    TranslationBlock *tb;
+
+    if (!tcg_smc_check || tcg_smc_call) {
+        return 0;
+    }
+    tb = tcg_tb_lookup(host_pc);
+    if (!tb || !tb->smc_inline ||
+        host_pc - (uintptr_t)tb->tc.ptr >= tb->smc_check_end ||
+        host_addr - (uintptr_t)g2h_untagged_vaddr(tb->pc) >= tb->smc_len) {
+        return 0;
+    }
+    return (uintptr_t)tb->smc_stale;
+}
+
 void tb_smc_check_fault(CPUState *cpu)
 {
     TranslationBlock *tb = cpu->smc_check_tb;
