@@ -485,6 +485,15 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
     if (xt_ec_probe_rtcs(er, guest, native)) {
         xt_continue_native(native);
     }
+    /* The module's int3, past the debugger: at the int3 for the dispatch. */
+    if (t && t->int3_rip && er->ExceptionCode == STATUS_BREAKPOINT &&
+        native->Pc == t->int3_rip) {
+        native->Pc--;
+        if (guest) {
+            guest->Rip--;
+        }
+        t->int3_rip = 0;
+    }
     if (native->Pc == (uintptr_t)xt_ec_exit_suspend_point) {
         qatomic_set(area->SuspendDoorbell, 0);
         native->Pc = (uintptr_t)xt_ec_exit_resume_point;
@@ -784,7 +793,11 @@ static G_NORETURN void leave_syscall(XtThread *t)
 
 /*
  * A guest exception, raised with the packed context as x64 Windows
- * reports it: a breakpoint at the int3, a fast fail second chance.
+ * reports it: a fast fail second chance; a breakpoint at the int3.  The
+ * int3 is raised with RIP past it, as x64 hardware leaves it: Windows
+ * shows a debugger an x64 breakpoint's RIP one byte back, as x64's kernel
+ * backs it up, but dispatches the context as raised, so the dispatch's
+ * entry (ResetToConsistentState) backs it up there.
  */
 static G_NORETURN void leave_exception(XtThread *t, XtExit *x)
 {
@@ -797,7 +810,6 @@ static G_NORETURN void leave_exception(XtThread *t, XtExit *x)
         break;
     case EXCP03_INT3:
     case 0x2d:
-        t->env->eip -= x->vector == EXCP03_INT3 ? 1 : 0;
         r->ExceptionCode = STATUS_BREAKPOINT;
         r->NumberParameters = 1;
         break;
@@ -821,7 +833,9 @@ static G_NORETURN void leave_exception(XtThread *t, XtExit *x)
     if (r->ExceptionCode == STATUS_WX86_SINGLE_STEP) {
         r->ExceptionCode = STATUS_SINGLE_STEP;
     }
-    r->ExceptionAddress = (void *)(uintptr_t)t->env->eip;
+    r->ExceptionAddress = (void *)(uintptr_t)(t->env->eip -
+                                              (x->vector == EXCP03_INT3));
+    t->int3_rip = x->vector == EXCP03_INT3 ? t->env->eip : 0;
     leave(t, &n, true);
     xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
     xt_syscall((uintptr_t)r, (uintptr_t)&n, first, 0, 0, 0, nr_raise);
