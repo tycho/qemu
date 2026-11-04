@@ -261,6 +261,7 @@ void xt_dump(XtThread *t, void *handle);
 void xt_log_flush(XtThread *t);
 void xt_log_open(void);
 void *xt_log_handle(void);
+void xt_log_text(const char *s);
 bool xt_guest_read(XtThread *t, vaddr addr, void *buf, size_t len);
 void xt_record_hold(void);
 void xt_record_release(void);
