@@ -1106,7 +1106,7 @@ static void smc_gen_check(DisasContextBase *db, TranslationBlock *tb,
         }
     }
     tb->smc_len = len;
-    tb->smc_crc = crc32c_fast(0xffffffff, s->smc_buf, len);
+    tb->smc_crc = tb_code_sum(s->smc_buf, len);
     tb->smc_reject = reject;
     tb->smc_check = true;
 
