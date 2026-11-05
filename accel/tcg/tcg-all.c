@@ -93,10 +93,12 @@ bool qemu_tcg_mttcg_enabled(void)
  * on, host-aware ("auto" where a setting has it).  Applied through the
  * properties, so a default behaves exactly as the same setting given on
  * the command line or in QEMU_XTCG, which can still override it.
+ * An ARM64EC build runs on an aarch64 host too, but its compiler defines
+ * __arm64ec__ and __x86_64__, not __aarch64__.
  */
 static void xtcg_fork_defaults(Object *obj)
 {
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__arm64ec__)
     static const char *const defaults[][2] = {
         { "x-tso", "auto" },
         { "x-tso-vec", "none" },
