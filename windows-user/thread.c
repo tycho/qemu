@@ -622,9 +622,10 @@ void xt_inject(XtThread *t, int point)
  * WINDOWS -> ACQUIRING -> ENGINE.  Slot 2 bit 0 is set before the import,
  * so a suspension from here on takes the cooperative path and waits for
  * this thread's next notification; the RCU reader exists only while the
- * engine owns the thread.
+ * engine owns the thread.  xt_acquire_begin and xt_acquire_end are the two
+ * halves, for a caller that imports the state itself in between.
  */
-void xt_acquire(XtThread *t, const XtGuestContext *c)
+void xt_acquire_begin(XtThread *t)
 {
     xt_park_if_terminating(t);
     xt_check(t, XT_WINDOWS, 1);
@@ -633,22 +634,35 @@ void xt_acquire(XtThread *t, const XtGuestContext *c)
     rcu_register_thread();
     t->rcu_registered = true;
     xt_inject(t, XT_INJ_ACQUIRE);
-    xt_import(t, c);
+}
+
+void xt_acquire_end(XtThread *t)
+{
     t->state = XT_ENGINE;
     xt_event(t, XT_EV_ACQUIRE, t->env->eip, t->env->regs[R_ESP]);
     xt_check(t, XT_ENGINE, 2);
 }
 
+void xt_acquire(XtThread *t, const XtGuestContext *c)
+{
+    xt_acquire_begin(t);
+    xt_import(t, c);
+    xt_acquire_end(t);
+}
+
 /*
  * ENGINE -> PUBLISHING -> WINDOWS: the exit's architectural effect is
- * complete; export, then end the RCU reader, then clear bit 0.  The caller
- * notifies (Wow64NotifyUnsimulateComplete) after.
+ * complete; export (into C, unless it is NULL: a caller that takes the
+ * state from the CPU itself), then end the RCU reader, then clear bit 0.
+ * The caller notifies (Wow64NotifyUnsimulateComplete) after.
  */
 void xt_publish(XtThread *t, XtGuestContext *c)
 {
     xt_check(t, XT_ENGINE, 3);
     t->state = XT_PUBLISHING;
-    xt_export(t, c);
+    if (c) {
+        xt_export(t, c);
+    }
     xt_inject(t, XT_INJ_PUBLISH);
     rcu_unregister_thread();
     t->rcu_registered = false;

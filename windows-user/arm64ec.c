@@ -758,10 +758,7 @@ static bool aux_take(XtThread *t, vaddr rsp, uint32_t *eflags)
  */
 static void leave(XtThread *t, ARM64_NT_CONTEXT *n, bool context_exit)
 {
-    XtGuestContext c;
-
-    memset(&c, 0, sizeof(c));
-    xt_publish(t, &c);
+    xt_publish(t, NULL);
     xt_ec_pack(t, n);
     if (context_exit) {
         aux_push(t, n->Sp, cpu_compute_eflags(t->env));
@@ -902,14 +899,14 @@ static XtThread *ec_thread(void)
 void xt_ec_enter(XtEcFrame *f)
 {
     XtThread *t = ec_thread();
-    CONTEXT c;
 
     t->ec_suspended = false;
     if (cross_process_work) {
         cross_process_work();
     }
-    xt_ec_call_context(t, &f->ctx, &c);
-    xt_acquire(t, &c);
+    xt_acquire_begin(t);
+    xt_ec_import_call(t, &f->ctx);
+    xt_acquire_end(t);
     ec_run(t, f);
 }
 
