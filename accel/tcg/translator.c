@@ -35,6 +35,7 @@
 #include "tb-internal.h"
 #include "tb-hash.h"
 #include "tcg/tcg-temp-internal.h"
+#include "tcg/tcg-internal.h"
 #ifdef CONFIG_USER_ONLY
 #include "exec/page-protection.h"
 #include "user/page-protection.h"
@@ -1054,16 +1055,53 @@ void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc,
  * flags and drop the TBs, change it) and not writable.  The pages are
  * those of the TB's extent: tb_page_addr1() isn't valid until tb_record.
  */
+static bool smc_page_needs_check(vaddr page)
+{
+    return (page_get_flags(page) & (PAGE_FIXED_CODE | PAGE_WRITE)) !=
+           PAGE_FIXED_CODE;
+}
+
 static bool smc_needs_check(const DisasContextBase *db,
                             const TranslationBlock *tb)
 {
-    vaddr page[2] = { db->pc_first & TARGET_PAGE_MASK,
-                      (db->pc_first + tb->size - 1) & TARGET_PAGE_MASK };
+    return smc_page_needs_check(db->pc_first & TARGET_PAGE_MASK) ||
+           smc_page_needs_check((db->pc_first + tb->size - 1) &
+                                TARGET_PAGE_MASK);
+}
 
-    for (int i = 0; i < 2; i++) {
-        if ((page_get_flags(page[i]) & (PAGE_FIXED_CODE | PAGE_WRITE)) !=
-            PAGE_FIXED_CODE) {
+/*
+ * x-smc=check: a TB whose code may be checked ends after each insn that
+ * may store to guest memory, so that a store into the TB's own later code
+ * is seen by the entry check of the TB that starts after the store, as an
+ * x86 CPU sees it at the next fetch.  Decided at the TB's start: its code
+ * lies on its first page and at most the one after.
+ */
+static bool smc_may_split(const DisasContextBase *db)
+{
+    vaddr page = db->pc_first & TARGET_PAGE_MASK;
+
+    return smc_page_needs_check(page) ||
+           smc_page_needs_check(page + TARGET_PAGE_SIZE);
+}
+
+/*
+ * Whether the ops from OP on may store to guest memory: a store, or a
+ * helper call that may have side effects.
+ */
+static bool smc_ops_may_store(TCGOp *op)
+{
+    for (; op; op = QTAILQ_NEXT(op, link)) {
+        switch (op->opc) {
+        case INDEX_op_qemu_st:
+        case INDEX_op_qemu_st2:
             return true;
+        case INDEX_op_call:
+            if (!(tcg_call_flags(op) & TCG_CALL_NO_SIDE_EFFECTS)) {
+                return true;
+            }
+            break;
+        default:
+            break;
         }
     }
     return false;
@@ -1227,6 +1265,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     bool is_head, unit = false;
 #ifdef CONFIG_USER_ONLY
     TCGOp *smc_mark;
+    bool smc_split;
 #else
     TCGOp *first_insn_start = NULL;
 #endif
@@ -1287,6 +1326,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     }
     tcg_ctx->smc_len = 0;
     tcg_ctx->smc_torn_at = UINT32_MAX;
+    smc_split = tcg_smc_check && smc_may_split(db);
 #endif
 
     /* Start translating.  */
@@ -1433,6 +1473,14 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             }
             break;
         }
+
+#ifdef CONFIG_USER_ONLY
+        /* Stop after an insn that may store into the TB's own code.  */
+        if (smc_split && smc_ops_may_store(db->insn_start)) {
+            db->is_jmp = DISAS_TOO_MANY;
+            break;
+        }
+#endif
 
         /* Stop translation if the output buffer is full,
            or we have executed all of the allowed instructions.  */
