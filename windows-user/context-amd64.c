@@ -199,7 +199,8 @@ static uint32_t ec_eflags(uint32_t cpsr)
  * looks for them (FEX's ARM64EC module packs them the same way), NZCV and
  * SS from EFLAGS, FPCR and FPSR from MXCSR; nothing in x13, x14, x18,
  * x23, x24 or x28.  The rest of EFLAGS and the x87 control state have no
- * place here.
+ * place here.  Straight from the CPU state: this runs on every exit to
+ * native code.
  */
 void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
 {
@@ -207,26 +208,37 @@ void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
     CPUX86State *env = t->env;
     uint32_t mx = env->mxcsr;
     uint64_t hi16 = 0, hi17 = 0;
-    CONTEXT c;
 
-    memset(&c, 0, sizeof(c));
-    xt_export(t, &c);
+    /*
+     * DR6's single-step and breakpoint bits have no place in the packed
+     * form either; they end here, as an export ends them.
+     */
+    if (env->dr[6] & (DR6_BS | 0xf)) {
+        env->dr[6] = 0;
+    }
     memset(n, 0, sizeof(*n));
     n->ContextFlags = CONTEXT_ARM64_FULL;
     for (int i = 0; i < 16; i++) {
-        *ec_gpr(n, i) = (&c.Rax)[i];
+        *ec_gpr(n, i) = env->regs[i];
     }
-    n->Pc = c.Rip;
-    n->Cpsr = ec_cpsr(c.EFlags);
-    memcpy(n->V, c.FltSave.XmmRegisters, 16 * sizeof(n->V[0]));
+    n->Pc = env->eip;
+    n->Cpsr = ec_cpsr(cpu_compute_eflags(env));
+    for (int i = 0; i < 16; i++) {
+        n->V[i].Low = env->xmm_regs[i].ZMM_Q(0);
+        n->V[i].High = env->xmm_regs[i].ZMM_Q(1);
+    }
+    /*
+     * MM0-7 are ST(0)-ST(7), as FXSAVE orders them: each mantissa in its
+     * register, the sign and exponent 16 bits each in x16 and x17.
+     */
     for (int i = 0; i < 8; i++) {
-        const M128A *mm = &c.FltSave.FloatRegisters[i];
+        const floatx80 *st = &env->fpregs[(env->fpstt + i) & 7].d;
 
-        n->X[mm_lo[i]] = mm->Low;
+        n->X[mm_lo[i]] = st->low;
         if (i < 4) {
-            hi16 |= (uint64_t)(mm->High & 0xffff) << (16 * i);
+            hi16 |= (uint64_t)st->high << (16 * i);
         } else {
-            hi17 |= (uint64_t)(mm->High & 0xffff) << (16 * (i - 4));
+            hi17 |= (uint64_t)st->high << (16 * (i - 4));
         }
     }
     n->X16 = hi16;
@@ -239,28 +251,53 @@ void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
               (mx & 2 ? 0x80 : 0);
 }
 
+/* Load SEL into R unless it is loaded already, with the base load_seg gives. */
+static void ec_seg(XtThread *t, X86Seg r, int sel)
+{
+    const SegmentCache *s = &t->env->segs[r];
+    uint64_t base = r == R_GS ? (uintptr_t)t->teb : 0;
+
+    if (s->selector != sel || s->base != base) {
+        load_seg(t, r, sel);
+    }
+}
+
 /*
- * A call or jump into x64 code from native code: the x64 registers from
+ * A call or jump into x64 code from native code, into the CPU state while
+ * the thread is being acquired (xt_acquire_begin): the x64 registers from
  * their ARM64EC places, RIP the target, x64 Windows' selectors.  EFLAGS'
  * SF, ZF, CF, OF and TF come from NZCV and SS, the rest (DF, PF, AF) is
  * the engine's, as it was at the last exit; the x87 state and MXCSR stay
- * the engine's.  Into C for xt_acquire.
+ * the engine's.  As xt_import would take the same registers from a
+ * CONTEXT, without the round trip: this runs on every entry.
  */
-void xt_ec_call_context(XtThread *t, ARM64_NT_CONTEXT *n, CONTEXT *c)
+void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n)
 {
-    memset(c, 0, sizeof(*c));
-    xt_export(t, c);
+    CPUX86State *env = t->env;
+    uint32_t eflags = (cpu_compute_eflags(env) &
+                       ~(CC_S | CC_Z | CC_C | CC_O | TF_MASK)) |
+                      ec_eflags(n->Cpsr);
+
     for (int i = 0; i < 16; i++) {
-        (&c->Rax)[i] = *ec_gpr(n, i);
+        env->regs[i] = *ec_gpr(n, i);
     }
-    c->Rip = n->Pc;
-    c->EFlags = (c->EFlags & ~(CC_S | CC_Z | CC_C | CC_O | TF_MASK)) |
-                ec_eflags(n->Cpsr);
-    memcpy(c->FltSave.XmmRegisters, n->V, 16 * sizeof(n->V[0]));
-    c->SegCs = 0x33;
-    c->SegDs = c->SegEs = c->SegSs = c->SegGs = 0x2b;
-    c->SegFs = 0x53;
-    c->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS |
-                      CONTEXT_FLOATING_POINT;
+    env->eip = n->Pc;
+    env->eflags = (env->eflags & ~EFLAGS_FROM_CONTEXT) |
+                  (eflags & EFLAGS_FROM_CONTEXT) | 0x2;
+    CC_SRC = eflags & (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
+    CC_OP = CC_OP_EFLAGS;
+    env->df = 1 - (2 * ((eflags >> 10) & 1));
+    t->bp_skip = (eflags & RF_MASK) || (t->bp_hit && n->Pc == t->bp_hit);
+    t->bp_hit = 0;
+    for (int i = 0; i < 16; i++) {
+        env->xmm_regs[i].ZMM_Q(0) = n->V[i].Low;
+        env->xmm_regs[i].ZMM_Q(1) = n->V[i].High;
+    }
+    ec_seg(t, R_CS, 0x33);
+    ec_seg(t, R_SS, 0x2b);
+    ec_seg(t, R_DS, 0x2b);
+    ec_seg(t, R_ES, 0x2b);
+    ec_seg(t, R_FS, 0x53);
+    ec_seg(t, R_GS, 0x2b);
 }
 #endif

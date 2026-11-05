@@ -256,6 +256,8 @@ void xt_gevent(XtEv kind, uint64_t a, uint64_t b);
 uint32_t xt_check(XtThread *t, XtState expect, int where);
 void xt_set_slot2(XtThread *t, bool running);
 void xt_acquire(XtThread *t, const XtGuestContext *c);
+void xt_acquire_begin(XtThread *t);
+void xt_acquire_end(XtThread *t);
 void xt_publish(XtThread *t, XtGuestContext *c);
 void xt_dump(XtThread *t, void *handle);
 void xt_log_flush(XtThread *t);
@@ -278,7 +280,7 @@ void xt_import(XtThread *t, const XtGuestContext *c);
 void xt_export(XtThread *t, XtGuestContext *c);
 #ifdef __arm64ec__
 void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n);
-void xt_ec_call_context(XtThread *t, ARM64_NT_CONTEXT *n, CONTEXT *c);
+void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n);
 #endif
 
 /* memory.c: Windows' memory notifications, the processor's identity */

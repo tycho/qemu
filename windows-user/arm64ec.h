@@ -88,10 +88,14 @@ static inline uint64_t xt_ec_bitmap_word(uint64_t addr)
     return w;
 }
 
-/* Whether ADDR is EC code (native), by the PEB's bitmap. */
+/*
+ * Whether ADDR is EC code (native), by the PEB's bitmap.  ntdll's test
+ * checks the address against the bitmap's range and reads the bitmap
+ * directly, with no system call: it runs on every transfer to native code.
+ */
 static inline bool xt_is_ec_code(uint64_t addr)
 {
-    return (xt_ec_bitmap_word(addr) >> ((addr >> 12) & 63)) & 1;
+    return RtlIsEcCode(addr);
 }
 
 /* arm64ec.S */
