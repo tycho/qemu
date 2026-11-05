@@ -256,6 +256,8 @@ void xt_gevent(XtEv kind, uint64_t a, uint64_t b);
 uint32_t xt_check(XtThread *t, XtState expect, int where);
 void xt_set_slot2(XtThread *t, bool running);
 void xt_acquire(XtThread *t, const XtGuestContext *c);
+void xt_acquire_begin(XtThread *t);
+void xt_acquire_end(XtThread *t);
 void xt_publish(XtThread *t, XtGuestContext *c);
 void xt_dump(XtThread *t, void *handle);
 void xt_log_flush(XtThread *t);
@@ -277,8 +279,19 @@ extern NTSTATUS xt_log_status;      /* the event log's opening */
 void xt_import(XtThread *t, const XtGuestContext *c);
 void xt_export(XtThread *t, XtGuestContext *c);
 #ifdef __arm64ec__
+/*
+ * The guest's EFLAGS.  Between cpu_exec's exit and its next entry,
+ * x86_cpu_exec_exit (or an import) has left them complete in env->eflags;
+ * only inside cpu_exec are they computed from the lazy condition codes.
+ */
+static inline uint32_t xt_ec_eflags(CPUX86State *env)
+{
+    return env_archcpu(env)->eflags_in_tcg ? cpu_compute_eflags(env)
+                                           : env->eflags;
+}
+
 void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n);
-void xt_ec_call_context(XtThread *t, ARM64_NT_CONTEXT *n, CONTEXT *c);
+void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n);
 #endif
 
 /* memory.c: Windows' memory notifications, the processor's identity */
