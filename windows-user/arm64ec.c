@@ -1100,8 +1100,25 @@ static LONG CALLBACK xt_ec_veh(EXCEPTION_POINTERS *p)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/*
+ * The native harness: its vectored handler sees faults through the x64
+ * view (from_ec_view), and its threads run generated code without the
+ * cooperative suspension, so pinning stays off (xt_fault_context_partial)
+ * unless XTAJIT_HARNESS_PIN is set, for runs that neither fault nor meet
+ * an asynchronous context operation (timing the generated code).
+ */
+static bool harness_pin(void)
+{
+    WCHAR w[8];
+    SIZE_T n = 0;
+
+    return RtlQueryEnvironmentVariable(NULL, L"XTAJIT_HARNESS_PIN", 18, w,
+                                       ARRAY_SIZE(w) - 1, &n) >= 0 && n;
+}
+
 XTEXPORT int xt_ec_test_init(int *rejected)
 {
+    xt_fault_context_partial = !harness_pin();
     if (!init_syscalls() || process_init() < 0) {
         return -1;
     }
