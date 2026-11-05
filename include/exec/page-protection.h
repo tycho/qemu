@@ -42,7 +42,8 @@
  * The page's contents change only through a mapping or protection change
  * that reaches the page flags: its code needs no check against
  * self-modification (x-smc=check).  Set by the OS layer that fills the
- * flags.
+ * flags: linux-user for private mappings, the Windows modules for image
+ * pages.
  */
 #define PAGE_FIXED_CODE 0x0800
 
