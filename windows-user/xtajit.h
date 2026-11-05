@@ -227,6 +227,17 @@ extern uint32_t xt_inject_point;    /* XTAJIT_INJECT: see xt_inject */
 /* engine.c */
 extern CPUState *xt_spare_cpu;      /* made at init, for the first thread */
 int xt_engine_init(const char *settings, int *applied, int *rejected);
+
+/*
+ * Set before xt_engine_init where the host's fault contexts may lack
+ * registers that generated code uses (the x64 module's native harness,
+ * whose vectored handler sees the x64 view, without x13, x14, x23, x24,
+ * x28 and v16-v31), or where Windows may capture and restore the thread's
+ * context asynchronously through that view while generated code runs.
+ * Guest registers then stay out of host registers across TBs: pinning
+ * and lazy sync are off.
+ */
+extern bool xt_fault_context_partial;
 /*
  * Diagnostics at every transition between Windows and the engine: the
  * state machine's invariant checks (xt_check) and the routine events
