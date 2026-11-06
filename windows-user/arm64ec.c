@@ -761,7 +761,7 @@ static void leave(XtThread *t, ARM64_NT_CONTEXT *n, bool context_exit)
     xt_publish(t, NULL);
     xt_ec_pack(t, n);
     if (context_exit) {
-        aux_push(t, n->Sp, cpu_compute_eflags(t->env));
+        aux_push(t, n->Sp, xt_ec_eflags(t->env));
     }
     xt_log_flush(t);
 }

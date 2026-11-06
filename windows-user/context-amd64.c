@@ -229,7 +229,7 @@ void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
         *ec_gpr(n, i) = env->regs[i];
     }
     n->Pc = env->eip;
-    n->Cpsr = ec_cpsr(cpu_compute_eflags(env));
+    n->Cpsr = ec_cpsr(xt_ec_eflags(env));
     for (int i = 0; i < 16; i++) {
         n->V[i].Low = env->xmm_regs[i].ZMM_Q(0);
         n->V[i].High = env->xmm_regs[i].ZMM_Q(1);
@@ -326,7 +326,7 @@ static void ec_seg(XtThread *t, X86Seg r, int sel)
 void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n)
 {
     CPUX86State *env = t->env;
-    uint32_t eflags = (cpu_compute_eflags(env) &
+    uint32_t eflags = (xt_ec_eflags(env) &
                        ~(CC_S | CC_Z | CC_C | CC_O | TF_MASK)) |
                       ec_eflags(n->Cpsr);
 
