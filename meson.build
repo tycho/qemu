@@ -3120,7 +3120,12 @@ config_host_data.set('CONFIG_ARM_AES_BUILTIN', cc.compiles('''
     void foo(uint8x16_t *p) { *p = vaesmcq_u8(*p); }
   '''))
 
-# For AArch64, detect if code can be built without vector registers.
+# For AArch64, detect if code can be built without vector registers: GCC's
+# target pragma, or clang's target attribute applied to a range of
+# functions.  Clang's form also sets the functions' register zeroing to
+# general registers (QEMU's -fzero-call-used-regs=used-gpr), as clang
+# would otherwise zero vector registers under =all; its probe has a call,
+# as the zeroing probe does, for the clang versions that crash on it.
 # Instrumented builds insert calls into runtimes that may use them
 # (sanitizers and their coverage, XRay, profile generation, gcov, -pg and
 # its spellings -p, --profile and -fprofile, -finstrument-functions): none
@@ -3148,6 +3153,15 @@ config_host_data.set('CONFIG_GENERAL_REGS_ONLY',
     #pragma GCC target("general-regs-only")
     int foo(int x) { return x + 1; }
   ''', args: ['-Werror', '-Wunknown-pragmas']))
+config_host_data.set('CONFIG_GENERAL_REGS_ONLY_CLANG',
+  host_arch == 'aarch64' and not instrumented_build and
+  not config_host_data.get('CONFIG_GENERAL_REGS_ONLY') and
+  cc.get_id() == 'clang' and cc.compiles('''
+    #pragma clang attribute push (__attribute__((target("+nosimd,+nofp"), zero_call_used_regs("used-gpr"))), apply_to = function)
+    extern struct { void (*cb)(void); } s;
+    void f(void) { s.cb(); }
+    #pragma clang attribute pop
+  ''', args: ['-O2', '-Werror', '-Wunknown-pragmas']))
 
 if get_option('membarrier').disabled()
   have_membarrier = false
