@@ -270,8 +270,9 @@ typedef TCGv_i64 TCGv_vaddr;
 /*
  * Helper uses no vector registers and doesn't access the memory of
  * vector globals: pinned vector globals stay in their registers across
- * the call.  Its file must be compiled QEMU_GENERAL_REGS_ONLY from before
- * any code the helper runs; where the compiler can't, the flag is 0.
+ * the call.  The helper and everything it runs must be compiled between
+ * QEMU_GENERAL_REGS_ONLY_BEGIN and QEMU_GENERAL_REGS_ONLY_END; where the
+ * compiler can't, the flag is 0.
  */
 #define TCG_CALL_NO_VREG (QEMU_HAVE_GENERAL_REGS_ONLY ? 0x0010 : 0)
 

@@ -3168,11 +3168,48 @@ config_host_data.set('CONFIG_ARM_AES_BUILTIN', cc.compiles('''
     void foo(uint8x16_t *p) { *p = vaesmcq_u8(*p); }
   '''))
 
-# For AArch64, detect if code can be built without vector registers.
-config_host_data.set('CONFIG_GENERAL_REGS_ONLY', host_arch == 'aarch64' and cc.compiles('''
+# For AArch64, detect if code can be built without vector registers: GCC's
+# target pragma, or clang's target attribute applied to a range of
+# functions.  Clang's form also sets the functions' register zeroing to
+# general registers (QEMU's -fzero-call-used-regs=used-gpr), as clang
+# would otherwise zero vector registers under =all; its probe has a call,
+# as the zeroing probe does, for the clang versions that crash on it.
+# Instrumented builds insert calls into runtimes that may use them
+# (sanitizers and their coverage, XRay, profile generation, gcov, -pg and
+# its spellings -p, --profile and -fprofile, -finstrument-functions): none
+# there.  b_sanitize is a string or, in
+# newer Meson, a list.
+instrumented_build = get_option('asan') or get_option('ubsan') or \
+  get_option('tsan') or get_option('fuzzing') or \
+  get_option('b_coverage') or get_option('b_pgo') == 'generate' or \
+  '@0@'.format(get_option('b_sanitize')) not in ['none', '[]']
+foreach arg : get_option('c_args')
+  foreach prefix : ['-fsanitize', '-fxray', '-fprofile-generate',
+                    '-fprofile-instr-generate', '-fcs-profile-generate',
+                    '-fprofile-arcs', '--coverage', '-pg',
+                    '-finstrument-functions']
+    if arg.startswith(prefix)
+      instrumented_build = true
+    endif
+  endforeach
+  if arg in ['-p', '--profile', '-fprofile']
+    instrumented_build = true
+  endif
+endforeach
+config_host_data.set('CONFIG_GENERAL_REGS_ONLY',
+  host_arch == 'aarch64' and not instrumented_build and cc.compiles('''
     #pragma GCC target("general-regs-only")
     int foo(int x) { return x + 1; }
   ''', args: ['-Werror', '-Wunknown-pragmas']))
+config_host_data.set('CONFIG_GENERAL_REGS_ONLY_CLANG',
+  host_arch == 'aarch64' and not instrumented_build and
+  not config_host_data.get('CONFIG_GENERAL_REGS_ONLY') and
+  cc.get_id() == 'clang' and cc.compiles('''
+    #pragma clang attribute push (__attribute__((target("+nosimd,+nofp"), zero_call_used_regs("used-gpr"))), apply_to = function)
+    extern struct { void (*cb)(void); } s;
+    void f(void) { s.cb(); }
+    #pragma clang attribute pop
+  ''', args: ['-O2', '-Werror', '-Wunknown-pragmas']))
 
 if get_option('membarrier').disabled()
   have_membarrier = false

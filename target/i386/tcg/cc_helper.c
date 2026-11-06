@@ -24,7 +24,7 @@
  * may use vector registers, the inline functions of the headers below
  * included.
  */
-QEMU_GENERAL_REGS_ONLY
+QEMU_GENERAL_REGS_ONLY_BEGIN
 
 #include "qemu/xtcg-stats.h"
 #include "cpu.h"
@@ -502,3 +502,5 @@ void helper_clts(CPUX86State *env)
     env->cr[0] &= ~CR0_TS_MASK;
     env->hflags &= ~HF_TS_MASK;
 }
+
+QEMU_GENERAL_REGS_ONLY_END
