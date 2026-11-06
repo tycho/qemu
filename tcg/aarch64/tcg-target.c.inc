@@ -3676,7 +3676,8 @@ static void tcg_out_goto_tb(TCGContext *s, int which)
  * wraps (BFXIL keeps the ring's base bits).  An entry is good only under
  * the epoch it was pushed in (tcg_retep_off, in steps of
  * TCG_RETSTACK_TAGS) with the same tag, and while the vCPU has no
- * breakpoints (as the jump-cache probes require).
+ * breakpoints (as the jump-cache probes require).  Tags start at 1, so a
+ * cleared entry, all zero, is never good.
  */
 #define TCG_TARGET_HAS_RETSTACK_ENV
 #define RETSTACK_ENV_BITS 14
@@ -3708,6 +3709,18 @@ static void tcg_out_ccmp_eq(TCGContext *s, TCGReg rn, TCGReg rm)
     /* CCMP Rn, Rm, #0, EQ: NE unless EQ before and Rn == Rm. */
     tcg_out32(s, 0x7a400000 | TCG_TYPE_I64 << 31 | rm << 16
               | tcg_cond_to_aarch64[TCG_COND_EQ] << 12 | rn << 5);
+}
+
+/*
+ * CCMP Rn, #0, #4, EQ: NE only if EQ before and Rn isn't zero.  After a
+ * return stack entry's checks, NE predicts: an entry whose landing is
+ * zero (never pushed since the ring was cleared) doesn't, whatever guest
+ * address it matched.
+ */
+static void tcg_out_ccmp_nz(TCGContext *s, TCGReg rn)
+{
+    tcg_out32(s, 0x7a400800 | TCG_TYPE_I64 << 31
+              | tcg_cond_to_aarch64[TCG_COND_EQ] << 12 | rn << 5 | 4);
 }
 
 static void tcg_out_ret_tb_env(TCGContext *s, TCGReg key, unsigned tag)
@@ -3785,8 +3798,26 @@ static void tcg_out_ret_tb(TCGContext *s, TCGReg key, unsigned tag)
                  tcg_retstack_reg, 16, 0, 1);
     tcg_out_insn(s, addsub_shift, SUBS, TCG_TYPE_I64,
                  TCG_REG_XZR, TCG_REG_TMP1, key);
-    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 2);
+    tcg_out_ccmp_nz(s, TCG_REG_LR);
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_EQ, 2);
     tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+}
+
+/*
+ * Whether the insn at @pc, in the code buffer, is one of the return
+ * stack's own accesses with its top in tcg_retstack_reg: a push
+ * (STP Xt, Xt2, [top, #-16]!) or a pop (LDP Xt, Xt2, [top], #16).
+ */
+bool tcg_retstack_access(uintptr_t pc)
+{
+    const uint32_t rn = (uint32_t)tcg_retstack_reg << 5;
+    uint32_t insn;
+
+    if (tcg_retstack_reg < 0) {
+        return false;
+    }
+    insn = *(const uint32_t *)pc & 0xffff83e0;
+    return insn == (0xa9bf0000 | rn) || insn == (0xa8c10000 | rn);
 }
 
 static void tcg_out_goto_ptr(TCGContext *s, TCGReg a0)

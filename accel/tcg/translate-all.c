@@ -917,12 +917,12 @@ void tcg_retstack_bump(CPUState *cpu)
     }
 }
 
-uintptr_t tcg_retstack_fault(CPUState *cpu, uintptr_t addr)
+uintptr_t tcg_retstack_fault(CPUState *cpu, uintptr_t pc, uintptr_t addr)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
     uintptr_t page = qemu_real_host_page_size(), ring;
 
-    if (!jc || !jc->retring) {
+    if (!jc || !jc->retring || !tcg_retstack_access(pc)) {
         return 0;
     }
     ring = (uintptr_t)jc->retring;
