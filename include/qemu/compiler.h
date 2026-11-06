@@ -183,18 +183,36 @@
 #endif
 
 /*
- * QEMU_GENERAL_REGS_ONLY: compile the rest of the file without vector and
- * floating-point registers, where the compiler can (CONFIG_GENERAL_REGS_ONLY:
- * GCC on AArch64); QEMU_HAVE_GENERAL_REGS_ONLY says whether it does.  Code
- * called from there that was compiled before it (inline functions from
- * headers included earlier) is not covered.
+ * QEMU_GENERAL_REGS_ONLY_BEGIN and QEMU_GENERAL_REGS_ONLY_END: compile the
+ * functions declared between them without vector and floating-point
+ * registers, where the compiler can (on AArch64: CONFIG_GENERAL_REGS_ONLY,
+ * GCC's target pragma; CONFIG_GENERAL_REGS_ONLY_CLANG, clang's target
+ * attribute on each of those functions, with register zeroing on return
+ * limited to general registers); QEMU_HAVE_GENERAL_REGS_ONLY says whether
+ * it does.  A function first declared in the range keeps the restriction
+ * where it is defined, even after the end.
+ *
+ * The restriction is not transitive across calls: it covers only the code
+ * generated for those functions.  Every function they call that returns,
+ * compiler-generated calls included (memcpy, outlined atomics), must also
+ * leave vector registers alone, for example by being in such a range too.
+ * Inline functions defined before the begin are not restricted.
  */
 #ifdef CONFIG_GENERAL_REGS_ONLY
 #define QEMU_HAVE_GENERAL_REGS_ONLY 1
-#define QEMU_GENERAL_REGS_ONLY _Pragma("GCC target(\"general-regs-only\")")
+#define QEMU_GENERAL_REGS_ONLY_BEGIN \
+    _Pragma("GCC push_options") _Pragma("GCC target(\"general-regs-only\")")
+#define QEMU_GENERAL_REGS_ONLY_END _Pragma("GCC pop_options")
+#elif defined(CONFIG_GENERAL_REGS_ONLY_CLANG)
+#define QEMU_HAVE_GENERAL_REGS_ONLY 1
+#define QEMU_GENERAL_REGS_ONLY_BEGIN \
+    _Pragma("clang attribute push (__attribute__((target(\"+nosimd,+nofp\"), \
+zero_call_used_regs(\"used-gpr\"))), apply_to = function)")
+#define QEMU_GENERAL_REGS_ONLY_END _Pragma("clang attribute pop")
 #else
 #define QEMU_HAVE_GENERAL_REGS_ONLY 0
-#define QEMU_GENERAL_REGS_ONLY
+#define QEMU_GENERAL_REGS_ONLY_BEGIN
+#define QEMU_GENERAL_REGS_ONLY_END
 #endif
 
 #if __has_attribute(annotate)
