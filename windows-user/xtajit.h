@@ -292,6 +292,17 @@ extern NTSTATUS xt_log_status;      /* the event log's opening */
 void xt_import(XtThread *t, const XtGuestContext *c);
 void xt_export(XtThread *t, XtGuestContext *c);
 #ifdef __arm64ec__
+/*
+ * The guest's EFLAGS.  Between cpu_exec's exit and its next entry,
+ * x86_cpu_exec_exit (or an import) has left them complete in env->eflags;
+ * only inside cpu_exec are they computed from the lazy condition codes.
+ */
+static inline uint32_t xt_ec_eflags(CPUX86State *env)
+{
+    return env_archcpu(env)->eflags_in_tcg ? cpu_compute_eflags(env)
+                                           : env->eflags;
+}
+
 void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n);
 void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n);
 bool xt_ec_ymm(XtThread *t);
