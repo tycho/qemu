@@ -32,6 +32,13 @@
 #include "exec/helper-info.c.inc"
 #undef  HELPER_H
 
+#ifdef __arm64ec__
+void *HELPER(memset)(void *ptr, int32_t c, void *len)
+{
+    return memset(ptr, c, (uintptr_t)len);
+}
+#endif
+
 /* 32-bit helpers */
 
 int32_t HELPER(div_i32)(int32_t arg1, int32_t arg2)
