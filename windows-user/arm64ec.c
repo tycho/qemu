@@ -1910,6 +1910,24 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
         }
         t->int3_rip = 0;
     }
+    /*
+     * Generated code's return stack push or pop ran into its ring's guard
+     * pages: back to the ring's middle, as linux-user's signal handler
+     * does.  Its top is in tcg_retstack_reg, which the full native context
+     * carries.
+     */
+    if (t && t == xt_self && t->state != XT_WINDOWS && tcg_retstack_reg >= 0 &&
+        er->ExceptionCode == STATUS_ACCESS_VIOLATION &&
+        er->NumberParameters >= 2 &&
+        in_code_gen_buffer((void *)(uintptr_t)native->Pc)) {
+        uintptr_t top = tcg_retstack_fault(t->cpu, native->Pc,
+                                           er->ExceptionInformation[1]);
+
+        if (top) {
+            native->X[tcg_retstack_reg] = top;
+            xt_continue_native(native);
+        }
+    }
     if (t && t == xt_self && t->state != XT_WINDOWS) {
         bool prev = area->InSyscallCallback;
         bool handled;
@@ -2897,6 +2915,8 @@ XTEXPORT int xt_ec_test_init(int *rejected)
     if (xt_cpu_avx()) {
         return -1;
     }
+    xt_fault_context_partial = !harness_pin();
+    xt_native_harness = true;
     xt_diag = true;
     if (!init_syscalls() || process_init() < 0) {
         return -1;
