@@ -753,6 +753,12 @@ enum {
     TCG_OPF_CARRY_OUT    = 0x100,
     /* Instruction consumes carry in. */
     TCG_OPF_CARRY_IN     = 0x200,
+    /*
+     * Instruction may raise the host's floating-point exception flags,
+     * which the guest can read back: it is not removed when its outputs
+     * are dead.  Unlike TCG_OPF_SIDE_EFFECTS, globals need not be synced.
+     */
+    TCG_OPF_FP_STATUS    = 0x400,
 };
 
 typedef struct TCGOpDef {

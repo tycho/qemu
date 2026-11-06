@@ -4197,10 +4197,12 @@ liveness_pass_1(TCGContext *s)
             /*
              * Test if the operation can be removed because all
              * its outputs are dead. We assume that nb_oargs == 0
-             * implies side effects.
+             * implies side effects.  An operation that may raise
+             * floating-point exception flags stays for those.
              */
             def = &tcg_op_defs[opc];
-            if (!(def->flags & TCG_OPF_SIDE_EFFECTS) && def->nb_oargs != 0) {
+            if (!(def->flags & (TCG_OPF_SIDE_EFFECTS | TCG_OPF_FP_STATUS)) &&
+                def->nb_oargs != 0) {
                 for (int i = def->nb_oargs - 1; i >= 0; i--) {
                     if (arg_temp(op->args[i])->state != TS_DEAD) {
                         goto do_not_remove;
