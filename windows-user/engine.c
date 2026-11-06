@@ -394,8 +394,8 @@ static void setup_mode(CPUX86State *env)
     env->cr[0] = CR0_PG_MASK | CR0_WP_MASK | CR0_PE_MASK | CR0_ET_MASK |
                  CR0_NE_MASK;
     env->hflags |= HF_PE_MASK | HF_CPL_MASK;
-    env->cr[4] |= CR4_OSFXSR_MASK | CR4_OSXMMEXCPT_MASK | CR4_PAE_MASK;
-    env->hflags |= HF_OSFXSR_MASK;
+    cpu_x86_update_cr4(env, env->cr[4] | CR4_OSFXSR_MASK |
+                       CR4_OSXMMEXCPT_MASK | CR4_PAE_MASK);
     env->efer |= MSR_EFER_LMA | MSR_EFER_LME | MSR_EFER_NXE;
     env->hflags |= HF_LMA_MASK;
     env->eflags |= IF_MASK;
@@ -437,8 +437,8 @@ static void setup_mode(CPUX86State *env)
     env->cr[0] = CR0_PG_MASK | CR0_WP_MASK | CR0_PE_MASK | CR0_ET_MASK |
                  CR0_NE_MASK;
     env->hflags |= HF_PE_MASK | HF_CPL_MASK;
-    env->cr[4] |= CR4_OSFXSR_MASK | CR4_OSXMMEXCPT_MASK;
-    env->hflags |= HF_OSFXSR_MASK;
+    cpu_x86_update_cr4(env, env->cr[4] | CR4_OSFXSR_MASK |
+                       CR4_OSXMMEXCPT_MASK);
     env->eflags |= IF_MASK;
     env->gdt.base = (uintptr_t)gdt;
     env->gdt.limit = GDT_ENTRIES * 8 - 1;
