@@ -193,12 +193,19 @@ static uint32_t ec_eflags(uint32_t cpsr)
            (cpsr & (1u << 21) ? TF_MASK : 0);
 }
 
+/* Whether the guest has YMM state: its XCR0 enables the AVX component. */
+bool xt_ec_ymm(XtThread *t)
+{
+    return t->env->xcr0 & XSTATE_YMM_MASK;
+}
+
 /*
  * The guest's state as native code keeps it (the packed form): x64
  * registers in their ARM64EC places, the MMX registers where Windows
  * looks for them (FEX's ARM64EC module packs them the same way), NZCV and
- * SS from EFLAGS, FPCR and FPSR from MXCSR; nothing in x13, x14, x18,
- * x23, x24 or x28.  The rest of EFLAGS and the x87 control state have no
+ * SS from EFLAGS, FPCR and FPSR from MXCSR; YMMn's upper half in V16+n,
+ * where Windows' x64 view of the context finds it; nothing in x13, x14,
+ * x18, x23, x24 or x28.  The rest of EFLAGS and the x87 control state have no
  * place here.  Straight from the CPU state: this runs on every exit to
  * native code.
  */
@@ -227,6 +234,12 @@ void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
         n->V[i].Low = env->xmm_regs[i].ZMM_Q(0);
         n->V[i].High = env->xmm_regs[i].ZMM_Q(1);
     }
+    if (xt_ec_ymm(t)) {
+        for (int i = 0; i < 16; i++) {
+            n->V[16 + i].Low = env->xmm_regs[i].ZMM_Q(2);
+            n->V[16 + i].High = env->xmm_regs[i].ZMM_Q(3);
+        }
+    }
     /*
      * MM0-7 are ST(0)-ST(7), as FXSAVE orders them: each mantissa in its
      * register, the sign and exponent 16 bits each in x16 and x17.
@@ -251,6 +264,43 @@ void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
               (mx & 2 ? 0x80 : 0);
 }
 
+/*
+ * The extended part of an x64 CONTEXT (CONTEXT_EX), which follows it when
+ * its flags have CONTEXT_XSTATE.
+ */
+typedef struct XtContextEx XtContextEx;
+ULONG64 NTAPI RtlGetExtendedFeaturesMask(XtContextEx *cx);
+PVOID NTAPI RtlLocateExtendedFeature(XtContextEx *cx, ULONG feature,
+                                     PULONG length);
+
+/*
+ * The YMM upper halves of a context Windows continues (C, in the CPU
+ * area, with its extended part): from its AVX state, or zero where its
+ * mask leaves AVX in its initial state.  A context without XSTATE leaves
+ * them as they are.
+ */
+void xt_ec_import_ymm(XtThread *t, const CONTEXT *c)
+{
+    CPUX86State *env = t->env;
+    XtContextEx *cx = (XtContextEx *)(c + 1);
+    const uint64_t *hi = NULL;
+    ULONG len = 0;
+
+    if ((c->ContextFlags & CONTEXT_XSTATE) != CONTEXT_XSTATE) {
+        return;
+    }
+    if (RtlGetExtendedFeaturesMask(cx) & XSTATE_MASK_AVX) {
+        hi = RtlLocateExtendedFeature(cx, XSTATE_AVX, &len);
+        if (len < 16 * 16) {
+            hi = NULL;
+        }
+    }
+    for (int i = 0; i < 16; i++) {
+        env->xmm_regs[i].ZMM_Q(2) = hi ? hi[2 * i] : 0;
+        env->xmm_regs[i].ZMM_Q(3) = hi ? hi[2 * i + 1] : 0;
+    }
+}
+
 /* Load SEL into R unless it is loaded already, with the base load_seg gives. */
 static void ec_seg(XtThread *t, X86Seg r, int sel)
 {
@@ -267,9 +317,11 @@ static void ec_seg(XtThread *t, X86Seg r, int sel)
  * the thread is being acquired (xt_acquire_begin): the x64 registers from
  * their ARM64EC places, RIP the target, x64 Windows' selectors.  EFLAGS'
  * SF, ZF, CF, OF and TF come from NZCV and SS, the rest (DF, PF, AF) is
- * the engine's, as it was at the last exit; the x87 state and MXCSR stay
- * the engine's.  As xt_import would take the same registers from a
- * CONTEXT, without the round trip: this runs on every entry.
+ * the engine's, as it was at the last exit; the x87 state, MXCSR and the
+ * YMM upper halves stay the engine's (native code's system calls zero
+ * v16-v31, and x64 calls don't preserve the upper halves).  As xt_import
+ * would take the same registers from a CONTEXT, without the round trip:
+ * this runs on every entry.
  */
 void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n)
 {
