@@ -343,15 +343,50 @@ static uint64_t cpuid_features(CPUX86State *env)
      1ull << PF_SSSE3_INSTRUCTIONS_AVAILABLE |                           \
      1ull << PF_SSE4_1_INSTRUCTIONS_AVAILABLE |                          \
      1ull << PF_SSE4_2_INSTRUCTIONS_AVAILABLE)
+#define MODEL_FEATURES_AVX2                                              \
+    (MODEL_FEATURES | 1ull << PF_XSAVE_ENABLED |                         \
+     1ull << PF_AVX_INSTRUCTIONS_AVAILABLE |                             \
+     1ull << PF_AVX2_INSTRUCTIONS_AVAILABLE)
+
+#ifdef TARGET_X86_64
+NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
+                                           SIZE_T, PSIZE_T);
+
+/*
+ * XTAJIT_CPU=avx2 selects the x64 module's AVX2 model (a development
+ * switch; sse or unset, the SSE model).  Decided at the first question,
+ * which may come before the engine exists.
+ */
+bool xt_cpu_avx(void)
+{
+    static int avx = -1;
+
+    if (avx < 0) {
+        WCHAR w[8];
+        SIZE_T n = 0;
+
+        avx = RtlQueryEnvironmentVariable(NULL, L"XTAJIT_CPU", 10, w,
+                                          ARRAY_SIZE(w) - 1, &n) >= 0 &&
+              n == 4 && !memcmp(w, L"avx2", 4 * sizeof(WCHAR));
+    }
+    return avx;
+}
+#else
+bool xt_cpu_avx(void)
+{
+    return false;
+}
+#endif
 
 BOOLEAN xt_feature_present(UINT feature)
 {
     CPUState *cs = first_cpu;
-    uint64_t m = MODEL_FEATURES;
+    uint64_t model = xt_cpu_avx() ? MODEL_FEATURES_AVX2 : MODEL_FEATURES;
+    uint64_t m = model;
 
     if (cs) {
         m = cpuid_features(cpu_env(cs));
-        assert(m == MODEL_FEATURES);
+        assert(m == model);
     }
     return feature < 64 && (m >> feature) & 1;
 }

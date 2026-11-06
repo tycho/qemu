@@ -1112,6 +1112,10 @@ static LONG CALLBACK xt_ec_veh(EXCEPTION_POINTERS *p)
 
 XTEXPORT int xt_ec_test_init(int *rejected)
 {
+    /* Its contexts have no place for the YMM upper halves. */
+    if (xt_cpu_avx()) {
+        return -1;
+    }
     if (!init_syscalls() || process_init() < 0) {
         return -1;
     }
