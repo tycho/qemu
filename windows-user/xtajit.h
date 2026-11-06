@@ -223,6 +223,8 @@ extern bool xt_fault_context_partial;
 CPUState *xt_cpu_new(void);
 void xt_cpu_free(CPUState *cs);
 extern const char *xt_cpu_model;   /* -cpu syntax; set before init */
+/* The x64 module's AVX2 model (XTAJIT_CPU=avx2), decided once. */
+bool xt_cpu_avx(void);
 void *xt_alloc_low(size_t len);
 bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed);
 void xt_invalidate(vaddr start, vaddr len);
@@ -292,6 +294,8 @@ void xt_export(XtThread *t, XtGuestContext *c);
 #ifdef __arm64ec__
 void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n);
 void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n);
+bool xt_ec_ymm(XtThread *t);
+void xt_ec_import_ymm(XtThread *t, const CONTEXT *c);
 #endif
 
 /* memory.c: Windows' memory notifications, the processor's identity */

@@ -771,6 +771,9 @@ static G_NORETURN void leave_native(XtThread *t, XtEcFrame *f,
 {
     leave(t, &f->ctx, false);
     f->ctx.Pc = target;
+    if (xt_ec_ymm(t)) {
+        xt_ec_exit_native_ymm(&f->ctx);
+    }
     xt_ec_exit_native(&f->ctx);
 }
 
@@ -939,7 +942,9 @@ static void ec_window_edits(const ARM64_NT_CONTEXT *kept, CONTEXT *c)
  * the CPU area's AMD64 context is authoritative, with what the packed
  * form couldn't carry from the exit it continues (the one at the same
  * RSP; a handler may move RIP past a faulting instruction): EFLAGS but
- * NZCV and TF.  The x87 state stays the engine's: Windows
+ * NZCV and TF.  The YMM upper halves come from its extended part, which
+ * Windows fills from the continued context; v16-v31 hold nothing here
+ * after a system call.  The x87 state stays the engine's: Windows
  * carries no control, status or tag word.
  */
 #define MXCSR_CARRIED 0xe03f
@@ -1011,7 +1016,12 @@ void xt_ec_begin(void)
         c.Dr7 = w->Dr7;
     }
     area->InSimulation = 1;
-    xt_acquire(t, &c);
+    xt_acquire_begin(t);
+    xt_import(t, &c);
+    if (xt_ec_ymm(t)) {
+        xt_ec_import_ymm(t, w);
+    }
+    xt_acquire_end(t);
     ec_run(t, (XtEcFrame *)area->EmulatorData[1]);
 }
 
@@ -1118,6 +1128,10 @@ static bool harness_pin(void)
 
 XTEXPORT int xt_ec_test_init(int *rejected)
 {
+    /* Its contexts have no place for the YMM upper halves. */
+    if (xt_cpu_avx()) {
+        return -1;
+    }
     xt_fault_context_partial = !harness_pin();
     if (!init_syscalls() || process_init() < 0) {
         return -1;
