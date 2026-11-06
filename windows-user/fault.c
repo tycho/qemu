@@ -10,6 +10,7 @@
 #include "hw/core/cpu.h"
 #include "cpu.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 #include "exec/mmap-lock.h"
 #include "exec/page-protection.h"
 #include "exec/translation-block.h"
@@ -35,6 +36,40 @@ static bool on_tb_pages(const TranslationBlock *tb, vaddr addr)
     vaddr p0 = tb_page_addr0(tb) & TARGET_PAGE_MASK;
 
     return page == p0 || page == p0 + TARGET_PAGE_SIZE;
+}
+
+/*
+ * A fault in generated code: store the pinned globals (tcg_pin_user) and
+ * the dirty globals a guest access left in host registers
+ * (tcg_lazysync_user) from the registers of the fault, before anything
+ * reads env, as linux-user's signal handler does (host_signal_lazysync).
+ * A retry that resumes the fault's context doesn't need them, and is
+ * unharmed.  The context has every register: the installed modules get
+ * the full native context (ResetToConsistentState), and where a host
+ * gives less, both flags are off (xt_fault_context_partial), unless the
+ * native harness's override asks for them for a run that doesn't fault.
+ */
+static void xt_fault_lazysync(const XtNativeContext *ctx)
+{
+    uint64_t regs[64][2];
+
+    if (!(tcg_lazysync_user || tcg_pin_user) ||
+        !in_code_gen_buffer((void *)(ctx->Pc - tcg_splitwx_diff))) {
+        return;
+    }
+    memset(regs, 0, sizeof(regs));
+    for (int i = 0; i < 29; i++) {
+        regs[i][0] = ctx->X[i];
+    }
+    regs[29][0] = ctx->Fp;
+    regs[30][0] = ctx->Lr;
+    regs[31][0] = ctx->Sp;
+    for (int i = 0; i < 32; i++) {
+        regs[32 + i][0] = ctx->V[i].Low;
+        regs[32 + i][1] = ctx->V[i].High;
+    }
+    tcg_pinned_unwind(regs, 64);
+    tb_lazysync_unwind(ctx->Pc, regs, 64);
 }
 
 /*
@@ -93,6 +128,7 @@ static void G_NORETURN xt_fault_continue(XtThread *t, XtActive prev)
         f->busy = 0;
         tb_smc_check_fault(cs);
     }
+    xt_fault_lazysync(&f->ctx);
     if (f->is_write && f->code == STATUS_ACCESS_VIOLATION &&
         f->kind != XT_FK_TRANSLATE) {
         int r = page_unprotect(cs, f->addr, f->host_pc);

@@ -567,7 +567,15 @@ static void log_settings(Object *accel)
             xt_log_text(line);
         }
     }
+    /* What the settings give here (xt_fault_context_partial). */
+    g_free(head);
+    head = g_strdup_printf("effective pin-user=%d lazysync-user=%d "
+                           "fault-context-partial=%d\n", tcg_pin_user,
+                           tcg_lazysync_user, xt_fault_context_partial);
+    xt_log_text(head);
 }
+
+bool xt_fault_context_partial;
 
 /*
  * The process-wide bring-up, as linux-user's main() without a loader:
@@ -599,6 +607,17 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     accel_init_interfaces(ac);
     if (settings) {
         set_settings(OBJECT(accel), settings);
+    }
+    /*
+     * Guest registers in host registers across TBs, and globals synced
+     * lazily: the engine's fault path stores them from the fault's native
+     * context (fault.c), as linux-user's signal handler does from its
+     * frame.  Not where those contexts lack registers
+     * (xt_fault_context_partial).  The modules load no plugins.
+     */
+    if (!xt_fault_context_partial) {
+        tcg_lazysync_user = tcg_lazysync;
+        tcg_pin_user = tcg_pin;
     }
     ac->init_machine(accel, NULL);
     log_settings(OBJECT(accel));
