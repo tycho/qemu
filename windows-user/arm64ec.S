@@ -178,14 +178,32 @@ BeginSimulation:
 /*
  * void xt_ec_exit_native(ARM64_NT_CONTEXT *n): leave the engine for
  * native code at n->Pc, with the packed guest state of N (xt_ec_pack):
- * the x64 registers in their places, sp the guest's.  The engine has
+ * the x64 registers in their places, sp the guest's.  The _ymm entry
+ * loads v16-v31 too, so the thread's context shows the YMM upper halves
+ * until native code changes them.  The engine has
  * given the thread back; no frame of the emulator stack is live.
  */
+    .globl "#xt_ec_exit_native_ymm"
+    .def "#xt_ec_exit_native_ymm"; .scl 2; .type 32; .endef
+"#xt_ec_exit_native_ymm":
+    mov     x16, x0
+    add     x17, x16, #C_V
+    ldp     q16, q17, [x17, #256]
+    ldp     q18, q19, [x17, #288]
+    ldp     q20, q21, [x17, #320]
+    ldp     q22, q23, [x17, #352]
+    ldp     q24, q25, [x17, #384]
+    ldp     q26, q27, [x17, #416]
+    ldp     q28, q29, [x17, #448]
+    ldp     q30, q31, [x17, #480]
+    b       1f
+
     .globl "#xt_ec_exit_native"
     .def "#xt_ec_exit_native"; .scl 2; .type 32; .endef
 "#xt_ec_exit_native":
     mov     x16, x0
     add     x17, x16, #C_V
+1:
     ldp     q0, q1, [x17, #0]
     ldp     q2, q3, [x17, #32]
     ldp     q4, q5, [x17, #64]
