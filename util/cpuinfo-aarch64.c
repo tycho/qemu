@@ -108,6 +108,18 @@ static uint64_t win32_id_reg(HANDLE key, const wchar_t *value)
     memcpy(&reg, info.data, sizeof(reg));
     return reg;
 }
+
+uint64_t cpuinfo_win32_ctr_el0(void)
+{
+    HANDLE key = win32_cpu_key();
+    uint64_t ctr = 0;
+
+    if (key) {
+        ctr = win32_id_reg(key, L"CP 5801");
+        NtClose(key);
+    }
+    return ctr;
+}
 #endif
 
 /* Called both as constructor and (possibly) via other constructors. */
