@@ -1252,8 +1252,24 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
             !mprotect(p + page, TCG_RETSTACK_SIZE, PROT_READ | PROT_WRITE)) {
             cpu->tb_jmp_cache->retring = p + page;
             tcg_retstack_reset(cpu);
-        } else if (p != MAP_FAILED) {
-            munmap(p, TCG_RETSTACK_SIZE + 2 * page);
+        } else {
+            if (p != MAP_FAILED) {
+                munmap(p, TCG_RETSTACK_SIZE + 2 * page);
+            }
+            /*
+             * Generated code pushes and pops with the top in
+             * tcg_retstack_reg, so it needs a ring.  Before the prologue
+             * has taken a register for it, the return stack goes off for
+             * good; after, this vCPU can't run.
+             */
+            if (tcg_retstack_reg < 0) {
+                tcg_retstack = false;
+            } else {
+                qemu_vfree(cpu->tb_jmp_cache);
+                cpu->tb_jmp_cache = NULL;
+                error_setg(errp, "no memory for the return stack's ring");
+                return false;
+            }
         }
     }
     if (tcg_jcgen) {
