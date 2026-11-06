@@ -353,9 +353,9 @@ NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
                                            SIZE_T, PSIZE_T);
 
 /*
- * XTAJIT_CPU=avx2 selects the x64 module's AVX2 model (a development
- * switch; sse or unset, the SSE model).  Decided at the first question,
- * which may come before the engine exists.
+ * XTAJIT_CPU selects the x64 module's model (a development switch): avx2
+ * or unset, the AVX2 model; sse, the SSE model.  Decided at the first
+ * question, which may come before the engine exists.
  */
 bool xt_cpu_avx(void)
 {
@@ -366,8 +366,8 @@ bool xt_cpu_avx(void)
         SIZE_T n = 0;
 
         avx = RtlQueryEnvironmentVariable(NULL, L"XTAJIT_CPU", 10, w,
-                                          ARRAY_SIZE(w) - 1, &n) >= 0 &&
-              n == 4 && !memcmp(w, L"avx2", 4 * sizeof(WCHAR));
+                                          ARRAY_SIZE(w) - 1, &n) < 0 ||
+              (n == 4 && !memcmp(w, L"avx2", 4 * sizeof(WCHAR)));
     }
     return avx;
 }
