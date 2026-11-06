@@ -450,14 +450,20 @@ static void setup_mode(CPUX86State *env)
 static QemuMutex cpu_create_mutex;
 
 /*
- * The guest's CPU: QEMU's qemu32 with the features Windows on Arm's own
- * x86 emulator offers 32-bit code, all of which TCG implements.  No XSAVE
- * or AVX: the WOW64 context has no place for the YMM state.
+ * The guest's CPU: QEMU's qemu32 or qemu64 with the features Windows on
+ * Arm's own x86 emulator offers, all of which TCG implements.  WOW64's
+ * has no XSAVE or AVX: its context has no place for the YMM state.  The
+ * x64 module's AVX2 model (xt_cpu_avx) adds what Windows' emulator offers
+ * x64 code, but RDRAND and FSGSBASE (which would move GS off the TEB).
  */
 #ifdef TARGET_X86_64
-const char *xt_cpu_model =
-    "qemu64,ssse3=on,sse4.1=on,sse4.2=on,popcnt=on,aes=on,pclmulqdq=on,"
-    "cx16=on,rdtscp=on,lahf-lm=on,3dnowprefetch=on,nx=on";
+#define XT_CPU_X64                                                      \
+    "qemu64,ssse3=on,sse4.1=on,sse4.2=on,popcnt=on,aes=on,pclmulqdq=on," \
+    "cx16=on,rdtscp=on,lahf-lm=on,3dnowprefetch=on,nx=on"
+const char *xt_cpu_model = XT_CPU_X64;
+static const char xt_cpu_model_avx2[] =
+    XT_CPU_X64 ",xsave=on,avx=on,avx2=on,fma=on,f16c=on,bmi1=on,bmi2=on,"
+    "movbe=on,abm=on";
 #else
 const char *xt_cpu_model =
     "qemu32,ssse3=on,sse4.1=on,sse4.2=on,popcnt=on,aes=on,pclmulqdq=on,"
@@ -607,6 +613,12 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
         *n_rejected = rejected;
     }
 
+#ifdef TARGET_X86_64
+    if (xt_cpu_avx()) {
+        xt_cpu_model = xt_cpu_model_avx2;
+    }
+    xt_log_text(xt_cpu_avx() ? "cpu-model avx2\n" : "cpu-model sse\n");
+#endif
     cpu_type = parse_cpu_option(xt_cpu_model);
 
     set_preferred_target_page_bits(ctz32(qemu_real_host_page_size()));
