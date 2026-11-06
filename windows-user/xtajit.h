@@ -238,6 +238,8 @@ int xt_engine_init(const char *settings, int *applied, int *rejected);
  * and lazy sync are off.
  */
 extern bool xt_fault_context_partial;
+/* The x64 module runs under its native test harness (xt_ec_test_init). */
+extern bool xt_native_harness;
 /*
  * Diagnostics at every transition between Windows and the engine: the
  * state machine's invariant checks (xt_check) and the routine events
