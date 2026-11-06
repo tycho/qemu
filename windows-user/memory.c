@@ -276,14 +276,12 @@ void xt_note_read_file(void *addr, SIZE_T len, BOOL after, NTSTATUS status)
 
 /*
  * What CPUID says, for IsProcessorFeaturePresent in the guest's code, as
- * a mask of PF_ numbers.  As Windows' own x86 emulator: no PAE, DAZ or
- * fast-fail feature (int 0x29 still ends the process).
+ * a mask of PF_ numbers: the leaves the guest reads, since OSXSAVE follows
+ * CR4 rather than a feature word.  As Windows' own x86 emulator: no PAE,
+ * DAZ or fast-fail feature (int 0x29 still ends the process).
  */
 static uint64_t cpuid_features(CPUX86State *env)
 {
-    uint32_t edx = env->features[FEAT_1_EDX];
-    uint32_t ecx = env->features[FEAT_1_ECX];
-    uint32_t ext2 = env->features[FEAT_8000_0001_EDX];
     static const struct {
         uint8_t pf;
         uint8_t word;
@@ -301,14 +299,28 @@ static uint64_t cpuid_features(CPUX86State *env)
         { PF_SSSE3_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSSE3 },
         { PF_SSE4_1_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSE41 },
         { PF_SSE4_2_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSE42 },
+        { PF_XSAVE_ENABLED, 1, CPUID_EXT_OSXSAVE },
+        { PF_AVX2_INSTRUCTIONS_AVAILABLE, 3, CPUID_7_0_EBX_AVX2 },
     };
-    uint32_t words[3] = { edx, ecx, ext2 };
+    uint32_t words[4], max, unused;
     uint64_t m = 0;
 
+    cpu_x86_cpuid(env, 0, 0, &max, &unused, &unused, &unused);
+    cpu_x86_cpuid(env, 1, 0, &unused, &unused, &words[1], &words[0]);
+    cpu_x86_cpuid(env, 0x80000001, 0, &unused, &unused, &unused, &words[2]);
+    /* Past the maximum leaf, CPUID answers the maximum's (qemu32: 4). */
+    words[3] = 0;
+    if (max >= 7) {
+        cpu_x86_cpuid(env, 7, 0, &unused, &words[3], &unused, &unused);
+    }
     for (int i = 0; i < ARRAY_SIZE(map); i++) {
         if (words[map[i].word] & map[i].bit) {
             m |= 1ull << map[i].pf;
         }
+    }
+    if ((words[1] & (CPUID_EXT_AVX | CPUID_EXT_OSXSAVE)) ==
+        (CPUID_EXT_AVX | CPUID_EXT_OSXSAVE)) {
+        m |= 1ull << PF_AVX_INSTRUCTIONS_AVAILABLE;
     }
     return m;
 }
