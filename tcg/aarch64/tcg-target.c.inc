@@ -6440,23 +6440,26 @@ static void tcg_target_init(TCGContext *s)
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X20);
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X21);
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X22);
-#ifndef __arm64ec__
     /*
      * ARM64EC code doesn't use x23, x24 or x28, so a helper leaves them
-     * alone, but Windows may lose them while it runs: a context captured
-     * asynchronously (an exception, an APC, a suspension) goes through the
-     * x64 context, which has no place for them.  No value lives in them
-     * across a call.
+     * alone, and Windows keeps them across system calls, faults and
+     * preemption.  It loses them only where it applies an x64 context,
+     * which has no place for them, at a point where the thread is
+     * consistent: never while the engine runs (the doorbell is answered
+     * at a TB's exit).  Under ARM64EC, x23 and x24 still hold nothing
+     * across a call: the native-exit path uses x23 as scratch, and
+     * keeping them would gain nothing measurable.  x28 does, for the
+     * return stack's top, which the prologue reloads on every entry and
+     * a guard fault repairs.
      */
+#ifndef __arm64ec__
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X23);
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X24);
 #endif
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X25);
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X26);
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X27);
-#ifndef __arm64ec__
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X28);
-#endif
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X29);
 
     /* The guest access slow paths save the vector registers themselves. */
@@ -6653,13 +6656,12 @@ static void tcg_target_qemu_prologue(TCGContext *s)
          */
 #ifdef __arm64ec__
         /*
-         * x28 doesn't survive helper calls in ARM64EC code (see
-         * tcg_target_init).  ARM64EC's only user mode is x64's, with
-         * 64-bit addresses and no guest base: x28 isn't needed, and the
-         * return stack stays in memory.
+         * ARM64EC's only user mode is x64's, with 64-bit addresses and no
+         * guest base: x28 holds the return stack's top (see
+         * tcg_target_init).
          */
         g_assert(guest_base == 0);
-#else
+#endif
         if (tcg_retstack && tcg_retsp_off && tcg_retstack_addr64 &&
             !guest_base) {
             /* Guest addresses don't use it: it holds the return stack. */
@@ -6668,7 +6670,6 @@ static void tcg_target_qemu_prologue(TCGContext *s)
             tcg_out_movi(s, TCG_TYPE_PTR, TCG_REG_GUEST_BASE, guest_base);
         }
         tcg_regset_set_reg(s->reserved_regs, TCG_REG_GUEST_BASE);
-#endif
     }
 
     tcg_out_mov(s, TCG_TYPE_PTR, TCG_AREG0, tcg_target_call_iarg_regs[0]);
