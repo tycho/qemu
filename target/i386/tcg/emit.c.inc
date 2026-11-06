@@ -705,8 +705,10 @@ static bool gen_fp_native_3(DisasContext *s, X86DecodedInsn *decode,
 }
 
 /*
- * The scalar forms work on element 0 of 128-bit vectors, and the host
- * operation leaves the other elements as x86 wants them (FPCR.NEP).
+ * Whether one host operation can be emitted at 128 bits.  The scalar forms
+ * work on element 0 of 128-bit vectors, and the host operation leaves the
+ * other elements as x86 wants them (FPCR.NEP); the conversions between
+ * doubles and int32s change the element size, so they check each step.
  */
 static bool fp_native_s(TCGOpcode opc, unsigned vece)
 {
@@ -2555,9 +2557,79 @@ DUP_SSE(VMOVSLDUP, pmovsldup, MO_32, PERM4(0, 0, 2, 2))
 DUP_SSE(VMOVSHDUP, pmovshdup, MO_32, PERM4(1, 1, 3, 3))
 DUP_SSE(VMOVDDUP,  pmovdldup, MO_64, PERM2(0, 0))
 
-UNARY_INT_SSE(VCVTDQ2PD, cvtdq2pd)
-UNARY_INT_SSE(VCVTPD2DQ, cvtpd2dq)
-UNARY_INT_SSE(VCVTTPD2DQ, cvttpd2dq)
+/*
+ * x-ssefp=native, 128-bit forms: the low two int32s of op2, widened, to
+ * two doubles.  Every int32 is exactly a double: no rounding, no flags.
+ * op2 is the register, or the decoder's 64-bit load of the memory operand.
+ */
+static bool gen_cvtdq2pd_native(DisasContext *s, X86DecodedInsn *decode)
+{
+    TCGv_vec t;
+
+    if (s->vex_l || !fp_native_s(INDEX_op_widen_vec, MO_32) ||
+        !fp_native_s(INDEX_op_scvtf_vec, MO_64)) {
+        return false;
+    }
+    t = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(t, tcg_env, decode->op[2].offset);
+    tcg_gen_widen_vec(MO_32, t, t, true, false);
+    tcg_gen_scvtf_vec(MO_64, t, t);
+    tcg_gen_st_vec(t, tcg_env, decode->op[0].offset);
+    return true;
+}
+
+/*
+ * x-ssefp=native, 128-bit forms: op2's two doubles to int32s in the low 64
+ * bits, zeros above.  FRINT32 rounds each in MXCSR's mode (or toward zero)
+ * to an integral double in int32's range, raising x86's masked flags (IE
+ * for a NaN or an out-of-range value, where it gives -2^31; else PE when
+ * inexact).  The conversion to int64 is then exact, and narrowing keeps
+ * the low 32 bits: -2^31 becomes x86's integer indefinite 0x80000000.
+ * As for the other native operations, an unmasked exception is not raised.
+ */
+static bool gen_cvtpd2dq_native(DisasContext *s, X86DecodedInsn *decode,
+                                TCGFrint mode)
+{
+    TCGv_vec t;
+
+    if (s->vex_l || !fp_native_s(INDEX_op_frint32_vec, MO_64) ||
+        !fp_native_s(INDEX_op_fcvtzs_vec, MO_64) ||
+        !fp_native_s(INDEX_op_narrow_vec, MO_32)) {
+        return false;
+    }
+    t = tcg_temp_new_vec(TCG_TYPE_V128);
+    tcg_gen_ld_vec(t, tcg_env, decode->op[2].offset);
+    tcg_gen_frint32_vec(MO_64, t, t, mode);
+    tcg_gen_fcvtzs_vec(MO_64, t, t);
+    tcg_gen_narrow_vec(MO_32, t, t, tcg_constant_vec(TCG_TYPE_V128, MO_64, 0),
+                       TCG_NARROW_TRUNC, 0, false);
+    tcg_gen_st_vec(t, tcg_env, decode->op[0].offset);
+    return true;
+}
+
+static void gen_VCVTDQ2PD(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (!gen_cvtdq2pd_native(s, decode)) {
+        gen_unary_int_sse(s, decode, gen_helper_cvtdq2pd_xmm,
+                          gen_helper_cvtdq2pd_ymm);
+    }
+}
+
+static void gen_VCVTPD2DQ(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (!gen_cvtpd2dq_native(s, decode, TCG_FRINT_CURRENT)) {
+        gen_unary_int_sse(s, decode, gen_helper_cvtpd2dq_xmm,
+                          gen_helper_cvtpd2dq_ymm);
+    }
+}
+
+static void gen_VCVTTPD2DQ(DisasContext *s, X86DecodedInsn *decode)
+{
+    if (!gen_cvtpd2dq_native(s, decode, TCG_FRINT_ZERO)) {
+        gen_unary_int_sse(s, decode, gen_helper_cvttpd2dq_xmm,
+                          gen_helper_cvttpd2dq_ymm);
+    }
+}
 
 /*
  * r is the host's conversion of a to int32.  Where a is a NaN or too
