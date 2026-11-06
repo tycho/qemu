@@ -24,4 +24,12 @@ extern unsigned cpuinfo;
  */
 unsigned cpuinfo_init(void);
 
+#ifdef _WIN32
+/*
+ * CTR_EL0, which Windows doesn't let user mode read, from the registry;
+ * 0 if Windows doesn't list it.
+ */
+uint64_t cpuinfo_win32_ctr_el0(void);
+#endif
+
 #endif /* HOST_CPUINFO_H */
