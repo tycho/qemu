@@ -119,11 +119,17 @@ void tcg_retstack_bump(CPUState *cpu);
 #define TCG_RETSTACK_TAGS 128
 void tcg_retstack_reset(CPUState *cpu);
 /*
- * A fault at @addr in generated code: if it is on a guard page of @cpu's
- * return stack (pushed or popped past an end), the top to retry with,
- * else 0.
+ * Whether the insn at @pc in the code buffer is a return stack push or
+ * pop with its top in tcg_retstack_reg.
  */
-uintptr_t tcg_retstack_fault(CPUState *cpu, uintptr_t addr);
+bool tcg_retstack_access(uintptr_t pc);
+/*
+ * A fault at @addr by the insn at @pc in generated code: if that insn is
+ * a return stack push or pop and @addr is on a guard page of @cpu's ring
+ * (pushed or popped past an end), the top to retry with, else 0.  A
+ * guest access that happens to address a guard page is the guest's own.
+ */
+uintptr_t tcg_retstack_fault(CPUState *cpu, uintptr_t pc, uintptr_t addr);
 
 /*
  * tcg_tb_flags_canon: targets leave out of a TB's flags the state that

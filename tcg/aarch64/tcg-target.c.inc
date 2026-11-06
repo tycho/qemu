@@ -2316,6 +2316,23 @@ static void tcg_out_ret_tb(TCGContext *s, TCGReg key, unsigned tag)
     tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
 }
 
+/*
+ * Whether the insn at @pc, in the code buffer, is one of the return
+ * stack's own accesses with its top in tcg_retstack_reg: a push
+ * (STP Xt, Xt2, [top, #-16]!) or a pop (LDP Xt, Xt2, [top], #16).
+ */
+bool tcg_retstack_access(uintptr_t pc)
+{
+    const uint32_t rn = (uint32_t)tcg_retstack_reg << 5;
+    uint32_t insn;
+
+    if (tcg_retstack_reg < 0) {
+        return false;
+    }
+    insn = *(const uint32_t *)pc & 0xffff83e0;
+    return insn == (0xa9bf0000 | rn) || insn == (0xa8c10000 | rn);
+}
+
 static void tcg_out_goto_ptr(TCGContext *s, TCGReg a0)
 {
     tcg_out_insn(s, bcond_reg, BR, a0);
