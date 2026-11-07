@@ -378,17 +378,66 @@ bool xt_cpu_avx(void)
 }
 #endif
 
+/* The model's answers, which Windows asks for before the first CPU exists. */
+static uint64_t model_features(void)
+{
+    return xt_cpu_avx() ? MODEL_FEATURES_AVX2 : MODEL_FEATURES;
+}
+
+/*
+ * The save state the module's contexts carry for the model: x87 and SSE,
+ * and the YMM upper halves in the x64 module's AVX models.
+ */
+static uint64_t context_xstate(void)
+{
+    return XSTATE_FP_MASK | XSTATE_SSE_MASK |
+           (xt_cpu_avx() ? XSTATE_YMM_MASK : 0);
+}
+
+/*
+ * Whether the first CPU says what the module told Windows before it
+ * existed, and has no state Windows' contexts would lose: XCR0's
+ * components, the ones leaf 0xD offers and no supervisor ones.  Windows
+ * keeps the early answers, so a CPU that differs can't run the process.
+ * REASON says what differed.
+ */
+bool xt_cpu_check(CPUState *cs, char *reason, size_t len)
+{
+    CPUX86State *env = cpu_env(cs);
+    uint64_t m = cpuid_features(env), model = model_features();
+    uint64_t carried = context_xstate();
+    uint32_t max, eax, ebx, ecx, edx;
+
+    if (m != model) {
+        snprintf(reason, len, "features %016" PRIx64 ", told Windows %016"
+                 PRIx64, m, model);
+        return false;
+    }
+    if (env->xcr0 & ~carried) {
+        snprintf(reason, len, "xcr0 %" PRIx64, env->xcr0);
+        return false;
+    }
+    cpu_x86_cpuid(env, 0, 0, &max, &ebx, &ecx, &edx);
+    if (max >= 0xd) {
+        cpu_x86_cpuid(env, 0xd, 0, &eax, &ebx, &ecx, &edx);
+        if (((uint64_t)edx << 32 | eax) & ~carried) {
+            snprintf(reason, len, "xsave components %08x%08x", edx, eax);
+            return false;
+        }
+        cpu_x86_cpuid(env, 0xd, 1, &eax, &ebx, &ecx, &edx);
+        if (ecx | edx) {
+            snprintf(reason, len, "supervisor xsave components %08x%08x",
+                     edx, ecx);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The model's answers: the first CPU's, as xt_cpu_check makes sure. */
 BOOLEAN xt_feature_present(UINT feature)
 {
-    CPUState *cs = first_cpu;
-    uint64_t model = xt_cpu_avx() ? MODEL_FEATURES_AVX2 : MODEL_FEATURES;
-    uint64_t m = model;
-
-    if (cs) {
-        m = cpuid_features(cpu_env(cs));
-        assert(m == model);
-    }
-    return feature < 64 && (m >> feature) & 1;
+    return feature < 64 && (model_features() >> feature) & 1;
 }
 
 /*

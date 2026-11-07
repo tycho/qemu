@@ -49,6 +49,7 @@ NTSTATUS NTAPI NtAllocateVirtualMemory(HANDLE, PVOID *, ULONG_PTR, PSIZE_T,
                                        ULONG, ULONG);
 NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, PVOID, int, PVOID, SIZE_T,
                                     PSIZE_T);
+NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
 
 /*
  * The mmap lock: recursive per thread, as in linux-user/mmap.c.  It
@@ -586,6 +587,7 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     AccelState *accel;
     AccelClass *ac;
     CPUState *first;
+    char reason[96];
 
     qemu_mutex_init(&mmap_mutex);
     qemu_mutex_init(&cpu_create_mutex);
@@ -627,6 +629,13 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
 
     /* The prologue needs a CPU; it becomes the first thread's. */
     first = xt_cpu_new();
+    if (!xt_cpu_check(first, reason, sizeof(reason))) {
+        g_autofree char *line = g_strdup_printf("cpu-model refused: %s\n",
+                                                reason);
+
+        xt_log_text(line);
+        NtTerminateProcess(GetCurrentProcess(), STATUS_NOT_SUPPORTED);
+    }
     tcg_prologue_init();
     xt_spare_cpu = first;
     return 0;

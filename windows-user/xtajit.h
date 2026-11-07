@@ -318,6 +318,7 @@ void xt_note_read_file(void *addr, SIZE_T len, BOOL after, NTSTATUS status);
 bool xt_unprotect_for_native(vaddr addr);
 bool xt_guard_restore(vaddr addr);
 BOOLEAN xt_feature_present(UINT feature);
+bool xt_cpu_check(CPUState *cs, char *reason, size_t len);
 void xt_processor_info(void *info, USHORT arch);
 /*
  * wow64.c, arm64ec.c: a scope of the engine's own work outside
