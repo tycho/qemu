@@ -158,6 +158,48 @@ static void set_region_flags(vaddr start, vaddr last, int flags)
 }
 
 /*
+ * A refreshed region's flags, except on the pages QEMU write-protected for
+ * its translations where Windows still shows the protection QEMU left
+ * (their flags without write): those keep their flags, PAGE_WRITE_ORG
+ * included, as the refreshed page itself does.  One allocation can hold
+ * such pages next to pages the guest made read-only or executable, and
+ * Windows reports them all as one region.
+ */
+static void refresh_region_flags(vaddr start, vaddr last, int flags)
+{
+    int now = flags & (PAGE_VALID | PAGE_RWX | PAGE_WRITE_ORG);
+    vaddr from = start;
+
+    while (from <= last) {
+        XtUnprotect u = { from, last };
+        vaddr p;
+        int keep = now;
+
+        if (!walk_memory_regions(&u, xt_find_protected)) {
+            break;
+        }
+        p = u.found & TARGET_PAGE_MASK;
+#ifdef TARGET_X86_64
+        if (xt_is_ec_code(p)) {
+            keep &= ~PAGE_EXEC;
+        }
+#endif
+        if (keep ==
+            (page_get_flags(p) & (PAGE_VALID | PAGE_READ | PAGE_EXEC))) {
+            if (p > from) {
+                set_region_flags(from, p - 1, flags);
+            }
+        } else {
+            set_region_flags(from, p | ~TARGET_PAGE_MASK, flags);
+        }
+        from = p + TARGET_PAGE_SIZE;
+    }
+    if (from <= last) {
+        set_region_flags(from, last, flags);
+    }
+}
+
+/*
  * Bring QEMU's page flags for ADDR's page up to date with Windows; true if
  * the access is allowed now, by the flags as they stand under the mmap
  * lock, and *CHANGED if this refresh changed them.  QEMU's flags are
@@ -177,9 +219,18 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
     want = access == MMU_INST_FETCH ? PAGE_EXEC
          : access == MMU_DATA_STORE ? PAGE_WRITE_ORG : PAGE_READ;
     *changed_out = false;
-    if (addr > guest_addr_max ||
-        NtQueryVirtualMemory(GetCurrentProcess(), (void *)(uintptr_t)addr,
+    if (addr > guest_addr_max) {
+        return false;
+    }
+    /*
+     * Query under the lock that QEMU's own protection changes hold, so
+     * that a protection QEMU makes between the query and the flags'
+     * update can't be overwritten by what Windows showed before it.
+     */
+    mmap_lock();
+    if (NtQueryVirtualMemory(GetCurrentProcess(), (void *)(uintptr_t)addr,
                              0, &mbi, sizeof(mbi), NULL) < 0) {
+        mmap_unlock();
         return false;
     }
     start = (uintptr_t)mbi.BaseAddress;
@@ -202,7 +253,6 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
         }
     }
 
-    mmap_lock();
     old = page_get_flags(addr) &
           (PAGE_VALID | PAGE_RWX | PAGE_WRITE_ORG | PAGE_FIXED_CODE);
     page = flags;
@@ -221,7 +271,7 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
             xt_event(xt_self, XT_EV_REFRESH, old << 16 | page | fixed, addr);
         }
         if (flags) {
-            set_region_flags(start, last, flags | fixed);
+            refresh_region_flags(start, last, flags | fixed);
         } else {
             page_set_flags(start, last, 0, PAGE_VALID);
         }
@@ -231,6 +281,44 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
 
     *changed_out = changed;
     return allowed;
+}
+
+/* The flags are filled lazily (xt_mem_refresh). */
+bool page_refresh_flags(vaddr address, MMUAccessType access)
+{
+    bool changed;
+
+    return xt_mem_refresh(address, access, &changed);
+}
+
+/*
+ * A write Windows refused, on a page QEMU's flags show writable: true if
+ * Windows refuses it still, so the flags are stale (a change made without
+ * a notification, such as another process's), and refreshes them.  False
+ * if Windows allows the write now (another thread lifted QEMU's write
+ * protection in between), or if the flags don't show the page writable
+ * (QEMU's write protection, page_unprotect's to lift).  QEMU clears
+ * PAGE_WRITE under the mmap lock before it write-protects a page, so the
+ * flags and Windows' protection are compared under it.
+ */
+bool xt_mem_stale_write(vaddr addr)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    bool stale = false, changed;
+
+    mmap_lock();
+    if (page_get_flags(addr) & PAGE_WRITE) {
+        stale = NtQueryVirtualMemory(GetCurrentProcess(),
+                                     (void *)(uintptr_t)addr, 0, &mbi,
+                                     sizeof(mbi), NULL) < 0 ||
+                mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) ||
+                !(prot_flags(mbi.Protect) & PAGE_WRITE);
+        if (stale) {
+            xt_mem_refresh(addr, MMU_DATA_STORE, &changed);
+        }
+    }
+    mmap_unlock();
+    return stale;
 }
 
 /*

@@ -236,6 +236,7 @@ XtCpuModel xt_cpu_x64_model(void);
 bool xt_cpu_avx(void);
 void *xt_alloc_low(size_t len);
 bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed);
+bool xt_mem_stale_write(vaddr addr);
 void xt_invalidate(vaddr start, vaddr len);
 
 /* thread.c */
