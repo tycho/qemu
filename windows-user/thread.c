@@ -767,6 +767,7 @@ static const char *const ev_names[XT_EV__MAX] = {
     [XT_EV_MEMNOTE] = "memnote",
     [XT_EV_REFRESH] = "refresh",
     [XT_EV_REAP] = "reap",
+    [XT_EV_CROSS] = "cross",
 };
 
 static void put(HANDLE h, const char *s, int n)

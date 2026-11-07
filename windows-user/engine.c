@@ -622,6 +622,12 @@ void xt_invalidate(vaddr start, vaddr len)
 
 CPUState *xt_spare_cpu;
 static int applied, rejected;
+/*
+ * crossinline: keep ordered accesses' inline crossing test (measuring);
+ * crossprobefault: the probe meets a fault (testing xt_cross_probe).
+ */
+static bool cross_inline, cross_probe_fault;
+static char cross_desc[160];
 
 static void set_settings(Object *accel, const char *settings)
 {
@@ -635,6 +641,16 @@ static void set_settings(Object *accel, const char *settings)
             /* nochain: no direct jumps between TBs, as -d nochain. */
             if (!strcmp(kv[i], "nochain")) {
                 qemu_loglevel |= CPU_LOG_TB_NOCHAIN;
+                applied++;
+            } else if (!strcmp(kv[i], "crossinline")) {
+                cross_inline = true;
+                applied++;
+            } else if (!strcmp(kv[i], "crossprobefault")) {
+                cross_probe_fault = true;
+                applied++;
+            } else if (!strcmp(kv[i], "crossinject")) {
+                /* Testing the crossing fault's path (xt_cross_inject). */
+                xt_cross_inject = true;
                 applied++;
             } else {
                 rejected++;
@@ -685,6 +701,11 @@ static void log_settings(Object *accel)
     head = g_strdup_printf("effective pin-user=%d lazysync-user=%d "
                            "fault-context-partial=%d\n", tcg_pin_user,
                            tcg_lazysync_user, xt_fault_context_partial);
+    xt_log_text(head);
+    g_free(head);
+    head = g_strdup_printf("tso-cross probe: %s; inline test %s%s\n",
+                           cross_desc, tcg_tso_cross_faults ? "off" : "on",
+                           cross_inline ? " (crossinline)" : "");
     xt_log_text(head);
 }
 
@@ -744,6 +765,16 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     if (xt_native_harness) {
         tcg_retstack = false;
     }
+    /*
+     * Ordered accesses (x-tso=acqrel) that cross 16 bytes: where this host
+     * performs them, generated code doesn't test for a crossing, and the
+     * fault path still promotes one that faults (xt_fault_redirect), as
+     * linux-user's SIGBUS handler does.  Where the probe saw a fault, or
+     * couldn't run, the inline test stays.
+     */
+    tcg_tso_cross_faults = xt_cross_probe(cross_probe_fault, cross_desc,
+                                          sizeof(cross_desc)) == 0 &&
+                           !cross_inline;
     ac->init_machine(accel, NULL);
     log_settings(OBJECT(accel));
     if (n_applied) {
