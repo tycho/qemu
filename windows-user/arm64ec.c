@@ -13,6 +13,7 @@
 #include "hw/core/cpu.h"
 #include "cpu.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 #include "exec/mmap-lock.h"
 #include "accel/tcg/tb-context.h"
 #include "exec/page-protection.h"
@@ -498,6 +499,24 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
         qatomic_set(area->SuspendDoorbell, 0);
         native->Pc = (uintptr_t)xt_ec_exit_resume_point;
         xt_continue_native(native);
+    }
+    /*
+     * Generated code's return stack push or pop ran into its ring's guard
+     * pages: back to the ring's middle, as linux-user's signal handler
+     * does.  Its top is in tcg_retstack_reg, which the full native context
+     * carries.
+     */
+    if (t && t == xt_self && t->state != XT_WINDOWS && tcg_retstack_reg >= 0 &&
+        er->ExceptionCode == STATUS_ACCESS_VIOLATION &&
+        er->NumberParameters >= 2 &&
+        in_code_gen_buffer((void *)(uintptr_t)native->Pc)) {
+        uintptr_t top = tcg_retstack_fault(t->cpu, native->Pc,
+                                           er->ExceptionInformation[1]);
+
+        if (top) {
+            native->X[tcg_retstack_reg] = top;
+            xt_continue_native(native);
+        }
     }
     if (t && t == xt_self && t->state != XT_WINDOWS) {
         bool prev = area->InSyscallCallback;
@@ -1133,6 +1152,7 @@ XTEXPORT int xt_ec_test_init(int *rejected)
         return -1;
     }
     xt_fault_context_partial = !harness_pin();
+    xt_native_harness = true;
     if (!init_syscalls() || process_init() < 0) {
         return -1;
     }

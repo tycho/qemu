@@ -220,6 +220,8 @@ int xt_engine_init(const char *settings, int *applied, int *rejected);
  * and lazy sync are off.
  */
 extern bool xt_fault_context_partial;
+/* The x64 module runs under its native test harness (xt_ec_test_init). */
+extern bool xt_native_harness;
 CPUState *xt_cpu_new(void);
 void xt_cpu_free(CPUState *cs);
 extern const char *xt_cpu_model;   /* -cpu syntax; set before init */

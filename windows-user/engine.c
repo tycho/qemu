@@ -582,6 +582,7 @@ static void log_settings(Object *accel)
 }
 
 bool xt_fault_context_partial;
+bool xt_native_harness;
 
 /*
  * The process-wide bring-up, as linux-user's main() without a loader:
@@ -624,6 +625,16 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     if (!xt_fault_context_partial) {
         tcg_lazysync_user = tcg_lazysync;
         tcg_pin_user = tcg_pin;
+    }
+    /*
+     * The x64 module's native harness resumes generated code and helpers
+     * through the x64 view of their context (xt_ec_veh), which has no
+     * register for the return stack's top, and its faults don't reach
+     * ResetToConsistentState: no return stack, whatever the settings say.
+     * Before the first CPU, whose prologue would take the register.
+     */
+    if (xt_native_harness) {
+        tcg_retstack = false;
     }
     ac->init_machine(accel, NULL);
     log_settings(OBJECT(accel));
