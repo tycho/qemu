@@ -225,7 +225,14 @@ extern bool xt_native_harness;
 CPUState *xt_cpu_new(void);
 void xt_cpu_free(CPUState *cs);
 extern const char *xt_cpu_model;   /* -cpu syntax; set before init */
-/* The x64 module's AVX2 model (XTAJIT_CPU=avx2), decided once. */
+/* The x64 module's CPU model (XTAJIT_CPU), decided once. */
+typedef enum XtCpuModel {
+    XT_CPU_SSE,
+    XT_CPU_AVX2,
+    XT_CPU_MAX,
+} XtCpuModel;
+XtCpuModel xt_cpu_x64_model(void);
+/* Whether the model has AVX: the AVX2 and max models. */
 bool xt_cpu_avx(void);
 void *xt_alloc_low(size_t len);
 bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed);
@@ -331,6 +338,7 @@ void xt_note_read_file(void *addr, SIZE_T len, BOOL after, NTSTATUS status);
 bool xt_unprotect_for_native(vaddr addr);
 bool xt_guard_restore(vaddr addr);
 BOOLEAN xt_feature_present(UINT feature);
+bool xt_cpu_check(CPUState *cs, char *reason, size_t len);
 void xt_processor_info(void *info, USHORT arch);
 /*
  * wow64.c, arm64ec.c: a scope of the engine's own work outside

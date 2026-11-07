@@ -49,6 +49,7 @@ NTSTATUS NTAPI NtAllocateVirtualMemory(HANDLE, PVOID *, ULONG_PTR, PSIZE_T,
                                        ULONG, ULONG);
 NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, PVOID, int, PVOID, SIZE_T,
                                     PSIZE_T);
+NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
 
 /*
  * The mmap lock: recursive per thread, as in linux-user/mmap.c.  It
@@ -453,8 +454,23 @@ static QemuMutex cpu_create_mutex;
  * The guest's CPU: QEMU's qemu32 or qemu64 with the features Windows on
  * Arm's own x86 emulator offers, all of which TCG implements.  WOW64's
  * has no XSAVE or AVX: its context has no place for the YMM state.  The
- * x64 module's AVX2 model (xt_cpu_avx) adds what Windows' emulator offers
- * x64 code, but RDRAND and FSGSBASE (which would move GS off the TEB).
+ * x64 module's AVX2 model adds what Windows' emulator offers x64 code,
+ * but RDRAND and FSGSBASE (which would move GS off the TEB).
+ *
+ * Its max model is QEMU's, without what Windows' x64 contexts can't
+ * carry or the module can't give:
+ *   - APX, MPX and PKU: their XSAVE state would be live and lost at every
+ *     context Windows saves, edits or restores (without APX alone, max
+ *     picks MPX);
+ *   - FSGSBASE: a GS base the guest set wouldn't survive a context, which
+ *     takes GS from the TEB;
+ *   - RDRAND and RDSEED: QEMU takes their numbers from the host's
+ *     generator through a call the module's runtime doesn't provide;
+ *   - MONITOR and MWAIT: kernel instructions in practice;
+ *   - ERMS and the fast short string features (FSRM, FZRM, FSRS, FSRC):
+ *     REP MOVS and STOS take a helper call and more per instruction, so
+ *     code these lead to string instructions is slower than the vector
+ *     loops it would otherwise use.
  */
 #ifdef TARGET_X86_64
 #define XT_CPU_X64                                                      \
@@ -464,6 +480,9 @@ const char *xt_cpu_model = XT_CPU_X64;
 static const char xt_cpu_model_avx2[] =
     XT_CPU_X64 ",xsave=on,avx=on,avx2=on,fma=on,f16c=on,bmi1=on,bmi2=on,"
     "movbe=on,abm=on";
+static const char xt_cpu_model_max[] =
+    "max,apxf=off,mpx=off,pku=off,fsgsbase=off,rdrand=off,rdseed=off,"
+    "monitor=off,erms=off,fsrm=off,fzrm=off,fsrs=off,fsrc=off";
 #else
 const char *xt_cpu_model =
     "qemu32,ssse3=on,sse4.1=on,sse4.2=on,popcnt=on,aes=on,pclmulqdq=on,"
@@ -595,6 +614,7 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     AccelState *accel;
     AccelClass *ac;
     CPUState *first;
+    char reason[96];
 
     qemu_mutex_init(&mmap_mutex);
     qemu_mutex_init(&cpu_create_mutex);
@@ -644,10 +664,19 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     }
 
 #ifdef TARGET_X86_64
-    if (xt_cpu_avx()) {
+    switch (xt_cpu_x64_model()) {
+    case XT_CPU_SSE:
+        xt_log_text("cpu-model sse\n");
+        break;
+    case XT_CPU_AVX2:
         xt_cpu_model = xt_cpu_model_avx2;
+        xt_log_text("cpu-model avx2\n");
+        break;
+    case XT_CPU_MAX:
+        xt_cpu_model = xt_cpu_model_max;
+        xt_log_text("cpu-model max\n");
+        break;
     }
-    xt_log_text(xt_cpu_avx() ? "cpu-model avx2\n" : "cpu-model sse\n");
 #endif
     cpu_type = parse_cpu_option(xt_cpu_model);
 
@@ -657,6 +686,13 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
 
     /* The prologue needs a CPU; it becomes the first thread's. */
     first = xt_cpu_new();
+    if (!xt_cpu_check(first, reason, sizeof(reason))) {
+        g_autofree char *line = g_strdup_printf("cpu-model refused: %s\n",
+                                                reason);
+
+        xt_log_text(line);
+        NtTerminateProcess(GetCurrentProcess(), STATUS_NOT_SUPPORTED);
+    }
     tcg_prologue_init();
     xt_spare_cpu = first;
     return 0;
