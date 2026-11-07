@@ -93,8 +93,13 @@ static void G_NORETURN xt_fault_continue(XtThread *t, XtActive prev)
         f->busy = 0;
         tb_smc_check_fault(cs);
     }
+    /*
+     * QEMU's write protection, page_unprotect's to lift; not a write to a
+     * page whose flags are stale, which page_unprotect would take for
+     * another thread's unprotect and resume for ever.
+     */
     if (f->is_write && f->code == STATUS_ACCESS_VIOLATION &&
-        f->kind != XT_FK_TRANSLATE) {
+        f->kind != XT_FK_TRANSLATE && !xt_mem_stale_write(f->addr)) {
         int r = page_unprotect(cs, f->addr, f->host_pc);
 
         xt_event(t, XT_EV_SMC, r, f->addr);
