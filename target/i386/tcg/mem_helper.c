@@ -143,6 +143,38 @@ static uint64_t rep_room(vaddr addr, target_ulong reg, uint64_t amask,
     return n;
 }
 
+#ifdef CONFIG_USER_ONLY
+/*
+ * A round's first element in guest order, by itself: if its page refuses
+ * the access, the host faults here, at the element's address and before
+ * anything of the round is written, as the element loop would.  The bulk
+ * copy touches the round in its own order (a fill from the lowest
+ * address, head and tail first).  @s is NULL for STOS, whose element is
+ * the low @size bytes of @pat, little-endian.  Single-byte atomic
+ * accesses, which the compiler can neither drop nor merge into the bulk
+ * copy, with compiler barriers to keep them in order: the first byte
+ * first, all loads before any store.
+ */
+static void rep_first(uint8_t *d, const uint8_t *s, uint64_t pat, int size)
+{
+    uint8_t v[8];
+    int i;
+
+    v[0] = s ? qatomic_read(&s[0]) : pat;
+    barrier();
+    for (i = 1; i < size; i++) {
+        v[i] = s ? qatomic_read(&s[i]) : pat >> (8 * i);
+    }
+    barrier();
+    qatomic_set(&d[0], v[0]);
+    barrier();
+    for (i = 1; i < size; i++) {
+        qatomic_set(&d[i], v[i]);
+    }
+    barrier();
+}
+#endif
+
 uint32_t helper_rep_fast(CPUX86State *env, uint32_t desc)
 {
     MemOp ot = extract32(desc, 0, 2);
@@ -187,8 +219,8 @@ uint32_t helper_rep_fast(CPUX86State *env, uint32_t desc)
         vaddr src = rep_linear(rsi, amask, src_base,
                                env->segs[src_seg].base, code64);
         uint64_t n = count;
-        uint64_t bytes;
-        void *hd, *hs = NULL;
+        uint64_t bytes, rest;
+        uint8_t *hd, *hs = NULL;
 
         /* Within a page, without wrapping the register or the address. */
         n = MIN(n, rep_room(dst, rdi, amask, size, code64, down));
@@ -238,17 +270,28 @@ uint32_t helper_rep_fast(CPUX86State *env, uint32_t desc)
             }
         }
         set_helper_retaddr(ra);
+        rest = bytes;
+#ifdef CONFIG_USER_ONLY
+        /* Up, the rest follows the first element; down, it lies below. */
+        rep_first(down ? hd + bytes - size : hd,
+                  movs ? (down ? hs + bytes - size : hs) : NULL, pat, size);
+        rest -= size;
+        if (!down) {
+            hd += size;
+            hs = movs ? hs + size : NULL;
+        }
+#endif
         if (movs) {
-            memmove(hd, hs, bytes);
+            memmove(hd, hs, rest);
         } else if (size == 1) {
-            memset(hd, (uint8_t)pat, bytes);
+            memset(hd, (uint8_t)pat, rest);
         } else {
             uint64_t i;
 
-            for (i = 0; i + 8 <= bytes; i += 8) {
+            for (i = 0; i + 8 <= rest; i += 8) {
                 memcpy(hd + i, &pat, 8);
             }
-            memcpy(hd + i, &pat, bytes - i);
+            memcpy(hd + i, &pat, rest - i);
         }
         clear_helper_retaddr();
         /* Writing a 32-bit address register zero-extends it, as x86 does. */
