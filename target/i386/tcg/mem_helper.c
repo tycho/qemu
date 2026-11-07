@@ -98,8 +98,13 @@ static void *rep_host(CPUX86State *env, vaddr addr, int len,
 {
 #ifdef CONFIG_USER_ONLY
     int need = type == MMU_DATA_STORE ? PAGE_WRITE : PAGE_READ;
+    int flags = page_get_flags(addr);
 
-    if ((page_get_flags(addr) & (PAGE_VALID | need)) != (PAGE_VALID | need)) {
+    /* Flags kept lazily are filled here, not only when a probe misses. */
+    if (!(flags & PAGE_VALID) && page_refresh_flags(addr, type)) {
+        flags = page_get_flags(addr);
+    }
+    if ((flags & (PAGE_VALID | need)) != (PAGE_VALID | need)) {
         return NULL;
     }
     return g2h(env_cpu(env), addr);
