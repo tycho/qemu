@@ -944,8 +944,9 @@ static void ec_window_edits(const ARM64_NT_CONTEXT *kept, CONTEXT *c)
  * RSP; a handler may move RIP past a faulting instruction): EFLAGS but
  * NZCV and TF.  The YMM upper halves come from its extended part, which
  * Windows fills from the continued context; v16-v31 hold nothing here
- * after a system call.  The x87 state stays the engine's: Windows
- * carries no control, status or tag word.
+ * after a system call.  ST0-ST7 (MM0-MM7) come from its FltSave, which
+ * Windows fills from the packed form's places for them; their control,
+ * status and tag words stay the engine's, as Windows carries none.
  */
 #define MXCSR_CARRIED 0xe03f
 void xt_ec_begin(void)
@@ -996,6 +997,8 @@ void xt_ec_begin(void)
          */
         uint32_t edited = MXCSR_CARRIED & (w->MxCsr ^ c.MxCsr);
 
+        memcpy(c.FltSave.FloatRegisters, w->FltSave.FloatRegisters,
+               sizeof(c.FltSave.FloatRegisters));
         memcpy(c.FltSave.XmmRegisters, w->FltSave.XmmRegisters,
                sizeof(c.FltSave.XmmRegisters));
         if (edited) {
