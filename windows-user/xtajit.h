@@ -90,6 +90,7 @@ typedef enum XtEv {
     XT_EV_MEMNOTE,          /* a = kind << 56 | prot << 32 | length, b = address */
     XT_EV_REFRESH,          /* a = old flags << 16 | new flags, b = address */
     XT_EV_REAP,             /* a = records freed, b = TLS blocks freed */
+    XT_EV_CROSS,            /* a = native code, b = guest pc: promoted */
     XT_EV__MAX,
 } XtEv;
 
@@ -113,6 +114,7 @@ typedef enum XtFaultKind {
     XT_FK_TRANSLATE,    /* the translator reading guest code */
     XT_FK_SMC,          /* a TB's entry check reading its guest code */
     XT_FK_ADAPTER,      /* xt_guest_read */
+    XT_FK_CROSS,        /* an ordered access crossing 16 bytes faulted */
 } XtFaultKind;
 
 typedef struct XtFault {
@@ -222,6 +224,19 @@ int xt_engine_init(const char *settings, int *applied, int *rejected);
 extern bool xt_fault_context_partial;
 /* The x64 module runs under its native test harness (xt_ec_test_init). */
 extern bool xt_native_harness;
+/*
+ * Whether ordered accesses that cross 16 bytes fault on this host
+ * (fault.c): the number of forms tried that faulted or gave wrong bytes,
+ * 0 if every one was performed, -1 if the probe couldn't run; what it saw
+ * in DESC.  FAULT_TEST (testing) adds an access that faults.
+ */
+int xt_cross_probe(bool fault_test, char *desc, size_t len);
+bool xt_cross_probe_take(uint32_t code, uint64_t *pc);
+/*
+ * Testing only: a guard page's fault at an ordered access in generated
+ * code is handled as that access's crossing fault.
+ */
+extern bool xt_cross_inject;
 CPUState *xt_cpu_new(void);
 void xt_cpu_free(CPUState *cs);
 extern const char *xt_cpu_model;   /* -cpu syntax; set before init */

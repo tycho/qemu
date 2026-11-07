@@ -118,25 +118,6 @@ MMUAccessType adjust_signal_pc(uintptr_t *pc, bool is_write)
     return is_write ? MMU_DATA_STORE : MMU_DATA_LOAD;
 }
 
-#ifndef _WIN32
-/**
- * handle_sigsegv_accerr_write:
- * @cpu: the cpu context
- * @old_set: the sigset_t from the signal ucontext_t
- * @host_pc: the host pc, adjusted for the signal
- * @guest_addr: the guest address of the fault
- *
- * Return true if the write fault has been handled, and should be re-tried.
- *
- * Note that it is important that we don't call page_unprotect() unless
- * this is really a "write to nonwritable page" fault, because
- * page_unprotect() assumes that if it is called for an access to
- * a page that's writable this means we had two threads racing and
- * another thread got there first and already made the page writable;
- * so we will retry the access. If we were to call page_unprotect()
- * for some other kind of fault that should really be passed to the
- * guest, we'd end up in an infinite loop of retrying the faulting access.
- */
 bool tcg_tso_cross_fault(CPUState *cpu, uintptr_t fault_pc, uintptr_t host_pc)
 {
     TranslationBlock *tb;
@@ -163,6 +144,25 @@ bool tcg_tso_cross_fault(CPUState *cpu, uintptr_t fault_pc, uintptr_t host_pc)
     return true;
 }
 
+#ifndef _WIN32
+/**
+ * handle_sigsegv_accerr_write:
+ * @cpu: the cpu context
+ * @old_set: the sigset_t from the signal ucontext_t
+ * @host_pc: the host pc, adjusted for the signal
+ * @guest_addr: the guest address of the fault
+ *
+ * Return true if the write fault has been handled, and should be re-tried.
+ *
+ * Note that it is important that we don't call page_unprotect() unless
+ * this is really a "write to nonwritable page" fault, because
+ * page_unprotect() assumes that if it is called for an access to
+ * a page that's writable this means we had two threads racing and
+ * another thread got there first and already made the page writable;
+ * so we will retry the access. If we were to call page_unprotect()
+ * for some other kind of fault that should really be passed to the
+ * guest, we'd end up in an infinite loop of retrying the faulting access.
+ */
 bool handle_sigsegv_accerr_write(CPUState *cpu, sigset_t *old_set,
                                  uintptr_t host_pc, vaddr guest_addr)
 {

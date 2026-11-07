@@ -483,6 +483,10 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
     XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
     XtThread *t = area ? area->EmulatorData[0] : NULL;
 
+    /* The engine's start-up probe of crossing accesses (xt_cross_probe). */
+    if (xt_cross_probe_take(er->ExceptionCode, &native->Pc)) {
+        xt_continue_native(native);
+    }
     if (xt_ec_probe_rtcs(er, guest, native)) {
         xt_continue_native(native);
     }
