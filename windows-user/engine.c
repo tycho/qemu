@@ -177,9 +177,18 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
     want = access == MMU_INST_FETCH ? PAGE_EXEC
          : access == MMU_DATA_STORE ? PAGE_WRITE_ORG : PAGE_READ;
     *changed_out = false;
-    if (addr > guest_addr_max ||
-        NtQueryVirtualMemory(GetCurrentProcess(), (void *)(uintptr_t)addr,
+    if (addr > guest_addr_max) {
+        return false;
+    }
+    /*
+     * Query under the lock that QEMU's own protection changes hold, so
+     * that a protection QEMU makes between the query and the flags'
+     * update can't be overwritten by what Windows showed before it.
+     */
+    mmap_lock();
+    if (NtQueryVirtualMemory(GetCurrentProcess(), (void *)(uintptr_t)addr,
                              0, &mbi, sizeof(mbi), NULL) < 0) {
+        mmap_unlock();
         return false;
     }
     start = (uintptr_t)mbi.BaseAddress;
@@ -202,7 +211,6 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
         }
     }
 
-    mmap_lock();
     old = page_get_flags(addr) &
           (PAGE_VALID | PAGE_RWX | PAGE_WRITE_ORG | PAGE_FIXED_CODE);
     page = flags;
