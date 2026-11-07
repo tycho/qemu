@@ -290,17 +290,21 @@ static uint64_t cpuid_features(CPUX86State *env)
         { PF_COMPARE_EXCHANGE_DOUBLE, 0, CPUID_CX8 },
         { PF_MMX_INSTRUCTIONS_AVAILABLE, 0, CPUID_MMX },
         { PF_XMMI_INSTRUCTIONS_AVAILABLE, 0, CPUID_SSE },
+        { PF_3DNOW_INSTRUCTIONS_AVAILABLE, 2, CPUID_EXT2_3DNOW },
         { PF_RDTSC_INSTRUCTION_AVAILABLE, 0, CPUID_TSC },
         { PF_XMMI64_INSTRUCTIONS_AVAILABLE, 0, CPUID_SSE2 },
         { PF_NX_ENABLED, 2, CPUID_EXT2_NX },
         { PF_SSE3_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSE3 },
         { PF_COMPARE_EXCHANGE128, 1, CPUID_EXT_CX16 },
+        { PF_RDWRFSGSBASE_AVAILABLE, 3, CPUID_7_0_EBX_FSGSBASE },
+        { PF_RDRAND_INSTRUCTION_AVAILABLE, 1, CPUID_EXT_RDRAND },
         { PF_RDTSCP_INSTRUCTION_AVAILABLE, 2, CPUID_EXT2_RDTSCP },
         { PF_SSSE3_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSSE3 },
         { PF_SSE4_1_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSE41 },
         { PF_SSE4_2_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSE42 },
         { PF_XSAVE_ENABLED, 1, CPUID_EXT_OSXSAVE },
         { PF_AVX2_INSTRUCTIONS_AVAILABLE, 3, CPUID_7_0_EBX_AVX2 },
+        { PF_ERMS_AVAILABLE, 3, CPUID_7_0_EBX_ERMS },
     };
     uint32_t words[4], max, unused;
     uint64_t m = 0;
@@ -347,41 +351,70 @@ static uint64_t cpuid_features(CPUX86State *env)
     (MODEL_FEATURES | 1ull << PF_XSAVE_ENABLED |                         \
      1ull << PF_AVX_INSTRUCTIONS_AVAILABLE |                             \
      1ull << PF_AVX2_INSTRUCTIONS_AVAILABLE)
+#define MODEL_FEATURES_MAX                                               \
+    (MODEL_FEATURES_AVX2 | 1ull << PF_3DNOW_INSTRUCTIONS_AVAILABLE)
 
 #ifdef TARGET_X86_64
 NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
                                            SIZE_T, PSIZE_T);
 
 /*
- * XTAJIT_CPU=avx2 selects the x64 module's AVX2 model (a development
- * switch; sse or unset, the SSE model).  Decided at the first question,
- * which may come before the engine exists.
+ * XTAJIT_CPU selects the x64 module's model (a development switch): sse
+ * or unset, the SSE model; avx2, the AVX2 model; max, the max model.
+ * Decided at the first question, which may come before the engine exists.
  */
-bool xt_cpu_avx(void)
+XtCpuModel xt_cpu_x64_model(void)
 {
-    static int avx = -1;
+    static const struct {
+        const WCHAR *name;
+        SIZE_T len;
+    } names[] = {
+        [XT_CPU_SSE] = { L"sse", 3 },
+        [XT_CPU_AVX2] = { L"avx2", 4 },
+        [XT_CPU_MAX] = { L"max", 3 },
+    };
+    static int model = -1;
 
-    if (avx < 0) {
+    if (model < 0) {
         WCHAR w[8];
         SIZE_T n = 0;
+        int m = XT_CPU_SSE;
 
-        avx = RtlQueryEnvironmentVariable(NULL, L"XTAJIT_CPU", 10, w,
-                                          ARRAY_SIZE(w) - 1, &n) >= 0 &&
-              n == 4 && !memcmp(w, L"avx2", 4 * sizeof(WCHAR));
+        if (RtlQueryEnvironmentVariable(NULL, L"XTAJIT_CPU", 10, w,
+                                        ARRAY_SIZE(w) - 1, &n) >= 0) {
+            for (int i = 0; i < ARRAY_SIZE(names); i++) {
+                if (n == names[i].len &&
+                    !memcmp(w, names[i].name, n * sizeof(WCHAR))) {
+                    m = i;
+                }
+            }
+        }
+        model = m;
     }
-    return avx;
+    return model;
 }
 #else
-bool xt_cpu_avx(void)
+XtCpuModel xt_cpu_x64_model(void)
 {
-    return false;
+    return XT_CPU_SSE;
 }
 #endif
+
+bool xt_cpu_avx(void)
+{
+    return xt_cpu_x64_model() != XT_CPU_SSE;
+}
 
 /* The model's answers, which Windows asks for before the first CPU exists. */
 static uint64_t model_features(void)
 {
-    return xt_cpu_avx() ? MODEL_FEATURES_AVX2 : MODEL_FEATURES;
+    static const uint64_t features[] = {
+        [XT_CPU_SSE] = MODEL_FEATURES,
+        [XT_CPU_AVX2] = MODEL_FEATURES_AVX2,
+        [XT_CPU_MAX] = MODEL_FEATURES_MAX,
+    };
+
+    return features[xt_cpu_x64_model()];
 }
 
 /*
