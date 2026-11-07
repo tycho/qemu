@@ -14,6 +14,7 @@
 
 #include "exec/vaddr.h"
 #include "exec/translation-block.h"
+#include "exec/mmu-access-type.h"
 
 int page_unprotect(CPUState *cpu, tb_page_addr_t address, uintptr_t pc);
 
@@ -34,6 +35,19 @@ G_NORETURN void tb_smc_check_fault(CPUState *cpu);
 uintptr_t tb_smc_inline_fault(uintptr_t host_pc, uintptr_t host_addr);
 
 int page_get_flags(vaddr address);
+
+/**
+ * page_refresh_flags:
+ * @address: guest address
+ * @access: the access about to be made
+ *
+ * Fill or update the flags of @address's page from the host, for a user
+ * mode that keeps them lazily.  True if they now allow @access by the
+ * page's own protection (a store: PAGE_WRITE_ORG); QEMU may still have
+ * write-protected the page, so callers check the flags they need.  Where
+ * the flags are always current, this returns false.
+ */
+bool page_refresh_flags(vaddr address, MMUAccessType access);
 
 /**
  * page_set_flags:

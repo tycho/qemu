@@ -283,6 +283,14 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
     return allowed;
 }
 
+/* The flags are filled lazily (xt_mem_refresh). */
+bool page_refresh_flags(vaddr address, MMUAccessType access)
+{
+    bool changed;
+
+    return xt_mem_refresh(address, access, &changed);
+}
+
 /*
  * A write Windows refused, on a page QEMU's flags show writable: true if
  * Windows refuses it still, so the flags are stale (a change made without
