@@ -62,6 +62,12 @@ void mmap_fork_end(int child)
         pthread_mutex_unlock(&mmap_mutex);
 }
 
+/* The page flags follow every mapping change: nothing to refresh. */
+bool page_refresh_flags(vaddr address, MMUAccessType access)
+{
+    return false;
+}
+
 /* NOTE: all the constants are the HOST ones, but addresses are target. */
 int target_mprotect(abi_ulong start, abi_ulong len, int prot)
 {
