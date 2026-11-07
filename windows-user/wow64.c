@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "tcg/tcg-cache.h"
 #include "qemu/rcu.h"
 #include "qemu/atomic.h"
 #include "hw/core/cpu.h"
@@ -269,8 +270,15 @@ static void bring_out_others(void)
 
 XTEXPORT void WINAPI BTCpuProcessTerm(HANDLE h, BOOL after, ULONG status)
 {
+    static bool cache_stats_done;
+
     if (!after && !h && xt_tls_ready()) {
         bring_out_others();
+    }
+    if (!h && tcg_cache_mode && !cache_stats_done
+        && (tcg_cache_stats_at_exit || getenv("XTCG_CACHE_STATS"))) {
+        cache_stats_done = true;
+        tcg_cache_print_stats();
     }
     /* A process ending itself never returns from the "before" call. */
     if (xt_log_handle() && xt_tls_ready()) {

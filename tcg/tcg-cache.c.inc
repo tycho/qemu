@@ -1,0 +1,1109 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * Translation artifacts (tcg-cache.h): capture a TB as a self-contained
+ * record, and install a record again at another place in the code buffer.
+ * Included at the end of tcg.c, for the layout and the back end's
+ * decode, zero and apply (TCG_TARGET_HAS_CACHE).
+ */
+
+int tcg_cache_mode;
+static bool tcg_cache_verify_on;
+unsigned tcg_cache_skew;
+bool tcg_cache_stats_at_exit;
+bool tcg_cache_debug;
+TCGCacheStats tcg_cache_stats;
+
+const char *const tcg_cache_x_names[TCG_CACHE_X_MAX] = {
+    [TCG_CACHE_X_NONE] = "none",
+    [TCG_CACHE_X_SMC] = "smc",
+    [TCG_CACHE_X_REGION] = "region",
+    [TCG_CACHE_X_PROMOTED] = "promoted",
+    [TCG_CACHE_X_HOSTPTR] = "hostptr",
+    [TCG_CACHE_X_PLUGIN] = "plugin",
+    [TCG_CACHE_X_TORN] = "torn",
+    [TCG_CACHE_X_SPAN] = "span",
+    [TCG_CACHE_X_FAKE] = "fake",
+    [TCG_CACHE_X_UNKNOWN_REF] = "unknown-ref",
+    [TCG_CACHE_X_RAW_ADRP] = "raw-adrp",
+    [TCG_CACHE_X_ORR_PTR] = "orr-ptr",
+    [TCG_CACHE_X_POOL_MIX] = "pool-mix",
+    [TCG_CACHE_X_UNSUPPORTED] = "unsupported",
+    [TCG_CACHE_X_TOO_MANY] = "too-many",
+    [TCG_CACHE_X_PROV] = "prov",
+    [TCG_CACHE_X_LAZY] = "lazy",
+    [TCG_CACHE_X_VERIFY] = "verify",
+};
+
+/*
+ * XTCG_CACHE=capture|stress (development): record and check every
+ * translation, or also install each from its artifact.  XTCG_CACHE_SKEW=n
+ * moves each install by up to n 16-byte steps in each part.
+ */
+static void tcg_cache_init(void)
+{
+    const char *m = getenv("XTCG_CACHE");
+    const char *k = getenv("XTCG_CACHE_SKEW");
+
+    if (m && !strcmp(m, "capture")) {
+        tcg_cache_mode = TCG_CACHE_CAPTURE;
+    } else if (m && !strcmp(m, "stress")) {
+        tcg_cache_mode = TCG_CACHE_STRESS;
+    }
+    tcg_cache_verify_on = tcg_cache_mode != TCG_CACHE_OFF
+                          && !getenv("XTCG_CACHE_NOVERIFY");
+    if (k) {
+        tcg_cache_skew = atoi(k);
+    }
+    if (getenv("XTCG_CACHE_DEBUG")) {
+        tcg_cache_debug = true;
+    }
+}
+
+/* Front end. */
+
+#define TCG_CACHE_MAX_EXT  64
+
+void tcg_cache_tb_start(TCGContext *s, vaddr pc_first, unsigned page_bits)
+{
+    uint32_t span = 2u << page_bits;
+
+    if (!s->cap_on) {
+        return;
+    }
+    s->cap_page = pc_first & ~(((vaddr)1 << page_bits) - 1);
+    if (span > s->cap_span) {
+        s->cap_bytes = g_realloc(s->cap_bytes, span);
+        s->cap_span = span;
+    }
+    if (!s->cap_ext) {
+        s->cap_ext = g_new(TCGCacheArtExt, TCG_CACHE_MAX_EXT);
+    }
+}
+
+void tcg_cache_exclude(TCGContext *s, unsigned reason)
+{
+    if (s->cap_on && !s->cap_excl) {
+        s->cap_excl = reason;
+    }
+}
+
+/*
+ * The bytes the translation read at @pc: kept by their offset in the two
+ * pages; a byte read again must read the same.
+ */
+void tcg_cache_read(TCGContext *s, vaddr pc, const void *p, size_t len)
+{
+    uint32_t off, end;
+    int i, j;
+
+    if (!s->cap_on || s->cap_excl || !len) {
+        return;
+    }
+    if (pc < s->cap_page || pc - s->cap_page + len > s->cap_span) {
+        tcg_cache_exclude(s, TCG_CACHE_X_SPAN);
+        return;
+    }
+    off = pc - s->cap_page;
+    end = off + len;
+    for (i = 0; i < s->cap_next; i++) {
+        uint32_t lo = MAX(off, s->cap_ext[i].off);
+        uint32_t hi = MIN(end, s->cap_ext[i].off + s->cap_ext[i].len);
+
+        if (lo < hi && memcmp(s->cap_bytes + lo,
+                              (const uint8_t *)p + (lo - off), hi - lo)) {
+            tcg_cache_exclude(s, TCG_CACHE_X_TORN);
+            return;
+        }
+    }
+    memcpy(s->cap_bytes + off, p, len);
+
+    /* Merge [off, end) into the sorted, disjoint extents. */
+    for (i = 0; i < s->cap_next && s->cap_ext[i].off + s->cap_ext[i].len
+                                   < off; i++) {
+        continue;
+    }
+    for (j = i; j < s->cap_next && s->cap_ext[j].off <= end; j++) {
+        off = MIN(off, s->cap_ext[j].off);
+        end = MAX(end, s->cap_ext[j].off + s->cap_ext[j].len);
+    }
+    if (j == i) {
+        if (s->cap_next == TCG_CACHE_MAX_EXT) {
+            tcg_cache_exclude(s, TCG_CACHE_X_SPAN);
+            return;
+        }
+        memmove(&s->cap_ext[i + 1], &s->cap_ext[i],
+                (s->cap_next - i) * sizeof(s->cap_ext[0]));
+        s->cap_next++;
+    } else if (j > i + 1) {
+        memmove(&s->cap_ext[i + 1], &s->cap_ext[j],
+                (s->cap_next - j) * sizeof(s->cap_ext[0]));
+        s->cap_next -= j - i - 1;
+    }
+    s->cap_ext[i].off = off;
+    s->cap_ext[i].len = end - off;
+}
+
+void tcg_cache_acqrel(TCGContext *s, uint64_t pc)
+{
+    if (!s->cap_on) {
+        return;
+    }
+    if (s->cap_nacq && s->cap_acq[s->cap_nacq - 1] == pc) {
+        return;
+    }
+    if (s->cap_nacq == s->cap_maxacq) {
+        s->cap_maxacq = s->cap_maxacq ? s->cap_maxacq * 2 : 32;
+        s->cap_acq = g_renew(uint64_t, s->cap_acq, s->cap_maxacq);
+    }
+    s->cap_acq[s->cap_nacq++] = pc;
+}
+
+#ifdef TCG_TARGET_HAS_CACHE
+
+/* Kinds that resolve to code or data outside the TB. */
+
+static uintptr_t tcg_cache_anchor(void)
+{
+    return (uintptr_t)tcg_gen_code;
+}
+
+static const void *tcg_cache_stub(unsigned id)
+{
+    switch (id) {
+    case TCG_STUB_EPILOGUE0:
+        return tcg_code_gen_epilogue;
+    case TCG_STUB_RET:
+        return tb_ret_addr;
+    case TCG_STUB_XPAGE:
+        return tcg_xpage_stub;
+    default:
+        return NULL;
+    }
+}
+
+/* QEMU's own image, for the verifier. */
+#ifdef _WIN32
+extern IMAGE_DOS_HEADER __ImageBase;
+
+static void tcg_cache_image(uintptr_t *lo, uintptr_t *hi)
+{
+    const IMAGE_NT_HEADERS *nt = (const void *)((const char *)&__ImageBase
+                                                + __ImageBase.e_lfanew);
+
+    *lo = (uintptr_t)&__ImageBase;
+    *hi = *lo + nt->OptionalHeader.SizeOfImage;
+}
+#elif defined(CONFIG_USER_ONLY) && defined(CONFIG_LINUX)
+extern char __executable_start[], _end[];
+
+static void tcg_cache_image(uintptr_t *lo, uintptr_t *hi)
+{
+    *lo = (uintptr_t)__executable_start;
+    *hi = (uintptr_t)_end;
+}
+#else
+/* Nothing is captured (system mode, other hosts). */
+static void tcg_cache_image(uintptr_t *lo, uintptr_t *hi)
+{
+    *lo = *hi = 0;
+}
+#endif
+
+/* The captured TB's two parts, as RW and RX ranges. */
+typedef struct CapParts {
+    uint8_t *hot, *cold;
+    uintptr_t hot_rx, cold_rx, tb_rx;
+    uint32_t hot_len, code_len, cold_len;
+    uint64_t pc;
+} CapParts;
+
+static int cap_rec_cmp(const void *a, const void *b)
+{
+    const TCGCapRec *x = a, *y = b;
+
+    if (x->site != y->site) {
+        return (uintptr_t)x->site < (uintptr_t)y->site ? -1 : 1;
+    }
+    return x->form - y->form;
+}
+
+/* The part a byte at @rw lies in: 0 hot, 1 cold, -1 neither. */
+static int cap_part_of(const CapParts *p, const void *rw, uint32_t *off)
+{
+    if ((const uint8_t *)rw >= p->hot
+        && (const uint8_t *)rw < p->hot + p->hot_len) {
+        *off = (const uint8_t *)rw - p->hot;
+        return 0;
+    }
+    if (p->cold_len && (const uint8_t *)rw >= p->cold
+        && (const uint8_t *)rw < p->cold + p->cold_len) {
+        *off = (const uint8_t *)rw - p->cold;
+        return 1;
+    }
+    return -1;
+}
+
+/* The part code at @rx lies in, ends included (a label at the end). */
+static int cap_part_of_rx(const CapParts *p, uintptr_t rx, uint32_t *off)
+{
+    if (rx >= p->hot_rx && rx <= p->hot_rx + p->hot_len) {
+        *off = rx - p->hot_rx;
+        return 0;
+    }
+    if (p->cold_len && rx >= p->cold_rx && rx <= p->cold_rx + p->cold_len) {
+        *off = rx - p->cold_rx;
+        return 1;
+    }
+    return -1;
+}
+
+static bool cap_form_pcrel(int form)
+{
+    return form != TCG_CAPF_MOVW && form != TCG_CAPF_POOL64;
+}
+
+static bool cap_form_adrp(int form)
+{
+    return form == TCG_CAPF_ADRP || form == TCG_CAPF_ADRP_ADD
+           || form == TCG_CAPF_ADRP_LDR || form == TCG_CAPF_RAW_ADRP;
+}
+
+/*
+ * A value whose meaning depends on placement: in QEMU's image, in this
+ * TB's struct or code, a stub or the chunk's thunk.  Not the rest of the
+ * code buffer: the Windows modules put it below 4 GiB, among the values
+ * a 32-bit guest uses.
+ */
+static bool cap_addr_suspect(TCGContext *s, const CapParts *p, uintptr_t v,
+                             uintptr_t img_lo, uintptr_t img_hi)
+{
+    if ((v >= img_lo && v < img_hi)
+        || (v >= p->tb_rx && v - p->tb_rx < tb_struct_size(TB_JMP_SLOTS))
+        || (v >= p->hot_rx && v - p->hot_rx <= p->hot_len)
+        || (p->cold_len && v >= p->cold_rx && v - p->cold_rx <= p->cold_len)
+        || (s->lay_thunk && v == (uintptr_t)s->lay_thunk)) {
+        return true;
+    }
+    for (unsigned i = 0; i < TCG_STUB_MAX; i++) {
+        if (tcg_cache_stub(i) && v == (uintptr_t)tcg_cache_stub(i)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Resolve a record's meaning into the artifact's form: 1 kept (*out
+ * filled), 0 dropped (it survives any move of its part), or -reason.
+ */
+static int cap_classify(TCGContext *s, const CapParts *p, const TCGCapRec *r,
+                        TCGCacheArtRel *out, uintptr_t img_lo,
+                        uintptr_t img_hi)
+{
+    uint32_t soff, toff;
+    int spart = cap_part_of(p, r->site, &soff);
+    uintptr_t pc = (uintptr_t)tcg_splitwx_to_rx(r->site), v;
+    int tpart, kind = r->kind;
+
+    if (spart < 0) {
+        return -TCG_CACHE_X_PROV;
+    }
+    if (!tcg_cache_decode(r->site, pc, r->form, r->aux, &v)) {
+        return -TCG_CACHE_X_PROV;
+    }
+    if (!cap_form_pcrel(r->form) && v != r->val) {
+        return -TCG_CACHE_X_PROV;
+    }
+    out->site = soff | (spart ? TCG_CACHE_COLD_BIT : 0);
+    out->form = r->form;
+    out->aux = r->aux;
+    out->kind = kind;
+
+    switch (kind) {
+    case TCG_CAP_NONE:
+        if (r->form == TCG_CAPF_RAW_ADRP) {
+            return -TCG_CACHE_X_RAW_ADRP;
+        }
+        tpart = cap_part_of_rx(p, v, &toff);
+        if (tpart < 0) {
+            return -TCG_CACHE_X_UNKNOWN_REF;
+        }
+        if (tpart == spart && !cap_form_adrp(r->form)) {
+            return 0;
+        }
+        out->kind = tpart ? TCG_CAP_COLD : TCG_CAP_HOT;
+        out->val = toff;
+        return 1;
+    case TCG_CAP_ABS:
+        /* Unchanged: so never something whose place moves. */
+        if (cap_addr_suspect(s, p, v, img_lo, img_hi)) {
+            return -TCG_CACHE_X_PROV;
+        }
+        out->val = v;
+        return 1;
+    case TCG_CAP_HOT:
+    case TCG_CAP_COLD:
+        /* Declared a place in the TB's code: which part, by the value. */
+        tpart = cap_part_of_rx(p, v, &toff);
+        if (tpart < 0) {
+            return -TCG_CACHE_X_PROV;
+        }
+        out->kind = tpart ? TCG_CAP_COLD : TCG_CAP_HOT;
+        out->val = toff;
+        return 1;
+    case TCG_CAP_HELPER:
+        out->val = v - tcg_cache_anchor();
+        return 1;
+    case TCG_CAP_STUB:
+        for (unsigned i = 0; i < TCG_STUB_MAX; i++) {
+            if (v == (uintptr_t)tcg_cache_stub(i)) {
+                out->val = i;
+                return 1;
+            }
+        }
+        return -TCG_CACHE_X_PROV;
+    case TCG_CAP_OWN_TB:
+        if (v - p->tb_rx >= tb_struct_size(TB_JMP_SLOTS)) {
+            return -TCG_CACHE_X_PROV;
+        }
+        out->val = v - p->tb_rx;
+        return 1;
+    case TCG_CAP_THUNK:
+        if (v != (uintptr_t)s->lay_thunk) {
+            return -TCG_CACHE_X_PROV;
+        }
+        out->val = 0;
+        return 1;
+    default:
+        return -TCG_CACHE_X_UNSUPPORTED;
+    }
+}
+
+/*
+ * The verifier: every PC-relative insn in the code has a record, and no
+ * MOVZ/MOVK group or pool word holding an address in the code buffer or
+ * QEMU's image goes unrecorded.  Sites of @recs (sorted) are RW.
+ */
+static bool cap_rec_at(const TCGCapRec *recs, int n, const void *site)
+{
+    int lo = 0, hi = n;
+
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+
+        if ((uintptr_t)recs[mid].site < (uintptr_t)site) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo < n && recs[lo].site == site;
+}
+
+static bool cap_verify_range(TCGContext *s, const CapParts *p,
+                             const TCGCapRec *recs, int n, uint8_t *start,
+                             uint32_t code_len, uint32_t pool_len)
+{
+    uintptr_t img_lo, img_hi, t;
+    const uint32_t *w = (const uint32_t *)start;
+    uint32_t nw = code_len / 4;
+
+    int j = 0;
+
+    tcg_cache_image(&img_lo, &img_hi);
+    for (uint32_t i = 0; i < nw; i++) {
+        const TCGCapRec *r = NULL;
+        uint64_t v;
+        int k;
+
+        /* Data in code: skip it. */
+        while (j < n && (uintptr_t)recs[j].site < (uintptr_t)&w[i]) {
+            j++;
+        }
+        for (int q = j; q < n && recs[q].site == &w[i]; q++) {
+            if (recs[q].form == TCG_CAPF_DATA
+                || recs[q].form == TCG_CAPF_REL32) {
+                r = &recs[q];
+            }
+        }
+        if (r) {
+            i += (r->form == TCG_CAPF_DATA ? r->aux / 4 : 1) - 1;
+            continue;
+        }
+        if (tcg_cache_insn_pcrel(&w[i],
+                                 (uintptr_t)tcg_splitwx_to_rx((void *)&w[i]),
+                                 &t)) {
+            if (!cap_rec_at(recs, n, &w[i])) {
+                if (tcg_cache_debug) {
+                    fprintf(stderr, "verify: pcrel %08x at +%x of %x -> %"
+                            PRIxPTR "\n", w[i], i * 4, code_len, t);
+                }
+                return false;
+            }
+            continue;
+        }
+        k = tcg_cache_insn_movw(&w[i], nw - i, &v);
+        if (k > 0) {
+            if (cap_addr_suspect(s, p, v, img_lo, img_hi)
+                && !cap_rec_at(recs, n, &w[i])) {
+                if (tcg_cache_debug) {
+                    fprintf(stderr, "verify: movw %08x x%d at +%x of %x = %"
+                            PRIx64 " (img %" PRIxPTR "-%" PRIxPTR " tb %"
+                            PRIxPTR " hot %" PRIxPTR " cold %" PRIxPTR
+                            " pc %" PRIx64 ")\n",
+                            w[i], k, i * 4, code_len, v, img_lo, img_hi,
+                            p->tb_rx, p->hot_rx, p->cold_rx,
+                            p->pc);
+                }
+                return false;
+            }
+            i += k - 1;
+        }
+    }
+    for (uint32_t o = ROUND_UP(code_len, 8); o + 8 <= code_len + pool_len;
+         o += 8) {
+        uint64_t v = ldq_he_p(start + o);
+
+        if (cap_addr_suspect(s, p, v, img_lo, img_hi)
+            && !cap_rec_at(recs, n, start + o)) {
+            if (tcg_cache_debug) {
+                fprintf(stderr, "verify: pool +%x = %" PRIx64 "\n", o, v);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+/* A slot offset (from the hot part's start) as a place. */
+static bool cap_place(const CapParts *p, uint32_t off, uint32_t *place)
+{
+    if (off == TB_JMP_OFFSET_INVALID) {
+        *place = off;
+        return true;
+    }
+    if (off <= p->hot_len) {
+        *place = off;
+        return true;
+    }
+    if (p->cold_len) {
+        uintptr_t rx = p->hot_rx + off;
+
+        if (rx >= p->cold_rx && rx <= p->cold_rx + p->cold_len) {
+            *place = (rx - p->cold_rx) | TCG_CACHE_COLD_BIT;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A growable byte buffer, for the artifact. */
+typedef struct CapBuf {
+    uint8_t *data;
+    size_t len, cap;
+} CapBuf;
+
+static void cap_buf_size(CapBuf *b, size_t len)
+{
+    if (len > b->cap) {
+        b->cap = MAX(len, b->cap * 2);
+        b->data = g_realloc(b->data, b->cap);
+    }
+    if (len > b->len) {
+        memset(b->data + b->len, 0, len - b->len);
+    }
+    b->len = len;
+}
+
+static void cap_buf_add(CapBuf *b, const void *p, size_t n)
+{
+    size_t at = b->len;
+
+    cap_buf_size(b, at + n);
+    memcpy(b->data + at, p, n);
+}
+
+static void cap_reject(TCGContext *s, unsigned reason)
+{
+    tcg_cache_stats.excluded[reason]++;
+}
+
+void *tcg_cache_capture(TCGContext *s, TranslationBlock *tb,
+                        const void *search, size_t search_len, size_t *lenp)
+{
+    int64_t t0 = get_clock();
+    CapParts p;
+    TCGCacheArt h = { };
+    TCGCacheArtRel *rels;
+    TCGCacheArtCon *cons;
+    TCGCacheArtSlot *slots;
+    TCGCapRec *recs = s->cap_rec;
+    int n = s->cap_nrec, nrel = 0, ncon = 0, m, i;
+    uint32_t ext_bytes = 0;
+    CapBuf ab = { }, *a = &ab;
+    size_t hot_at, cold_at;
+    uintptr_t img_lo, img_hi;
+    uint8_t *hot, *cold;
+
+    tcg_cache_stats.tried++;
+    if (s->cap_excl) {
+        cap_reject(s, s->cap_excl);
+        return NULL;
+    }
+#ifdef CONFIG_USER_ONLY
+    if (tb->smc_check || tb->smc_inline) {
+        cap_reject(s, TCG_CACHE_X_SMC);
+        return NULL;
+    }
+#endif
+    if (s->cap_fail) {
+        cap_reject(s, s->cap_fail);
+        return NULL;
+    }
+
+    p.hot = (uint8_t *)tcg_splitwx_to_rw(tb->tc.ptr);
+    p.hot_rx = (uintptr_t)tb->tc.ptr;
+    p.hot_len = tb->tc.size;
+    p.code_len = s->data_gen_ptr
+                 ? (uint8_t *)s->data_gen_ptr - p.hot : p.hot_len;
+    p.cold = s->cap_cold;
+    p.cold_len = s->cap_cold ? (uint8_t *)s->cap_cold_end - p.cold : 0;
+    p.cold_rx = p.cold ? (uintptr_t)tcg_splitwx_to_rx(p.cold) : 0;
+    p.tb_rx = (uintptr_t)tcg_splitwx_to_rx(tb);
+    p.pc = tb->pc;
+
+#ifdef CONFIG_USER_ONLY
+    /* The lazy-sync map's offsets are from the hot part's start. */
+    for (i = 0; i < s->nb_lazy_map; i++) {
+        if (s->lazy_map[i].end > p.code_len) {
+            cap_reject(s, TCG_CACHE_X_LAZY);
+            return NULL;
+        }
+    }
+#endif
+
+    /* Merge the records at each site: patches and emissions. */
+    qsort(recs, n, sizeof(*recs), cap_rec_cmp);
+    for (i = 0, m = 0; i < n; i++) {
+        TCGCapRec *r = &recs[i];
+
+        if (m && recs[m - 1].site == r->site && r->form != TCG_CAPF_CON
+            && recs[m - 1].form != TCG_CAPF_CON) {
+            TCGCapRec *q = &recs[m - 1];
+
+            if (q->form != r->form) {
+                if (q->form == TCG_CAPF_RAW_ADRP && cap_form_adrp(r->form)) {
+                    q->form = r->form;
+                    q->aux = r->aux;
+                } else if (!(r->form == TCG_CAPF_RAW_ADRP
+                             && cap_form_adrp(q->form))) {
+                    cap_reject(s, TCG_CACHE_X_PROV);
+                    return NULL;
+                }
+            }
+            if (q->kind == TCG_CAP_NONE) {
+                q->kind = r->kind;
+                q->val = r->val;
+            } else if (r->kind != TCG_CAP_NONE
+                       && (r->kind != q->kind || r->val != q->val)) {
+                cap_reject(s, TCG_CACHE_X_PROV);
+                return NULL;
+            }
+            continue;
+        }
+        recs[m++] = *r;
+    }
+    n = m;
+
+    if (tcg_cache_verify_on
+        && (!cap_verify_range(s, &p, recs, n, p.hot, p.code_len,
+                              p.hot_len - p.code_len)
+            || (p.cold_len
+                && !cap_verify_range(s, &p, recs, n, p.cold, p.cold_len,
+                                     0)))) {
+        cap_reject(s, TCG_CACHE_X_VERIFY);
+        return NULL;
+    }
+
+    tcg_cache_image(&img_lo, &img_hi);
+    rels = g_newa(TCGCacheArtRel, n + 1);
+    cons = g_newa(TCGCacheArtCon, n + 1);
+    for (i = 0; i < n; i++) {
+        TCGCapRec *r = &recs[i];
+        int ret;
+
+        if (r->form == TCG_CAPF_DATA) {
+            continue;
+        }
+        if (r->form == TCG_CAPF_CON) {
+            uint32_t off;
+            int part = cap_part_of(&p, r->site, &off);
+
+            if (part < 0) {
+                cap_reject(s, TCG_CACHE_X_PROV);
+                return NULL;
+            }
+            cons[ncon].site = off | (part ? TCG_CACHE_COLD_BIT : 0);
+            cons[ncon].kind = r->kind;
+            cons[ncon].slot = r->aux;
+            cons[ncon].pad = 0;
+            ncon++;
+            continue;
+        }
+        ret = cap_classify(s, &p, r, &rels[nrel], img_lo, img_hi);
+        if (ret < 0) {
+            cap_reject(s, -ret);
+            return NULL;
+        }
+        nrel += ret;
+    }
+
+    /* The header. */
+    h.magic = TCG_CACHE_MAGIC;
+    h.version = TCG_CACHE_VERSION;
+    /* The pages tb_record will give the TB, from its size. */
+    h.flags = (s->lay_on ? TCG_CACHE_ART_SPLIT : 0)
+              | (((tb->pc + tb->size - 1) ^ tb->pc) & TARGET_PAGE_MASK
+                 ? TCG_CACHE_ART_PAGE2 : 0);
+    h.nb_slots = tb->nb_slots;
+    h.n_rel = nrel;
+    h.n_con = ncon;
+    h.n_acq = s->cap_nacq;
+    h.n_ext = s->cap_next;
+    h.size = tb->size;
+    h.icount = tb->icount;
+    h.jmp_call = tb->jmp_call;
+    h.jmp_cold = tb->jmp_cold;
+    h.jmp_far = tb->jmp_far;
+    h.loops = tb->loops;
+    h.edge_end = tb->edge_end;
+    h.chain_dead_in = tb->chain_dead_in;
+    h.tb_flags = tb->flags;
+    h.cflags = tb->cflags;
+    h.pc = tb->pc;
+    h.cs_base = tb->cs_base;
+    h.hot_len = p.hot_len;
+    h.pool_off = p.code_len;
+    h.cold_len = p.cold_len;
+    h.search_len = search_len;
+    for (i = 0; i < s->cap_next; i++) {
+        ext_bytes += s->cap_ext[i].len;
+    }
+    h.ext_bytes = ext_bytes;
+
+    slots = g_newa(TCGCacheArtSlot, tb->nb_slots + 1);
+    for (i = 0; i < tb->nb_slots; i++) {
+        uint32_t cond = tb->jmp[i].cond;
+
+        memset(&slots[i], 0, sizeof(slots[i]));
+        if (!cap_place(&p, tb->jmp[i].reset_offset, &slots[i].reset)
+            || !cap_place(&p, tb->jmp[i].insn_offset, &slots[i].insn)
+            || (cond && !cap_place(&p, cond - 1, &slots[i].cond))) {
+            cap_reject(s, TCG_CACHE_X_PROV);
+            return NULL;
+        }
+        slots[i].cond += cond ? 1 : 0;
+        slots[i].dead = tb->jmp[i].dead;
+    }
+
+    cap_buf_size(a, 0);
+    cap_buf_add(a, (void *)&h, sizeof(h));
+    cap_buf_add(a, (void *)slots, sizeof(*slots) * h.nb_slots);
+    cap_buf_add(a, (void *)rels, sizeof(*rels) * nrel);
+    cap_buf_add(a, (void *)cons, sizeof(*cons) * ncon);
+    cap_buf_add(a, (void *)s->cap_acq, 8 * h.n_acq);
+    cap_buf_add(a, (void *)s->cap_ext, sizeof(*s->cap_ext) * h.n_ext);
+    for (i = 0; i < s->cap_next; i++) {
+        cap_buf_add(a, s->cap_bytes + s->cap_ext[i].off,
+                            s->cap_ext[i].len);
+    }
+    cap_buf_size(a, ROUND_UP(a->len, 8));
+
+    /* The code, canonical: every relocated field zeroed. */
+    hot_at = a->len;
+    cap_buf_add(a, p.hot, p.hot_len);
+    cap_buf_size(a, ROUND_UP(a->len, 8));
+    cold_at = a->len;
+    if (p.cold_len) {
+        cap_buf_add(a, p.cold, p.cold_len);
+    }
+    cap_buf_size(a, ROUND_UP(a->len, 8));
+    cap_buf_add(a, search, search_len);
+    cap_buf_size(a, ROUND_UP(a->len, 8));
+    hot = a->data + hot_at;
+    cold = a->data + cold_at;
+    for (i = 0; i < nrel; i++) {
+        uint32_t site = rels[i].site;
+        uint8_t *at = site & TCG_CACHE_COLD_BIT
+                      ? cold + (site & ~TCG_CACHE_COLD_BIT) : hot + site;
+
+        tcg_cache_zero(at, rels[i].form, rels[i].aux);
+        tcg_cache_stats.rel_kind[rels[i].kind]++;
+        tcg_cache_stats.rel_form[rels[i].form]++;
+    }
+    ((TCGCacheArt *)a->data)->len = a->len;
+
+    tcg_cache_stats.captured++;
+    tcg_cache_stats.bytes += a->len;
+    tcg_cache_stats.hot_bytes += p.hot_len;
+    tcg_cache_stats.cold_bytes += p.cold_len;
+    tcg_cache_stats.search_bytes += search_len;
+    tcg_cache_stats.ext_total += ext_bytes;
+    tcg_cache_stats.capture_ns += get_clock() - t0;
+    *lenp = a->len;
+    return a->data;
+}
+
+#else
+
+void *tcg_cache_capture(TCGContext *s, TranslationBlock *tb,
+                        const void *search, size_t search_len, size_t *lenp)
+{
+    return NULL;
+}
+
+#endif /* TCG_TARGET_HAS_CACHE */
+
+/* Locate and bounds-check an artifact's arrays and parts. */
+bool tcg_cache_art_view(const void *art, size_t len, TCGCacheArtView *v)
+{
+    const TCGCacheArt *h = art;
+    size_t o = sizeof(*h);
+    const uint8_t *b = art;
+
+#define TAKE(field, type, count) do {                           \
+        size_t sz_ = (size_t)(count) * sizeof(type);            \
+        if (o + sz_ > len) {                                    \
+            if (tcg_cache_debug) {                   \
+                fprintf(stderr, "view: %s o=%zu sz=%zu len=%zu\n", \
+                        #field, o, sz_, len);                   \
+            }                                                   \
+            return false;                                       \
+        }                                                       \
+        v->field = (const void *)(b + o);                       \
+        o += sz_;                                               \
+    } while (0)
+
+    if (len < sizeof(*h) || h->magic != TCG_CACHE_MAGIC
+        || h->version != TCG_CACHE_VERSION || h->len != len
+        || h->nb_slots > TB_JMP_SLOTS) {
+        if (tcg_cache_debug) {
+            fprintf(stderr, "view: hdr len %zu/%u magic %x\n", len,
+                    len >= sizeof(*h) ? h->len : 0, h->magic);
+        }
+        return false;
+    }
+    v->h = h;
+    TAKE(slot, TCGCacheArtSlot, h->nb_slots);
+    TAKE(rel, TCGCacheArtRel, h->n_rel);
+    TAKE(con, TCGCacheArtCon, h->n_con);
+    TAKE(acq, uint64_t, h->n_acq);
+    TAKE(ext, TCGCacheArtExt, h->n_ext);
+    TAKE(ext_bytes, uint8_t, h->ext_bytes);
+    o = ROUND_UP(o, 8);
+    TAKE(hot, uint8_t, h->hot_len);
+    o = ROUND_UP(o, 8);
+    TAKE(cold, uint8_t, h->cold_len);
+    o = ROUND_UP(o, 8);
+    TAKE(search, uint8_t, h->search_len);
+#undef TAKE
+    return h->pool_off <= h->hot_len;
+}
+
+/*
+ * Reserve places for @v in the current layout, without changing it: the
+ * chunk tcg_tb_alloc would use now (split), or the packed code stream.
+ * Any transition (a new chunk or region) is left to translation.
+ */
+bool tcg_cache_reserve(TCGContext *s, const TCGCacheArtView *v,
+                       TCGCacheRes *r)
+{
+    const TCGCacheArt *h = v->h;
+    size_t size = tb_struct_size(h->nb_slots);
+    uint8_t *p = s->code_gen_ptr;
+    uintptr_t skew_hot = 0, skew_cold = 0;
+
+    if (!p) {
+        return false;
+    }
+    if (tcg_cache_skew) {
+        uint32_t x = (uintptr_t)p * 2654435761u >> 7;
+
+        skew_hot = (x % tcg_cache_skew) * 16;
+        skew_cold = ((x >> 12) % tcg_cache_skew) * 16;
+    }
+    memset(r, 0, sizeof(*r));
+    if (h->flags & TCG_CACHE_ART_SPLIT) {
+        uint8_t *tb, *cold, *search, *end, *hot;
+
+        /* tb_layout_chunk's test for keeping the current chunk. */
+        if (!tcg_tblayout || !s->lay_chunk || p < (uint8_t *)s->lay_chunk
+            || p + TBLAYOUT_RESERVE > (uint8_t *)s->lay_hot_end
+            || (uint8_t *)s->lay_cold + TBLAYOUT_RESERVE
+               > (uint8_t *)s->lay_cold_end) {
+            return false;
+        }
+        tb = (void *)ROUND_UP((uintptr_t)s->lay_cold + skew_cold,
+                              TCG_TBPACK_ALIGN);
+        cold = (void *)ROUND_UP((uintptr_t)tb + size, TCG_TBPACK_ALIGN);
+        search = (void *)ROUND_UP((uintptr_t)cold + h->cold_len, 16);
+        end = (void *)ROUND_UP((uintptr_t)search + h->search_len,
+                               CODE_GEN_ALIGN);
+        hot = (void *)ROUND_UP((uintptr_t)p + skew_hot, CODE_GEN_ALIGN);
+        if (end > (uint8_t *)tcg_tb_data_highwater(s)
+            || hot + h->hot_len > (uint8_t *)s->lay_hot_end - TCG_HIGHWATER) {
+            return false;
+        }
+        r->split = true;
+        r->tb = tb;
+        r->hot = hot;
+        r->cold = cold;
+        r->search = search;
+        r->lay_cold = end;
+        r->code_gen_ptr = (void *)ROUND_UP((uintptr_t)hot + h->hot_len,
+                                           CODE_GEN_ALIGN);
+        r->thunk = s->lay_thunk;
+    } else {
+        uintptr_t align = tcg_tbpack ? TCG_TBPACK_ALIGN
+                                     : qemu_icache_linesize;
+        uint8_t *tb, *hot, *end;
+
+        /* Packed: without the layout, or after the region's last chunk. */
+        if (tcg_tblayout && s->lay_chunk) {
+            return false;
+        }
+        if (h->cold_len) {
+            return false;
+        }
+        tb = (void *)ROUND_UP((uintptr_t)p + skew_hot, align);
+        hot = (void *)ROUND_UP((uintptr_t)tb + size, align);
+        end = (void *)ROUND_UP((uintptr_t)hot + h->hot_len + h->search_len,
+                               CODE_GEN_ALIGN);
+        if (end > (uint8_t *)s->code_gen_highwater) {
+            return false;
+        }
+        r->tb = tb;
+        r->hot = hot;
+        r->cold = hot + h->hot_len;
+        r->search = hot + h->hot_len;
+        r->code_gen_ptr = end;
+    }
+    return true;
+}
+
+#ifdef TCG_TARGET_HAS_CACHE
+/* A place in the new TB: RW and RX. */
+static uint8_t *res_at(const TCGCacheRes *r, uint32_t place, uintptr_t *rx)
+{
+    uint8_t *rw = place & TCG_CACHE_COLD_BIT
+                  ? (uint8_t *)r->cold + (place & ~TCG_CACHE_COLD_BIT)
+                  : (uint8_t *)r->hot + place;
+
+    *rx = (uintptr_t)tcg_splitwx_to_rx(rw);
+    return rw;
+}
+
+/* A place as an offset from the new hot part, for the slots. */
+static uint32_t res_off(const TCGCacheRes *r, uint32_t place)
+{
+    uintptr_t rx;
+
+    if (place == TB_JMP_OFFSET_INVALID) {
+        return place;
+    }
+    res_at(r, place, &rx);
+    return rx - (uintptr_t)tcg_splitwx_to_rx(r->hot);
+}
+#endif
+
+TranslationBlock *tcg_cache_place(TCGContext *s, const TCGCacheArtView *v,
+                                  const TCGCacheRes *r)
+{
+#ifdef TCG_TARGET_HAS_CACHE
+    const TCGCacheArt *h = v->h;
+    TranslationBlock *tb = r->tb;
+    uintptr_t tb_rx = (uintptr_t)tcg_splitwx_to_rx(tb);
+    uintptr_t hot_rx = (uintptr_t)tcg_splitwx_to_rx(r->hot);
+
+    /* Poison the struct: every field must be written below. */
+    memset(tb, 0xa5, tb_struct_size(h->nb_slots));
+    memcpy(r->hot, v->hot, h->hot_len);
+    memcpy(r->cold, v->cold, h->cold_len);
+    memcpy(r->search, v->search, h->search_len);
+
+    tb->pc = h->pc;
+    tb->cs_base = h->cs_base;
+    tb->flags = h->tb_flags;
+    tb->cflags = h->cflags;
+    tb->loops = h->loops;
+    tb->edge_end = h->edge_end;
+    tb->size = h->size;
+    tb->icount = h->icount;
+    tb->tc.ptr = (void *)hot_rx;
+    tb->tc.size = h->hot_len;
+    tb->tc.search = tcg_splitwx_to_rx(r->search);
+#ifdef CONFIG_USER_ONLY
+    memset(&tb->itree, 0, sizeof(tb->itree));
+    tb->smc_check = false;
+    tb->smc_reject = false;
+    tb->smc_inline = false;
+    tb->smc_len = 0;
+    tb->smc_check_end = 0;
+    tb->smc_crc = 0;
+    tb->smc_stale = NULL;
+#else
+    tb->page_next[0] = tb->page_next[1] = 0;
+    tb->page_addr[0] = tb->page_addr[1] = -1;
+#endif
+    qemu_spin_init(&tb->jmp_lock);
+    tb->jmp_call = h->jmp_call;
+    tb->chain_dead_in = h->chain_dead_in;
+    tb->jmp_cold = h->jmp_cold;
+    tb->jmp_far = h->jmp_far;
+    tb->nb_slots = h->nb_slots;
+    tb->jmp_list_head = 0;
+    for (int n = 0; n < h->nb_slots; n++) {
+        const TCGCacheArtSlot *sl = &v->slot[n];
+
+        if (sl->dead > h->nb_slots) {
+            return NULL;
+        }
+        tb->jmp[n].reset_offset = res_off(r, sl->reset);
+        tb->jmp[n].insn_offset = res_off(r, sl->insn);
+        tb->jmp[n].cond = sl->cond ? res_off(r, sl->cond - 1) + 1 : 0;
+        tb->jmp[n].dead = sl->dead;
+        tb->jmp[n].target_addr = 0;
+        tb->jmp[n].list_next = 0;
+        tb->jmp[n].dest = 0;
+    }
+
+    for (int i = 0; i < h->n_rel; i++) {
+        const TCGCacheArtRel *rel = &v->rel[i];
+        uintptr_t rx, val;
+        uint8_t *rw = res_at(r, rel->site, &rx);
+
+        switch (rel->kind) {
+        case TCG_CAP_ABS:
+            val = rel->val;
+            break;
+        case TCG_CAP_HELPER:
+            val = tcg_cache_anchor() + rel->val;
+            break;
+        case TCG_CAP_STUB:
+            val = (uintptr_t)tcg_cache_stub(rel->val);
+            if (!val) {
+                return NULL;
+            }
+            break;
+        case TCG_CAP_OWN_TB:
+            val = tb_rx + rel->val;
+            break;
+        case TCG_CAP_THUNK:
+            if (!r->thunk) {
+                return NULL;
+            }
+            val = (uintptr_t)r->thunk;
+            break;
+        case TCG_CAP_HOT:
+            val = hot_rx + rel->val;
+            break;
+        case TCG_CAP_COLD:
+            val = (uintptr_t)tcg_splitwx_to_rx(r->cold) + rel->val;
+            break;
+        default:
+            return NULL;
+        }
+        if (!tcg_cache_apply(rw, rx, rel->form, rel->aux, val)) {
+            if (tcg_cache_debug) {
+                fprintf(stderr, "reloc: form %d kind %d aux %x site %x "
+                        "val %" PRIx64 " -> %" PRIxPTR " at %" PRIxPTR "\n",
+                        rel->form, rel->kind, rel->aux, rel->site, rel->val,
+                        val, rx);
+            }
+            return NULL;
+        }
+    }
+
+    for (int i = 0; i < h->n_con; i++) {
+        const TCGCacheArtCon *c = &v->con[i];
+        uintptr_t rx, fa;
+        intptr_t off;
+
+        if (c->kind != TCG_CAPC_SLOT_LDRLIT || c->slot >= h->nb_slots) {
+            return NULL;
+        }
+        res_at(r, c->site, &rx);
+        fa = (uintptr_t)tcg_splitwx_to_rx(&tb->jmp[c->slot].target_addr);
+        off = fa - rx;
+        if (off != sextract64(off, 0, 21)) {
+            return NULL;
+        }
+    }
+    return tb;
+#else
+    return NULL;
+#endif
+}
+
+void tcg_cache_commit(TCGContext *s, const TCGCacheRes *r)
+{
+#ifndef CONFIG_TCG_INTERPRETER
+    flush_idcache_range((uintptr_t)tcg_splitwx_to_rx(r->hot),
+                        (uintptr_t)r->hot,
+                        (uint8_t *)r->code_gen_ptr - (uint8_t *)r->hot);
+    if (r->split) {
+        flush_idcache_range((uintptr_t)tcg_splitwx_to_rx(r->cold),
+                            (uintptr_t)r->cold,
+                            (uint8_t *)r->lay_cold - (uint8_t *)r->cold);
+    }
+#endif
+    if (r->split) {
+        s->lay_cold = r->lay_cold;
+    }
+    qatomic_set(&s->code_gen_ptr, r->code_gen_ptr);
+}
+
+void tcg_cache_print_stats(void)
+{
+    TCGCacheStats *t = &tcg_cache_stats;
+    static const char *const kinds[] = {
+        "none", "abs", "helper", "stub", "own-tb", "thunk", "hot", "cold",
+        "unsupported",
+    };
+    static const char *const forms[] = {
+        "none", "b26", "bcond19", "tbz14", "ldrlit19", "adr21", "adrp",
+        "adrp+add", "adrp+ldr", "raw-adrp", "movw", "pool64", "rel32",
+    };
+
+    fprintf(stderr, "xtcg-cache: tried %" PRIu64 " captured %" PRIu64
+            " bytes %" PRIu64 " (hot %" PRIu64 " cold %" PRIu64
+            " search %" PRIu64 " guest %" PRIu64 ") capture %.3f ms\n",
+            t->tried, t->captured, t->bytes, t->hot_bytes, t->cold_bytes,
+            t->search_bytes, t->ext_total, t->capture_ns / 1e6);
+    fprintf(stderr, "xtcg-cache: excluded");
+    for (int i = 1; i < TCG_CACHE_X_MAX; i++) {
+        if (t->excluded[i]) {
+            fprintf(stderr, " %s=%" PRIu64, tcg_cache_x_names[i],
+                    t->excluded[i]);
+        }
+    }
+    fprintf(stderr, "\nxtcg-cache: relocs");
+    for (int i = 0; i < ARRAY_SIZE(kinds); i++) {
+        if (t->rel_kind[i]) {
+            fprintf(stderr, " %s=%" PRIu64, kinds[i], t->rel_kind[i]);
+        }
+    }
+    fprintf(stderr, " |");
+    for (int i = 0; i < ARRAY_SIZE(forms); i++) {
+        if (t->rel_form[i]) {
+            fprintf(stderr, " %s=%" PRIu64, forms[i], t->rel_form[i]);
+        }
+    }
+    fprintf(stderr, "\nxtcg-cache: installs %" PRIu64 " (%.3f ms) fail:"
+            " reserve=%" PRIu64 " reloc=%" PRIu64 " bytes=%" PRIu64
+            " con=%" PRIu64 " promoted=%" PRIu64 " key=%" PRIu64
+            " dup=%" PRIu64 "\n",
+            t->installs, t->install_ns / 1e6, t->inst_fail_reserve,
+            t->inst_fail_reloc, t->inst_fail_bytes, t->inst_fail_con,
+            t->inst_fail_promoted, t->inst_fail_key, t->inst_dup);
+}

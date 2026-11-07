@@ -18,6 +18,12 @@
  */
 
 #include "qemu/osdep.h"
+#include "tcg/tcg-cache.h"
+#include "qemu/timer.h"
+#include "qemu/cacheflush.h"
+#ifdef CONFIG_USER_ONLY
+#include "user/guest-host.h"
+#endif
 
 #include "trace.h"
 #include "disas/disas.h"
@@ -369,6 +375,124 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
     return tcg_gen_code(tcg_ctx, tb, pc);
 }
 
+#ifdef CONFIG_USER_ONLY
+/* The cflags a captured TB may have. */
+#define TB_CACHE_CFLAGS  (CF_PARALLEL | CF_CLUSTER_MASK | CF_COUNT_MASK)
+
+/*
+ * Install the TB for @s from artifact @art, as a fresh translation is
+ * published: NULL if it doesn't apply here (the reason counted), else the
+ * TB, or one an other thread published for the same key first.  Called
+ * with mmap_lock held.
+ */
+static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
+                                          tb_page_addr_t phys_pc,
+                                          const void *art, size_t len)
+{
+    int64_t t0 = get_clock();
+    CPUArchState *env = cpu_env(cpu);
+    TCGCacheArtView v;
+    TCGCacheRes r;
+    const TCGCacheArt *h;
+    TranslationBlock *tb, *existing_tb;
+    tb_page_addr_t phys_p2 = -1;
+    vaddr page = s.pc & TARGET_PAGE_MASK;
+    uint32_t off;
+
+    if (!tcg_cache_art_view(art, len, &v)) {
+        tcg_cache_stats.inst_fail_key++;
+        return NULL;
+    }
+    h = v.h;
+    if (h->pc != s.pc || h->cs_base != s.cs_base || h->tb_flags != s.flags
+        || h->cflags != s.cflags || !h->size) {
+        if (tcg_cache_debug) {
+            fprintf(stderr,
+                    "key: pc %llx/%llx cs %llx/%llx fl %x/%x cf %x/%x\n",
+                    (unsigned long long)h->pc, (unsigned long long)s.pc,
+                    (unsigned long long)h->cs_base,
+                    (unsigned long long)s.cs_base, h->tb_flags, s.flags,
+                    h->cflags, s.cflags);
+        }
+        tcg_cache_stats.inst_fail_key++;
+        return NULL;
+    }
+
+    /* The bytes the translation read are still there. */
+    off = 0;
+    for (int i = 0; i < h->n_ext; i++) {
+        const TCGCacheArtExt *e = &v.ext[i];
+
+        if (e->off + e->len > 2 * TARGET_PAGE_SIZE || off + e->len
+            > h->ext_bytes || memcmp(g2h_untagged_vaddr(page + e->off),
+                                     v.ext_bytes + off, e->len)) {
+            tcg_cache_stats.inst_fail_bytes++;
+            return NULL;
+        }
+        off += e->len;
+    }
+    if (((s.pc + h->size - 1) & TARGET_PAGE_MASK) != page) {
+        phys_p2 = get_page_addr_code(env, page + TARGET_PAGE_SIZE);
+        if (phys_p2 == -1 || !(h->flags & TCG_CACHE_ART_PAGE2)) {
+            tcg_cache_stats.inst_fail_bytes++;
+            return NULL;
+        }
+    } else if (h->flags & TCG_CACHE_ART_PAGE2) {
+        if (tcg_cache_debug) {
+            fprintf(stderr, "page2: pc %llx size %u\n",
+                    (unsigned long long)s.pc, h->size);
+        }
+        tcg_cache_stats.inst_fail_key++;
+        return NULL;
+    }
+
+    /* Promoted since: translation gives different code now. */
+    for (int i = 0; i < h->n_acq; i++) {
+        if (tcg_tso_cross_promoted(v.acq[i])) {
+            tcg_cache_stats.inst_fail_promoted++;
+            return NULL;
+        }
+    }
+
+    if (!tcg_cache_reserve(tcg_ctx, &v, &r)) {
+        tcg_cache_stats.inst_fail_reserve++;
+        return NULL;
+    }
+    tb = tcg_cache_place(tcg_ctx, &v, &r);
+    if (!tb) {
+        tcg_cache_stats.inst_fail_reloc++;
+        return NULL;
+    }
+    tb_set_page_addr0(tb, phys_pc);
+    tb_lock_page0(phys_pc);
+    if (phys_p2 != -1) {
+        tb_set_page_addr1(tb, phys_p2);
+        tb_lock_page1(phys_pc, phys_p2);
+    }
+    tcg_cache_commit(tcg_ctx, &r);
+
+    for (int n = 0; n < tb->nb_slots; n++) {
+        if (tb->jmp[n].reset_offset != TB_JMP_OFFSET_INVALID) {
+            tb_reset_jump(tb, n);
+        }
+    }
+    perf_report_code(s.pc, tb, tb->tc.ptr);
+    tcg_tb_insert(tb);
+    existing_tb = tb_link_page(tb);
+    assert_no_pages_locked();
+    tcg_cache_stats.installs++;
+    tcg_cache_stats.install_ns += get_clock() - t0;
+    if (unlikely(existing_tb != tb)) {
+        tcg_cache_stats.inst_dup++;
+        qatomic_set(&tcg_ctx->code_gen_ptr,
+                    r.split ? r.hot : (void *)tb);
+        tcg_tb_remove(tb);
+        return existing_tb;
+    }
+    return tb;
+}
+#endif
+
 /* Called with mmap_lock held for user mode emulation.  */
 TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 {
@@ -380,6 +504,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     uint8_t *search, *search_hw;
     int64_t ti;
     void *host_pc;
+#ifdef CONFIG_USER_ONLY
+    void *art = NULL;
+    size_t art_len = 0;
+#endif
 
     assert_memory_lock();
     qemu_thread_jit_write();
@@ -398,6 +526,11 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
         max_insns = TCG_MAX_INSNS;
     }
     QEMU_BUILD_BUG_ON(CF_COUNT_MASK + 1 != TCG_MAX_INSNS);
+
+#ifdef CONFIG_USER_ONLY
+    tcg_ctx->cap_on = tcg_cache_mode && phys_pc != -1
+                      && !(s.cflags & ~TB_CACHE_CFLAGS);
+#endif
 
  buffer_overflow:
     assert_no_pages_locked();
@@ -558,6 +691,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
         tb->smc_check_end = tcg_ctx->insn0_off;
         tb->smc_stale = tcg_ctx->smc_stale->u.value_ptr;
     }
+    if (tcg_ctx->cap_on) {
+        art = tcg_cache_capture(tcg_ctx, tb, search, search_size, &art_len);
+        tcg_ctx->cap_on = false;
+    }
 #endif
     if (tcg_ctx->lay_on) {
         tcg_ctx->lay_cold = (void *)ROUND_UP((uintptr_t)search + search_size,
@@ -647,6 +784,37 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     qatomic_set(&tcg_ctx->code_gen_ptr, (void *)
         ROUND_UP((uintptr_t)gen_code_buf + gen_code_size + search_size,
                  CODE_GEN_ALIGN));
+
+#ifdef CONFIG_USER_ONLY
+    /*
+     * XTCG_CACHE=stress: publish a copy installed from the artifact
+     * instead, and poison the translation, which is never published.
+     */
+    if (art) {
+        TranslationBlock *itb = NULL;
+
+        if (tcg_cache_mode == TCG_CACHE_STRESS) {
+            itb = tb_cache_install(cpu, s, phys_pc, art, art_len);
+        }
+        g_free(art);
+        if (itb) {
+            memset(gen_code_buf, 0, gen_code_size);
+            flush_idcache_range((uintptr_t)tb->tc.ptr,
+                                (uintptr_t)gen_code_buf, gen_code_size);
+            if (tcg_ctx->cap_cold) {
+                size_t n = (uint8_t *)tcg_ctx->cap_cold_end
+                           - (uint8_t *)tcg_ctx->cap_cold;
+
+                memset(tcg_ctx->cap_cold, 0, n);
+                flush_idcache_range(
+                    (uintptr_t)tcg_splitwx_to_rx(tcg_ctx->cap_cold),
+                    (uintptr_t)tcg_ctx->cap_cold, n);
+            }
+            memset(tb, 0x5a, tb_struct_size(tb->nb_slots));
+            return itb;
+        }
+    }
+#endif
 
     /* init jump list */
     qemu_spin_init(&tb->jmp_lock);

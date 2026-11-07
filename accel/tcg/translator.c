@@ -8,6 +8,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "tcg/tcg-cache.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
@@ -420,6 +421,7 @@ void translator_region_forget(tb_page_addr_t start, tb_page_addr_t last)
 
 static void region_count(uint64_t *counter)
 {
+    tcg_cache_exclude(tcg_ctx, TCG_CACHE_X_REGION);
     TCGv_ptr p = tcg_constant_ptr(counter);
     TCGv_i64 c = tcg_temp_new_i64();
 
@@ -822,6 +824,7 @@ bool translator_ptr_guard(DisasContextBase *db, vaddr pc, vaddr addr,
 
 void translator_gen_ptr_respec(DisasContextBase *db, vaddr pc)
 {
+    tcg_cache_exclude(tcg_ctx, TCG_CACHE_X_HOSTPTR);
     gen_helper_ptr_respec(tcg_env, tcg_constant_ptr(db->tb),
                           tcg_constant_i64(pc));
 }
@@ -1231,6 +1234,7 @@ static void smc_gen_check(DisasContextBase *db, TranslationBlock *tb,
     tb->smc_crc = tb_code_sum(s->smc_buf, len);
     tb->smc_reject = reject;
     tb->smc_check = true;
+    tcg_cache_exclude(s, TCG_CACHE_X_SMC);
 
     s->emit_before_op = mark ? QTAILQ_NEXT(mark, link)
                              : QTAILQ_FIRST(&s->ops);
@@ -1279,6 +1283,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     /* Initialize DisasContext */
     db->tb = tb;
     db->pc_first = pc;
+    tcg_cache_tb_start(tcg_ctx, pc, TARGET_PAGE_BITS);
     db->pc_next = pc;
     db->pc_second_page = -1;
     db->is_jmp = DISAS_NEXT;
@@ -1343,6 +1348,9 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
     plugin_enabled = plugin_gen_tb_start(cpu, db);
     db->plugin_enabled = plugin_enabled;
+    if (plugin_enabled) {
+        tcg_cache_exclude(tcg_ctx, TCG_CACHE_X_PLUGIN);
+    }
 
     /*
      * With tcg_region, a TB may branch back to its first insn instead
@@ -1375,6 +1383,9 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     unit = db->region_capable && region_cap >= 0 && !is_head
            && tcg_units > 1;
 #endif
+    if (is_head) {
+        tcg_cache_exclude(tcg_ctx, TCG_CACHE_X_REGION);
+    }
     if (is_head || unit) {
         TranslatorRegion *r = tcg_malloc(sizeof(*r));
         bool kept = unit;
@@ -1812,6 +1823,9 @@ static bool translator_ld(CPUArchState *env, DisasContextBase *db,
     if (ok && translator_smc_check()) {
         smc_capture(db, pc, dest, len);
     }
+    if (ok && tcg_ctx->cap_on) {
+        tcg_cache_read(tcg_ctx, pc, dest, len);
+    }
     return ok;
 }
 
@@ -1930,6 +1944,9 @@ uint8_t translator_ldub(CPUArchState *env, DisasContextBase *db, vaddr pc)
         if (translator_smc_check()) {
             smc_capture(db, pc, &val, sizeof(val));
         }
+        if (tcg_ctx->cap_on) {
+            tcg_cache_read(tcg_ctx, pc, &val, sizeof(val));
+        }
     }
     return val;
 }
@@ -1945,6 +1962,9 @@ uint16_t translator_lduw_end(CPUArchState *env, DisasContextBase *db,
         record_save(db, pc, &val, sizeof(val));
         if (translator_smc_check()) {
             smc_capture(db, pc, &val, sizeof(val));
+        }
+        if (tcg_ctx->cap_on) {
+            tcg_cache_read(tcg_ctx, pc, &val, sizeof(val));
         }
     }
     if (endian & MO_BSWAP) {
@@ -1965,6 +1985,9 @@ uint32_t translator_ldl_end(CPUArchState *env, DisasContextBase *db,
         if (translator_smc_check()) {
             smc_capture(db, pc, &val, sizeof(val));
         }
+        if (tcg_ctx->cap_on) {
+            tcg_cache_read(tcg_ctx, pc, &val, sizeof(val));
+        }
     }
     if (endian & MO_BSWAP) {
         val = bswap32(val);
@@ -1984,6 +2007,9 @@ uint64_t translator_ldq_end(CPUArchState *env, DisasContextBase *db,
         if (translator_smc_check()) {
             smc_capture(db, pc, &val, sizeof(val));
         }
+        if (tcg_ctx->cap_on) {
+            tcg_cache_read(tcg_ctx, pc, &val, sizeof(val));
+        }
     }
     if (endian & MO_BSWAP) {
         val = bswap64(val);
@@ -1993,6 +2019,7 @@ uint64_t translator_ldq_end(CPUArchState *env, DisasContextBase *db,
 
 void translator_fake_ld(DisasContextBase *db, const void *data, size_t len)
 {
+    tcg_cache_exclude(tcg_ctx, TCG_CACHE_X_FAKE);
     db->fake_insn = true;
     record_save(db, db->pc_first, data, len);
 }

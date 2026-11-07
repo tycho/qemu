@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "tcg/tcg-cache.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -651,6 +652,22 @@ static void set_settings(Object *accel, const char *settings)
             } else if (!strcmp(kv[i], "crossinject")) {
                 /* Testing the crossing fault's path (xt_cross_inject). */
                 xt_cross_inject = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cachecapture")) {
+                /* Translation artifacts (tcg-cache.h), development. */
+                tcg_cache_mode = TCG_CACHE_CAPTURE;
+                applied++;
+            } else if (!strcmp(kv[i], "cachestress")) {
+                tcg_cache_mode = TCG_CACHE_STRESS;
+                applied++;
+            } else if (!strcmp(kv[i], "cacheskew")) {
+                tcg_cache_skew = 37;
+                applied++;
+            } else if (!strcmp(kv[i], "cachedebug")) {
+                tcg_cache_debug = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cachestats")) {
+                tcg_cache_stats_at_exit = true;
                 applied++;
             } else {
                 rejected++;
