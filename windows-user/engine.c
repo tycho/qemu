@@ -284,6 +284,36 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
 }
 
 /*
+ * A write Windows refused, on a page QEMU's flags show writable: true if
+ * Windows refuses it still, so the flags are stale (a change made without
+ * a notification, such as another process's), and refreshes them.  False
+ * if Windows allows the write now (another thread lifted QEMU's write
+ * protection in between), or if the flags don't show the page writable
+ * (QEMU's write protection, page_unprotect's to lift).  QEMU clears
+ * PAGE_WRITE under the mmap lock before it write-protects a page, so the
+ * flags and Windows' protection are compared under it.
+ */
+bool xt_mem_stale_write(vaddr addr)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    bool stale = false, changed;
+
+    mmap_lock();
+    if (page_get_flags(addr) & PAGE_WRITE) {
+        stale = NtQueryVirtualMemory(GetCurrentProcess(),
+                                     (void *)(uintptr_t)addr, 0, &mbi,
+                                     sizeof(mbi), NULL) < 0 ||
+                mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) ||
+                !(prot_flags(mbi.Protect) & PAGE_WRITE);
+        if (stale) {
+            xt_mem_refresh(addr, MMU_DATA_STORE, &changed);
+        }
+    }
+    mmap_unlock();
+    return stale;
+}
+
+/*
  * A guest fault: #PF (x86_cpu_record_sigsegv), the access refused by
  * QEMU's page flags or faulting natively.  Before it is raised the page's
  * flags are refreshed from Windows (xt_mem_refresh), and it is retried if
