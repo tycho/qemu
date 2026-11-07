@@ -58,6 +58,9 @@
 #include "accel/tcg/cpu-ldst-common.h"
 #include "tcg/tcg-temp-internal.h"
 #include "tcg-internal.h"
+#include "tcg-cache-rec.h"
+
+static void tcg_cache_init(void);
 #include "tcg/perf.h"
 #include "tcg-has.h"
 #ifdef CONFIG_USER_ONLY
@@ -736,6 +739,8 @@ typedef struct TCGLabelPoolData {
     intptr_t addend;
     int rtype;
     unsigned nlong;
+    /* A captured translation: the provenance of a one-word entry. */
+    uint8_t cap_kind;
     tcg_target_ulong data[];
 } TCGLabelPoolData;
 
@@ -749,6 +754,7 @@ static TCGLabelPoolData *new_pool_alloc(TCGContext *s, int nlong, int rtype,
     n->addend = addend;
     n->rtype = rtype;
     n->nlong = nlong;
+    n->cap_kind = s->cap_kind > TCG_CAP_ABS ? s->cap_kind : TCG_CAP_NONE;
     return n;
 }
 
@@ -909,8 +915,15 @@ static int tcg_out_pool_finalize(TCGContext *s)
                 return -1;
             }
             memcpy(a, p->data, size);
+            if (p->cap_kind != TCG_CAP_NONE) {
+                tcg_cap_rec_k(s, a, TCG_CAPF_POOL64, p->cap_kind, 0,
+                              p->data[0]);
+            }
             a += size;
             l = p;
+        } else if (l->cap_kind != p->cap_kind) {
+            /* One word for two meanings: it can't be relocated. */
+            tcg_cap_fail(s, TCG_CACHE_X_POOL_MIX);
         }
 
         value = (uintptr_t)tcg_splitwx_to_rx(a) - size;
@@ -2365,6 +2378,11 @@ static void tcg_context_init(unsigned max_threads)
 
 void tcg_init(size_t tb_size, int splitwx, unsigned max_threads)
 {
+    tcg_cache_init();
+    /* Development: translation artifacts under split W^X (qemu-user). */
+    if (getenv("XTCG_CACHE_SPLITWX")) {
+        splitwx = 1;
+    }
     tcg_context_init(max_threads);
     tcg_region_init(tb_size, splitwx, max_threads);
 }
@@ -2633,6 +2651,10 @@ void tcg_prologue_init(void)
 
 void tcg_func_start(TCGContext *s)
 {
+    /* A captured translation: this translation attempt's front-end state. */
+    s->cap_excl = 0;
+    s->cap_next = 0;
+    s->cap_nacq = 0;
     s->align_access = false;
     s->tso_run_ld = false;
     s->tso_run_st = false;
@@ -10128,7 +10150,10 @@ static void tcg_out_helper_load_common_args(TCGContext *s,
         tcg_out_helper_load_slots(s, 1, &ptr_mov, parm);
     } else {
         imm = (uintptr_t)ldst->raddr;
+        /* A captured translation: a place in the TB's own code. */
+        tcg_cap_prov(s, TCG_CAP_HOT);
         tcg_out_helper_load_imm(s, slot, TCG_TYPE_PTR, imm, parm);
+        tcg_cap_prov(s, TCG_CAP_NONE);
     }
 }
 
@@ -12476,3 +12501,5 @@ void tcg_expand_vec_op(TCGOpcode o, TCGType t, unsigned e, TCGArg a0, ...)
     g_assert_not_reached();
 }
 #endif
+
+#include "tcg-cache.c.inc"
