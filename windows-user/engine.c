@@ -158,6 +158,48 @@ static void set_region_flags(vaddr start, vaddr last, int flags)
 }
 
 /*
+ * A refreshed region's flags, except on the pages QEMU write-protected for
+ * its translations where Windows still shows the protection QEMU left
+ * (their flags without write): those keep their flags, PAGE_WRITE_ORG
+ * included, as the refreshed page itself does.  One allocation can hold
+ * such pages next to pages the guest made read-only or executable, and
+ * Windows reports them all as one region.
+ */
+static void refresh_region_flags(vaddr start, vaddr last, int flags)
+{
+    int now = flags & (PAGE_VALID | PAGE_RWX | PAGE_WRITE_ORG);
+    vaddr from = start;
+
+    while (from <= last) {
+        XtUnprotect u = { from, last };
+        vaddr p;
+        int keep = now;
+
+        if (!walk_memory_regions(&u, xt_find_protected)) {
+            break;
+        }
+        p = u.found & TARGET_PAGE_MASK;
+#ifdef TARGET_X86_64
+        if (xt_is_ec_code(p)) {
+            keep &= ~PAGE_EXEC;
+        }
+#endif
+        if (keep ==
+            (page_get_flags(p) & (PAGE_VALID | PAGE_READ | PAGE_EXEC))) {
+            if (p > from) {
+                set_region_flags(from, p - 1, flags);
+            }
+        } else {
+            set_region_flags(from, p | ~TARGET_PAGE_MASK, flags);
+        }
+        from = p + TARGET_PAGE_SIZE;
+    }
+    if (from <= last) {
+        set_region_flags(from, last, flags);
+    }
+}
+
+/*
  * Bring QEMU's page flags for ADDR's page up to date with Windows; true if
  * the access is allowed now, by the flags as they stand under the mmap
  * lock, and *CHANGED if this refresh changed them.  QEMU's flags are
@@ -229,7 +271,7 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed_out)
             xt_event(xt_self, XT_EV_REFRESH, old << 16 | page | fixed, addr);
         }
         if (flags) {
-            set_region_flags(start, last, flags | fixed);
+            refresh_region_flags(start, last, flags | fixed);
         } else {
             page_set_flags(start, last, 0, PAGE_VALID);
         }
