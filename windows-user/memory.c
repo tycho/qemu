@@ -359,8 +359,8 @@ NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
                                            SIZE_T, PSIZE_T);
 
 /*
- * XTAJIT_CPU selects the x64 module's model (a development switch): sse
- * or unset, the SSE model; avx2, the AVX2 model; max, the max model.
+ * XTAJIT_CPU selects the x64 module's model (a development switch): max
+ * or unset, the max model; avx2, the AVX2 model; sse, the SSE model.
  * Decided at the first question, which may come before the engine exists.
  */
 XtCpuModel xt_cpu_x64_model(void)
@@ -378,10 +378,11 @@ XtCpuModel xt_cpu_x64_model(void)
     if (model < 0) {
         WCHAR w[8];
         SIZE_T n = 0;
-        int m = XT_CPU_SSE;
+        int m = XT_CPU_MAX;
 
         if (RtlQueryEnvironmentVariable(NULL, L"XTAJIT_CPU", 10, w,
                                         ARRAY_SIZE(w) - 1, &n) >= 0) {
+            m = XT_CPU_SSE;
             for (int i = 0; i < ARRAY_SIZE(names); i++) {
                 if (n == names[i].len &&
                     !memcmp(w, names[i].name, n * sizeof(WCHAR))) {
