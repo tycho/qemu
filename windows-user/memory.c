@@ -290,17 +290,21 @@ static uint64_t cpuid_features(CPUX86State *env)
         { PF_COMPARE_EXCHANGE_DOUBLE, 0, CPUID_CX8 },
         { PF_MMX_INSTRUCTIONS_AVAILABLE, 0, CPUID_MMX },
         { PF_XMMI_INSTRUCTIONS_AVAILABLE, 0, CPUID_SSE },
+        { PF_3DNOW_INSTRUCTIONS_AVAILABLE, 2, CPUID_EXT2_3DNOW },
         { PF_RDTSC_INSTRUCTION_AVAILABLE, 0, CPUID_TSC },
         { PF_XMMI64_INSTRUCTIONS_AVAILABLE, 0, CPUID_SSE2 },
         { PF_NX_ENABLED, 2, CPUID_EXT2_NX },
         { PF_SSE3_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSE3 },
         { PF_COMPARE_EXCHANGE128, 1, CPUID_EXT_CX16 },
+        { PF_RDWRFSGSBASE_AVAILABLE, 3, CPUID_7_0_EBX_FSGSBASE },
+        { PF_RDRAND_INSTRUCTION_AVAILABLE, 1, CPUID_EXT_RDRAND },
         { PF_RDTSCP_INSTRUCTION_AVAILABLE, 2, CPUID_EXT2_RDTSCP },
         { PF_SSSE3_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSSE3 },
         { PF_SSE4_1_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSE41 },
         { PF_SSE4_2_INSTRUCTIONS_AVAILABLE, 1, CPUID_EXT_SSE42 },
         { PF_XSAVE_ENABLED, 1, CPUID_EXT_OSXSAVE },
         { PF_AVX2_INSTRUCTIONS_AVAILABLE, 3, CPUID_7_0_EBX_AVX2 },
+        { PF_ERMS_AVAILABLE, 3, CPUID_7_0_EBX_ERMS },
     };
     uint32_t words[4], max, unused;
     uint64_t m = 0;
@@ -347,48 +351,126 @@ static uint64_t cpuid_features(CPUX86State *env)
     (MODEL_FEATURES | 1ull << PF_XSAVE_ENABLED |                         \
      1ull << PF_AVX_INSTRUCTIONS_AVAILABLE |                             \
      1ull << PF_AVX2_INSTRUCTIONS_AVAILABLE)
+#define MODEL_FEATURES_MAX                                               \
+    (MODEL_FEATURES_AVX2 | 1ull << PF_3DNOW_INSTRUCTIONS_AVAILABLE)
 
 #ifdef TARGET_X86_64
 NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
                                            SIZE_T, PSIZE_T);
 
 /*
- * XTAJIT_CPU selects the x64 module's model (a development switch): avx2
- * or unset, the AVX2 model; sse, the SSE model.  Decided at the first
- * question, which may come before the engine exists.
+ * XTAJIT_CPU selects the x64 module's model (a development switch): sse
+ * or unset, the SSE model; avx2, the AVX2 model; max, the max model.
+ * Decided at the first question, which may come before the engine exists.
  */
-bool xt_cpu_avx(void)
+XtCpuModel xt_cpu_x64_model(void)
 {
-    static int avx = -1;
+    static const struct {
+        const WCHAR *name;
+        SIZE_T len;
+    } names[] = {
+        [XT_CPU_SSE] = { L"sse", 3 },
+        [XT_CPU_AVX2] = { L"avx2", 4 },
+        [XT_CPU_MAX] = { L"max", 3 },
+    };
+    static int model = -1;
 
-    if (avx < 0) {
+    if (model < 0) {
         WCHAR w[8];
         SIZE_T n = 0;
+        int m = XT_CPU_SSE;
 
-        avx = RtlQueryEnvironmentVariable(NULL, L"XTAJIT_CPU", 10, w,
-                                          ARRAY_SIZE(w) - 1, &n) < 0 ||
-              (n == 4 && !memcmp(w, L"avx2", 4 * sizeof(WCHAR)));
+        if (RtlQueryEnvironmentVariable(NULL, L"XTAJIT_CPU", 10, w,
+                                        ARRAY_SIZE(w) - 1, &n) >= 0) {
+            for (int i = 0; i < ARRAY_SIZE(names); i++) {
+                if (n == names[i].len &&
+                    !memcmp(w, names[i].name, n * sizeof(WCHAR))) {
+                    m = i;
+                }
+            }
+        }
+        model = m;
     }
-    return avx;
+    return model;
 }
 #else
-bool xt_cpu_avx(void)
+XtCpuModel xt_cpu_x64_model(void)
 {
-    return false;
+    return XT_CPU_SSE;
 }
 #endif
 
+bool xt_cpu_avx(void)
+{
+    return xt_cpu_x64_model() != XT_CPU_SSE;
+}
+
+/* The model's answers, which Windows asks for before the first CPU exists. */
+static uint64_t model_features(void)
+{
+    static const uint64_t features[] = {
+        [XT_CPU_SSE] = MODEL_FEATURES,
+        [XT_CPU_AVX2] = MODEL_FEATURES_AVX2,
+        [XT_CPU_MAX] = MODEL_FEATURES_MAX,
+    };
+
+    return features[xt_cpu_x64_model()];
+}
+
+/*
+ * The save state the module's contexts carry for the model: x87 and SSE,
+ * and the YMM upper halves in the x64 module's AVX models.
+ */
+static uint64_t context_xstate(void)
+{
+    return XSTATE_FP_MASK | XSTATE_SSE_MASK |
+           (xt_cpu_avx() ? XSTATE_YMM_MASK : 0);
+}
+
+/*
+ * Whether the first CPU says what the module told Windows before it
+ * existed, and has no state Windows' contexts would lose: XCR0's
+ * components, the ones leaf 0xD offers and no supervisor ones.  Windows
+ * keeps the early answers, so a CPU that differs can't run the process.
+ * REASON says what differed.
+ */
+bool xt_cpu_check(CPUState *cs, char *reason, size_t len)
+{
+    CPUX86State *env = cpu_env(cs);
+    uint64_t m = cpuid_features(env), model = model_features();
+    uint64_t carried = context_xstate();
+    uint32_t max, eax, ebx, ecx, edx;
+
+    if (m != model) {
+        snprintf(reason, len, "features %016" PRIx64 ", told Windows %016"
+                 PRIx64, m, model);
+        return false;
+    }
+    if (env->xcr0 & ~carried) {
+        snprintf(reason, len, "xcr0 %" PRIx64, env->xcr0);
+        return false;
+    }
+    cpu_x86_cpuid(env, 0, 0, &max, &ebx, &ecx, &edx);
+    if (max >= 0xd) {
+        cpu_x86_cpuid(env, 0xd, 0, &eax, &ebx, &ecx, &edx);
+        if (((uint64_t)edx << 32 | eax) & ~carried) {
+            snprintf(reason, len, "xsave components %08x%08x", edx, eax);
+            return false;
+        }
+        cpu_x86_cpuid(env, 0xd, 1, &eax, &ebx, &ecx, &edx);
+        if (ecx | edx) {
+            snprintf(reason, len, "supervisor xsave components %08x%08x",
+                     edx, ecx);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The model's answers: the first CPU's, as xt_cpu_check makes sure. */
 BOOLEAN xt_feature_present(UINT feature)
 {
-    CPUState *cs = first_cpu;
-    uint64_t model = xt_cpu_avx() ? MODEL_FEATURES_AVX2 : MODEL_FEATURES;
-    uint64_t m = model;
-
-    if (cs) {
-        m = cpuid_features(cpu_env(cs));
-        assert(m == model);
-    }
-    return feature < 64 && (m >> feature) & 1;
+    return feature < 64 && (model_features() >> feature) & 1;
 }
 
 /*
