@@ -17,6 +17,7 @@
 #define TCG_CACHE_H
 
 #include "exec/vaddr.h"
+#include "qemu/rcu.h"
 
 typedef struct TCGContext TCGContext;
 typedef struct TranslationBlock TranslationBlock;
@@ -482,10 +483,61 @@ int tcg_cache_file_get(const TCGCacheFile *f, const TCGCacheIdx *e,
 void tcg_cache_nofault(int64_t code);
 bool tcg_cache_segment_name_ok(const char name[64]);
 /*
+ * The files a process reads (step 2 of the design's phase 3): loose
+ * segments newest first, then the pack.  Immutable once published;
+ * @release unmaps them, after a grace period.
+ */
+#define TCG_CACHE_SNAP_FILES 17
+
+typedef struct TCGCacheSnap {
+    struct rcu_head rcu;
+    int n;
+    TCGCacheFile f[TCG_CACHE_SNAP_FILES];
+    void *os[TCG_CACHE_SNAP_FILES];     /* the back end's, per file */
+    void (*release)(struct TCGCacheSnap *s);
+} TCGCacheSnap;
+
+/* Read with qatomic_rcu_read, under rcu_read_lock. */
+extern TCGCacheSnap *tcg_cache_snap;
+/* Replace the snapshot; false (and nothing done) while one waits. */
+bool tcg_cache_snap_publish(TCGCacheSnap *s);
+bool tcg_cache_snap_waiting(void);
+void tcg_cache_snap_fork_child(void);
+/* Testing: pauses in retiring a snapshot, and before a capture's lock. */
+extern unsigned tcg_cache_retire_pause_ms, tcg_cache_sink_pause_ms;
+/* A lookup in the snapshot found nothing: the back end may refresh it. */
+extern bool tcg_cache_file_missed;
+/* The day captures are born, set by the back end. */
+extern uint32_t tcg_cache_born;
+
+/* Capture buffers for the back end's writer (see tcg-cache-file.c.inc). */
+#define TCG_CACHE_BUF_SIZE  (256 * 1024)
+#define TCG_CACHE_BUFS      4
+
+extern bool tcg_cache_sink_on;
+/* Called (outside the sink's lock) when a buffer is queued. */
+extern void (*tcg_cache_sink_wake)(void);
+void tcg_cache_sink_init(void);
+void tcg_cache_sink_put(uint64_t id, uint64_t rva, uint32_t born,
+                        const void *art, size_t len, int64_t now);
+void *tcg_cache_sink_take(int64_t now, int64_t age_ns, bool force,
+                          bool trylock, size_t *lenp);
+void tcg_cache_sink_give(void *data);
+void tcg_cache_sink_hold(unsigned ms);
+int tcg_cache_sink_close(void **data, size_t *lens);
+void tcg_cache_sink_fork_start(void);
+void tcg_cache_sink_fork_end(bool child);
+
+/*
  * The distinct, validated candidates for a key, each passed to @use until
  * it returns true; why others were refused counted in @rejects.
  */
 int tcg_cache_file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
+                          uint32_t flags, uint64_t cs_base, uint32_t cflags,
+                          void *buf, size_t bufsz,
+                          bool (*use)(const TCGCacheEnv *env, void *opaque),
+                          void *opaque, uint64_t *rejects);
+int tcg_cache_snap_select(const TCGCacheSnap *snap, uint64_t id, uint64_t rva,
                           uint32_t flags, uint64_t cs_base, uint32_t cflags,
                           void *buf, size_t bufsz,
                           bool (*use)(const TCGCacheEnv *env, void *opaque),
@@ -519,6 +571,9 @@ typedef struct TCGCacheStats {
     uint64_t flushes, inj_promote, copies, checks, guard_lost;
     /* XTCG_CACHE_LOAD */
     uint64_t file_lookups, file_hits, file_reject[TCG_CACHE_V_MAX];
+    uint64_t sink_put, sink_dropped, published, publish_fail, publish_ns;
+    uint64_t snaps, snap_skipped, snap_files, startup_ns, refresh_ns;
+    uint64_t snap_refused;
     uint64_t look_ns, copy_ns, check_ns, hit_ns;
 } TCGCacheStats;
 
