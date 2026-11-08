@@ -189,17 +189,20 @@ void tcg_cache_acqrel(TCGContext *s, uint64_t pc)
     s->cap_acq[s->cap_nacq++] = pc;
 }
 
-/* The last capture's exclusion (statistics). */
-unsigned tcg_cache_last_reason;
-
-#ifdef TCG_TARGET_HAS_CACHE
-
 /* Kinds that resolve to code or data outside the TB. */
 
 static uintptr_t tcg_cache_anchor(void)
 {
     return (uintptr_t)tcg_gen_code;
 }
+
+/* The last capture's exclusion (statistics). */
+unsigned tcg_cache_last_reason;
+
+/* The last failed install's relocation (statistics). */
+unsigned tcg_cache_fail_kind, tcg_cache_fail_form;
+
+#ifdef TCG_TARGET_HAS_CACHE
 
 static const void *tcg_cache_stub(unsigned id)
 {
@@ -1051,6 +1054,8 @@ TranslationBlock *tcg_cache_place(TCGContext *s, const TCGCacheArtView *v,
         case TCG_CAP_STUB:
             val = (uintptr_t)tcg_cache_stub(rel->val);
             if (!val) {
+                tcg_cache_fail_kind = rel->kind;
+                tcg_cache_fail_form = rel->form;
                 return NULL;
             }
             break;
@@ -1059,6 +1064,8 @@ TranslationBlock *tcg_cache_place(TCGContext *s, const TCGCacheArtView *v,
             break;
         case TCG_CAP_THUNK:
             if (!r->thunk) {
+                tcg_cache_fail_kind = rel->kind;
+                tcg_cache_fail_form = rel->form;
                 return NULL;
             }
             val = (uintptr_t)r->thunk;
@@ -1070,9 +1077,13 @@ TranslationBlock *tcg_cache_place(TCGContext *s, const TCGCacheArtView *v,
             val = (uintptr_t)tcg_splitwx_to_rx(r->cold) + rel->val;
             break;
         default:
+            tcg_cache_fail_kind = TCG_CAP_UNSUPPORTED;
+            tcg_cache_fail_form = rel->form;
             return NULL;
         }
         if (!tcg_cache_apply(rw, rx, rel->form, rel->aux, val)) {
+            tcg_cache_fail_kind = rel->kind;
+            tcg_cache_fail_form = rel->form;
             if (tcg_cache_debug) {
                 fprintf(stderr, "reloc: form %d kind %d aux %x site %x "
                         "val %" PRIx64 " -> %" PRIxPTR " at %" PRIxPTR "\n",
@@ -1088,6 +1099,8 @@ TranslationBlock *tcg_cache_place(TCGContext *s, const TCGCacheArtView *v,
         uintptr_t rx, fa;
         intptr_t off;
 
+        tcg_cache_fail_kind = TCG_CAP_NONE;
+        tcg_cache_fail_form = TCG_CAPF_LDRLIT19;
         if (c->kind != TCG_CAPC_SLOT_LDRLIT || c->slot >= h->nb_slots) {
             return NULL;
         }
@@ -1306,6 +1319,9 @@ int tcg_cache_dump_line(char *buf, size_t size, uint64_t id, uint64_t rva,
 
 void tcg_cache_print_stats(void)
 {
+    static const char *const why[] = {
+        "none", "helper", "stub", "thunk", "reloc", "key-pc", "key", "other",
+    };
     TCGCacheStats *t = &tcg_cache_stats;
     static const char *const kinds[] = {
         "none", "abs", "helper", "stub", "own-tb", "thunk", "hot", "cold",
@@ -1365,8 +1381,24 @@ void tcg_cache_print_stats(void)
     fprintf(stderr, "xtcg-cache: on: guard not restored %" PRIu64 "\n",
             t->guard_lost);
     if (t->snaps || t->sink_put) {
-        fprintf(stderr, "xtcg-cache: dir: refused %" PRIu64 "\n",
-                t->snap_refused);
+        fprintf(stderr, "xtcg-cache: dir: refused %" PRIu64 " scans "
+                "truncated %" PRIu64 " over budget: mapping %" PRIu64
+                " disk %" PRIu64 "; unpublished after a partial scan %"
+                PRIu64 "\n", t->snap_refused, t->scan_trunc,
+                t->map_budget, t->publish_budget, t->publish_blind);
+        fprintf(stderr, "xtcg-cache: dir: compactions %" PRIu64 " (failed %"
+                PRIu64 ", at exit %" PRIu64 ", busy %" PRIu64 ") %.3f ms: %"
+                PRIu64 " files, %" PRIu64 " artifacts read, %" PRIu64
+                " kept, %" PRIu64 " aged out, %" PRIu64 " damaged, %" PRIu64
+                " copies; %" PRIu64 " bytes; skipped %" PRIu64
+                ", tables regrown %" PRIu64 ", collisions %" PRIu64
+                "; removed %" PRIu64 " (failed %" PRIu64 ")\n",
+                t->compactions, t->compact_fail, t->compact_exit,
+                t->compact_busy, t->compact_ns / 1e6, t->compact_in,
+                t->compact_arts, t->compact_kept, t->compact_aged,
+                t->compact_damaged, t->compact_dups, t->compact_bytes,
+                t->compact_skip, t->compact_regrow, t->compact_collide,
+                t->removed, t->remove_fail);
         fprintf(stderr, "xtcg-cache: dir: snapshots %" PRIu64 " (%" PRIu64
                 " files, %" PRIu64 " skipped) start-up %.3f ms, snapshots"
                 " %.3f ms; captured %" PRIu64 " (dropped %" PRIu64
@@ -1385,6 +1417,37 @@ void tcg_cache_print_stats(void)
             }
         }
         fprintf(stderr, "\n");
+    }
+    if (t->file_fail) {
+        fprintf(stderr, "xtcg-cache: file: failed installs %" PRIu64
+                " (%.3f ms); relocs", t->file_fail, t->file_fail_ns / 1e6);
+        for (int i = 0; i < ARRAY_SIZE(kinds); i++) {
+            if (t->inst_fail_rk[i]) {
+                fprintf(stderr, " %s=%" PRIu64, kinds[i], t->inst_fail_rk[i]);
+            }
+        }
+        fprintf(stderr, " |");
+        for (int i = 0; i < ARRAY_SIZE(forms); i++) {
+            if (t->inst_fail_rf[i]) {
+                fprintf(stderr, " %s=%" PRIu64, forms[i], t->inst_fail_rf[i]);
+            }
+        }
+        fprintf(stderr, "; key-pc=%" PRIu64 "\n", t->inst_fail_kpc);
+    }
+    if (t->file_lookups) {
+        fprintf(stderr, "xtcg-cache: file: translated after");
+        for (int i = 0; i < TCG_CACHE_W_MAX; i++) {
+            if (t->gen[i]) {
+                fprintf(stderr, " %s=%" PRIu64 " (%.3f ms)", why[i],
+                        t->gen[i], t->gen_ns[i] / 1e6);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+    if (tcg_ctx->code_gen_buffer) {
+        fprintf(stderr, "xtcg-cache: layout: code buffer %p+%zx anchor %"
+                PRIxPTR "\n", tcg_ctx->code_gen_buffer,
+                tcg_ctx->code_gen_buffer_size, tcg_cache_anchor());
     }
     fprintf(stderr, "xtcg-cache: on: ns lookup %.0f copy %.0f check %.0f"
             " hit %.0f (per lookup, per copy, per guest-byte check,"
