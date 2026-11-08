@@ -375,7 +375,7 @@ int tcg_cache_dump_line(char *buf, size_t size, uint64_t id, uint64_t rva,
 #define TCG_CACHE_ENV_MAGIC     0x45435458      /* "XTCE" */
 #define TCG_CACHE_SEG_MAGIC     0x53435458      /* "XTCS" */
 #define TCG_CACHE_PACK_MAGIC    0x50435458      /* "XTCP" */
-#define TCG_CACHE_FILE_VERSION  1
+#define TCG_CACHE_FILE_VERSION  3
 
 /* The readers' hard limits. */
 #define TCG_CACHE_ART_MAX           (64 * 1024)
@@ -398,8 +398,10 @@ typedef struct TCGCacheEnv {
     uint32_t pad;
     uint64_t id, rva, cs_base;
     uint32_t flags, cflags;
-    uint64_t content;       /* the key and the artifact, not born */
-    uint64_t check;         /* all of it, this field zero */
+    /* XXH3_64 of the key and the artifact's XXH3_64, not born */
+    uint64_t content;
+    /* XXH3_64 of the header up to here and the artifact's XXH3_64 */
+    uint64_t check;
 } TCGCacheEnv;
 
 typedef struct TCGCacheIdx {
