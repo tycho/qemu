@@ -110,7 +110,7 @@ static int64_t decode_sleb128(const uint8_t **pp)
    with the host pc, and the middle columns with zeros.  */
 
 /* tcg_lazysync map: the register byte of a constant-valued global. */
-#define LAZY_WB_CONST 0xff
+#define LAZY_WB_CONST TCG_CACHE_LAZY_WB_CONST
 
 static int encode_search(TranslationBlock *tb, uint8_t *block,
                          uint8_t *highwater)
@@ -781,6 +781,24 @@ static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
     return tb;
 }
 
+/* A file's candidate, installed if it applies (tcg_cache_file_select). */
+typedef struct TBCacheUse {
+    CPUState *cpu;
+    TCGTBCPUState s;
+    tb_page_addr_t phys_pc;
+    const TCGCacheImage *img;
+    TranslationBlock *tb;
+} TBCacheUse;
+
+static bool tb_cache_use(const TCGCacheEnv *env, void *opaque)
+{
+    TBCacheUse *u = opaque;
+
+    u->tb = tb_cache_install(u->cpu, u->s, u->phys_pc, env + 1,
+                             env->len - sizeof(*env), u->img);
+    return u->tb != NULL;
+}
+
 /*
  * TCG_CACHE_ON: the TB for @s from the store, if a candidate for @img
  * applies, else NULL.  Each candidate is copied out (guarded) and its
@@ -798,6 +816,27 @@ static TranslationBlock *tb_cache_lookup(CPUState *cpu, TCGTBCPUState s,
     int n;
 
     tcg_cache_stats.lookups++;
+    /* Testing (XTCG_CACHE_LOAD): a file's artifacts first. */
+    if (tcg_cache_have_loaded) {
+        static void *fbuf;
+        TBCacheUse u = { cpu, s, phys_pc, img, NULL };
+
+        if (!fbuf) {
+            fbuf = g_malloc(sizeof(TCGCacheEnv) + TCG_CACHE_ART_MAX);
+        }
+        tcg_cache_stats.file_lookups++;
+        tcg_cache_file_select(&tcg_cache_loaded, img->id, s.pc - img->base,
+                              s.flags, s.cs_base, s.cflags, fbuf,
+                              sizeof(TCGCacheEnv) + TCG_CACHE_ART_MAX,
+                              tb_cache_use, &u, tcg_cache_stats.file_reject);
+        if (u.tb) {
+            tcg_cache_stats.file_hits++;
+            tcg_cache_stats.hits++;
+            tcg_cache_stats.hit_ns += get_clock() - t0;
+            tcg_cache_stats.look_ns += get_clock() - t0;
+            return u.tb;
+        }
+    }
     n = tcg_cache_store_find(img->id, s.pc - img->base, s.flags, s.cs_base,
                              s.cflags, c);
     if (!n) {
@@ -867,6 +906,16 @@ static void tb_cache_count(CPUState *cpu)
         tcg_cache_stats.flushes++;
         queue_tb_flush(cpu);
     }
+}
+#else
+/*
+ * System mode installs nothing from files; their readers, built in every
+ * mode, copy with a plain one.
+ */
+int64_t tcg_cache_gcopy(void *dst, const void *src, size_t len)
+{
+    memcpy(dst, src, len);
+    return 0;
 }
 #endif
 

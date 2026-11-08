@@ -156,6 +156,7 @@ typedef struct TCGCacheArt {
     uint8_t pad[3];
     uint32_t tb_flags;
     uint32_t cflags;
+    uint32_t pad1;
     uint64_t pc;
     uint64_t cs_base;
     uint32_t hot_len;       /* code and pool */
@@ -340,6 +341,169 @@ void tcg_cache_store_foreach(void (*fn)(void *opaque, uint64_t id,
 int tcg_cache_dump_line(char *buf, size_t size, uint64_t id, uint64_t rva,
                         uint64_t base, const void *art, size_t len);
 
+/*
+ * Files (tcg-cache-file.c.inc).  An artifact is stored in an envelope: its
+ * full key, the day it was first captured, a content identity (its key
+ * and bytes, not the day) and a checksum of everything.  A segment holds
+ * envelopes and an index sorted by key hash; a pack holds envelopes, an
+ * open-addressed index and the list of segments it covers.  All offsets
+ * are from the file's start, all fields host-order.
+ */
+#define TCG_CACHE_ENV_MAGIC     0x45435458      /* "XTCE" */
+#define TCG_CACHE_SEG_MAGIC     0x53435458      /* "XTCS" */
+#define TCG_CACHE_PACK_MAGIC    0x50435458      /* "XTCP" */
+#define TCG_CACHE_FILE_VERSION  1
+
+/* The readers' hard limits. */
+#define TCG_CACHE_ART_MAX           (64 * 1024)
+#define TCG_CACHE_MAX_EXT           64
+#define TCG_CACHE_MAX_REL           1024
+#define TCG_CACHE_MAX_ACQ           4096
+#define TCG_CACHE_FILE_MAX          (512u << 20)
+#define TCG_CACHE_SEG_ENTRIES_MAX   (1u << 20)
+#define TCG_CACHE_SLOT_LOG2_MAX     22
+#define TCG_CACHE_COVER_MAX         4096
+#define TCG_CACHE_PROBES            64
+
+/* The lazy-sync map's register byte for a constant. */
+#define TCG_CACHE_LAZY_WB_CONST     0xff
+
+typedef struct TCGCacheEnv {
+    uint32_t magic;
+    uint32_t len;           /* this envelope and its artifact */
+    uint32_t born;          /* days since the epoch, at first capture */
+    uint32_t pad;
+    uint64_t id, rva, cs_base;
+    uint32_t flags, cflags;
+    uint64_t content;       /* the key and the artifact, not born */
+    uint64_t check;         /* all of it, this field zero */
+} TCGCacheEnv;
+
+typedef struct TCGCacheIdx {
+    uint64_t khash;         /* the key's hash; 0: an empty pack slot */
+    uint32_t off, len;      /* the envelope */
+    uint32_t check;         /* rva ^ flags, folded */
+    uint32_t pad;
+} TCGCacheIdx;
+
+typedef struct TCGCacheCover {
+    char name[64];
+    uint64_t hdr_check;     /* the segment's header checksum */
+    uint64_t pad;
+} TCGCacheCover;
+
+typedef struct TCGCacheFileHdr {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t hdr_len;
+    uint8_t fp[16];         /* tcg_cache_fingerprint */
+    uint64_t tick;          /* a segment's publication; a pack's generation */
+    uint32_t n_index;       /* entries, used slots in a pack */
+    uint32_t index_off;
+    uint32_t slot_log2;     /* a pack's slot table; 0 in a segment */
+    uint32_t n_cover;
+    uint32_t cover_off, cover_len;
+    uint32_t data_off, data_len;
+    uint64_t cover_check;
+    uint64_t check;         /* this header, this field zero */
+} TCGCacheFileHdr;
+
+typedef struct TCGCacheFile {
+    TCGCacheFileHdr hdr;    /* copied out, checked */
+    const void *map;
+    size_t size;
+    uint64_t index_bytes;
+    TCGCacheCover *cover;   /* copied out, checked */
+    int64_t (*copy)(void *dst, const void *src, size_t len);
+    void (*fault)(int64_t code);
+} TCGCacheFile;
+
+/* What a check found (tcg_cache_validate and the readers). */
+enum {
+    TCG_CACHE_V_OK,
+    TCG_CACHE_V_HEADER,
+    TCG_CACHE_V_LIMIT,
+    TCG_CACHE_V_SPAN,
+    TCG_CACHE_V_EXTENT,
+    TCG_CACHE_V_REL_ORDER,
+    TCG_CACHE_V_REL_FORM,
+    TCG_CACHE_V_REL_SITE,
+    TCG_CACHE_V_REL_CANON,
+    TCG_CACHE_V_REL_TARGET,
+    TCG_CACHE_V_SLOT,
+    TCG_CACHE_V_CON,
+    TCG_CACHE_V_UNWIND,
+    TCG_CACHE_V_LAZY,
+    TCG_CACHE_V_KEY,
+    TCG_CACHE_V_CHECK,
+    TCG_CACHE_V_FAULT,
+    TCG_CACHE_V_INSN,
+    TCG_CACHE_V_MAX
+};
+
+extern uint8_t tcg_cache_fingerprint[16];
+/*
+ * The target's check of one insn's unwind data, as its
+ * restore_state_to_opc will read it; unset, no artifact validates.
+ */
+extern bool (*tcg_cache_insn_ok)(const uint64_t *data, bool pcrel);
+/* Testing: values of the second word the target's check must refuse. */
+extern const uint64_t *tcg_cache_insn_bad;
+extern int tcg_cache_insn_nbad;
+
+const char *tcg_cache_v_name(int v);
+uint64_t tcg_cache_hash64(uint64_t seed, const void *data, size_t len);
+/* An artifact as it may be installed: TCG_CACHE_V_OK, or why not. */
+int tcg_cache_validate(const void *art, size_t len);
+/* Write @art's envelope at @out (room for ROUND_UP(64 + len, 8)). */
+size_t tcg_cache_envelope(void *out, uint64_t id, uint64_t rva,
+                          uint32_t born, const void *art, size_t len);
+/*
+ * A file of the envelopes in @data (a pack if @pack), g_malloc'd; NULL if
+ * the envelopes aren't back to back and bounded, or a reader would refuse
+ * the file.
+ */
+void *tcg_cache_write_file(bool pack, uint64_t tick, const void *data,
+                           size_t data_len, const TCGCacheCover *cover,
+                           uint32_t n_cover, size_t *lenp);
+int tcg_cache_file_open(TCGCacheFile *f, const void *map, size_t size,
+                        int64_t (*copy)(void *, const void *, size_t),
+                        void (*fault)(int64_t));
+void tcg_cache_file_close(TCGCacheFile *f);
+/* Up to @max index entries for a key, or -1 if the index is damaged. */
+int tcg_cache_file_find(const TCGCacheFile *f, uint64_t id, uint64_t rva,
+                        uint32_t flags, uint64_t cs_base, uint32_t cflags,
+                        TCGCacheIdx *out, int max);
+/* An entry's envelope copied into @buf and checked against the key. */
+int tcg_cache_file_get(const TCGCacheFile *f, const TCGCacheIdx *e,
+                       uint64_t id, uint64_t rva, uint32_t flags,
+                       uint64_t cs_base, uint32_t cflags, void *buf,
+                       size_t buf_size, const TCGCacheEnv **envp);
+void tcg_cache_nofault(int64_t code);
+bool tcg_cache_segment_name_ok(const char name[64]);
+/*
+ * The distinct, validated candidates for a key, each passed to @use until
+ * it returns true; why others were refused counted in @rejects.
+ */
+int tcg_cache_file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
+                          uint32_t flags, uint64_t cs_base, uint32_t cflags,
+                          void *buf, size_t bufsz,
+                          bool (*use)(const TCGCacheEnv *env, void *opaque),
+                          void *opaque, uint64_t *rejects);
+/* Testing (XTCG_CACHE_LOAD): a file lookups read before the store. */
+extern TCGCacheFile tcg_cache_loaded;
+extern bool tcg_cache_have_loaded;
+/*
+ * Testing (XTCG_CACHE_SAVE): the store's envelopes, an owned copy for
+ * tcg_cache_write_file; @born the day.  Called with mmap_lock held.
+ */
+void *tcg_cache_store_envelopes(uint32_t born, size_t *lenp);
+/* Testing: validate every artifact of a file; damage it every way. */
+int tcg_cache_check_file(const void *map, size_t size, bool quiet,
+                         uint64_t *counts);
+int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
+                        unsigned arts);
+
 /* Counters, printed at exit with XTCG_CACHE_STATS. */
 typedef struct TCGCacheStats {
     uint64_t tried, captured, bytes, excluded[TCG_CACHE_X_MAX];
@@ -353,6 +517,8 @@ typedef struct TCGCacheStats {
     uint64_t store_bytes, lookups, look_inel, look_none, hits;
     uint64_t miss_base, miss_struct, miss_region, miss_inel, miss_fault;
     uint64_t flushes, inj_promote, copies, checks, guard_lost;
+    /* XTCG_CACHE_LOAD */
+    uint64_t file_lookups, file_hits, file_reject[TCG_CACHE_V_MAX];
     uint64_t look_ns, copy_ns, check_ns, hit_ns;
 } TCGCacheStats;
 

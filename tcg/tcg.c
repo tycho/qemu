@@ -12428,3 +12428,4 @@ void tcg_expand_vec_op(TCGOpcode o, TCGType t, unsigned e, TCGArg a0, ...)
 #endif
 
 #include "tcg-cache.c.inc"
+#include "tcg-cache-file.c.inc"
