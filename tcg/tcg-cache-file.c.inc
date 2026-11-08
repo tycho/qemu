@@ -925,30 +925,28 @@ int tcg_cache_file_get(const TCGCacheFile *f, const TCGCacheIdx *e,
     return TCG_CACHE_V_OK;
 }
 
-/*
- * The candidates for a key, in index order, each passed to @use until it
- * returns true: distinct artifacts whose full key matches, at most
- * TCG_CACHE_CANDS, already validated.  Index entries whose envelope has
- * another key, or a copy of one already passed (the same content, its
- * bytes compared), don't count.  @buf holds the one being passed.  The
- * number passed.
- */
-int tcg_cache_file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
-                          uint32_t flags, uint64_t cs_base, uint32_t cflags,
-                          void *buf, size_t bufsz,
-                          bool (*use)(const TCGCacheEnv *env, void *opaque),
-                          void *opaque, uint64_t *rejects)
+/* Candidates already passed, across the files of one lookup. */
+typedef struct SelSeen {
+    void *env[TCG_CACHE_CANDS];
+    int n;
+} SelSeen;
+
+/* One file's candidates for a key; true if @use stopped the lookup. */
+static bool file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
+                        uint32_t flags, uint64_t cs_base, uint32_t cflags,
+                        void *buf, size_t bufsz,
+                        bool (*use)(const TCGCacheEnv *env, void *opaque),
+                        void *opaque, uint64_t *rejects, SelSeen *seen)
 {
     TCGCacheIdx fe[TCG_CACHE_PROBES];
-    void *seen[TCG_CACHE_CANDS];
-    int fn, nseen = 0;
+    int fn;
 
     fn = tcg_cache_file_find(f, id, rva, flags, cs_base, cflags, fe,
                              TCG_CACHE_PROBES);
     if (fn < 0 && rejects) {
         rejects[TCG_CACHE_V_LIMIT]++;
     }
-    for (int i = 0; i < fn && nseen < TCG_CACHE_CANDS; i++) {
+    for (int i = 0; i < fn && seen->n < TCG_CACHE_CANDS; i++) {
         const TCGCacheEnv *env;
         bool dup = false;
         int r;
@@ -959,8 +957,8 @@ int tcg_cache_file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
             continue;
         }
         if (!r) {
-            for (int k = 0; k < nseen && !dup; k++) {
-                const TCGCacheEnv *o = seen[k];
+            for (int k = 0; k < seen->n && !dup; k++) {
+                const TCGCacheEnv *o = seen->env[k];
 
                 dup = o->content == env->content && o->len == env->len
                       && !memcmp(o + 1, env + 1, env->len - sizeof(*env));
@@ -976,15 +974,322 @@ int tcg_cache_file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
             }
             continue;
         }
-        seen[nseen++] = g_memdup2(env, env->len);
+        seen->env[seen->n++] = g_memdup2(env, env->len);
         if (use(env, opaque)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void sel_seen_free(SelSeen *seen)
+{
+    for (int k = 0; k < seen->n; k++) {
+        g_free(seen->env[k]);
+    }
+}
+
+/*
+ * The candidates for a key, in index order, each passed to @use until it
+ * returns true: distinct artifacts whose full key matches, at most
+ * TCG_CACHE_CANDS, already validated.  Index entries whose envelope has
+ * another key, or a copy of one already passed (the same content, its
+ * bytes compared), don't count.  @buf holds the one being passed.  The
+ * number passed.
+ */
+int tcg_cache_file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
+                          uint32_t flags, uint64_t cs_base, uint32_t cflags,
+                          void *buf, size_t bufsz,
+                          bool (*use)(const TCGCacheEnv *env, void *opaque),
+                          void *opaque, uint64_t *rejects)
+{
+    SelSeen seen = { };
+    int n;
+
+    file_select(f, id, rva, flags, cs_base, cflags, buf, bufsz, use, opaque,
+                rejects, &seen);
+    n = seen.n;
+    sel_seen_free(&seen);
+    return n;
+}
+
+/* The same over a snapshot's files, in order, with one budget. */
+int tcg_cache_snap_select(const TCGCacheSnap *snap, uint64_t id, uint64_t rva,
+                          uint32_t flags, uint64_t cs_base, uint32_t cflags,
+                          void *buf, size_t bufsz,
+                          bool (*use)(const TCGCacheEnv *env, void *opaque),
+                          void *opaque, uint64_t *rejects)
+{
+    SelSeen seen = { };
+    int n;
+
+    for (int i = 0; i < snap->n && seen.n < TCG_CACHE_CANDS; i++) {
+        if (file_select(&snap->f[i], id, rva, flags, cs_base, cflags, buf,
+                        bufsz, use, opaque, rejects, &seen)) {
             break;
         }
     }
-    for (int k = 0; k < nseen; k++) {
-        g_free(seen[k]);
+    n = seen.n;
+    sel_seen_free(&seen);
+    return n;
+}
+
+/*
+ * The snapshot lookups read (TCGCacheSnap), published by RCU: a back end
+ * replaces it, and the old one is released after a grace period, so a
+ * reader keeps its views mapped while it copies.  At most one released
+ * snapshot waits: until it goes, tcg_cache_snap_publish refuses.
+ */
+TCGCacheSnap *tcg_cache_snap;
+static bool snap_retired;
+bool tcg_cache_file_missed;
+uint32_t tcg_cache_born;
+
+unsigned tcg_cache_retire_pause_ms;
+
+static void snap_free(TCGCacheSnap *s)
+{
+    if (tcg_cache_retire_pause_ms) {
+        g_usleep(tcg_cache_retire_pause_ms * 1000);
     }
-    return nseen;
+    for (int i = 0; i < s->n; i++) {
+        tcg_cache_file_close(&s->f[i]);
+    }
+    if (s->release) {
+        s->release(s);
+    }
+    g_free(s);
+    qatomic_set(&snap_retired, false);
+}
+
+bool tcg_cache_snap_publish(TCGCacheSnap *s)
+{
+    TCGCacheSnap *old;
+
+    if (qatomic_read(&snap_retired)) {
+        return false;
+    }
+    old = qatomic_xchg(&tcg_cache_snap, s);
+    if (old) {
+        qatomic_set(&snap_retired, true);
+        call_rcu(old, snap_free, rcu);
+    }
+    return true;
+}
+
+bool tcg_cache_snap_waiting(void)
+{
+    return qatomic_read(&snap_retired);
+}
+
+/*
+ * A fork's child: a snapshot being retired belongs to the parent's RCU
+ * thread, which the child doesn't have; its callback may run in the
+ * child's new one or not at all.  Nothing in the child uses it (lookups
+ * read the current snapshot) and the child never publishes, so it is
+ * forgotten: at worst its mappings stay.
+ */
+void tcg_cache_snap_fork_child(void)
+{
+    qatomic_set(&snap_retired, false);
+}
+
+/*
+ * The sink: captured artifacts, as envelopes, in a queue of buffers the
+ * back end's writer publishes.  A buffer is free, filling (the producer's,
+ * at most one), queued (full, or handed over), or being written.  All of
+ * it under sink_lock, held only to copy.  With no free buffer, captures
+ * are dropped and counted.
+ */
+enum { BUF_FREE, BUF_FILLING, BUF_QUEUED, BUF_WRITING };
+
+typedef struct SinkBuf {
+    uint8_t *data;
+    size_t len;
+    int64_t first_ns;
+    int state;
+} SinkBuf;
+
+bool tcg_cache_sink_on;
+void (*tcg_cache_sink_wake)(void);
+unsigned tcg_cache_sink_pause_ms;
+static QemuMutex sink_lock;
+static SinkBuf sink[TCG_CACHE_BUFS];
+static int sink_cur = -1;
+
+void tcg_cache_sink_init(void)
+{
+    qemu_mutex_init(&sink_lock);
+    for (int i = 0; i < TCG_CACHE_BUFS; i++) {
+        sink[i] = (SinkBuf){ .data = g_malloc(TCG_CACHE_BUF_SIZE) };
+    }
+    sink_cur = -1;
+    qatomic_set(&tcg_cache_sink_on, true);
+}
+
+static int sink_free_buf(void)
+{
+    for (int i = 0; i < TCG_CACHE_BUFS; i++) {
+        if (sink[i].state == BUF_FREE) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void tcg_cache_sink_put(uint64_t id, uint64_t rva, uint32_t born,
+                        const void *art, size_t len, int64_t now)
+{
+    size_t need = ROUND_UP(sizeof(TCGCacheEnv) + len, 8);
+    bool queued = false;
+
+    if (!qatomic_read(&tcg_cache_sink_on) || need > TCG_CACHE_BUF_SIZE) {
+        tcg_cache_stats.sink_dropped++;
+        return;
+    }
+    if (tcg_cache_sink_pause_ms) {
+        g_usleep(tcg_cache_sink_pause_ms * 1000);
+    }
+    qemu_mutex_lock(&sink_lock);
+    /* Closed meanwhile (an exit): nothing more is taken. */
+    if (!qatomic_read(&tcg_cache_sink_on)) {
+        qemu_mutex_unlock(&sink_lock);
+        tcg_cache_stats.sink_dropped++;
+        return;
+    }
+    if (sink_cur >= 0 && sink[sink_cur].len + need > TCG_CACHE_BUF_SIZE) {
+        sink[sink_cur].state = BUF_QUEUED;
+        sink_cur = -1;
+        queued = true;
+    }
+    if (sink_cur < 0) {
+        sink_cur = sink_free_buf();
+        if (sink_cur >= 0) {
+            sink[sink_cur].state = BUF_FILLING;
+            sink[sink_cur].len = 0;
+            sink[sink_cur].first_ns = now;
+        }
+    }
+    if (sink_cur < 0) {
+        qemu_mutex_unlock(&sink_lock);
+        tcg_cache_stats.sink_dropped++;
+        if (queued && tcg_cache_sink_wake) {
+            tcg_cache_sink_wake();
+        }
+        return;
+    }
+    sink[sink_cur].len += tcg_cache_envelope(sink[sink_cur].data
+                                             + sink[sink_cur].len, id, rva,
+                                             born, art, len);
+    tcg_cache_stats.sink_put++;
+    qemu_mutex_unlock(&sink_lock);
+    if (queued && tcg_cache_sink_wake) {
+        tcg_cache_sink_wake();
+    }
+}
+
+/*
+ * For the writer: a queued buffer, or the filling one if it is older
+ * than @age_ns or @force; NULL if none.  It is the caller's until
+ * tcg_cache_sink_give.  @trylock: give up if the lock is busy.
+ */
+void *tcg_cache_sink_take(int64_t now, int64_t age_ns, bool force,
+                          bool trylock, size_t *lenp)
+{
+    void *d = NULL;
+
+    if (trylock ? qemu_mutex_trylock(&sink_lock)
+                : (qemu_mutex_lock(&sink_lock), 0)) {
+        return NULL;
+    }
+    for (int i = 0; i < TCG_CACHE_BUFS && !d; i++) {
+        if (sink[i].state == BUF_QUEUED) {
+            sink[i].state = BUF_WRITING;
+            d = sink[i].data;
+            *lenp = sink[i].len;
+        }
+    }
+    if (!d && sink_cur >= 0 && sink[sink_cur].len
+        && (force || now - sink[sink_cur].first_ns >= age_ns)) {
+        sink[sink_cur].state = BUF_WRITING;
+        d = sink[sink_cur].data;
+        *lenp = sink[sink_cur].len;
+        sink_cur = -1;
+    }
+    qemu_mutex_unlock(&sink_lock);
+    return d;
+}
+
+/* Testing: hold the sink's lock for @ms. */
+void tcg_cache_sink_hold(unsigned ms)
+{
+    qemu_mutex_lock(&sink_lock);
+    g_usleep(ms * 1000);
+    qemu_mutex_unlock(&sink_lock);
+}
+
+void tcg_cache_sink_give(void *data)
+{
+    qemu_mutex_lock(&sink_lock);
+    for (int i = 0; i < TCG_CACHE_BUFS; i++) {
+        if (sink[i].data == data) {
+            sink[i].state = BUF_FREE;
+            sink[i].len = 0;
+        }
+    }
+    qemu_mutex_unlock(&sink_lock);
+}
+
+/*
+ * A clean exit: stop taking captures and claim every buffer with data,
+ * at most TCG_CACHE_BUFS, without waiting for the lock (if it is busy,
+ * nothing).  The claimed buffers are the caller's, never given back.
+ */
+int tcg_cache_sink_close(void **data, size_t *lens)
+{
+    int n = 0;
+
+    if (!qatomic_read(&tcg_cache_sink_on) || qemu_mutex_trylock(&sink_lock)) {
+        return 0;
+    }
+    qatomic_set(&tcg_cache_sink_on, false);
+    for (int i = 0; i < TCG_CACHE_BUFS; i++) {
+        if ((sink[i].state == BUF_QUEUED || sink[i].state == BUF_FILLING)
+            && sink[i].len) {
+            sink[i].state = BUF_WRITING;
+            data[n] = sink[i].data;
+            lens[n++] = sink[i].len;
+        }
+    }
+    sink_cur = -1;
+    qemu_mutex_unlock(&sink_lock);
+    return n;
+}
+
+/* fork: the lock held across it; a child drops every buffer, and stops. */
+void tcg_cache_sink_fork_start(void)
+{
+    if (sink[0].data) {
+        qemu_mutex_lock(&sink_lock);
+    }
+}
+
+void tcg_cache_sink_fork_end(bool child)
+{
+    if (!sink[0].data) {
+        return;
+    }
+    if (child) {
+        qemu_mutex_init(&sink_lock);
+        for (int i = 0; i < TCG_CACHE_BUFS; i++) {
+            sink[i].state = BUF_FREE;
+            sink[i].len = 0;
+        }
+        sink_cur = -1;
+        qatomic_set(&tcg_cache_sink_on, false);
+    } else {
+        qemu_mutex_unlock(&sink_lock);
+    }
 }
 
 /* Writers, from a list of envelopes (each 8-aligned in @data). */

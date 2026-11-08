@@ -585,6 +585,14 @@ void *tcg_cache_capture(TCGContext *s, TranslationBlock *tb,
         cap_reject(s, s->cap_excl);
         return NULL;
     }
+    /*
+     * Code from no guest bytes (x86's vsyscall page, which raises an
+     * exception without reading it): nothing to validate it by.
+     */
+    if (!s->cap_next) {
+        cap_reject(s, TCG_CACHE_X_FAKE);
+        return NULL;
+    }
 #ifdef CONFIG_USER_ONLY
     if (tb->smc_check || tb->smc_inline) {
         cap_reject(s, TCG_CACHE_X_SMC);
@@ -1356,6 +1364,17 @@ void tcg_cache_print_stats(void)
             t->inj_promote);
     fprintf(stderr, "xtcg-cache: on: guard not restored %" PRIu64 "\n",
             t->guard_lost);
+    if (t->snaps || t->sink_put) {
+        fprintf(stderr, "xtcg-cache: dir: refused %" PRIu64 "\n",
+                t->snap_refused);
+        fprintf(stderr, "xtcg-cache: dir: snapshots %" PRIu64 " (%" PRIu64
+                " files, %" PRIu64 " skipped) start-up %.3f ms, snapshots"
+                " %.3f ms; captured %" PRIu64 " (dropped %" PRIu64
+                "), published %" PRIu64 " (failed %" PRIu64 ") %.3f ms\n",
+                t->snaps, t->snap_files, t->snap_skipped, t->startup_ns / 1e6,
+                t->refresh_ns / 1e6, t->sink_put, t->sink_dropped,
+                t->published, t->publish_fail, t->publish_ns / 1e6);
+    }
     if (t->file_lookups) {
         fprintf(stderr, "xtcg-cache: file: lookups %" PRIu64 " hits %"
                 PRIu64 " rejected:", t->file_lookups, t->file_hits);
