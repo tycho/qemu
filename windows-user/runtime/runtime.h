@@ -96,6 +96,12 @@ extern CrtFn __CTOR_LIST__[];
 #endif
 
 /*
+ * The lowest address of the WOW64 module's VirtualAlloc(NULL): 16 GiB,
+ * more than ADRP's 4 GiB reach above the guest's 4 GiB.
+ */
+#define XT_HIGH_ALLOC_BASE 0x400000000ull
+
+/*
  * SYSTEM_BASIC_INFORMATION as Windows has it (winternl.h's leaves its
  * fields reserved).
  */
