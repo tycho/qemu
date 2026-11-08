@@ -93,7 +93,6 @@ static void tcg_cache_init(void)
 
 /* Front end. */
 
-#define TCG_CACHE_MAX_EXT  64
 
 void tcg_cache_tb_start(TCGContext *s, vaddr pc_first, unsigned page_bits)
 {
@@ -778,6 +777,13 @@ void *tcg_cache_capture(TCGContext *s, TranslationBlock *tb,
         tcg_cache_stats.rel_form[rels[i].form]++;
     }
     ((TCGCacheArt *)a->data)->len = a->len;
+    /* What a reader would refuse isn't kept. */
+    if (a->len > TCG_CACHE_ART_MAX || nrel > TCG_CACHE_MAX_REL
+        || h.n_acq > TCG_CACHE_MAX_ACQ) {
+        g_free(a->data);
+        cap_reject(s, TCG_CACHE_X_TOO_MANY);
+        return NULL;
+    }
 
     tcg_cache_stats.captured++;
     tcg_cache_stats.bytes += a->len;
@@ -1007,6 +1013,15 @@ TranslationBlock *tcg_cache_place(TCGContext *s, const TCGCacheArtView *v,
         tb->jmp[n].reset_offset = res_off(r, sl->reset);
         tb->jmp[n].insn_offset = res_off(r, sl->insn);
         tb->jmp[n].cond = sl->cond ? res_off(r, sl->cond - 1) + 1 : 0;
+        /* tb_set_cond_link points the branch at the slot: in its reach. */
+        if (sl->cond) {
+            int64_t d = (int64_t)tb->jmp[n].insn_offset
+                        - (int64_t)(tb->jmp[n].cond - 1);
+
+            if ((d & 3) || d != sextract64(d, 0, 21)) {
+                return NULL;
+            }
+        }
         tb->jmp[n].dead = sl->dead;
         tb->jmp[n].target_addr = 0;
         tb->jmp[n].list_next = 0;
@@ -1341,6 +1356,17 @@ void tcg_cache_print_stats(void)
             t->inj_promote);
     fprintf(stderr, "xtcg-cache: on: guard not restored %" PRIu64 "\n",
             t->guard_lost);
+    if (t->file_lookups) {
+        fprintf(stderr, "xtcg-cache: file: lookups %" PRIu64 " hits %"
+                PRIu64 " rejected:", t->file_lookups, t->file_hits);
+        for (int i = 1; i < TCG_CACHE_V_MAX; i++) {
+            if (t->file_reject[i]) {
+                fprintf(stderr, " %s=%" PRIu64, tcg_cache_v_name(i),
+                        t->file_reject[i]);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
     fprintf(stderr, "xtcg-cache: on: ns lookup %.0f copy %.0f check %.0f"
             " hit %.0f (per lookup, per copy, per guest-byte check,"
             " per hit)\n",
