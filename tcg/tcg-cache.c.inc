@@ -11,6 +11,27 @@ static bool tcg_cache_verify_on;
 unsigned tcg_cache_skew;
 bool tcg_cache_stats_at_exit;
 bool tcg_cache_debug;
+bool tcg_cache_costs;
+bool tcg_cache_timing;
+bool tcg_cache_no_write;
+unsigned tcg_cache_test_reject;
+bool tcg_cache_test_reget_fail;
+
+/*
+ * With XTCG_CACHE_COSTS, the time since *@t added to *@acc, and *@t moved
+ * on.  Off by default: where reading the clock is slow (about 80 ns on
+ * Windows on Arm), a lookup's dozens of readings would cost more than its
+ * parts.
+ */
+void tcg_cache_part(uint64_t *acc, int64_t *t)
+{
+    if (tcg_cache_costs) {
+        int64_t now = get_clock();
+
+        *acc += now - *t;
+        *t = now;
+    }
+}
 unsigned tcg_cache_flush_every;
 size_t tcg_cache_max = 256 * MiB;
 bool tcg_cache_inj_promote;
@@ -75,6 +96,17 @@ static void tcg_cache_init(void)
     if (getenv("XTCG_CACHE_DEBUG")) {
         tcg_cache_debug = true;
     }
+    tcg_cache_costs = getenv("XTCG_CACHE_COSTS");
+    if (tcg_cache_costs || getenv("XTCG_CACHE_STATS")) {
+        tcg_cache_timing = true;
+    }
+    if (getenv("XTCG_CACHE_NOWRITE")) {
+        tcg_cache_no_write = true;
+    }
+    if (getenv("XTCG_CACHE_TEST_REJECT")) {
+        tcg_cache_test_reject = atoi(getenv("XTCG_CACHE_TEST_REJECT"));
+    }
+    tcg_cache_test_reget_fail = getenv("XTCG_CACHE_TEST_REGETFAIL");
     k = getenv("XTCG_CACHE_FLUSH");
     if (k) {
         tcg_cache_flush_every = atoi(k);
@@ -569,7 +601,7 @@ static void cap_reject(TCGContext *s, unsigned reason)
 void *tcg_cache_capture(TCGContext *s, TranslationBlock *tb,
                         const void *search, size_t search_len, size_t *lenp)
 {
-    int64_t t0 = get_clock();
+    int64_t t0 = TCG_CACHE_CLOCK();
     CapParts p;
     TCGCacheArt h = { };
     TCGCacheArtRel *rels;
@@ -802,7 +834,7 @@ void *tcg_cache_capture(TCGContext *s, TranslationBlock *tb,
     tcg_cache_stats.cold_bytes += p.cold_len;
     tcg_cache_stats.search_bytes += search_len;
     tcg_cache_stats.ext_total += ext_bytes;
-    tcg_cache_stats.capture_ns += get_clock() - t0;
+    tcg_cache_stats.capture_ns += TCG_CACHE_CLOCK() - t0;
     *lenp = a->len;
     return a->data;
 }
@@ -1402,10 +1434,12 @@ void tcg_cache_print_stats(void)
         fprintf(stderr, "xtcg-cache: dir: snapshots %" PRIu64 " (%" PRIu64
                 " files, %" PRIu64 " skipped) start-up %.3f ms, snapshots"
                 " %.3f ms; captured %" PRIu64 " (dropped %" PRIu64
-                "), published %" PRIu64 " (failed %" PRIu64 ") %.3f ms\n",
+                "), published %" PRIu64 " (failed %" PRIu64 ") %.3f ms, %"
+                PRIu64 " bytes\n",
                 t->snaps, t->snap_files, t->snap_skipped, t->startup_ns / 1e6,
                 t->refresh_ns / 1e6, t->sink_put, t->sink_dropped,
-                t->published, t->publish_fail, t->publish_ns / 1e6);
+                t->published, t->publish_fail, t->publish_ns / 1e6,
+                t->publish_bytes);
     }
     if (t->file_lookups) {
         fprintf(stderr, "xtcg-cache: file: lookups %" PRIu64 " hits %"
@@ -1416,7 +1450,7 @@ void tcg_cache_print_stats(void)
                         t->file_reject[i]);
             }
         }
-        fprintf(stderr, "\n");
+        fprintf(stderr, "; copies skipped %" PRIu64 "\n", t->sel_dups);
     }
     if (t->file_fail) {
         fprintf(stderr, "xtcg-cache: file: failed installs %" PRIu64
@@ -1434,7 +1468,7 @@ void tcg_cache_print_stats(void)
         }
         fprintf(stderr, "; key-pc=%" PRIu64 "\n", t->inst_fail_kpc);
     }
-    if (t->file_lookups) {
+    if (t->file_lookups || t->gen[TCG_CACHE_W_NONE]) {
         fprintf(stderr, "xtcg-cache: file: translated after");
         for (int i = 0; i < TCG_CACHE_W_MAX; i++) {
             if (t->gen[i]) {
@@ -1456,4 +1490,24 @@ void tcg_cache_print_stats(void)
             t->copies ? (double)t->copy_ns / t->copies : 0,
             t->checks ? (double)t->check_ns / t->checks : 0,
             t->hits ? (double)t->hit_ns / t->hits : 0);
+    if (tcg_cache_costs) {
+        /* What reading the clock costs, which each part's time includes. */
+        int64_t c0 = get_clock();
+
+        for (int i = 0; i < 10000; i++) {
+            get_clock();
+        }
+        fprintf(stderr, "xtcg-cache: clock %.1f ns a reading\n",
+                (get_clock() - c0) / 10000.0);
+        fprintf(stderr, "xtcg-cache: cost: select %" PRIu64 " finds %.3f ms, %"
+                PRIu64 " gets %.3f ms (%" PRIu64 " bytes), copies %.3f ms, %"
+                PRIu64 " validations %.3f ms; install prep %.3f check %.3f"
+                " reserve %.3f place %.3f flush %.3f link %.3f ms\n",
+                t->sel_finds, t->sel_find_ns / 1e6, t->sel_gets,
+                t->sel_get_ns / 1e6, t->sel_get_bytes, t->sel_dup_ns / 1e6,
+                t->sel_vals, t->sel_val_ns / 1e6, t->inst_prep_ns / 1e6,
+                t->check_ns / 1e6, t->inst_res_ns / 1e6,
+                t->inst_place_ns / 1e6, t->inst_flush_ns / 1e6,
+                t->inst_link_ns / 1e6);
+    }
 }

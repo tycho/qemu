@@ -35,6 +35,28 @@ extern int tcg_cache_mode;
 extern unsigned tcg_cache_skew;
 extern bool tcg_cache_stats_at_exit;
 extern bool tcg_cache_debug;
+/* XTCG_CACHE_COSTS: lookups and installs timed by part (tcg_cache_part). */
+extern bool tcg_cache_costs;
+/*
+ * Testing: XTCG_CACHE_TEST_REJECT=n, each lookup's first n candidates
+ * rejected; XTCG_CACHE_TEST_REGETFAIL, the duplicate test's second gets
+ * fail (so no candidate is known to be a copy).
+ */
+extern unsigned tcg_cache_test_reject;
+extern bool tcg_cache_test_reget_fail;
+void tcg_cache_part(uint64_t *acc, int64_t *t);
+/*
+ * The statistics' times are read only when they are printed
+ * (XTCG_CACHE_STATS, the module's cachestats, XTCG_CACHE_COSTS): reading
+ * the clock costs about 80 ns on Windows on Arm, a hit's share otherwise.
+ */
+extern bool tcg_cache_timing;
+#define TCG_CACHE_CLOCK() (tcg_cache_timing ? get_clock() : 0)
+/*
+ * XTCG_CACHE_NOWRITE (the module's cachenowrite), development: files are
+ * read, never written: no captures published, no maintenance.
+ */
+extern bool tcg_cache_no_write;
 /* Testing: queue a code-buffer flush every this many translations. */
 extern unsigned tcg_cache_flush_every;
 /* The store's bound, in bytes. */
@@ -491,8 +513,8 @@ int tcg_cache_file_get(const TCGCacheFile *f, const TCGCacheIdx *e,
 void tcg_cache_nofault(int64_t code);
 bool tcg_cache_segment_name_ok(const char name[64]);
 /*
- * The files a process reads (step 2 of the design's phase 3): loose
- * segments newest first, then the pack.  Immutable once published;
+ * The files a process reads: the pack first, then loose segments newest
+ * first, the order lookups take them in.  Immutable once published;
  * @release unmaps them, after a grace period.
  */
 #define TCG_CACHE_SNAP_FILES 17
@@ -689,6 +711,11 @@ typedef struct TCGCacheStats {
     uint64_t compact_dups, compact_skip, compact_regrow;
     uint64_t compact_exit, compact_collide;
     uint64_t look_ns, copy_ns, check_ns, hit_ns;
+    /* A file lookup's parts, and an install's (XTCG_CACHE_COSTS). */
+    uint64_t sel_finds, sel_find_ns, sel_gets, sel_get_bytes, sel_get_ns;
+    uint64_t sel_dup_ns, sel_vals, sel_val_ns;
+    uint64_t inst_prep_ns, inst_res_ns, inst_place_ns, inst_flush_ns;
+    uint64_t inst_link_ns, publish_bytes, sel_dups;
     /* Files' candidates that didn't install: why, and what it cost. */
     uint64_t inst_fail_rk[TCG_CAP_UNSUPPORTED + 1];
     uint64_t inst_fail_rf[TCG_CAPF_MAX], inst_fail_kpc;
