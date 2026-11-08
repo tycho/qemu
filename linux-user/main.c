@@ -150,12 +150,14 @@ void fork_start(void)
     qemu_plugin_user_prefork_lock();
     gdbserver_fork_start();
     fd_trans_prefork();
+    tcg_cache_dir_fork_start();
 }
 
 void fork_end(pid_t pid)
 {
     bool child = pid == 0;
 
+    tcg_cache_dir_fork_end(child);
     fd_trans_postfork();
     qemu_plugin_user_postfork(child);
     mmap_fork_end(child);
@@ -1211,6 +1213,7 @@ int main(int argc, char **argv, char **envp)
         munmap(p, 2 * pg);
     }
     cache_file_switches();
+    tcg_cache_dir_init(cpu_model);
 
     init_main_thread(cpu, info);
 

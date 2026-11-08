@@ -89,6 +89,7 @@ void preexit_cleanup(CPUArchState *env, int code)
             tcg_cache_store_foreach(cache_dump, NULL);
             mmap_unlock();
         }
+        tcg_cache_dir_exit();
         cache_save("XTCG_CACHE_SAVE", false);
         cache_save("XTCG_CACHE_SAVEPACK", true);
 }

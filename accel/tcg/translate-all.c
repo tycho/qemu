@@ -45,6 +45,7 @@
 #include "tb-context.h"
 #include "internal-common.h"
 #include "tcg/perf.h"
+#include "qemu/plugin.h"
 #include "tcg/insn-start-words.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/cpu_loop.h"
@@ -816,6 +817,39 @@ static TranslationBlock *tb_cache_lookup(CPUState *cpu, TCGTBCPUState s,
     int n;
 
     tcg_cache_stats.lookups++;
+    /* The directory's files (the back end's snapshot). */
+    {
+        TCGCacheSnap *snap;
+
+        RCU_READ_LOCK_GUARD();
+        snap = qatomic_rcu_read(&tcg_cache_snap);
+        if (qatomic_read(&tcg_cache_sink_on) && (!snap || !snap->n)) {
+            /* Nothing mapped yet: others may have published since. */
+            qatomic_set(&tcg_cache_file_missed, true);
+        }
+        if (snap && snap->n) {
+            static void *sbuf;
+            TBCacheUse u = { cpu, s, phys_pc, img, NULL };
+
+            if (!sbuf) {
+                sbuf = g_malloc(sizeof(TCGCacheEnv) + TCG_CACHE_ART_MAX);
+            }
+            tcg_cache_stats.file_lookups++;
+            tcg_cache_snap_select(snap, img->id, s.pc - img->base, s.flags,
+                                  s.cs_base, s.cflags, sbuf,
+                                  sizeof(TCGCacheEnv) + TCG_CACHE_ART_MAX,
+                                  tb_cache_use, &u,
+                                  tcg_cache_stats.file_reject);
+            if (u.tb) {
+                tcg_cache_stats.file_hits++;
+                tcg_cache_stats.hits++;
+                tcg_cache_stats.hit_ns += get_clock() - t0;
+                tcg_cache_stats.look_ns += get_clock() - t0;
+                return u.tb;
+            }
+            qatomic_set(&tcg_cache_file_missed, true);
+        }
+    }
     /* Testing (XTCG_CACHE_LOAD): a file's artifacts first. */
     if (tcg_cache_have_loaded) {
         static void *fbuf;
@@ -896,7 +930,11 @@ static void tb_cache_trace(const TCGTBCPUState *s, const TCGCacheImage *img,
     tcg_cache_out(line);
 }
 
-/* TCG_CACHE_ON: testing, a flush every tcg_cache_flush_every TBs. */
+/*
+ * TCG_CACHE_ON: testing, a flush every tcg_cache_flush_every translations
+ * (not installs, so that a working set larger than that doesn't keep the
+ * flushes going by itself).
+ */
 static void tb_cache_count(CPUState *cpu)
 {
     static unsigned n;
@@ -961,13 +999,23 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 #ifdef CONFIG_USER_ONLY
     tcg_ctx->cap_on = tcg_cache_mode && phys_pc != -1
                       && !(s.cflags & ~TB_CACHE_CFLAGS);
+#ifdef CONFIG_PLUGIN
+    /*
+     * A plugin instruments TBs as they are translated: nothing cached may
+     * stand in for a translation, and nothing translated is kept.
+     */
+    if (cpu->plugin_state
+        && test_bit(QEMU_PLUGIN_EV_VCPU_TB_TRANS,
+                    cpu->plugin_state->event_mask)) {
+        tcg_ctx->cap_on = false;
+    }
+#endif
     if (tcg_ctx->cap_on && tcg_cache_mode == TCG_CACHE_ON) {
         cache_elig = tb_cache_host()->page_image(s.pc & TARGET_PAGE_MASK,
                                                  &cache_img);
         if (cache_elig) {
             tb = tb_cache_lookup(cpu, s, phys_pc, &cache_img);
             if (tb) {
-                tb_cache_count(cpu);
                 return tb;
             }
         } else {
@@ -1276,6 +1324,13 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
                   img2.id == cache_img.id && img2.base == cache_img.base))) {
                 cache_ghash = tcg_cache_art_ghash(art, art_len);
                 cache_outcome = tcg_cache_store_put(&cache_img, art, art_len);
+                /* A new artifact, still the store's: to the files too. */
+                if (qatomic_read(&tcg_cache_sink_on)
+                    && !strcmp(cache_outcome, "stored")) {
+                    tcg_cache_sink_put(cache_img.id, s.pc - cache_img.base,
+                                       tcg_cache_born, art, art_len,
+                                       get_clock());
+                }
             } else {
                 tcg_cache_stats.inel_capture++;
                 cache_outcome = "inel2";

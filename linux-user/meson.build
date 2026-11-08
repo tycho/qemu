@@ -8,6 +8,7 @@ common_user_inc += include_directories('include/host/' / host_arch)
 common_user_inc += include_directories('include')
 
 linux_user_ss.add(files(
+  'cache.c',
   'elfload.c',
   'exit.c',
   'fd-trans.c',
