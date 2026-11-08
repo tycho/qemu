@@ -203,6 +203,11 @@ static void refresh_region_flags(vaddr start, vaddr last, int flags)
     }
 }
 
+bool xt_is_own_image(const void *alloc_base)
+{
+    return alloc_base == (const void *)&__ImageBase;
+}
+
 /*
  * Bring QEMU's page flags for ADDR's page up to date with Windows; true if
  * the access is allowed now, by the flags as they stand under the mmap
@@ -629,6 +634,8 @@ bool xt_diag;
 bool xt_rcu_stress;
 int xt_rcu_inj_step;
 static int applied, rejected;
+/* The translation cache (testing): cachedump, cacheselftest. */
+bool cache_dump, cache_selftest;
 /*
  * crossinline: keep ordered accesses' inline crossing test (measuring);
  * crossprobefault: the probe meets a fault (testing xt_cross_probe).
@@ -846,6 +853,9 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
                            !cross_inline;
     ac->init_machine(accel, NULL);
     log_settings(OBJECT(accel));
+    if (tcg_cache_mode) {
+        xt_cache_init();
+    }
     if (n_applied) {
         *n_applied = applied;
         *n_rejected = rejected;

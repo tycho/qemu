@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "tcg/tcg-cache.h"
 #include "qemu/help-texts.h"
 #include "qemu/units.h"
 #include "qemu/accel.h"
@@ -1060,6 +1061,18 @@ int main(int argc, char **argv, char **envp)
        generating the prologue until now so that the prologue can take
        the real value of GUEST_BASE into account.  */
     tcg_prologue_init();
+    if (getenv("XTCG_CACHE_SELFTEST")) {
+        /* Testing the cache's guarded routines (tcg-cache.h). */
+        size_t pg = qemu_real_host_page_size();
+        uint8_t *p = mmap(NULL, 2 * pg, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        if (p == MAP_FAILED || mprotect(p + pg, pg, PROT_NONE) ||
+            tcg_cache_selftest(p, pg)) {
+            exit(1);
+        }
+        munmap(p, 2 * pg);
+    }
 
     init_main_thread(cpu, info);
 

@@ -26,6 +26,7 @@ enum {
     TCG_CACHE_OFF,
     TCG_CACHE_CAPTURE,      /* record and check; install nothing */
     TCG_CACHE_STRESS,       /* install every captured TB from its artifact */
+    TCG_CACHE_ON,           /* keep eligible artifacts, install from them */
 };
 
 extern int tcg_cache_mode;
@@ -33,6 +34,12 @@ extern int tcg_cache_mode;
 extern unsigned tcg_cache_skew;
 extern bool tcg_cache_stats_at_exit;
 extern bool tcg_cache_debug;
+/* Testing: queue a code-buffer flush every this many translations. */
+extern unsigned tcg_cache_flush_every;
+/* The store's bound, in bytes. */
+extern size_t tcg_cache_max;
+/* Testing: promote an install's first acquire/release site after its check. */
+extern bool tcg_cache_inj_promote;
 
 /*
  * Why a translation isn't captured.  Front-end reasons latch for the
@@ -63,6 +70,8 @@ enum {
 };
 
 extern const char *const tcg_cache_x_names[TCG_CACHE_X_MAX];
+/* Why the last capture returned NULL. */
+extern unsigned tcg_cache_last_reason;
 
 /* Provenance: what the value at a site is. */
 enum {
@@ -236,6 +245,101 @@ TranslationBlock *tcg_cache_place(TCGContext *s, const TCGCacheArtView *v,
                                   const TCGCacheRes *r);
 void tcg_cache_commit(TCGContext *s, const TCGCacheRes *r);
 
+/*
+ * What the OS layer provides for TCG_CACHE_ON.  An image is a mapped
+ * executable: an identity (a hash of what names its contents) and the base
+ * it is mapped at now.
+ */
+typedef struct TCGCacheImage {
+    uint64_t id;
+    uint64_t base;
+} TCGCacheImage;
+
+/* A guarded routine's fault: this bit, the guard bit, and the address. */
+#define TCG_CACHE_GFAULT        (1ull << 63)
+#define TCG_CACHE_GFAULT_GUARD  (1ull << 62)
+
+typedef struct TCGCacheHost {
+    /*
+     * Whether the guest page @page holds code a cached translation may
+     * come from, and its image.  Called with mmap_lock held.
+     */
+    bool (*page_image)(vaddr page, TCGCacheImage *img);
+    /*
+     * Copy or compare host memory that may change or go under the
+     * caller: 0 when copied or equal, 1 when different, or a fault code
+     * (TCG_CACHE_GFAULT), after which @fault is called with it.
+     */
+    int64_t (*copy)(void *dst, const void *src, size_t len);
+    int64_t (*compare)(const void *a, const void *b, size_t len);
+    void (*fault)(int64_t code);
+    /* Testing: around the guest-byte comparison of a candidate. */
+    void (*inject)(vaddr addr, bool before);
+} TCGCacheHost;
+
+extern const TCGCacheHost *tcg_cache_host;
+
+/*
+ * The guarded routines, for TCGCacheHost's copy and compare: leaf
+ * functions whose source loads a fault handler recognises by PC
+ * (tcg_cache_guard_pc).  The handler then resumes at the caller (the
+ * routine's LR) with a fault code in the result register.  Elsewhere
+ * they are plain copies and comparisons.
+ */
+int64_t tcg_cache_gcopy(void *dst, const void *src, size_t len);
+int64_t tcg_cache_gcmp(const void *a, const void *b, size_t len);
+bool tcg_cache_guard_pc(uintptr_t pc);
+/* Where the guarded routines are assembly: their source loads' PCs. */
+#define TCG_CACHE_GLOADS 6
+extern const uintptr_t tcg_cache_gloads[TCG_CACHE_GLOADS];
+/*
+ * Testing: exercise the guarded routines on @p, two pages of @page bytes,
+ * the first readable and writable, the second inaccessible.  The number
+ * of failed checks; each is printed.
+ */
+int tcg_cache_selftest(uint8_t *p, size_t page);
+
+/*
+ * Testing (XTCG_CACHE_TRACE, the module's cachetrace): a line for each
+ * translation with its key, outcome, guest-bytes hash and cost, through
+ * tcg_cache_out (stderr unless the OS layer sets it).
+ */
+extern bool tcg_cache_trace;
+extern void (*tcg_cache_out)(const char *line);
+
+/*
+ * The store: artifacts by image, rva, flags, cs_base and cflags, newest
+ * first.  Under mmap_lock in user mode.
+ */
+typedef struct TCGCacheCand {
+    const void *art;
+    size_t len;
+    uint64_t base;
+} TCGCacheCand;
+
+#define TCG_CACHE_CANDS 4
+
+/*
+ * Keep @art (g_malloc'd; the store owns it now, or frees it): "stored",
+ * "dup" (an identical candidate is kept) or "full".  A fifth candidate
+ * for a key replaces the oldest.
+ */
+const char *tcg_cache_store_put(const TCGCacheImage *img, void *art,
+                                size_t len);
+/* A hash of the guest bytes an artifact read: offsets, lengths, bytes. */
+uint64_t tcg_cache_art_ghash(const void *art, size_t len);
+int tcg_cache_store_find(uint64_t id, uint64_t rva, uint32_t flags,
+                         uint64_t cs_base, uint32_t cflags,
+                         TCGCacheCand *c);
+/* Each stored artifact, for the dump. */
+void tcg_cache_store_foreach(void (*fn)(void *opaque, uint64_t id,
+                                        uint64_t rva, uint64_t base,
+                                        const void *art, size_t len),
+                             void *opaque);
+/* A line describing a stored artifact, for the dump. */
+int tcg_cache_dump_line(char *buf, size_t size, uint64_t id, uint64_t rva,
+                        uint64_t base, const void *art, size_t len);
+
 /* Counters, printed at exit with XTCG_CACHE_STATS. */
 typedef struct TCGCacheStats {
     uint64_t tried, captured, bytes, excluded[TCG_CACHE_X_MAX];
@@ -244,6 +348,12 @@ typedef struct TCGCacheStats {
     uint64_t rel_kind[TCG_CAP_UNSUPPORTED + 1], rel_form[TCG_CAPF_MAX];
     uint64_t hot_bytes, cold_bytes, search_bytes, ext_total;
     uint64_t capture_ns, install_ns;
+    /* TCG_CACHE_ON */
+    uint64_t translations, inel_capture, stored, store_dup, store_full;
+    uint64_t store_bytes, lookups, look_inel, look_none, hits;
+    uint64_t miss_base, miss_struct, miss_region, miss_inel, miss_fault;
+    uint64_t flushes, inj_promote, copies, checks, guard_lost;
+    uint64_t look_ns, copy_ns, check_ns, hit_ns;
 } TCGCacheStats;
 
 extern TCGCacheStats tcg_cache_stats;
