@@ -23,6 +23,8 @@ bool tcg_cache_test_reget_fail;
  * Windows on Arm), a lookup's dozens of readings would cost more than its
  * parts.
  */
+unsigned tcg_cache_test_img_shift;
+
 void tcg_cache_part(uint64_t *acc, int64_t *t)
 {
     if (tcg_cache_costs) {
@@ -97,6 +99,14 @@ static void tcg_cache_init(void)
         tcg_cache_debug = true;
     }
     tcg_cache_costs = getenv("XTCG_CACHE_COSTS");
+    tcg_cache_pages = getenv("XTCG_CACHE_PAGES");
+    if (getenv("XTCG_CACHE_TEST_IMG_SHIFT")) {
+        const char *v = getenv("XTCG_CACHE_TEST_IMG_SHIFT");
+
+        int shift = atoi(v);
+
+        tcg_cache_test_img_shift = shift > 0 && shift < 64 ? shift : 0;
+    }
     if (tcg_cache_costs || getenv("XTCG_CACHE_STATS")) {
         tcg_cache_timing = true;
     }
@@ -1445,7 +1455,13 @@ void tcg_cache_print_stats(void)
                     t->merge_act_ns[k] / 1e6, t->merge_age_ns[k] / 1e6,
                     t->merge_in_bytes[k] >> 10, t->merge_entries[k]);
         }
-        fprintf(stderr, "; deferred %" PRIu64, t->merge_deferred);
+        fprintf(stderr, "; deferred %" PRIu64 "; index refused: images %"
+                PRIu64 " slots %" PRIu64 " probes %" PRIu64 " cancelled %"
+                PRIu64, t->merge_deferred,
+                t->merge_refused_index[TCG_CACHE_PLAN_IMG],
+                t->merge_refused_index[TCG_CACHE_PLAN_SLOTS],
+                t->merge_refused_index[TCG_CACHE_PLAN_PROBES],
+                t->merge_refused_index[TCG_CACHE_PLAN_CANCEL]);
         fprintf(stderr, "; emergency %" PRIu64 ", saturated %" PRIu64
                 ", written %" PRIu64 " KiB; parts %" PRIu64 " live %" PRIu64
                 " unresolved %" PRIu64 " covered, overflows %" PRIu64
@@ -1473,7 +1489,14 @@ void tcg_cache_print_stats(void)
                         t->file_reject[i]);
             }
         }
-        fprintf(stderr, "; copies skipped %" PRIu64 "\n", t->sel_dups);
+        fprintf(stderr, "; copies skipped %" PRIu64 "; finds examined %"
+                PRIu64 " slots (largest %" PRIu64 "); opens %" PRIu64
+                " (%.3f ms, image records %" PRIu64 " bytes)\n", t->sel_dups,
+                t->find_slots, t->find_slots_max, t->opens, t->open_ns / 1e6,
+                t->open_img_bytes);
+    }
+    if (tcg_cache_pages) {
+        tcg_cache_pages_print();
     }
     if (t->file_fail) {
         fprintf(stderr, "xtcg-cache: file: failed installs %" PRIu64

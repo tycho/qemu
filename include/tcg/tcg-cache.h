@@ -368,14 +368,16 @@ int tcg_cache_dump_line(char *buf, size_t size, uint64_t id, uint64_t rva,
  * Files (tcg-cache-file.c.inc).  An artifact is stored in an envelope: its
  * full key, the day it was first captured, a content identity (its key
  * and bytes, not the day) and a checksum of everything.  A segment holds
- * envelopes and an index sorted by key hash; a pack holds envelopes, an
- * open-addressed index and the list of segments it covers.  All offsets
- * are from the file's start, all fields host-order.
+ * envelopes and an index sorted by key hash.  A pack holds envelopes, the
+ * list of segments it covers, and an index in one open-addressed table per
+ * image, found through the pack's image records (sorted by id), so that a
+ * process reads the index of the images it runs.  All offsets are from the
+ * file's start, all fields host-order.
  */
 #define TCG_CACHE_ENV_MAGIC     0x45435458      /* "XTCE" */
 #define TCG_CACHE_SEG_MAGIC     0x53435458      /* "XTCS" */
 #define TCG_CACHE_PACK_MAGIC    0x50435458      /* "XTCP" */
-#define TCG_CACHE_FILE_VERSION  3
+#define TCG_CACHE_FILE_VERSION  4
 
 /* The readers' hard limits. */
 #define TCG_CACHE_ART_MAX           (64 * 1024)
@@ -384,7 +386,8 @@ int tcg_cache_dump_line(char *buf, size_t size, uint64_t id, uint64_t rva,
 #define TCG_CACHE_MAX_ACQ           4096
 #define TCG_CACHE_FILE_MAX          (512u << 20)
 #define TCG_CACHE_SEG_ENTRIES_MAX   (1u << 20)
-#define TCG_CACHE_SLOT_LOG2_MAX     22
+#define TCG_CACHE_SLOTS_MAX         (1u << 22)
+#define TCG_CACHE_IMG_MAX           4096
 #define TCG_CACHE_COVER_MAX         4096
 #define TCG_CACHE_PROBES            64
 
@@ -407,9 +410,15 @@ typedef struct TCGCacheEnv {
 typedef struct TCGCacheIdx {
     uint64_t khash;         /* the key's hash; 0: an empty pack slot */
     uint32_t off, len;      /* the envelope */
-    uint32_t check;         /* rva ^ flags, folded */
-    uint32_t pad;
 } TCGCacheIdx;
+
+/* A pack's image: its table is slots [slot, slot + n_slots) of the index. */
+typedef struct TCGCacheImg {
+    uint64_t id;
+    uint32_t slot, n_slots;
+    uint32_t n;             /* its entries */
+    uint32_t pad;
+} TCGCacheImg;
 
 typedef struct TCGCacheCover {
     char name[64];
@@ -423,13 +432,16 @@ typedef struct TCGCacheFileHdr {
     uint16_t hdr_len;
     uint8_t fp[16];         /* tcg_cache_fingerprint */
     uint64_t tick;          /* a segment's publication; a pack's generation */
-    uint32_t n_index;       /* entries, used slots in a pack */
+    uint32_t n_index;       /* entries */
     uint32_t index_off;
-    uint32_t slot_log2;     /* a pack's slot table; 0 in a segment */
+    uint32_t n_slots;       /* a pack's index slots; a segment's n_index */
     uint32_t n_cover;
     uint32_t cover_off, cover_len;
     uint32_t data_off, data_len;
+    uint32_t n_img;         /* a pack's image records; 0 in a segment */
+    uint32_t img_off;
     uint64_t cover_check;
+    uint64_t img_check;     /* the image records' XXH64; 0 if none */
     uint64_t check;         /* this header, this field zero */
 } TCGCacheFileHdr;
 
@@ -439,10 +451,27 @@ typedef struct TCGCacheFile {
     size_t size;
     uint64_t index_bytes;
     TCGCacheCover *cover;   /* copied out, checked */
+    TCGCacheImg *img;       /* a pack's image records, copied out, checked */
     int level;              /* in a snapshot: TCG_CACHE_LEVEL_* */
     int64_t (*copy)(void *dst, const void *src, size_t len);
     void (*fault)(int64_t code);
+    struct TCGCachePages *pages;    /* testing: tcg_cache_pages */
 } TCGCacheFile;
+
+/*
+ * Testing (XTCG_CACHE_PAGES): the 4 KiB pages reads touch in each mapped
+ * file of a snapshot, by region, and the envelopes read whole, printed
+ * with the statistics.
+ */
+extern bool tcg_cache_pages;
+/*
+ * Testing (XTCG_CACHE_TEST_IMG_SHIFT): qemu-user's keys in an image a
+ * 2^shift-byte region of the address space, not one image, so that its
+ * packs hold several.
+ */
+extern unsigned tcg_cache_test_img_shift;
+void tcg_cache_pages_track(TCGCacheFile *f);
+void tcg_cache_pages_print(void);
 
 /* What a check found (tcg_cache_validate and the readers). */
 enum {
@@ -464,6 +493,7 @@ enum {
     TCG_CACHE_V_CHECK,
     TCG_CACHE_V_FAULT,
     TCG_CACHE_V_INSN,
+    TCG_CACHE_V_INDEX,      /* the whole-file check: entries and envelopes */
     TCG_CACHE_V_MAX
 };
 
@@ -504,9 +534,14 @@ int tcg_cache_file_open(TCGCacheFile *f, const void *map, size_t size,
                         int64_t (*copy)(void *, const void *, size_t),
                         void (*fault)(int64_t));
 void tcg_cache_file_close(TCGCacheFile *f);
-/* Up to @max index entries for a key, or -1 if the index is damaged. */
-int tcg_cache_file_find(const TCGCacheFile *f, uint64_t id, uint64_t rva,
-                        uint32_t flags, uint64_t cs_base, uint32_t cflags,
+/* The hash a key's index entries carry (tcg_cache_file_find's @kh). */
+uint64_t tcg_cache_key_hash(uint64_t id, uint64_t rva, uint32_t flags,
+                            uint64_t cs_base, uint32_t cflags);
+/*
+ * Up to @max index entries with key hash @kh in image @id, or -1 if the
+ * index is damaged.
+ */
+int tcg_cache_file_find(const TCGCacheFile *f, uint64_t id, uint64_t kh,
                         TCGCacheIdx *out, int max);
 /* An entry's envelope copied into @buf and checked against the key. */
 int tcg_cache_file_get(const TCGCacheFile *f, const TCGCacheIdx *e,
@@ -655,19 +690,55 @@ TCGCacheIdx tcg_cache_env_idx(const TCGCacheEnv *e, uint32_t off);
  */
 int tcg_cache_env_verify(const TCGCacheEnv *env, size_t len);
 /*
+ * A pack's index planned: its image records, and each slot's entry.  For
+ * @n entries of image ids @id and key hashes @kh (nonzero): positions
+ * grouped by image, each image's table max(4, 2n) slots, each entry within
+ * @probes slots of its home, a table doubled (to 64 slots an entry) until
+ * they are.  @checkpoint, if set, is called between images and every few
+ * thousand entries; false from it gives up.  0, or why not
+ * (TCG_CACHE_PLAN_*); *@p zeroed first, owning nothing after a refusal.
+ */
+enum {
+    TCG_CACHE_PLAN_OK,
+    TCG_CACHE_PLAN_IMG,         /* past the image records' limit */
+    TCG_CACHE_PLAN_SLOTS,       /* past the slots' limit */
+    TCG_CACHE_PLAN_PROBES,      /* an image's entries can't fit their probes */
+    TCG_CACHE_PLAN_CANCEL,
+    TCG_CACHE_PLAN_MAX
+};
+
+typedef struct TCGCacheIdxPlan {
+    TCGCacheImg *img;
+    uint32_t n_img, n_slots;
+    uint32_t *slot_entry;       /* n_slots: an entry's position + 1, or 0 */
+    uint64_t growths;           /* tables doubled */
+} TCGCacheIdxPlan;
+
+int tcg_cache_index_plan(const uint64_t *id, const uint64_t *kh, size_t n,
+                         unsigned probes, uint32_t img_max, uint32_t slots_max,
+                         bool (*checkpoint)(void), TCGCacheIdxPlan *p);
+void tcg_cache_index_plan_free(TCGCacheIdxPlan *p);
+G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(TCGCacheIdxPlan, tcg_cache_index_plan_free)
+/*
+ * @p's index into @out (p->n_slots entries): each occupied slot the entry
+ * whose envelope is at @data_off + @rel[e], @len[e] bytes; empty slots
+ * zero.  @checkpoint as for the plan; false if it gave up.
+ */
+bool tcg_cache_index_fill(const TCGCacheIdxPlan *p, const uint64_t *kh,
+                          uint64_t data_off, const uint32_t *rel,
+                          const uint32_t *len, bool (*checkpoint)(void),
+                          TCGCacheIdx *out);
+/*
  * A pack written in parts: @h laid out for @n envelopes of @data_len
- * bytes and @n_cover covered segments, its slot table at least
- * 2^@min_log2 (its length, or 0 past a reader's limits); each envelope's
- * entry put in the slot table within @probes of its home, as a reader
- * looks for it (false if it can't be); then the header sealed over the
- * cover list.
+ * bytes, @p's index and @n_cover covered segments (its length, or 0 past
+ * a reader's limits); the index filled and written, the image records at
+ * img_off; then the header sealed over the records and the cover list.
  */
 size_t tcg_cache_pack_layout(TCGCacheFileHdr *h, uint64_t generation,
-                             uint32_t n, uint32_t n_cover, size_t data_len,
-                             uint32_t min_log2);
-bool tcg_cache_pack_slot(TCGCacheIdx *slots, uint32_t slot_log2,
-                         TCGCacheIdx x, unsigned probes);
-void tcg_cache_pack_seal(TCGCacheFileHdr *h, const TCGCacheCover *cover);
+                             uint32_t n, const TCGCacheIdxPlan *p,
+                             uint32_t n_cover, size_t data_len);
+void tcg_cache_pack_seal(TCGCacheFileHdr *h, const TCGCacheImg *img,
+                         const TCGCacheCover *cover);
 int tcg_cache_check_file(const void *map, size_t size, bool quiet,
                          uint64_t *counts);
 int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
@@ -715,6 +786,7 @@ typedef struct TCGCacheStats {
     uint64_t compact_in, compact_arts, compact_kept, compact_aged;
     uint64_t compact_damaged, compact_bytes, removed, remove_fail;
     uint64_t compact_dups, compact_skip, compact_regrow;
+    uint64_t merge_refused_index[TCG_CACHE_PLAN_MAX];
     uint64_t compact_exit, compact_collide;
     /* Merges by kind: minor, parts, major, first (tcg-cache-dir.c.inc). */
     uint64_t merge_done[4], merge_fail[4], merge_exit[4];
@@ -729,6 +801,7 @@ typedef struct TCGCacheStats {
     uint64_t sel_dup_ns, sel_vals, sel_val_ns;
     uint64_t inst_prep_ns, inst_res_ns, inst_place_ns, inst_flush_ns;
     uint64_t inst_link_ns, publish_bytes, sel_dups;
+    uint64_t find_slots, find_slots_max, opens, open_ns, open_img_bytes;
     /* Files' candidates that didn't install: why, and what it cost. */
     uint64_t inst_fail_rk[TCG_CAP_UNSUPPORTED + 1];
     uint64_t inst_fail_rf[TCG_CAPF_MAX], inst_fail_kpc;

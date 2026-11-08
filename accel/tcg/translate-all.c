@@ -584,7 +584,7 @@ static bool tb_cache_page_image(vaddr page, TCGCacheImage *img)
         != want) {
         return false;
     }
-    img->id = 0;
+    img->id = tcg_cache_test_img_shift ? page >> tcg_cache_test_img_shift : 0;
     img->base = 0;
     return true;
 }
