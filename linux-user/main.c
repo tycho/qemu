@@ -467,13 +467,13 @@ static int cache_truncate_test(const void *snap, size_t size)
     const TCGCacheFileHdr *h = snap;
     const TCGCacheIdx *idx = (const void *)((const uint8_t *)snap
                                             + h->index_off);
-    uint32_t n = h->slot_log2 ? 1u << h->slot_log2 : h->n_index;
+    uint32_t n = h->n_slots;
     size_t pg = qemu_real_host_page_size(), cut, meta;
     int fd;
     void *m;
 
-    meta = MAX(h->data_off, MAX(h->cover_off + h->cover_len,
-                                h->index_off + n * sizeof(TCGCacheIdx)));
+    /* Header, image records, index and cover list all precede the data. */
+    meta = h->data_off;
     cut = ROUND_UP(meta, pg) + pg;
     if (cut + 2 * pg > size) {
         fprintf(stderr, "xtcg-cache truncate: skipped, file too small\n");
