@@ -268,12 +268,44 @@ static void bring_out_others(void)
     g_array_free(threads, TRUE);
 }
 
+/* @h names this process. */
+static bool is_self(HANDLE h)
+{
+    PROCESS_BASIC_INFORMATION pbi;
+
+    return h == GetCurrentProcess() ||
+           (NtQueryInformationProcess(h, ProcessBasicInformation, &pbi,
+                                      sizeof(pbi), NULL) >= 0 &&
+            (DWORD)(uintptr_t)pbi.UniqueProcessId == GetCurrentProcessId());
+}
+
 XTEXPORT void WINAPI BTCpuProcessTerm(HANDLE h, BOOL after, ULONG status)
 {
     static bool cache_stats_done;
+    bool began;
 
+    if (tcg_cache_debug) {
+        fprintf(stderr, "xtcg-cache: process term %p after %d\n", h, after);
+    }
     if (!after && !h && xt_tls_ready()) {
         bring_out_others();
+        /*
+         * The translation cache's writer stops while it can still be
+         * waited for, before the process kills it; what was captured is
+         * published.  The rest (DLL detach code) is published below.  In
+         * an adapter scope, as the termination's publication below: a
+         * thread ending the process at the same time doesn't stop this
+         * one holding the cache's locks.
+         */
+        began = xt_adapter_begin();
+        tcg_cache_dir_quiesce();
+        xt_adapter_end(began);
+    }
+    /* This process's last call, its other threads gone. */
+    if (!after && h && xt_tls_ready() && is_self(h)) {
+        began = xt_adapter_begin();
+        tcg_cache_dir_exit();
+        xt_adapter_end(began);
     }
     if (!h && tcg_cache_mode && !cache_stats_done
         && (tcg_cache_stats_at_exit || getenv("XTCG_CACHE_STATS"))) {

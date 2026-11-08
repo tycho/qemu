@@ -680,6 +680,11 @@ static void set_settings(Object *accel, const char *settings)
                 /* Keep image code's artifacts; install before translating. */
                 tcg_cache_mode = TCG_CACHE_ON;
                 applied++;
+            } else if (!strcmp(kv[i], "cachefiles")) {
+                /* With cache: artifacts also in files (cache-files.c). */
+                tcg_cache_mode = TCG_CACHE_ON;
+                xt_cache_files = true;
+                applied++;
             } else if (!strcmp(kv[i], "cachetrace")) {
                 tcg_cache_trace = true;
                 applied++;
@@ -880,5 +885,6 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     }
     tcg_prologue_init();
     xt_spare_cpu = first;
+    xt_cache_files_init(first);
     return 0;
 }

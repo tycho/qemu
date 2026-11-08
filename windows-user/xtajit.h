@@ -406,6 +406,10 @@ void xt_cache_fault(int64_t code);
 void xt_cache_print_stats(void);
 void xt_cache_dump(void);
 void xt_cache_selftest(void);
+/* cache-files.c: the translation cache's files (cachefiles) */
+extern IMAGE_DOS_HEADER __ImageBase;
+extern bool xt_cache_files;
+void xt_cache_files_init(CPUState *first);
 
 /* fault.c */
 bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx);
