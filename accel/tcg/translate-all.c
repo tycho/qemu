@@ -614,6 +614,9 @@ static const TCGCacheHost *tb_cache_host(void)
  * state may have changed what translation would give.  Called with
  * mmap_lock held.
  */
+/* Why the last install failed (TCG_CACHE_W_*), and the last lookup. */
+static unsigned tb_cache_fail, tb_cache_why;
+
 static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
                                           tb_page_addr_t phys_pc,
                                           const void *art, size_t len,
@@ -631,6 +634,7 @@ static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
     bool spans, reads_p2 = false;
     uint32_t off;
 
+    tb_cache_fail = TCG_CACHE_W_OTHER;
     if (!tcg_cache_art_view(art, len, &v)) {
         if (img) {
             tcg_cache_stats.miss_struct++;
@@ -651,11 +655,18 @@ static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
                     h->cflags, s.cflags);
         }
         tcg_cache_stats.inst_fail_key++;
+        if (h->pc != s.pc) {
+            tcg_cache_stats.inst_fail_kpc++;
+            tb_cache_fail = TCG_CACHE_W_KEYPC;
+        } else {
+            tb_cache_fail = TCG_CACHE_W_KEY;
+        }
         return NULL;
     }
     spans = ((s.pc + h->size - 1) & TARGET_PAGE_MASK) != page;
     if (spans != !!(h->flags & TCG_CACHE_ART_PAGE2)) {
         tcg_cache_stats.inst_fail_key++;
+        tb_cache_fail = TCG_CACHE_W_KEY;
         return NULL;
     }
     off = 0;
@@ -751,6 +762,22 @@ static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
     tb = tcg_cache_place(tcg_ctx, &v, &r);
     if (!tb) {
         tcg_cache_stats.inst_fail_reloc++;
+        tcg_cache_stats.inst_fail_rk[tcg_cache_fail_kind]++;
+        tcg_cache_stats.inst_fail_rf[tcg_cache_fail_form]++;
+        switch (tcg_cache_fail_kind) {
+        case TCG_CAP_HELPER:
+            tb_cache_fail = TCG_CACHE_W_HELPER;
+            break;
+        case TCG_CAP_STUB:
+            tb_cache_fail = TCG_CACHE_W_STUB;
+            break;
+        case TCG_CAP_THUNK:
+            tb_cache_fail = TCG_CACHE_W_THUNK;
+            break;
+        default:
+            tb_cache_fail = TCG_CACHE_W_RELOC;
+            break;
+        }
         return NULL;
     }
     tb_set_page_addr0(tb, phys_pc);
@@ -794,9 +821,15 @@ typedef struct TBCacheUse {
 static bool tb_cache_use(const TCGCacheEnv *env, void *opaque)
 {
     TBCacheUse *u = opaque;
+    int64_t t0 = get_clock();
 
     u->tb = tb_cache_install(u->cpu, u->s, u->phys_pc, env + 1,
                              env->len - sizeof(*env), u->img);
+    if (!u->tb) {
+        tcg_cache_stats.file_fail++;
+        tcg_cache_stats.file_fail_ns += get_clock() - t0;
+        tb_cache_why = tb_cache_fail;
+    }
     return u->tb != NULL;
 }
 
@@ -817,6 +850,7 @@ static TranslationBlock *tb_cache_lookup(CPUState *cpu, TCGTBCPUState s,
     int n;
 
     tcg_cache_stats.lookups++;
+    tb_cache_why = TCG_CACHE_W_NONE;
     /* The directory's files (the back end's snapshot). */
     {
         TCGCacheSnap *snap;
@@ -976,6 +1010,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     const char *cache_outcome = NULL;
     uint64_t cache_ghash = 0;
     int64_t cache_t0 = tcg_cache_trace ? get_clock() : 0;
+    int64_t gen_t0 = 0;
 #endif
 
     assert_memory_lock();
@@ -1018,6 +1053,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
             if (tb) {
                 return tb;
             }
+            gen_t0 = get_clock();
         } else {
             tcg_cache_stats.look_inel++;
             tcg_ctx->cap_on = false;
@@ -1285,6 +1321,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 #ifdef CONFIG_USER_ONLY
     if (tcg_cache_mode == TCG_CACHE_ON) {
         tcg_cache_stats.translations++;
+        if (gen_t0) {
+            tcg_cache_stats.gen[tb_cache_why]++;
+            tcg_cache_stats.gen_ns[tb_cache_why] += get_clock() - gen_t0;
+        }
         tb_cache_count(cpu);
     }
     if (tcg_cache_mode == TCG_CACHE_ON && tcg_cache_trace && !art) {

@@ -21,6 +21,7 @@
 #include "qemu/osdep.h"
 #include <dirent.h>
 #include <link.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include "qemu/thread.h"
 #include "qemu/rcu.h"
@@ -176,33 +177,55 @@ static int cache_open_dir(int at, const char *name)
 
 /* The POSIX side of the directory back end (TCGCacheDirOps). */
 
-static int posix_list(char (*names)[64], int max)
+static int posix_list(TCGCacheDirEntryFn *fn, void *opaque, int max)
 {
     /* Its own open file description: a dup would share the offset. */
     int dfd = openat(cache_dirfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     DIR *d = dfd >= 0 ? fdopendir(dfd) : NULL;
     struct dirent *de;
-    int n = 0, seen = 0;
+    bool failed = false;
+    int seen = 0;
 
     if (!d) {
         if (dfd >= 0) {
             close(dfd);
         }
-        return 0;
+        return -1;
     }
-    while (n < max && (de = readdir(d)) && seen++ < max) {
-        size_t len = strlen(de->d_name);
+    while (seen < max) {
+        char name[64] = "";
+        struct stat st;
 
+        errno = 0;
+        de = readdir(d);
+        if (!de) {
+            if (errno) {
+                seen = -1;
+            }
+            break;
+        }
+
+        seen++;
         /* As a coverage list holds it: a 64-byte field, zero after it. */
-        if (len >= 64) {
+        if (strlen(de->d_name) >= 64) {
             continue;
         }
-        memset(names[n], 0, 64);
-        memcpy(names[n], de->d_name, len);
-        n++;
+        /* Gone since: absent.  Any other failure: the listing is unsure. */
+        if (fstatat(cache_dirfd, de->d_name, &st, AT_SYMLINK_NOFOLLOW)) {
+            if (errno != ENOENT) {
+                failed = true;
+            }
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) {
+            continue;
+        }
+        /* Zero-padded, as a coverage list holds a name. */
+        memcpy(name, de->d_name, strlen(de->d_name));
+        fn(opaque, name, st.st_size, st.st_mtime);
     }
     closedir(d);
-    return n;
+    return failed ? -1 : seen;
 }
 
 static void *posix_open(const char *name, size_t *sizep)
@@ -230,8 +253,21 @@ static int posix_fd(void *fh)
 
 static int64_t posix_read(void *fh, void *dst, uint64_t off, size_t len)
 {
-    return pread(posix_fd(fh), dst, len, off) == (ssize_t)len
-           ? 0 : TCG_CACHE_GFAULT;
+    size_t done = 0;
+
+    while (done < len) {
+        ssize_t n = pread(posix_fd(fh), (uint8_t *)dst + done, len - done,
+                          off + done);
+
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return TCG_CACHE_GFAULT;
+        }
+        done += n;
+    }
+    return 0;
 }
 
 static const void *posix_map(void *fh, size_t size)
@@ -308,6 +344,92 @@ static bool posix_publish(const void *data, size_t len, const char *name,
     return true;
 }
 
+typedef struct PosixTmp {
+    int fd;
+    char name[64];
+} PosixTmp;
+
+static void *posix_create(void)
+{
+    PosixTmp *t = g_new0(PosixTmp, 1);
+
+    t->fd = posix_tmp(t->name, sizeof(t->name));
+    if (t->fd < 0) {
+        g_free(t);
+        return NULL;
+    }
+    return t;
+}
+
+static bool posix_write(void *wh, const void *data, size_t len, uint64_t off)
+{
+    PosixTmp *t = wh;
+    size_t done = 0;
+
+    while (done < len) {
+        ssize_t n = pwrite(t->fd, (const uint8_t *)data + done, len - done,
+                           off + done);
+
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        done += n;
+    }
+    return true;
+}
+
+static void posix_drop(void *wh)
+{
+    PosixTmp *t = wh;
+
+    close(t->fd);
+    unlinkat(cache_dirfd, t->name, 0);
+    g_free(t);
+}
+
+static bool posix_commit(void *wh, const char *name)
+{
+    PosixTmp *t = wh;
+    bool ok;
+
+    close(t->fd);
+    ok = !renameat2(cache_dirfd, t->name, cache_dirfd, name, RENAME_NOREPLACE)
+         || ((errno == EINVAL || errno == ENOSYS)
+             && !linkat(cache_dirfd, t->name, cache_dirfd, name, 0));
+    /* linkat's fallback leaves the temporary name too. */
+    unlinkat(cache_dirfd, t->name, 0);
+    g_free(t);
+    return ok;
+}
+
+static bool posix_remove(const char *name)
+{
+    return !unlinkat(cache_dirfd, name, 0);
+}
+
+static void *posix_trylock(void)
+{
+    int fd = openat(cache_dirfd, "lock",
+                    O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+
+    if (fd < 0) {
+        return NULL;
+    }
+    if (!cache_owned(fd, false) || flock(fd, LOCK_EX | LOCK_NB)) {
+        close(fd);
+        return NULL;
+    }
+    return (void *)(intptr_t)(fd + 1);
+}
+
+static void posix_unlock(void *lh)
+{
+    close((int)(intptr_t)lh - 1);
+}
+
 static TCGCacheDirOps posix_ops = {
     .list = posix_list,
     .open = posix_open,
@@ -316,6 +438,13 @@ static TCGCacheDirOps posix_ops = {
     .close = posix_close,
     .unmap = posix_unmap,
     .publish = posix_publish,
+    .create = posix_create,
+    .write = posix_write,
+    .commit = posix_commit,
+    .drop = posix_drop,
+    .remove = posix_remove,
+    .trylock = posix_trylock,
+    .unlock = posix_unlock,
 };
 
 /*

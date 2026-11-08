@@ -349,7 +349,8 @@ static int val_search(TCGContext *s, const TCGCacheArtView *v)
 
 int tcg_cache_validate(const void *art, size_t len)
 {
-    TCGContext *s = tcg_ctx;
+    /* Off translating threads (the writer's compaction), the first one's. */
+    TCGContext *s = tcg_ctx ? tcg_ctx : &tcg_init_ctx;
     TCGCacheArtView v;
     const TCGCacheArt *h;
     ValParts vp;
@@ -1456,6 +1457,85 @@ size_t tcg_cache_segment_bound(size_t data_len)
 {
     return sizeof(TCGCacheFileHdr) + 8 + data_len
            + data_len / sizeof(TCGCacheEnv) * sizeof(TCGCacheIdx);
+}
+
+TCGCacheIdx tcg_cache_env_idx(const TCGCacheEnv *e, uint32_t off)
+{
+    return env_idx(e, off);
+}
+
+int tcg_cache_env_verify(const TCGCacheEnv *env, size_t len)
+{
+    const TCGCacheArt *h = (const void *)(env + 1);
+    size_t alen;
+
+    if (len < sizeof(*env) || len > sizeof(*env) + TCG_CACHE_ART_MAX
+        || env->magic != TCG_CACHE_ENV_MAGIC || env->len != len) {
+        return TCG_CACHE_V_HEADER;
+    }
+    alen = len - sizeof(*env);
+    if (env_check(env, env + 1, alen) != env->check
+        || env_content(env, env + 1, alen) != env->content) {
+        return TCG_CACHE_V_CHECK;
+    }
+    if (env->pad || alen < sizeof(TCGCacheArt) || h->tb_flags != env->flags
+        || h->cflags != env->cflags || h->cs_base != env->cs_base) {
+        return TCG_CACHE_V_KEY;
+    }
+    return tcg_cache_validate(env + 1, alen);
+}
+
+size_t tcg_cache_pack_layout(TCGCacheFileHdr *h, uint64_t generation,
+                             uint32_t n, uint32_t n_cover, size_t data_len,
+                             uint32_t min_log2)
+{
+    size_t out_len;
+
+    if (n > TCG_CACHE_SEG_ENTRIES_MAX || n_cover > TCG_CACHE_COVER_MAX
+        || 2ull * n > 1ull << TCG_CACHE_SLOT_LOG2_MAX
+        || min_log2 > TCG_CACHE_SLOT_LOG2_MAX) {
+        return 0;
+    }
+    *h = (TCGCacheFileHdr){
+        .magic = TCG_CACHE_PACK_MAGIC,
+        .version = TCG_CACHE_FILE_VERSION, .hdr_len = sizeof(*h),
+        .tick = generation, .n_index = n, .slot_log2 = MAX(min_log2, 4),
+    };
+    memcpy(h->fp, tcg_cache_fingerprint, sizeof(h->fp));
+    while ((1u << h->slot_log2) < 2 * n) {
+        h->slot_log2++;
+    }
+    h->index_off = sizeof(*h);
+    h->n_cover = n_cover;
+    h->cover_off = h->index_off + (sizeof(TCGCacheIdx) << h->slot_log2);
+    h->cover_len = n_cover * sizeof(TCGCacheCover);
+    h->data_off = ROUND_UP(h->cover_off + h->cover_len, 8);
+    h->data_len = data_len;
+    out_len = (size_t)h->data_off + data_len;
+    return out_len > TCG_CACHE_FILE_MAX ? 0 : out_len;
+}
+
+bool tcg_cache_pack_slot(TCGCacheIdx *slots, uint32_t slot_log2,
+                         TCGCacheIdx x, unsigned probes)
+{
+    uint32_t mask = (1u << slot_log2) - 1, k = x.khash & mask;
+
+    for (unsigned i = 0; i < probes; i++, k = (k + 1) & mask) {
+        if (!slots[k].khash) {
+            slots[k] = x;
+            return true;
+        }
+    }
+    return false;
+}
+
+void tcg_cache_pack_seal(TCGCacheFileHdr *h, const TCGCacheCover *cover)
+{
+    if (h->n_cover) {
+        h->cover_check = tcg_cache_hash64(3, cover, h->cover_len);
+    }
+    h->check = 0;
+    h->check = hdr_check(h);
 }
 
 /*

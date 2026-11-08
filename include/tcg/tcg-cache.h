@@ -541,9 +541,17 @@ void tcg_cache_sink_fork_end(bool child);
  * snapshots, the exit's publication and fork, over the OS's files.  The
  * OS checks the directory before start, and each file as it opens it.
  */
+typedef void TCGCacheDirEntryFn(void *opaque, const char *name,
+                                uint64_t size, int64_t mtime);
+
 typedef struct TCGCacheDirOps {
-    /* At most @max entries' names, zero-padded, NUL within 64 bytes. */
-    int (*list)(char (*names)[64], int max);
+    /*
+     * Each of the first @max entries whose name fits 64 bytes with its
+     * NUL, to @fn with its size and modification time (seconds since the
+     * epoch); the number of entries seen (@max: perhaps not all), or -1
+     * if the listing failed part way.
+     */
+    int (*list)(TCGCacheDirEntryFn *fn, void *opaque, int max);
     /* @name opened to read: ours and checked, else NULL; its size. */
     void *(*open)(const char *name, size_t *sizep);
     /* A checked read at @off: 0, or TCG_CACHE_GFAULT if short. */
@@ -560,6 +568,19 @@ typedef struct TCGCacheDirOps {
      */
     bool (*publish)(const void *data, size_t len, const char *name,
                     unsigned pause_ms);
+    /*
+     * The same in parts: a temporary created, written at offsets, then
+     * published as @name (never replacing) or dropped; either closes it.
+     */
+    void *(*create)(void);
+    bool (*write)(void *wh, const void *data, size_t len, uint64_t off);
+    bool (*commit)(void *wh, const char *name);
+    void (*drop)(void *wh);
+    /* @name deleted, POSIX semantics where there is a choice. */
+    bool (*remove)(const char *name);
+    /* The directory's compaction lock, if free at once; released. */
+    void *(*trylock)(void);
+    void (*unlock)(void *lh);
     unsigned pid;
 } TCGCacheDirOps;
 
@@ -598,10 +619,50 @@ extern bool tcg_cache_have_loaded;
  */
 void *tcg_cache_store_envelopes(uint32_t born, size_t *lenp);
 /* Testing: validate every artifact of a file; damage it every way. */
+/* @e's index entry for envelope @e at @off. */
+TCGCacheIdx tcg_cache_env_idx(const TCGCacheEnv *e, uint32_t off);
+/*
+ * An envelope copied out (@len bytes) checked as tcg_cache_file_get
+ * checks one, and its artifact validated: 0, or why not.
+ */
+int tcg_cache_env_verify(const TCGCacheEnv *env, size_t len);
+/*
+ * A pack written in parts: @h laid out for @n envelopes of @data_len
+ * bytes and @n_cover covered segments, its slot table at least
+ * 2^@min_log2 (its length, or 0 past a reader's limits); each envelope's
+ * entry put in the slot table within @probes of its home, as a reader
+ * looks for it (false if it can't be); then the header sealed over the
+ * cover list.
+ */
+size_t tcg_cache_pack_layout(TCGCacheFileHdr *h, uint64_t generation,
+                             uint32_t n, uint32_t n_cover, size_t data_len,
+                             uint32_t min_log2);
+bool tcg_cache_pack_slot(TCGCacheIdx *slots, uint32_t slot_log2,
+                         TCGCacheIdx x, unsigned probes);
+void tcg_cache_pack_seal(TCGCacheFileHdr *h, const TCGCacheCover *cover);
 int tcg_cache_check_file(const void *map, size_t size, bool quiet,
                          uint64_t *counts);
 int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
                         unsigned arts);
+
+/*
+ * Why an eligible lookup translated: no file candidate, or the last one
+ * tried failed (tcg_cache_w_names).
+ */
+enum {
+    TCG_CACHE_W_NONE,
+    TCG_CACHE_W_HELPER,     /* a relocation to QEMU's image didn't fit */
+    TCG_CACHE_W_STUB,       /* ... to a start-up stub */
+    TCG_CACHE_W_THUNK,      /* ... to the chunk's slow-path thunk */
+    TCG_CACHE_W_RELOC,      /* any other relocation or constraint */
+    TCG_CACHE_W_KEYPC,      /* captured at another guest address */
+    TCG_CACHE_W_KEY,        /* other key fields, or the page split */
+    TCG_CACHE_W_OTHER,      /* guest bytes, promotion, eligibility, ... */
+    TCG_CACHE_W_MAX
+};
+
+/* Why tcg_cache_place last returned NULL: the relocation's kind and form. */
+extern unsigned tcg_cache_fail_kind, tcg_cache_fail_form;
 
 /* Counters, printed at exit with XTCG_CACHE_STATS. */
 typedef struct TCGCacheStats {
@@ -620,8 +681,19 @@ typedef struct TCGCacheStats {
     uint64_t file_lookups, file_hits, file_reject[TCG_CACHE_V_MAX];
     uint64_t sink_put, sink_dropped, published, publish_fail, publish_ns;
     uint64_t snaps, snap_skipped, snap_files, startup_ns, refresh_ns;
-    uint64_t snap_refused;
+    uint64_t snap_refused, scan_trunc, map_budget, publish_budget;
+    uint64_t publish_blind;
+    uint64_t compactions, compact_fail, compact_busy, compact_ns;
+    uint64_t compact_in, compact_arts, compact_kept, compact_aged;
+    uint64_t compact_damaged, compact_bytes, removed, remove_fail;
+    uint64_t compact_dups, compact_skip, compact_regrow;
+    uint64_t compact_exit, compact_collide;
     uint64_t look_ns, copy_ns, check_ns, hit_ns;
+    /* Files' candidates that didn't install: why, and what it cost. */
+    uint64_t inst_fail_rk[TCG_CAP_UNSUPPORTED + 1];
+    uint64_t inst_fail_rf[TCG_CAPF_MAX], inst_fail_kpc;
+    uint64_t file_fail, file_fail_ns;
+    uint64_t gen[TCG_CACHE_W_MAX], gen_ns[TCG_CACHE_W_MAX];
 } TCGCacheStats;
 
 extern TCGCacheStats tcg_cache_stats;
