@@ -1294,11 +1294,41 @@ void tcg_cache_sink_fork_end(bool child)
 
 /* Writers, from a list of envelopes (each 8-aligned in @data). */
 
-static int idx_cmp(const void *a, const void *b)
+/* Heapsort by key hash, in place: the exit's writer allocates nothing. */
+static void idx_sift(TCGCacheIdx *a, uint32_t i, uint32_t n)
 {
-    const TCGCacheIdx *x = a, *y = b;
+    for (;;) {
+        uint32_t c = 2 * i + 1;
+        TCGCacheIdx t;
 
-    return x->khash < y->khash ? -1 : x->khash > y->khash;
+        if (c >= n) {
+            return;
+        }
+        if (c + 1 < n && a[c + 1].khash > a[c].khash) {
+            c++;
+        }
+        if (a[i].khash >= a[c].khash) {
+            return;
+        }
+        t = a[i];
+        a[i] = a[c];
+        a[c] = t;
+        i = c;
+    }
+}
+
+static void idx_sort(TCGCacheIdx *a, uint32_t n)
+{
+    for (uint32_t i = n / 2; i-- > 0;) {
+        idx_sift(a, i, n);
+    }
+    for (uint32_t end = n; end > 1; end--) {
+        TCGCacheIdx t = a[0];
+
+        a[0] = a[end - 1];
+        a[end - 1] = t;
+        idx_sift(a, 0, end - 1);
+    }
 }
 
 static TCGCacheIdx env_idx(const TCGCacheEnv *e, uint32_t off)
@@ -1309,9 +1339,13 @@ static TCGCacheIdx env_idx(const TCGCacheEnv *e, uint32_t off)
     };
 }
 
-void *tcg_cache_write_file(bool pack, uint64_t tick, const void *data,
-                           size_t data_len, const TCGCacheCover *cover,
-                           uint32_t n_cover, size_t *lenp)
+/*
+ * A file from @data's envelopes into @out (@cap bytes; NULL to allocate
+ * one); its length, or 0 if they don't make a file a reader would take.
+ */
+static size_t write_file(void **outp, size_t cap, bool pack, uint64_t tick,
+                         const void *data, size_t data_len,
+                         const TCGCacheCover *cover, uint32_t n_cover)
 {
     TCGCacheFileHdr h = {
         .magic = pack ? TCG_CACHE_PACK_MAGIC : TCG_CACHE_SEG_MAGIC,
@@ -1331,7 +1365,7 @@ void *tcg_cache_write_file(bool pack, uint64_t tick, const void *data,
             || e->len < sizeof(*e)
             || e->len > sizeof(*e) + TCG_CACHE_ART_MAX
             || ROUND_UP(e->len, 8) > data_len - o) {
-            return NULL;
+            return 0;
         }
         n++;
         o += ROUND_UP(e->len, 8);
@@ -1341,7 +1375,7 @@ void *tcg_cache_write_file(bool pack, uint64_t tick, const void *data,
         || n > TCG_CACHE_SEG_ENTRIES_MAX || n_cover > TCG_CACHE_COVER_MAX
         || data_len > TCG_CACHE_FILE_MAX
         || (pack && 2ull * n > 1ull << TCG_CACHE_SLOT_LOG2_MAX)) {
-        return NULL;
+        return 0;
     }
     memcpy(h.fp, tcg_cache_fingerprint, sizeof(h.fp));
     if (pack) {
@@ -1362,10 +1396,15 @@ void *tcg_cache_write_file(bool pack, uint64_t tick, const void *data,
     h.data_off = ROUND_UP(h.cover_off + h.cover_len, 8);
     h.data_len = data_len;
     out_len = h.data_off + data_len;
-    if (out_len > TCG_CACHE_FILE_MAX) {
-        return NULL;
+    if (out_len > TCG_CACHE_FILE_MAX || (*outp && out_len > cap)) {
+        return 0;
     }
-    out = g_malloc0(out_len);
+    if (*outp) {
+        out = *outp;
+        memset(out, 0, out_len);
+    } else {
+        out = *outp = g_malloc0(out_len);
+    }
     idx = (TCGCacheIdx *)(out + h.index_off);
     at = 0;
     for (size_t o = 0; o < data_len;) {
@@ -1385,7 +1424,7 @@ void *tcg_cache_write_file(bool pack, uint64_t tick, const void *data,
         o += ROUND_UP(e->len, 8);
     }
     if (!pack) {
-        qsort(idx, n, sizeof(*idx), idx_cmp);
+        idx_sort(idx, n);
     }
     if (n_cover) {
         memcpy(out + h.cover_off, cover, h.cover_len);
@@ -1394,8 +1433,29 @@ void *tcg_cache_write_file(bool pack, uint64_t tick, const void *data,
     memcpy(out + h.data_off, data, data_len);
     h.check = hdr_check(&h);
     memcpy(out, &h, sizeof(h));
-    *lenp = out_len;
-    return out;
+    return out_len;
+}
+
+void *tcg_cache_write_file(bool pack, uint64_t tick, const void *data,
+                           size_t data_len, const TCGCacheCover *cover,
+                           uint32_t n_cover, size_t *lenp)
+{
+    void *out = NULL;
+
+    *lenp = write_file(&out, 0, pack, tick, data, data_len, cover, n_cover);
+    return *lenp ? out : NULL;
+}
+
+size_t tcg_cache_write_segment_to(void *out, size_t cap, uint64_t tick,
+                                  const void *data, size_t data_len)
+{
+    return write_file(&out, cap, false, tick, data, data_len, NULL, 0);
+}
+
+size_t tcg_cache_segment_bound(size_t data_len)
+{
+    return sizeof(TCGCacheFileHdr) + 8 + data_len
+           + data_len / sizeof(TCGCacheEnv) * sizeof(TCGCacheIdx);
 }
 
 /*
