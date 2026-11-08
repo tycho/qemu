@@ -1431,6 +1431,29 @@ void tcg_cache_print_stats(void)
                 t->compact_damaged, t->compact_dups, t->compact_bytes,
                 t->compact_skip, t->compact_regrow, t->compact_collide,
                 t->removed, t->remove_fail);
+        fprintf(stderr, "xtcg-cache: dir: merges");
+        for (int k = 0; k < 4; k++) {
+            static const char *const kn[4] = {
+                "minor", "parts", "major", "first",
+            };
+
+            fprintf(stderr, " %s %" PRIu64 "/%" PRIu64 "/%" PRIu64
+                    " (est %.1f act %.1f age %.1f ms, %" PRIu64 " KiB in, %"
+                    PRIu64 " entries)",
+                    kn[k], t->merge_done[k], t->merge_fail[k],
+                    t->merge_exit[k], t->merge_est_ns[k] / 1e6,
+                    t->merge_act_ns[k] / 1e6, t->merge_age_ns[k] / 1e6,
+                    t->merge_in_bytes[k] >> 10, t->merge_entries[k]);
+        }
+        fprintf(stderr, "; deferred %" PRIu64, t->merge_deferred);
+        fprintf(stderr, "; emergency %" PRIu64 ", saturated %" PRIu64
+                ", written %" PRIu64 " KiB; parts %" PRIu64 " live %" PRIu64
+                " unresolved %" PRIu64 " covered, overflows %" PRIu64
+                "; loose %" PRIu64 "; scan retained %" PRIu64 " KiB\n",
+                t->merge_emergency, t->merge_saturated,
+                t->merge_tmp_bytes >> 10, t->parts_live,
+                t->parts_unresolved, t->parts_covered, t->parts_overflow,
+                t->scan_loose, t->scan_mem_max >> 10);
         fprintf(stderr, "xtcg-cache: dir: snapshots %" PRIu64 " (%" PRIu64
                 " files, %" PRIu64 " skipped) start-up %.3f ms, snapshots"
                 " %.3f ms; captured %" PRIu64 " (dropped %" PRIu64

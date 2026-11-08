@@ -52,7 +52,9 @@ static QemuMutex dir_wwork;
 #define DIR_SIZE_CLAMP      (1ull << 40)
 #define DIR_PACKS_MAX       8       /* pack names a scan keeps */
 #define DIR_TMPS_MAX        64      /* old temporaries a scan keeps */
-#define DIR_LOOSE_MAX       (TCG_CACHE_SNAP_FILES - 1)
+#define DIR_LOOSE_MAX       16
+#define DIR_PARTS_MAX       8       /* parts a snapshot maps; minors' bound */
+#define DIR_PARTS_SEEN      64      /* part names a scan keeps */
 #define DIR_AGE_NS          (2 * NANOSECONDS_PER_SECOND)
 #define DIR_REFRESH_NS      NANOSECONDS_PER_SECOND
 /* Compaction: when, its inputs, what it keeps. */
@@ -61,6 +63,10 @@ static QemuMutex dir_wwork;
 #define DIR_COMPACT_NS      (60 * NANOSECONDS_PER_SECOND)
 #define DIR_COMPACT_URGENT  (2 * DIR_LOOSE_MAX)
 #define DIR_COMPACT_IN      64
+/* Merge admission: a time per entry, its floor, the least budget. */
+#define DIR_MERGE_NS        4000
+#define DIR_MERGE_NS_MIN    100
+#define DIR_MERGE_BUDGET    (30 * SCALE_MS)
 #define DIR_KEEP_PER_KEY    4
 #define DIR_TMP_AGE_S       600
 /* Budgets: the directory's bytes; the bytes a process maps. */
@@ -97,6 +103,12 @@ static bool dir_refresh_always, dir_exit_nolock;
  * (after the rename, before the deletions).
  */
 static uint64_t dir_compact_loose = DIR_COMPACT_LOOSE;
+/*
+ * Testing: XTCG_CACHE_PARTS_MAX, the bound on parts; XTCG_CACHE_TEST_MAJOR,
+ * a major is due whenever P exists.
+ */
+static unsigned dir_parts_max = DIR_PARTS_MAX;
+static bool dir_test_major;
 static int64_t dir_compact_ns = DIR_COMPACT_NS;
 static uint64_t dir_disk_max = DIR_DISK_MAX, dir_map_max = DIR_MAP_MAX;
 static int64_t dir_tmp_age_s = DIR_TMP_AGE_S;
@@ -226,6 +238,17 @@ static uint64_t dir_pack_gen(const char *name)
     return gen;
 }
 
+/* A pack's or a part's name's generation. */
+static uint64_t dir_name_gen(const char *name)
+{
+    uint64_t gen = 0;
+
+    if (!tcg_cache_part_name_gen(name, &gen)) {
+        gen = dir_pack_gen(name);
+    }
+    return gen;
+}
+
 static uint64_t dir_env_u64(const char *name, uint64_t dflt)
 {
     const char *v = getenv(name);
@@ -274,27 +297,40 @@ static void dir_keep(DirCand *a, int *n, int max, const char *name,
     *n = MIN(*n + 1, max);
 }
 
-/* @name's place in @pack's cover list, or -1. */
-static int dir_cover_find(const TCGCacheFile *pack, const char *name)
-{
-    for (uint32_t i = 0; pack && i < pack->hdr.n_cover; i++) {
-        if (!strncmp(pack->cover[i].name, name, 64)) {
-            return i;
-        }
-    }
-    return -1;
-}
-
 /*
  * A scan of the directory, in two passes over its entries.  The first
- * keeps the highest pack names, which are then opened: the newest valid
- * one is P (its header validates and its generation is its name's).  The
- * second, against P's cover list: the loose segments (the newest, the
- * oldest), the newest of those P covers by name, which of P's covered
- * segments are listed, the old temporaries, and the totals.  Only a
- * complete scan (both listings whole) establishes that a file is absent.
+ * keeps the highest pack names and every part name (DIR_PARTS_SEEN at
+ * most; past that the scan isn't complete), which are then opened: the
+ * newest valid pack is P (its header validates and its generation is its
+ * name's); each part is valid, invalid (conclusively) or unresolved (it
+ * couldn't be opened or read: that proves nothing).  The valid files'
+ * cover entries make the claims, sorted by name: a file named by a claim
+ * whose checksum is the file's header's is covered, by any of the claims
+ * (a part's entries name only older parts).  The second pass, against
+ * the claims: the loose segments (the newest, the oldest), the newest of
+ * those named by a claim, which claimed files are listed, the old
+ * temporaries, and the totals.  Only a complete scan (both listings
+ * whole, no part overflow) establishes that a file is absent.
  */
 enum { DIR_PACK_UNREAD, DIR_PACK_VALID, DIR_PACK_INVALID };
+
+typedef struct DirPart {
+    DirCand c;
+    uint64_t gen;
+    int state;
+    bool covered;
+    bool deleted;                   /* by cleanup: never an input */
+    TCGCacheFile f;                 /* valid: header and cover list */
+    bool *present;                  /* per cover entry: listed */
+} DirPart;
+
+/* A cover entry of a valid file: holder -1 is P, else a part's index. */
+typedef struct DirClaim {
+    const char *name;
+    uint64_t check;
+    int holder;
+    uint32_t idx;
+} DirClaim;
 
 typedef struct DirScan {
     int pass;
@@ -305,8 +341,15 @@ typedef struct DirScan {
     int p;                          /* packs[p] is P, or -1 */
     TCGCacheFile pack;              /* P's header and cover list */
     bool *present;                  /* per P cover entry: listed */
+    DirPart *parts;                 /* highest generations first */
+    int nparts, parts_seen;
+    uint64_t max_gen;               /* of any pack or part name */
+    DirClaim *claims;               /* by name */
+    size_t nclaims;
+    int live, unresolved;           /* parts */
+    uint64_t live_bytes, live_entries;
     uint32_t n_present;
-    DirCand newest[DIR_LOOSE_MAX];  /* not in P's cover list */
+    DirCand newest[DIR_LOOSE_MAX];  /* named by no claim */
     int nnewest;
     DirCand newest_cov[DIR_LOOSE_MAX];
     int nnewest_cov;
@@ -322,17 +365,93 @@ typedef struct DirScan {
 
 /*
  * Leftovers cleanup would delete, by the last scan; whether that scan was
- * complete (only a complete one authorizes publication and maintenance).
+ * complete (only a complete one authorizes publication and maintenance);
+ * its parts (live, and live plus unresolved: the bound's count) and
+ * whether a major merge is due.
  */
 static uint64_t dir_seen_leftovers;
 static bool dir_seen_complete;
 static int64_t dir_last_scan;
+static int dir_seen_live, dir_seen_bound;
+static bool dir_seen_major_due;
+
+static int dir_claim_cmp(const void *a, const void *b)
+{
+    return strncmp(((const DirClaim *)a)->name, ((const DirClaim *)b)->name,
+                   64);
+}
+
+/* The claims naming @name: their first index, *@n of them. */
+static size_t dir_claims_of(const DirClaim *cl, size_t ncl, const char *name,
+                            size_t *n)
+{
+    size_t lo = 0, hi = ncl;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+
+        if (strncmp(cl[mid].name, name, 64) < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    for (hi = lo; hi < ncl && !strncmp(cl[hi].name, name, 64); hi++) {
+        continue;
+    }
+    *n = hi - lo;
+    return lo;
+}
+
+/* Whether a claim covers @name exactly: its checksum is @check. */
+static bool dir_claimed(const DirClaim *cl, size_t ncl, const char *name,
+                        uint64_t check)
+{
+    size_t n, i = dir_claims_of(cl, ncl, name, &n);
+
+    for (size_t k = 0; k < n; k++) {
+        if (cl[i + k].check == check) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Append @f's cover entries, as @holder's, to the claims. */
+static void dir_claims_add(DirClaim **cl, size_t *ncl, const TCGCacheFile *f,
+                           int holder)
+{
+    *cl = g_renew(DirClaim, *cl, *ncl + f->hdr.n_cover);
+    for (uint32_t i = 0; i < f->hdr.n_cover; i++) {
+        (*cl)[(*ncl)++] = (DirClaim){
+            .name = f->cover[i].name, .check = f->cover[i].hdr_check,
+            .holder = holder, .idx = i,
+        };
+    }
+}
+
+/* The claims naming a listed file: each holder's entry is present. */
+static void dir_scan_present(DirScan *sc, const char *name)
+{
+    size_t n, i = dir_claims_of(sc->claims, sc->nclaims, name, &n);
+
+    for (size_t k = 0; k < n; k++) {
+        const DirClaim *c = &sc->claims[i + k];
+        bool *pr = c->holder < 0 ? sc->present : sc->parts[c->holder].present;
+
+        if (!pr[c->idx]) {
+            pr[c->idx] = true;
+            sc->n_present++;
+        }
+    }
+}
 
 static void dir_scan_entry(void *opaque, const char *name, uint64_t size,
                            int64_t mtime)
 {
     DirScan *sc = opaque;
-    int c;
+    uint64_t gen;
+    size_t n;
 
     /* Clamped, so that no sum of a scan's sizes can wrap. */
     size = MIN(size, DIR_SIZE_CLAMP);
@@ -340,7 +459,26 @@ static void dir_scan_entry(void *opaque, const char *name, uint64_t size,
         sc->bytes += size;
         if (dir_pack_name_ok(name)) {
             sc->packs_seen++;
+            sc->max_gen = MAX(sc->max_gen, dir_pack_gen(name));
             dir_keep(sc->packs, &sc->npacks, DIR_PACKS_MAX, name, size, true);
+        } else if (tcg_cache_part_name_gen(name, &gen)) {
+            int i = sc->nparts;
+
+            sc->parts_seen++;
+            sc->max_gen = MAX(sc->max_gen, gen);
+            if (sc->nparts < DIR_PARTS_SEEN) {
+                /* Highest generations first, as dir_keep does. */
+                while (i > 0 && gen > sc->parts[i - 1].gen) {
+                    i--;
+                }
+                memmove(&sc->parts[i + 1], &sc->parts[i],
+                        (sc->nparts - i) * sizeof(*sc->parts));
+                memset(&sc->parts[i], 0, sizeof(sc->parts[i]));
+                memcpy(sc->parts[i].c.name, name, strnlen(name, 63));
+                sc->parts[i].c.size = size;
+                sc->parts[i].gen = gen;
+                sc->nparts++;
+            }
         }
         return;
     }
@@ -350,15 +488,16 @@ static void dir_scan_entry(void *opaque, const char *name, uint64_t size,
         }
         return;
     }
+    if (tcg_cache_part_name_gen(name, &gen)) {
+        dir_scan_present(sc, name);
+        return;
+    }
     if (!dir_seg_name_ok(name)) {
         return;
     }
-    c = sc->p >= 0 ? dir_cover_find(&sc->pack, name) : -1;
-    if (c >= 0) {
-        if (!sc->present[c]) {
-            sc->present[c] = true;
-            sc->n_present++;
-        }
+    dir_claims_of(sc->claims, sc->nclaims, name, &n);
+    if (n) {
+        dir_scan_present(sc, name);
         dir_keep(sc->newest_cov, &sc->nnewest_cov, DIR_LOOSE_MAX, name, size,
                  true);
         dir_keep(sc->oldest_cov, &sc->noldest_cov, DIR_COMPACT_IN, name, size,
@@ -390,6 +529,13 @@ static bool dir_ending(void)
     return qatomic_read(&dir_shutdown) != DIR_RUNNING;
 }
 
+/* @f, opened as @name: a valid pack or part (by @prefix's generation). */
+static bool dir_level_ok(const TCGCacheFile *f, const char *name)
+{
+    return f->hdr.magic == TCG_CACHE_PACK_MAGIC
+           && f->hdr.tick == dir_name_gen(name);
+}
+
 /* The scan; dir_scan_done releases what it holds. */
 static void dir_scan(DirScan *sc)
 {
@@ -398,6 +544,7 @@ static void dir_scan(DirScan *sc)
 
     sc->p = -1;
     sc->pass = 1;
+    sc->parts = g_new0(DirPart, DIR_PARTS_SEEN);
     whole = dir_scan_list(sc);
     for (int i = 0; i < sc->npacks; i++) {
         TCGCacheFile f;
@@ -410,8 +557,7 @@ static void dir_scan(DirScan *sc)
             continue;
         }
         dir_ops->close(fh);
-        if (f.hdr.magic != TCG_CACHE_PACK_MAGIC
-            || f.hdr.tick != dir_pack_gen(sc->packs[i].name)) {
+        if (!dir_level_ok(&f, sc->packs[i].name)) {
             sc->pack_state[i] = DIR_PACK_INVALID;
             tcg_cache_file_close(&f);
             continue;
@@ -421,6 +567,7 @@ static void dir_scan(DirScan *sc)
             sc->p = i;
             sc->pack = f;
             sc->present = g_new0(bool, f.hdr.n_cover);
+            dir_claims_add(&sc->claims, &sc->nclaims, &sc->pack, -1);
         } else {
             tcg_cache_file_close(&f);
         }
@@ -428,6 +575,71 @@ static void dir_scan(DirScan *sc)
     }
     for (int i = 0; i < sc->npacks; i++) {
         leftovers += sc->pack_state[i] == DIR_PACK_INVALID;
+    }
+    if (sc->parts_seen > DIR_PARTS_SEEN) {
+        tcg_cache_stats.parts_overflow++;
+        whole = false;
+    }
+    for (int i = 0; i < sc->nparts; i++) {
+        DirPart *pt = &sc->parts[i];
+        size_t size;
+        bool invalid;
+        void *fh = dir_open_file(pt->c.name, &pt->f, &size, &invalid);
+
+        pt->state = invalid ? DIR_PACK_INVALID : DIR_PACK_UNREAD;
+        if (!fh) {
+            leftovers += invalid;
+            continue;
+        }
+        dir_ops->close(fh);
+        if (!dir_level_ok(&pt->f, pt->c.name)) {
+            pt->state = DIR_PACK_INVALID;
+            tcg_cache_file_close(&pt->f);
+            leftovers++;
+            continue;
+        }
+        pt->state = DIR_PACK_VALID;
+        pt->present = g_new0(bool, pt->f.hdr.n_cover);
+        dir_claims_add(&sc->claims, &sc->nclaims, &pt->f, i);
+    }
+    qsort(sc->claims, sc->nclaims, sizeof(*sc->claims), dir_claim_cmp);
+    {
+        /*
+         * What the scan retains: parts, cover lists, presence, claims (not
+         * its temporaries, the allocator's overhead or a snapshot's).
+         */
+        uint64_t mem = DIR_PARTS_SEEN * sizeof(DirPart)
+                       + sc->nclaims * sizeof(DirClaim);
+
+        for (int i = -1; i < sc->nparts; i++) {
+            const TCGCacheFile *f = i < 0 ? (sc->p >= 0 ? &sc->pack : NULL)
+                                    : sc->parts[i].state == DIR_PACK_VALID
+                                    ? &sc->parts[i].f : NULL;
+
+            if (f) {
+                mem += (uint64_t)f->hdr.n_cover
+                       * (sizeof(TCGCacheCover) + sizeof(bool));
+            }
+        }
+        tcg_cache_stats.scan_mem_max = MAX(tcg_cache_stats.scan_mem_max,
+                                           mem);
+    }
+    for (int i = 0; i < sc->nparts; i++) {
+        DirPart *pt = &sc->parts[i];
+
+        if (pt->state == DIR_PACK_UNREAD) {
+            sc->unresolved++;
+        } else if (pt->state == DIR_PACK_VALID) {
+            pt->covered = dir_claimed(sc->claims, sc->nclaims, pt->c.name,
+                                      pt->f.hdr.check);
+            if (pt->covered) {
+                leftovers++;
+            } else {
+                sc->live++;
+                sc->live_bytes += pt->c.size;
+                sc->live_entries += pt->f.hdr.n_index;
+            }
+        }
     }
     sc->tmp_before = g_get_real_time() / G_USEC_PER_SEC - dir_tmp_age_s;
     sc->pass = 2;
@@ -442,14 +654,27 @@ static void dir_scan(DirScan *sc)
                                  sc->bytes);
     dir_seen_leftovers = leftovers;
     dir_seen_complete = whole;
+    dir_seen_live = sc->live;
+    dir_seen_bound = sc->live + sc->unresolved;
+    dir_seen_major_due = sc->p >= 0
+                         && (dir_test_major
+                             || (sc->live
+                                 && sc->live_bytes
+                                    >= sc->packs[sc->p].size / 2));
+    tcg_cache_stats.parts_live = sc->live;
+    tcg_cache_stats.parts_unresolved = sc->unresolved;
+    tcg_cache_stats.parts_covered = sc->nparts - sc->live - sc->unresolved;
+    tcg_cache_stats.scan_loose = sc->loose;
     dir_last_scan = get_clock();
     dir_pub_since = dir_pub_bytes_since = 0;
     if (tcg_cache_debug) {
         fprintf(stderr, "xtcg-cache dir: %s scan: %" PRIu64 " bytes, %"
-                PRIu64 " loose segments (%" PRIu64 " bytes), pack %s, %"
-                PRIu64 " leftovers\n", whole ? "complete" : "partial",
-                sc->bytes, sc->loose, sc->loose_bytes,
-                sc->p >= 0 ? sc->packs[sc->p].name : "none", leftovers);
+                PRIu64 " loose segments (%" PRIu64 " bytes), pack %s, "
+                "parts %d live %d unresolved, %" PRIu64 " leftovers\n",
+                whole ? "complete" : "partial", sc->bytes, sc->loose,
+                sc->loose_bytes,
+                sc->p >= 0 ? sc->packs[sc->p].name : "none", sc->live,
+                sc->unresolved, leftovers);
     }
 }
 
@@ -459,6 +684,14 @@ static void dir_scan_done(DirScan *sc)
         tcg_cache_file_close(&sc->pack);
     }
     g_free(sc->present);
+    for (int i = 0; sc->parts && i < sc->nparts; i++) {
+        if (sc->parts[i].state == DIR_PACK_VALID) {
+            tcg_cache_file_close(&sc->parts[i].f);
+        }
+        g_free(sc->parts[i].present);
+    }
+    g_free(sc->parts);
+    g_free(sc->claims);
 }
 
 static void dir_snap_release(TCGCacheSnap *s)
@@ -525,25 +758,65 @@ static uint64_t dir_snap_bytes(const TCGCacheSnap *s)
  */
 static bool dir_pack_owed;
 
+/* The third listing of a snapshot: segments against the mapped files. */
+typedef struct DirSnapList {
+    const DirClaim *mc;
+    size_t nmc;
+    DirCand newest[DIR_LOOSE_MAX];      /* named by no mapped file */
+    int nnewest;
+    DirCand newest_cov[DIR_LOOSE_MAX];  /* named by one */
+    int nnewest_cov;
+} DirSnapList;
+
+static void dir_snap_entry(void *opaque, const char *name, uint64_t size,
+                           int64_t mtime)
+{
+    DirSnapList *sl = opaque;
+    size_t n;
+
+    if (!dir_seg_name_ok(name)) {
+        return;
+    }
+    dir_claims_of(sl->mc, sl->nmc, name, &n);
+    if (n) {
+        dir_keep(sl->newest_cov, &sl->nnewest_cov, DIR_LOOSE_MAX, name,
+                 MIN(size, DIR_SIZE_CLAMP), true);
+    } else {
+        dir_keep(sl->newest, &sl->nnewest, DIR_LOOSE_MAX, name,
+                 MIN(size, DIR_SIZE_CLAMP), true);
+    }
+}
+
 /*
- * A snapshot of the directory: P, and the newest DIR_LOOSE_MAX segments
- * it doesn't cover.  Only checked reads; files are mapped, never read
- * through the mapping here.  A segment is suppressed only by the pack
- * actually mapped, by name and header checksum.  Within the mapping
- * budget, counted with the current snapshot (which this one retires; no
- * build runs while a retired one is pending, and a fork's child builds
- * none): the pack first, then segments newest first, until one doesn't
- * fit.  Lookups take the files in that order too.
+ * A snapshot of the directory: P, then parts, then the newest
+ * DIR_LOOSE_MAX segments, each unless a file mapped in this snapshot
+ * covers it exactly (name and header checksum).  Only checked reads;
+ * files are mapped, never read through the mapping here.
+ *
+ * Parts are taken newest generation first, so that a coverer is
+ * considered before what it covers: a part whose coverer was mapped is
+ * suppressed, and one whose coverer couldn't be mapped is mapped in its
+ * place, up to dir_parts_max.  Segments come from a listing of their own,
+ * after the parts are mapped, against the mapped files' claims: the
+ * newest DIR_LOOSE_MAX named by none, and the newest named by one (opened
+ * and checked).  Older candidates behind those (exactly covered, or too
+ * big for the budget) aren't considered: a bounded miss.
+ *
+ * Within the mapping budget, counted with the current snapshot (which
+ * this one retires; no build runs while a retired one is pending, and a
+ * fork's child builds none): a file that doesn't fit is skipped, counted,
+ * and the next considered.  Lookups take the files in this order.
  */
 static TCGCacheSnap *dir_snap_build(void)
 {
     TCGCacheSnap *snap = g_new0(TCGCacheSnap, 1);
     g_autofree DirScan *sc = g_new0(DirScan, 1);
+    g_autofree DirSnapList *sl = g_new0(DirSnapList, 1);
+    g_autofree DirClaim *mc = NULL;
+    size_t nmc = 0;
     uint64_t mapped = dir_snap_bytes(qatomic_read(&tcg_cache_snap));
-    TCGCacheFile pack = { };
-    bool have_pack = false;
     int64_t t0 = get_clock();
-    int i = 0, j = 0;
+    int nparts = 0, nloose = 0, i = 0, j = 0;
 
     dir_scan(sc);
     dir_pause(dir_pause_snap_ms);
@@ -551,6 +824,7 @@ static TCGCacheSnap *dir_snap_build(void)
     dir_pack_owed = false;
     if (sc->p >= 0) {
         uint64_t size = sc->packs[sc->p].size;
+        TCGCacheFile *f = &snap->f[0];
 
         if (mapped + size > dir_map_max) {
             tcg_cache_stats.map_budget++;
@@ -559,47 +833,72 @@ static TCGCacheSnap *dir_snap_build(void)
             if (dir_pack_owed) {
                 goto done;
             }
-        } else if (dir_map_file(sc->packs[sc->p].name, &pack,
+        } else if (dir_map_file(sc->packs[sc->p].name, f,
                                 dir_map_max - mapped)) {
-            if (pack.hdr.check == sc->pack.hdr.check) {
-                have_pack = true;
-                mapped += pack.size;
+            if (f->hdr.check == sc->pack.hdr.check) {
+                f->level = TCG_CACHE_LEVEL_PACK;
+                mapped += f->size;
+                dir_claims_add(&mc, &nmc, f, snap->n++);
             } else {
-                dir_unmap_file(&pack);
+                dir_unmap_file(f);
             }
         }
     }
-    /*
-     * The pack first: in steady state it holds nearly every hit, and a
-     * lookup stops at the first candidate that installs.
-     */
-    if (have_pack) {
-        snap->f[snap->n++] = pack;
-    }
-    while (snap->n - have_pack < DIR_LOOSE_MAX
-           && (i < sc->nnewest || j < sc->nnewest_cov)) {
-        bool cov = i == sc->nnewest
-                   || (j < sc->nnewest_cov
-                       && strcmp(sc->newest_cov[j].name,
-                                 sc->newest[i].name) > 0);
-        const DirCand *d = cov ? &sc->newest_cov[j++] : &sc->newest[i++];
+    qsort(mc, nmc, sizeof(*mc), dir_claim_cmp);
+    for (int k = 0; k < sc->nparts && nparts < dir_parts_max; k++) {
+        const DirPart *pt = &sc->parts[k];
         TCGCacheFile *f = &snap->f[snap->n];
-        int c;
+
+        if (pt->state != DIR_PACK_VALID
+            || dir_claimed(mc, nmc, pt->c.name, pt->f.hdr.check)) {
+            continue;
+        }
+        if (mapped + pt->c.size > dir_map_max) {
+            tcg_cache_stats.map_budget++;
+            continue;
+        }
+        if (!dir_map_file(pt->c.name, f, dir_map_max - mapped)) {
+            continue;
+        }
+        if (f->hdr.check != pt->f.hdr.check || !dir_level_ok(f, pt->c.name)) {
+            dir_unmap_file(f);
+            continue;
+        }
+        f->level = TCG_CACHE_LEVEL_PART;
+        mapped += f->size;
+        nparts++;
+        dir_claims_add(&mc, &nmc, f, snap->n++);
+        qsort(mc, nmc, sizeof(*mc), dir_claim_cmp);
+    }
+    sl->mc = mc;
+    sl->nmc = nmc;
+    if (dir_ops->list(dir_snap_entry, sl, DIR_SCAN_MAX) < 0) {
+        goto done;
+    }
+    while (nloose < DIR_LOOSE_MAX
+           && (i < sl->nnewest || j < sl->nnewest_cov)) {
+        bool cov = i == sl->nnewest
+                   || (j < sl->nnewest_cov
+                       && strcmp(sl->newest_cov[j].name,
+                                 sl->newest[i].name) > 0);
+        const DirCand *d = cov ? &sl->newest_cov[j++] : &sl->newest[i++];
+        TCGCacheFile *f = &snap->f[snap->n];
 
         if (mapped + d->size > dir_map_max) {
             tcg_cache_stats.map_budget++;
-            break;
+            continue;
         }
         if (!dir_map_file(d->name, f, dir_map_max - mapped)) {
             continue;
         }
-        c = cov && have_pack ? dir_cover_find(&snap->f[0], d->name) : -1;
-        if (c >= 0 && snap->f[0].cover[c].hdr_check == f->hdr.check) {
+        if (cov && dir_claimed(mc, nmc, d->name, f->hdr.check)) {
             dir_unmap_file(f);
             continue;
         }
+        f->level = TCG_CACHE_LEVEL_SEG;
         mapped += f->size;
         snap->n++;
+        nloose++;
     }
 done:
     dir_scan_done(sc);
@@ -792,10 +1091,14 @@ typedef struct DirArt {
     uint32_t pad;
 } DirArt;
 
+/* A merge's inputs: P, parts, loose segments. */
+#define DIR_MERGE_IN        (1 + DIR_PARTS_SEEN + DIR_COMPACT_IN)
+
 typedef struct DirCompact {
-    TCGCacheFile in[DIR_COMPACT_IN + 1];
-    void *fh[DIR_COMPACT_IN + 1];
-    char name[DIR_COMPACT_IN + 1][64];
+    TCGCacheFile in[DIR_MERGE_IN];
+    void *fh[DIR_MERGE_IN];
+    char name[DIR_MERGE_IN][64];
+    int level[DIR_MERGE_IN];
     uint32_t nin;
     DirArt *arts;
     size_t n, cap;
@@ -1224,8 +1527,9 @@ static bool dir_remove_covered(const TCGCacheCover *e)
 
 /*
  * Cleanup, as the comment above says: valid packs ranked after
- * @keep_rank in the scan (-1: all of them, after a merge), what P covers
- * exactly, old temporaries.
+ * @keep_rank in the scan (-1: all of them, after a major), invalid packs
+ * and parts, parts a valid file covers exactly, segments a valid file's
+ * listed claim covers exactly (each opened and checked), old temporaries.
  */
 static void dir_compact_clean(DirScan *sc, int keep_rank)
 {
@@ -1237,9 +1541,35 @@ static void dir_compact_clean(DirScan *sc, int keep_rank)
             sc->pack_state[i] = DIR_PACK_UNREAD;
         }
     }
-    for (uint32_t i = 0; sc->p >= 0 && i < sc->pack.hdr.n_cover; i++) {
-        if (sc->present[i] && dir_remove_covered(&sc->pack.cover[i])) {
-            sc->present[i] = false;
+    for (int i = 0; i < sc->nparts; i++) {
+        DirPart *pt = &sc->parts[i];
+
+        if (!pt->deleted
+            && (pt->state == DIR_PACK_INVALID
+                || (pt->state == DIR_PACK_VALID && pt->covered))
+            && dir_remove(pt->c.name)) {
+            pt->deleted = true;
+        }
+    }
+    for (size_t i = 0; i < sc->nclaims; i++) {
+        const DirClaim *c = &sc->claims[i];
+        bool *pr = c->holder < 0 ? sc->present : sc->parts[c->holder].present;
+        TCGCacheCover e = { .hdr_check = c->check };
+
+        if (!pr[c->idx] || !dir_seg_name_ok(c->name)) {
+            continue;
+        }
+        memcpy(e.name, c->name, strnlen(c->name, 63));
+        if (dir_remove_covered(&e)) {
+            /* Gone: no other claim on it is tried. */
+            size_t n, k = dir_claims_of(sc->claims, sc->nclaims, c->name, &n);
+
+            for (size_t m = 0; m < n; m++) {
+                const DirClaim *o = &sc->claims[k + m];
+
+                (o->holder < 0 ? sc->present
+                               : sc->parts[o->holder].present)[o->idx] = false;
+            }
         }
     }
     for (int i = 0; i < sc->ntmps; i++) {
@@ -1260,125 +1590,298 @@ static bool dir_compact_room(const DirScan *sc, uint64_t len)
            <= dir_disk_max + dir_budget_slack;
 }
 
-/* The merge; whether the new pack was published. */
-static bool dir_compact_merge(DirScan *sc, DirCompact *c, uint64_t gen)
+/*
+ * The kinds of merge.  A minor makes a part of the oldest loose segments,
+ * never reading P or a part; a parts merge makes a part of parts; a major
+ * makes a new pack of P, parts and loose segments; the first pack is made
+ * of loose segments when there is no P.
+ */
+enum { DIR_MINOR, DIR_PARTS, DIR_MAJOR, DIR_FIRST, DIR_KINDS };
+static const char *const dir_kind_name[DIR_KINDS] = {
+    "minor", "parts", "major", "first",
+};
+enum { DIR_M_NONE, DIR_M_DONE, DIR_M_FAILED };
+
+/*
+ * The estimator of a merge's cost, for its admission: time per input
+ * entry, this process's last measured (never under DIR_MERGE_NS_MIN), or
+ * DIR_MERGE_NS before the first; testing, XTCG_CACHE_MERGE_NS, a fixed
+ * value (0: admit everything).  A merge is
+ * admitted while its estimate is at most the larger of DIR_MERGE_BUDGET
+ * and the process's age (XTCG_CACHE_AGE_MS added, for tests): an
+ * experimental heuristic, so that a short process starts small merges.
+ */
+static uint64_t dir_ns_per_entry = DIR_MERGE_NS;
+/*
+ * A round whose merges were refused only for their estimates: the least
+ * estimate refused (dir_cost_need), and the clock time at which the
+ * process's age reaches it (dir_cost_retry_at), when the writer tries
+ * again, whatever the interval; such a refusal isn't a lack of progress.
+ */
+static uint64_t dir_cost_need;
+static int64_t dir_cost_retry_at;
+static int64_t dir_merge_t0;        /* the last attempt's start */
+static bool dir_admit_all, dir_ns_fixed;
+static int64_t dir_start_clock, dir_age_extra;
+
+static uint64_t dir_merge_budget(void)
+{
+    int64_t age = get_clock() - dir_start_clock + dir_age_extra;
+
+    return MAX(DIR_MERGE_BUDGET, MAX(age, 0));
+}
+
+static uint64_t dir_sat_mul(uint64_t a, uint64_t b)
+{
+    return b && a > UINT64_MAX / b ? UINT64_MAX : a * b;
+}
+
+static uint64_t dir_sat_add(uint64_t a, uint64_t b)
+{
+    return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+
+/*
+ * The output's cover list as inputs are admitted: unique by name.  A
+ * direct input's name and header replace a carried entry for that name
+ * (that file is gone: a file of that name with another header is here);
+ * a carried entry whose name the list holds with another checksum,
+ * carried, conflicts, and its input isn't taken.
+ */
+typedef struct DirCover {
+    TCGCacheCover *e;
+    bool *direct;
+    uint32_t n;
+    GHashTable *by_name;        /* name -> index + 1 */
+} DirCover;
+
+/*
+ * Whether input @name (a direct input's name and header @check; NULL for
+ * P) and @f's present entries, carried, fit the list; added if so.
+ */
+static bool dir_cover_admit(DirCover *dc, const char *name, uint64_t check,
+                            const TCGCacheFile *f, const bool *present,
+                            bool dry)
+{
+    uint32_t add = 0;
+    uint32_t nf = f ? f->hdr.n_cover : 0;
+
+    /* First the checks, then the changes. */
+    if (name) {
+        gpointer v = g_hash_table_lookup(dc->by_name, name);
+
+        if (!v) {
+            add++;
+        } else if (dc->direct[GPOINTER_TO_UINT(v) - 1]) {
+            return false;
+        }
+    }
+    for (uint32_t i = 0; i < nf; i++) {
+        gpointer v;
+
+        if (!present[i]) {
+            continue;
+        }
+        if (name && !strncmp(f->cover[i].name, name, 64)) {
+            return false;
+        }
+        v = g_hash_table_lookup(dc->by_name, f->cover[i].name);
+        if (!v) {
+            add++;
+            continue;
+        }
+        if (dc->e[GPOINTER_TO_UINT(v) - 1].hdr_check
+            != f->cover[i].hdr_check && !dc->direct[GPOINTER_TO_UINT(v) - 1]) {
+            return false;
+        }
+    }
+    if (dc->n + add > TCG_CACHE_COVER_MAX) {
+        return false;
+    }
+    if (dry) {
+        return true;
+    }
+    if (name) {
+        gpointer v = g_hash_table_lookup(dc->by_name, name);
+        uint32_t k = v ? GPOINTER_TO_UINT(v) - 1 : dc->n++;
+
+        memset(&dc->e[k], 0, sizeof(dc->e[k]));
+        memcpy(dc->e[k].name, name, strnlen(name, 63));
+        dc->e[k].hdr_check = check;
+        dc->direct[k] = true;
+        g_hash_table_insert(dc->by_name, dc->e[k].name,
+                            GUINT_TO_POINTER(k + 1));
+    }
+    for (uint32_t i = 0; i < nf; i++) {
+        if (present[i]
+            && !g_hash_table_contains(dc->by_name, f->cover[i].name)) {
+            dc->e[dc->n] = f->cover[i];
+            dc->direct[dc->n] = false;
+            g_hash_table_insert(dc->by_name, dc->e[dc->n].name,
+                                GUINT_TO_POINTER(dc->n + 1));
+            dc->n++;
+        }
+    }
+    return true;
+}
+
+/* A merge's admission so far. */
+typedef struct DirAdmit {
+    uint64_t arts, in_bytes, est, budget;
+    uint32_t segs, parts;
+} DirAdmit;
+
+/*
+ * Take input @name (level @level) into @c if it fits: entries, the
+ * estimate, the cover list, the disk room.  @want_check, if nonzero, is
+ * the header the scan read (a part, or P), which the file must still have.
+ */
+static bool dir_admit(DirScan *sc, DirCompact *c, DirAdmit *ad, DirCover *dc,
+                      const char *name, int level, uint64_t want_check,
+                      const TCGCacheFile *carry, const bool *present)
+{
+    uint32_t k = c->nin;
+    size_t size;
+    bool invalid, ok;
+    uint64_t est;
+
+    if (k >= DIR_MERGE_IN) {
+        return false;
+    }
+    c->fh[k] = dir_open_file(name, &c->in[k], &size, &invalid);
+    if (!c->fh[k]) {
+        return false;
+    }
+    est = dir_sat_add(ad->est, dir_sat_mul(c->in[k].hdr.n_index,
+                                           dir_ns_per_entry));
+    ok = (level == TCG_CACHE_LEVEL_SEG
+          ? c->in[k].hdr.magic == TCG_CACHE_SEG_MAGIC
+            && !dir_claimed(sc->claims, sc->nclaims, name, c->in[k].hdr.check)
+          : dir_level_ok(&c->in[k], name)
+            && c->in[k].hdr.check == want_check);
+    if (ad->arts + c->in[k].hdr.n_index > dir_compact_arts) {
+        ok = false;
+    }
+    if (ok && !dir_admit_all && est > ad->budget) {
+        /*
+         * Not affordable yet: the age at which it would be is noted, if
+         * nothing else refuses it (the disk room, the cover list).
+         */
+        if (dir_compact_room(sc, ad->in_bytes + size)
+            && dir_cover_admit(dc, level == TCG_CACHE_LEVEL_PACK ? NULL : name,
+                               c->in[k].hdr.check, carry, present, true)) {
+            dir_cost_need = dir_cost_need ? MIN(dir_cost_need, est) : est;
+        }
+        ok = false;
+    }
+    ok = ok && dir_compact_room(sc, ad->in_bytes + size)
+         && dir_cover_admit(dc, level == TCG_CACHE_LEVEL_PACK ? NULL : name,
+                            c->in[k].hdr.check, carry, present, false);
+    if (!ok) {
+        tcg_cache_file_close(&c->in[k]);
+        dir_ops->close(c->fh[k]);
+        c->fh[k] = NULL;
+        return false;
+    }
+    ad->arts += c->in[k].hdr.n_index;
+    ad->in_bytes += size;
+    ad->est = est;
+    ad->segs += level == TCG_CACHE_LEVEL_SEG;
+    ad->parts += level == TCG_CACHE_LEVEL_PART;
+    memcpy(c->name[k], name, 64);
+    c->level[k] = level;
+    c->nin++;
+    return true;
+}
+
+/* The oldest loose segments, as many as fit. */
+static void dir_admit_loose(DirScan *sc, DirCompact *c, DirAdmit *ad,
+                            DirCover *dc)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        const DirCand *list = pass ? sc->oldest_cov : sc->oldest;
+        int nlist = pass ? sc->noldest_cov : sc->noldest;
+
+        for (int i = 0; i < nlist && ad->segs < DIR_COMPACT_IN; i++) {
+            dir_admit(sc, c, ad, dc, list[i].name, TCG_CACHE_LEVEL_SEG, 0,
+                      NULL, NULL);
+        }
+    }
+}
+
+/*
+ * The merge of @kind: its inputs admitted (@parts, part indices in the
+ * order to try, for a parts merge or a major), read, merged and written
+ * as part or pack @gen.  DIR_M_NONE if its minimum isn't admitted (a
+ * minor or the first pack, a segment; a parts merge, two parts; a major,
+ * P and a part or segment, a part if @need_part).
+ */
+static int dir_compact_merge(DirScan *sc, DirCompact *c, int kind,
+                             const int *parts, int nparts, bool need_part,
+                             uint64_t gen)
 {
     static const uint8_t zero[8];
     g_autofree TCGCacheCover *cover = g_new0(TCGCacheCover,
                                              TCG_CACHE_COVER_MAX);
+    g_autofree bool *direct = g_new0(bool, TCG_CACHE_COVER_MAX);
+    g_autoptr(GHashTable) by_name = g_hash_table_new(g_str_hash,
+                                                     g_str_equal);
     g_autofree TCGCacheIdx *slots = NULL;
-    uint32_t n_cover = 0, carried = 0, max_loose;
-    uint64_t data, budget, arts, in_bytes = 0;
+    DirCover dc = { .e = cover, .direct = direct, .by_name = by_name };
+    DirAdmit ad = { .budget = dir_merge_budget() };
+    bool pack_out = kind == DIR_MAJOR || kind == DIR_FIRST;
+    uint64_t data, budget, written = 0, read = 0;
+    int64_t t0 = get_clock();
     TCGCacheFileHdr h;
     size_t kept, out_len;
     bool giveup = false;
     char name[64];
     void *wh;
 
-    /* What P covered, carried unless a complete scan saw it gone. */
-    for (uint32_t i = 0; sc->p >= 0 && i < sc->pack.hdr.n_cover; i++) {
-        if (!sc->complete || sc->present[i]) {
-            carried++;
-        }
+    if (kind == DIR_MAJOR
+        && !dir_admit(sc, c, &ad, &dc, sc->packs[sc->p].name,
+                      TCG_CACHE_LEVEL_PACK, sc->pack.hdr.check, &sc->pack,
+                      sc->present)) {
+        return DIR_M_NONE;
     }
-    if (carried >= TCG_CACHE_COVER_MAX) {
-        tcg_cache_stats.compact_skip++;
-        return false;
-    }
-    max_loose = MIN(DIR_COMPACT_IN, TCG_CACHE_COVER_MAX - carried);
+    for (int i = 0; i < nparts; i++) {
+        DirPart *pt = &sc->parts[parts[i]];
 
-    /* The inputs, P first, within the metadata bound. */
-    arts = 0;
-    if (sc->p >= 0) {
-        size_t size;
-        bool invalid;
-
-        c->fh[0] = dir_open_file(sc->packs[sc->p].name, &c->in[0], &size,
-                                 &invalid);
-        if (!c->fh[0]) {
-            return false;
-        }
-        c->nin = 1;
-        in_bytes = size;
-        memcpy(c->name[0], sc->packs[sc->p].name, 64);
-        /* Not the pack the scan read, or too big to merge. */
-        arts = c->in[0].hdr.n_index;
-        if (c->in[0].hdr.check != sc->pack.hdr.check
-            || arts > dir_compact_arts) {
-            tcg_cache_stats.compact_skip++;
-            return false;
-        }
+        dir_admit(sc, c, &ad, &dc, pt->c.name, TCG_CACHE_LEVEL_PART,
+                  pt->f.hdr.check, &pt->f, pt->present);
     }
-    /*
-     * Then loose segments, the oldest first: those P doesn't cover, and
-     * those it covers by name whose header isn't the one it covers.
-     */
-    for (int pass = 0; pass < 2; pass++) {
-        const DirCand *list = pass ? sc->oldest_cov : sc->oldest;
-        int nlist = pass ? sc->noldest_cov : sc->noldest;
-
-        for (int i = 0; i < nlist && c->nin - (sc->p >= 0) < max_loose; i++) {
-            uint32_t k = c->nin;
-            int cv = pass ? dir_cover_find(&sc->pack, list[i].name) : -1;
-            size_t size;
-            bool invalid, bad;
-
-            c->fh[k] = dir_open_file(list[i].name, &c->in[k], &size,
-                                     &invalid);
-            if (!c->fh[k]) {
-                continue;
-            }
-            bad = c->in[k].hdr.magic != TCG_CACHE_SEG_MAGIC
-                  || (cv >= 0 && c->in[k].hdr.check
-                                 == sc->pack.cover[cv].hdr_check);
-            if (bad || arts + c->in[k].hdr.n_index > dir_compact_arts) {
-                tcg_cache_file_close(&c->in[k]);
-                dir_ops->close(c->fh[k]);
-                c->fh[k] = NULL;
-                if (bad) {
-                    continue;
-                }
-                break;
-            }
-            if (cv >= 0) {
-                /* Not what P covers: an input, and P's entry not carried. */
-                sc->present[cv] = false;
-            }
-            arts += c->in[k].hdr.n_index;
-            in_bytes += size;
-            memcpy(c->name[k], list[i].name, 64);
-            c->nin++;
-        }
+    if (kind != DIR_PARTS) {
+        dir_admit_loose(sc, c, &ad, &dc);
     }
-    if (c->nin == (sc->p >= 0)) {
-        return false;
+    if ((kind == DIR_MINOR || kind == DIR_FIRST) ? !ad.segs
+        : kind == DIR_PARTS ? ad.parts < 2
+        : need_part ? !ad.parts : !(ad.parts + ad.segs)) {
+        return DIR_M_NONE;
     }
-    /* Its output can't take the directory past the budget's slack. */
-    if (!dir_compact_room(sc, in_bytes)) {
-        tcg_cache_stats.compact_skip++;
-        return false;
+    tcg_cache_stats.merge_age_ns[kind] += get_clock() - dir_start_clock
+                                          + dir_age_extra;
+    tcg_cache_stats.merge_est_ns[kind] += ad.est;
+    tcg_cache_stats.merge_in_bytes[kind] += ad.in_bytes;
+    dir_merge_t0 = t0;
+    if (tcg_cache_debug) {
+        fprintf(stderr, "xtcg-cache dir: %s merge: %u files, %" PRIu64
+                " entries, estimate %" PRIu64 " us of %" PRIu64 "\n",
+                dir_kind_name[kind], c->nin, ad.arts, ad.est / 1000,
+                ad.budget / 1000);
     }
     for (uint32_t i = 0; i < c->nin; i++) {
         if (!dir_compact_read(c, i)) {
-            return false;
+            /* What was read before, counted as the time spent on it is. */
+            tcg_cache_stats.merge_entries[kind] += c->n;
+            return DIR_M_FAILED;
         }
     }
     tcg_cache_stats.compact_arts += c->n;
-
-    /* The new pack's cover list: its loose inputs, then what it carries. */
-    for (uint32_t i = sc->p >= 0; i < c->nin; i++) {
-        memcpy(cover[n_cover].name, c->name[i], 64);
-        cover[n_cover++].hdr_check = c->in[i].hdr.check;
-    }
-    for (uint32_t i = 0; sc->p >= 0 && i < sc->pack.hdr.n_cover; i++) {
-        if (!sc->complete || sc->present[i]) {
-            cover[n_cover++] = sc->pack.cover[i];
-        }
-    }
-
+    tcg_cache_stats.merge_entries[kind] += c->n;
+    read = c->n;
     c->n = dir_compact_dedup(c, &giveup);
     if (giveup || dir_ending()) {
-        return false;
+        return DIR_M_FAILED;
     }
     /*
      * The envelopes' room: the file less its header, its padding, its
@@ -1386,28 +1889,27 @@ static bool dir_compact_merge(DirScan *sc, DirCompact *c, uint64_t gen)
      * probe clusters may need more than the count suggests).
      */
     budget = TCG_CACHE_FILE_MAX - sizeof(TCGCacheFileHdr) - 8
-             - (uint64_t)n_cover * sizeof(TCGCacheCover)
+             - (uint64_t)dc.n * sizeof(TCGCacheCover)
              - (sizeof(TCGCacheIdx) << TCG_CACHE_SLOT_LOG2_MAX);
     kept = dir_compact_select(c->arts, c->n, budget,
                               dir_compact_arts / 4 * 3, &data);
-    slots = dir_compact_table(c->arts, kept, data, n_cover, gen, &h,
-                              &out_len);
+    slots = dir_compact_table(c->arts, kept, data, dc.n, gen, &h, &out_len);
     if (!slots) {
         tcg_cache_stats.compact_skip++;
-        return false;
+        return DIR_M_FAILED;
     }
     /* The actual size, past what the inputs' sizes suggested. */
     if (!dir_compact_room(sc, out_len)) {
         tcg_cache_stats.compact_skip++;
-        return false;
+        return DIR_M_FAILED;
     }
     dir_pause(dir_pause_compact_ms);
     if (dir_ending()) {
-        return false;
+        return DIR_M_FAILED;
     }
     wh = dir_ops->create();
     if (!wh) {
-        return false;
+        return DIR_M_FAILED;
     }
     for (size_t i = 0, at = h.data_off; i < kept; i++) {
         const TCGCacheEnv *env;
@@ -1426,6 +1928,7 @@ static bool dir_compact_merge(DirScan *sc, DirCompact *c, uint64_t gen)
                                at + env->len)) {
             goto abort;
         }
+        written += ROUND_UP(env->len, 8);
         at += ROUND_UP(env->len, 8);
     }
     tcg_cache_pack_seal(&h, cover);
@@ -1436,6 +1939,7 @@ static bool dir_compact_merge(DirScan *sc, DirCompact *c, uint64_t gen)
         || !dir_ops->write(wh, &h, sizeof(h), 0)) {
         goto abort;
     }
+    written = out_len;
     dir_pause(dir_pause_compact_ms);
     if (dir_ending()) {
         goto abort;
@@ -1445,116 +1949,247 @@ static bool dir_compact_merge(DirScan *sc, DirCompact *c, uint64_t gen)
         tcg_cache_stats.compact_skip++;
         goto abort;
     }
-    snprintf(name, sizeof(name), "pack-%016" PRIx64 ".xtp", gen);
+    snprintf(name, sizeof(name), "%s-%016" PRIx64 ".xtp",
+             pack_out ? "pack" : "part", gen);
     if (!dir_ops->commit(wh, name)) {
-        return false;
+        tcg_cache_stats.merge_tmp_bytes += written;
+        return DIR_M_FAILED;
     }
+    tcg_cache_stats.merge_tmp_bytes += written;
     /* Counted as published until a complete scan sees what is left. */
     dir_pub_bytes_since += out_len;
     tcg_cache_stats.compactions++;
+    tcg_cache_stats.merge_done[kind]++;
     tcg_cache_stats.compact_in += c->nin;
     tcg_cache_stats.compact_kept += kept;
     tcg_cache_stats.compact_bytes += out_len;
+    /* Learned per entry read, as admission counts them (before dedup). */
+    if (read && !dir_ns_fixed) {
+        dir_ns_per_entry = MAX(DIR_MERGE_NS_MIN, (get_clock() - t0) / read);
+    }
     if (tcg_cache_debug) {
         fprintf(stderr, "xtcg-cache dir: compacted %u files, %zu of %zu "
                 "artifacts, into %s (%zu bytes)\n", c->nin, kept, c->n, name,
                 out_len);
     }
-    return true;
+    return DIR_M_DONE;
 
 abort:
+    tcg_cache_stats.merge_tmp_bytes += written;
     dir_ops->drop(wh);
-    return false;
+    return DIR_M_FAILED;
 }
 
 /*
- * One round of maintenance: a merge if @may_merge and there are loose
- * segments to take, then cleanup; or cleanup alone.  False if it made no
- * progress: its scan was incomplete, or a merge it was asked for didn't
- * happen (not because another process holds the lock, or this one is
- * ending).
+ * A parts merge's candidates, into @out: the live parts within 4x of the
+ * smallest's entries, smallest first; at the bound (@emergency), if no
+ * pair is within 4x, the two smallest (*@emergency stays true).  Their
+ * number.
  */
-static bool dir_compact(bool may_merge)
+static int dir_parts_choose(const DirScan *sc, int *out, bool *emergency)
+{
+    int n = 0, m = 0;
+
+    for (int i = 0; i < sc->nparts; i++) {
+        if (sc->parts[i].state == DIR_PACK_VALID && !sc->parts[i].covered
+            && !sc->parts[i].deleted) {
+            out[n++] = i;
+        }
+    }
+    /* Fewest entries first (at most DIR_PARTS_SEEN: insertion). */
+    for (int i = 1; i < n; i++) {
+        int x = out[i], j = i;
+
+        while (j > 0 && sc->parts[out[j - 1]].f.hdr.n_index
+                        > sc->parts[x].f.hdr.n_index) {
+            out[j] = out[j - 1];
+            j--;
+        }
+        out[j] = x;
+    }
+    while (m < n && sc->parts[out[m]].f.hdr.n_index
+                    <= 4ull * MAX(sc->parts[out[0]].f.hdr.n_index, 1)) {
+        m++;
+    }
+    if (m < 2 && *emergency && n >= 2) {
+        return 2;
+    }
+    *emergency = false;
+    return m < 2 ? 0 : m;
+}
+
+/* A major's parts, oldest generation first. */
+static int dir_parts_oldest(const DirScan *sc, int *out)
+{
+    int n = 0;
+
+    for (int i = sc->nparts - 1; i >= 0; i--) {
+        if (sc->parts[i].state == DIR_PACK_VALID && !sc->parts[i].covered
+            && !sc->parts[i].deleted) {
+            out[n++] = i;
+        }
+    }
+    return n;
+}
+
+/*
+ * One round of maintenance: cleanup, then at most one merge, the first
+ * admissible of the kinds the directory's state calls for:
+ *  - over the disk budget: a major, a parts merge, the first pack;
+ *  - at the bound (live and unresolved parts): a parts merge, then a
+ *    major that takes a part; never a minor;
+ *  - otherwise: a major when due (the live parts' bytes at least half of
+ *    P's), the first pack when there is no P, a minor (if @loose: the
+ *    loose trigger holds), a tidy parts merge (more than 4 live parts).
+ * Majors and the first pack need P to be the newest pack that isn't
+ * invalid (revision 9); minors and parts merges don't read P.  False if
+ * the round made no progress: its scan was incomplete, or a merge the
+ * state called for wasn't admissible or failed (not because another
+ * process holds the lock, or this one is ending).
+ */
+static bool dir_compact(bool loose)
 {
     g_autofree DirScan *sc = g_new0(DirScan, 1);
     g_autofree DirCompact *c = g_new0(DirCompact, 1);
     int64_t t0 = get_clock();
-    bool merged = false, progress = false, asked = may_merge;
+    int kinds[4], nk = 0, r = DIR_M_NONE, kind = -1;
+    bool progress = false, wanted = false, pack_ok = true, bound, over;
+    int order[DIR_PARTS_SEEN], norder;
+    bool emergency = false;
     void *lh = dir_ops->trylock();
 
     if (!lh) {
         tcg_cache_stats.compact_busy++;
         return true;
     }
+    dir_cost_need = 0;
+    dir_cost_retry_at = 0;
     dir_scan(sc);
     /* Only a complete scan establishes what is there, and what isn't. */
     if (dir_ending() || !sc->complete) {
         progress = dir_ending();
         goto out;
     }
-    /*
-     * A merge needs P to be the newest pack that isn't invalid, and room
-     * under the budget's slack; otherwise only cleanup, of what the scan
-     * established.
-     */
     for (int i = 0; i < (sc->p >= 0 ? sc->p : sc->npacks); i++) {
         if (sc->pack_state[i] != DIR_PACK_INVALID) {
-            may_merge = false;
+            pack_ok = false;
         }
     }
-    if (sc->p < 0 && sc->packs_seen > sc->npacks) {
-        may_merge = false;
-    }
-    if (sc->bytes > dir_disk_max + dir_budget_slack) {
-        may_merge = false;
+    if (sc->packs_seen > sc->npacks && sc->p < 0) {
+        pack_ok = false;
     }
     /*
      * Cleanup first, which needs no merge and is cheap, so that a process
-     * too short to finish a merge still does it: invalid packs (so that
-     * none blocks the next generation), packs P supersedes, what P covers
-     * exactly, old temporaries.
+     * too short to finish a merge still does it.
      */
     dir_compact_clean(sc, sc->p >= 0 ? sc->p : sc->npacks);
-    if (sc->npacks && dir_pack_gen(sc->packs[0].name) == UINT64_MAX) {
+    if (sc->max_gen == UINT64_MAX) {
         tcg_cache_stats.compact_skip++;
-        may_merge = false;
+        goto out;
     }
-    if (may_merge && (sc->noldest || sc->noldest_cov)) {
-        uint64_t gen = sc->npacks ? dir_pack_gen(sc->packs[0].name) + 1 : 1;
-
-        c->buf = g_malloc(DIR_BUF_SIZE);
-        c->buf2 = g_malloc(DIR_BUF_SIZE);
-        c->win = g_malloc(DIR_WIN_SIZE);
-        merged = dir_compact_merge(sc, c, gen);
-        if (merged || dir_ending()) {
-            progress = true;
+    bound = sc->live + sc->unresolved >= (int)dir_parts_max;
+    over = sc->bytes > dir_disk_max;
+    if (over) {
+        if (sc->p >= 0 && pack_ok) {
+            kinds[nk++] = DIR_MAJOR;
         }
-        if (!merged) {
-            if (dir_ending()) {
-                tcg_cache_stats.compact_exit++;
-            } else {
-                tcg_cache_stats.compact_fail++;
-            }
+        kinds[nk++] = DIR_PARTS;
+        if (sc->p < 0 && pack_ok) {
+            kinds[nk++] = DIR_FIRST;
+        }
+    } else if (bound) {
+        kinds[nk++] = DIR_PARTS;
+        if (sc->p >= 0 && pack_ok) {
+            kinds[nk++] = DIR_MAJOR;
         }
     } else {
-        /* Asked for one and refused it: as little progress as a failure. */
-        progress = !asked || !(sc->noldest || sc->noldest_cov);
+        if (sc->p >= 0 && pack_ok
+            && (dir_test_major
+                || (sc->live
+                    && sc->live_bytes >= sc->packs[sc->p].size / 2))) {
+            kinds[nk++] = DIR_MAJOR;
+        }
+        if (sc->p < 0 && pack_ok && loose) {
+            kinds[nk++] = DIR_FIRST;
+        }
+        if (loose) {
+            kinds[nk++] = DIR_MINOR;
+        }
+        if (sc->live > 4) {
+            kinds[nk++] = DIR_PARTS;
+        }
+    }
+    wanted = nk > 0;
+    c->buf = g_malloc(DIR_BUF_SIZE);
+    c->buf2 = g_malloc(DIR_BUF_SIZE);
+    c->win = g_malloc(DIR_WIN_SIZE);
+    for (int i = 0; i < nk && r == DIR_M_NONE; i++) {
+        kind = kinds[i];
+        emergency = bound;
+        norder = kind == DIR_PARTS ? dir_parts_choose(sc, order, &emergency)
+                 : kind == DIR_MAJOR ? dir_parts_oldest(sc, order) : 0;
+        if (kind == DIR_PARTS && norder < 2) {
+            continue;
+        }
+        r = dir_compact_merge(sc, c, kind, order, norder,
+                              kind == DIR_MAJOR && bound && !over,
+                              sc->max_gen + 1);
+        if (r == DIR_M_NONE) {
+            for (uint32_t k = 0; k < c->nin; k++) {
+                tcg_cache_file_close(&c->in[k]);
+                dir_ops->close(c->fh[k]);
+            }
+            c->nin = 0;
+        }
+    }
+    if (r != DIR_M_NONE) {
+        /* Every attempt that began, whatever its outcome. */
+        tcg_cache_stats.merge_act_ns[kind] += get_clock() - dir_merge_t0;
+    }
+    if (r == DIR_M_NONE) {
+        if (wanted && (over || bound)) {
+            tcg_cache_stats.merge_saturated++;
+        }
+        progress = !wanted;
+        if (wanted && dir_cost_need) {
+            /* Refused for its cost alone: again once the process is older. */
+            dir_cost_retry_at = dir_start_clock - dir_age_extra
+                                + (int64_t)MIN(dir_cost_need, INT64_MAX / 2);
+            tcg_cache_stats.merge_deferred++;
+            progress = true;
+        }
+    } else if (r == DIR_M_DONE) {
+        progress = true;
+        if (kind == DIR_PARTS && emergency) {
+            tcg_cache_stats.merge_emergency++;
+        }
+    } else if (dir_ending()) {
+        tcg_cache_stats.compact_exit++;
+        tcg_cache_stats.merge_exit[kind]++;
+        progress = true;
+    } else {
+        tcg_cache_stats.compact_fail++;
+        tcg_cache_stats.merge_fail[kind]++;
     }
     for (uint32_t i = 0; i < c->nin; i++) {
         tcg_cache_file_close(&c->in[i]);
         dir_ops->close(c->fh[i]);
     }
-    if (merged) {
+    if (r == DIR_M_DONE) {
         dir_pause(dir_pause_committed_ms);
-        /* The inputs, P with them: the new pack has their artifacts. */
+        /* The inputs: the new file has their artifacts and carries them. */
         for (uint32_t i = 0; i < c->nin; i++) {
             dir_remove(c->name[i]);
         }
-        if (sc->p >= 0) {
+        if (kind == DIR_MAJOR) {
             sc->pack_state[sc->p] = DIR_PACK_UNREAD;
         }
-        /* Every valid pack is older now; what P covered, the new one does. */
-        dir_compact_clean(sc, -1);
+        /*
+         * What the inputs covered, the new file does; after a major every
+         * valid pack is older.
+         */
+        dir_compact_clean(sc, kind == DIR_MAJOR || kind == DIR_FIRST
+                              ? -1 : sc->p);
     }
 out:
     dir_scan_done(sc);
@@ -1574,11 +2209,21 @@ static void dir_writer_wake(void)
 
 static void *dir_writer_main(void *arg)
 {
+    bool first = true;
+
     qemu_mutex_lock(&dir_wlock);
     while (dir_writer_on) {
         int64_t now;
 
-        qemu_cond_timedwait(&dir_wcond, &dir_wlock, 100);
+        /*
+         * The first round at once, so that a process shorter than the wait
+         * still does its first maintenance (a start-up of 100 ms would
+         * otherwise end before it).
+         */
+        if (!first) {
+            qemu_cond_timedwait(&dir_wcond, &dir_wlock, 100);
+        }
+        first = false;
         if (!dir_writer_on) {
             break;
         }
@@ -1605,15 +2250,27 @@ static void *dir_writer_main(void *arg)
             bool merge = loose > dir_compact_loose
                          || dir_seen_loose_bytes + dir_pub_bytes_since
                             > DIR_COMPACT_BYTES;
+            bool bound = dir_seen_bound >= (int)dir_parts_max;
             /*
-             * Once a minute at most, unless there are more loose segments
-             * than a snapshot can read (those are lost to lookups) and the
-             * last round made progress.
+             * Once a minute at most, unless the last round made progress
+             * and there are more loose segments than a snapshot can read
+             * (those are lost to lookups), or the parts are at the bound,
+             * or a major is due.
+             */
+            /*
+             * A merge deferred for its cost waits for the process's age to
+             * reach its estimate, not the urgent rounds.
              */
             bool due = now - dir_last_compact >= dir_compact_ns
-                       || (loose > DIR_COMPACT_URGENT && !dir_compact_stuck);
+                       || (dir_cost_retry_at
+                           ? now >= dir_cost_retry_at
+                           : !dir_compact_stuck
+                             && (loose > DIR_COMPACT_URGENT || bound
+                                 || dir_seen_major_due));
 
-            if (due && (merge || dir_seen_leftovers || dir_over_budget())) {
+            if (due && (merge || dir_seen_leftovers || dir_over_budget()
+                        || bound || dir_seen_major_due
+                        || dir_seen_live > 4)) {
                 dir_last_compact = now;
                 dir_compact_stuck = !dir_compact(merge);
             }
@@ -1709,7 +2366,7 @@ static void dir_test_pack(bool badcheck)
 }
 
 /*
- * Testing (XTCG_CACHE_CHECKALL): every segment and pack in the directory,
+ * Testing (XTCG_CACHE_CHECKALL): every segment, part and pack in the directory,
  * up to 4096 entries, each artifact validated as a lookup would; one
  * line of totals on stderr.
  */
@@ -1723,7 +2380,10 @@ static void dir_test_check(void)
     for (int i = 0; i < nnames; i++) {
         TCGCacheFile f;
 
-        if (!dir_pack_name_ok(names[i]) && !dir_seg_name_ok(names[i])) {
+        uint64_t gen;
+
+        if (!dir_pack_name_ok(names[i]) && !dir_seg_name_ok(names[i])
+            && !tcg_cache_part_name_gen(names[i], &gen)) {
             continue;
         }
         if (!dir_map_file(names[i], &f, UINT64_MAX)) {
@@ -1789,6 +2449,14 @@ void tcg_cache_dir_start(const TCGCacheDirOps *ops, int64_t t0)
     dir_test_onegroup = getenv("XTCG_CACHE_TEST_ONEGROUP");
     dir_budget_slack = dir_env_u64("XTCG_CACHE_TEST_SLACK", dir_budget_slack);
     dir_compact_arts = dir_env_u64("XTCG_CACHE_TEST_ARTS", DIR_COMPACT_ARTS);
+    dir_parts_max = MAX(dir_env_u64("XTCG_CACHE_PARTS_MAX", DIR_PARTS_MAX), 2);
+    dir_parts_max = MIN(dir_parts_max, DIR_PARTS_MAX);
+    dir_test_major = getenv("XTCG_CACHE_TEST_MAJOR");
+    dir_ns_per_entry = dir_env_u64("XTCG_CACHE_MERGE_NS", DIR_MERGE_NS);
+    dir_ns_fixed = getenv("XTCG_CACHE_MERGE_NS");
+    dir_admit_all = !dir_ns_per_entry;
+    dir_age_extra = dir_env_ms("XTCG_CACHE_AGE_MS") * SCALE_MS;
+    dir_start_clock = t0;
     if (getenv("XTCG_CACHE_TEST_PROBES")) {
         dir_test_probes = MAX(atoi(getenv("XTCG_CACHE_TEST_PROBES")), 1);
     }
