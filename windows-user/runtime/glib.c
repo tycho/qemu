@@ -1697,6 +1697,15 @@ struct _GDateTime {
     gint64 unix_us;
 };
 
+gint64 g_get_real_time(void)
+{
+    LARGE_INTEGER t;
+
+    /* 100 ns units since 1601. */
+    NtQuerySystemTime(&t);
+    return (t.QuadPart - 116444736000000000LL) / 10;
+}
+
 GDateTime *g_date_time_new_now_utc(void)
 {
     GDateTime *d = g_malloc(sizeof(*d));
