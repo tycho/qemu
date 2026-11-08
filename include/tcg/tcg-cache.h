@@ -467,6 +467,14 @@ size_t tcg_cache_envelope(void *out, uint64_t id, uint64_t rva,
 void *tcg_cache_write_file(bool pack, uint64_t tick, const void *data,
                            size_t data_len, const TCGCacheCover *cover,
                            uint32_t n_cover, size_t *lenp);
+/*
+ * A segment of @data's envelopes written into @out, allocating nothing;
+ * its length, or 0 (as tcg_cache_write_file's NULL, or more than @cap).
+ * At most tcg_cache_segment_bound(@data_len) bytes.
+ */
+size_t tcg_cache_write_segment_to(void *out, size_t cap, uint64_t tick,
+                                  const void *data, size_t data_len);
+size_t tcg_cache_segment_bound(size_t data_len);
 int tcg_cache_file_open(TCGCacheFile *f, const void *map, size_t size,
                         int64_t (*copy)(void *, const void *, size_t),
                         void (*fault)(int64_t));
@@ -527,6 +535,45 @@ void tcg_cache_sink_hold(unsigned ms);
 int tcg_cache_sink_close(void **data, size_t *lens);
 void tcg_cache_sink_fork_start(void);
 void tcg_cache_sink_fork_end(bool child);
+
+/*
+ * The directory back end (tcg-cache-dir.c.inc): the writer thread, the
+ * snapshots, the exit's publication and fork, over the OS's files.  The
+ * OS checks the directory before start, and each file as it opens it.
+ */
+typedef struct TCGCacheDirOps {
+    /* At most @max entries' names, zero-padded, NUL within 64 bytes. */
+    int (*list)(char (*names)[64], int max);
+    /* @name opened to read: ours and checked, else NULL; its size. */
+    void *(*open)(const char *name, size_t *sizep);
+    /* A checked read at @off: 0, or TCG_CACHE_GFAULT if short. */
+    int64_t (*read)(void *fh, void *dst, uint64_t off, size_t len);
+    /* An open file mapped read-only, or NULL. */
+    const void *(*map)(void *fh, size_t size);
+    void (*close)(void *fh);
+    void (*unmap)(const void *map, size_t size);
+    /*
+     * @len bytes published as @name, never replacing a file: written to
+     * a temporary, then renamed.  It allocates nothing and takes no lock
+     * (the exit's publication calls it).  Testing: @pause_ms with the
+     * temporary open.
+     */
+    bool (*publish)(const void *data, size_t len, const char *name,
+                    unsigned pause_ms);
+    unsigned pid;
+} TCGCacheDirOps;
+
+/* Map the first snapshot and start the writer; @t0 when start-up began. */
+void tcg_cache_dir_start(const TCGCacheDirOps *ops, int64_t t0);
+/*
+ * The process is ending and only this thread will run guest code: the
+ * writer is stopped after its round, and what the sink holds published.
+ */
+void tcg_cache_dir_quiesce(void);
+/* A clean exit: captures stop, and what is left is published, at best. */
+void tcg_cache_dir_exit(void);
+void tcg_cache_dir_fork_start(void);
+void tcg_cache_dir_fork_end(bool child);
 
 /*
  * The distinct, validated candidates for a key, each passed to @use until

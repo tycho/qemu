@@ -233,8 +233,5 @@ CPUArchState *cpu_copy(CPUArchState *env);
 
 /* cache.c: the translation cache's files (testing) */
 void tcg_cache_dir_init(const char *cpu_model);
-void tcg_cache_dir_exit(void);
-void tcg_cache_dir_fork_start(void);
-void tcg_cache_dir_fork_end(bool child);
 
 #endif
