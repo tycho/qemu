@@ -269,6 +269,34 @@ LPVOID WINAPI VirtualAlloc(LPVOID addr, SIZE_T len, DWORD type, DWORD prot)
         }
         return base;
     }
+#else
+    /*
+     * The module's own memory (TCG's code buffer, the runtime's) lies
+     * outside the 32-bit guest's address space, and far enough above it
+     * that generated code reaches neither guest addresses by ADRP nor the
+     * module's image, which Windows maps below 4 GiB, by BL: each takes
+     * the same form in every process, wherever Windows put the module.
+     */
+    if (!addr) {
+        XtBasicInfo sbi;
+        MEM_ADDRESS_REQUIREMENTS req = { 0 };
+        MEM_EXTENDED_PARAMETER ext = { 0 };
+
+        if (NtQuerySystemInformation(SystemBasicInformation, &sbi,
+                                     sizeof(sbi), NULL) < 0) {
+            return NULL;
+        }
+        req.LowestStartingAddress = (void *)XT_HIGH_ALLOC_BASE;
+        req.HighestEndingAddress = (void *)sbi.MaximumUserModeAddress;
+        ext.Type = MemExtendedParameterAddressRequirements;
+        ext.Pointer = &req;
+        if (NtAllocateVirtualMemoryEx(GetCurrentProcess(), &base, &size,
+                                      nt_alloc_type(type), prot, &ext,
+                                      1) < 0) {
+            return NULL;
+        }
+        return base;
+    }
 #endif
     if (NtAllocateVirtualMemory(GetCurrentProcess(), &base, 0, &size,
                                 nt_alloc_type(type), prot) < 0) {
