@@ -13,6 +13,7 @@
  * guest bytes say, which the directory's ownership vouches for.
  */
 
+#include "qemu/xxh3.h"
 #include "tcg/insn-start-words.h"
 
 uint8_t tcg_cache_fingerprint[16];
@@ -640,21 +641,31 @@ int tcg_cache_validate(const void *art, size_t len)
 
 /* Envelopes. */
 
-static uint64_t env_content(const TCGCacheEnv *e, const void *art,
-                            size_t len)
+/*
+ * An envelope's two values come from one XXH3_64 of its artifact, @ah:
+ * - its content identity hashes the key and @ah, leaving out when it was
+ *   born, so that a recapture compares equal;
+ * - its checksum hashes the header before it (the content identity
+ *   included) and @ah.
+ * A hit hashes the artifact once and checks the checksum alone, which
+ * covers the stored content identity.
+ */
+static uint64_t env_content(const TCGCacheEnv *e, uint64_t ah)
 {
-    uint64_t k[4] = { e->id, e->rva, e->cs_base,
-                      (uint64_t)e->flags << 32 | e->cflags };
+    uint64_t k[5] = { e->id, e->rva, e->cs_base,
+                      (uint64_t)e->flags << 32 | e->cflags, ah };
 
-    return tcg_cache_hash64(tcg_cache_hash64(0, k, sizeof(k)), art, len);
+    return qemu_xxh3_64(k, sizeof(k));
 }
 
-static uint64_t env_check(const TCGCacheEnv *e, const void *art, size_t len)
+static uint64_t env_check(const TCGCacheEnv *e, uint64_t ah)
 {
-    TCGCacheEnv c = *e;
+    uint8_t b[sizeof(TCGCacheEnv)];
 
-    c.check = 0;
-    return tcg_cache_hash64(tcg_cache_hash64(1, &c, sizeof(c)), art, len);
+    QEMU_BUILD_BUG_ON(offsetof(TCGCacheEnv, check) + 8 != sizeof(*e));
+    memcpy(b, e, offsetof(TCGCacheEnv, check));
+    stq_he_p(b + offsetof(TCGCacheEnv, check), ah);
+    return qemu_xxh3_64(b, sizeof(b));
 }
 
 size_t tcg_cache_envelope(void *out, uint64_t id, uint64_t rva,
@@ -662,6 +673,7 @@ size_t tcg_cache_envelope(void *out, uint64_t id, uint64_t rva,
 {
     const TCGCacheArt *h = art;
     TCGCacheEnv *e = out;
+    uint64_t ah;
 
     *e = (TCGCacheEnv){
         .magic = TCG_CACHE_ENV_MAGIC, .len = sizeof(*e) + len, .born = born,
@@ -671,8 +683,9 @@ size_t tcg_cache_envelope(void *out, uint64_t id, uint64_t rva,
     memcpy(e + 1, art, len);
     memset((uint8_t *)(e + 1) + len, 0,
            ROUND_UP(sizeof(*e) + len, 8) - sizeof(*e) - len);
-    e->content = env_content(e, art, len);
-    e->check = env_check(e, art, len);
+    ah = qemu_xxh3_64(art, len);
+    e->content = env_content(e, ah);
+    e->check = env_check(e, ah);
     return ROUND_UP(sizeof(*e) + len, 8);
 }
 
@@ -973,8 +986,7 @@ int tcg_cache_file_get(const TCGCacheFile *f, const TCGCacheIdx *e,
     }
     alen = env->len - sizeof(*env);
     if (memcmp(env, &hdr, sizeof(hdr))
-        || env_check(env, env + 1, alen) != env->check
-        || env_content(env, env + 1, alen) != env->content) {
+        || env_check(env, qemu_xxh3_64(env + 1, alen)) != env->check) {
         return TCG_CACHE_V_CHECK;
     }
     /* The artifact's own key agrees with its envelope's. */
@@ -1588,6 +1600,7 @@ TCGCacheIdx tcg_cache_env_idx(const TCGCacheEnv *e, uint32_t off)
 int tcg_cache_env_verify(const TCGCacheEnv *env, size_t len)
 {
     const TCGCacheArt *h = (const void *)(env + 1);
+    uint64_t ah;
     size_t alen;
 
     if (len < sizeof(*env) || len > sizeof(*env) + TCG_CACHE_ART_MAX
@@ -1595,8 +1608,9 @@ int tcg_cache_env_verify(const TCGCacheEnv *env, size_t len)
         return TCG_CACHE_V_HEADER;
     }
     alen = len - sizeof(*env);
-    if (env_check(env, env + 1, alen) != env->check
-        || env_content(env, env + 1, alen) != env->content) {
+    ah = qemu_xxh3_64(env + 1, alen);
+    if (env_check(env, ah) != env->check
+        || env_content(env, ah) != env->content) {
         return TCG_CACHE_V_CHECK;
     }
     if (env->pad || alen < sizeof(TCGCacheArt) || h->tb_flags != env->flags
@@ -2519,6 +2533,45 @@ static uint64_t fuzz_rng(uint64_t *s)
     return *s;
 }
 
+/*
+ * XXH3_64's known answers (xxHash's own values for its sanity buffer, at
+ * lengths through each of its paths); the number of failures.
+ */
+static int xxh3_known_answers(void)
+{
+    static const struct {
+        size_t len, off;
+        uint64_t hash;
+    } want[] = {
+        { 0, 0, 0x2d06800538d394c2ULL },
+        { 3, 0, 0x54247382a8d6b94dULL },
+        { 8, 0, 0x24ccc9acaa9f65e4ULL },
+        { 16, 0, 0x981b17d36c7498c9ULL },
+        { 128, 0, 0xfcff24126754d861ULL },
+        { 240, 0, 0x81c3c2b67f568ccfULL },
+        { 241, 0, 0xc5a639ecd2030e5eULL },
+        { 1025, 0, 0xd870c0fa13211c6aULL },
+        { 4096, 0, 0xe91206429d1f48f9ULL },
+        { 777, 3, 0xa0212fd2fa7ca084ULL },
+    };
+    g_autofree uint8_t *buf = g_malloc(4096);
+    uint64_t gen = 2654435761U;
+    int fails = 0;
+
+    for (size_t i = 0; i < 4096; i++) {
+        buf[i] = gen >> 56;
+        gen *= 11400714785074694797ULL;
+    }
+    for (int i = 0; i < ARRAY_SIZE(want); i++) {
+        if (qemu_xxh3_64(buf + want[i].off, want[i].len) != want[i].hash) {
+            fprintf(stderr, "xtcg-cache fuzz: xxh3 at %zu+%zu wrong\n",
+                    want[i].off, want[i].len);
+            fails++;
+        }
+    }
+    return fails;
+}
+
 /* Known answers: LEB128 bounds and XXH64. The number failing. */
 static int fuzz_known(void)
 {
@@ -2579,6 +2632,7 @@ static int fuzz_known(void)
         fprintf(stderr, "xtcg-cache fuzz: xxh64 of 0..99 wrong\n");
         fails++;
     }
+    fails += xxh3_known_answers();
     fprintf(stderr, "xtcg-cache fuzz: known answers: %d failures\n", fails);
     return fails;
 }
@@ -2688,6 +2742,78 @@ out:
     return fails;
 }
 
+/*
+ * Each envelope's checksum and content identity against XXH3_64 computed
+ * here over their inputs; a checksum with one bit flipped refused by the
+ * reader; the file with version 2 (its header's checksum made good)
+ * refused.  @f is @snap opened, with @n index slots.  The number of
+ * failures.
+ */
+static int fuzz_envelopes(const TCGCacheFile *f, const uint8_t *snap,
+                          size_t size, uint32_t n)
+{
+    g_autofree uint8_t *copy = g_memdup2(snap, size);
+    TCGCacheFile g;
+    uint32_t checked = 0;
+    int fails = 0;
+
+    for (uint32_t i = 0; i < n; i++) {
+        TCGCacheIdx e;
+        TCGCacheEnv env;
+        uint64_t ah, k[5];
+        uint8_t hdr[sizeof(env)];
+
+        if (!file_entry(f, i, &e) || !e.khash || e.len > TCG_CACHE_FILE_MAX
+            || e.off + (uint64_t)e.len > size || e.len < sizeof(env)) {
+            continue;
+        }
+        memcpy(&env, snap + e.off, sizeof(env));
+        ah = qemu_xxh3_64(snap + e.off + sizeof(env), e.len - sizeof(env));
+        memcpy(hdr, &env, sizeof(hdr));
+        memcpy(hdr + offsetof(TCGCacheEnv, check), &ah, sizeof(ah));
+        k[0] = env.id;
+        k[1] = env.rva;
+        k[2] = env.cs_base;
+        k[3] = (uint64_t)env.flags << 32 | env.cflags;
+        k[4] = ah;
+        if (qemu_xxh3_64(hdr, sizeof(hdr)) != env.check
+            || qemu_xxh3_64(k, sizeof(k)) != env.content) {
+            if (fails++ < 4) {
+                fprintf(stderr, "xtcg-cache fuzz: envelope at %u: its xxh3 "
+                        "values differ\n", e.off);
+            }
+        }
+        /* One bit of the stored checksum flipped: refused. */
+        ((TCGCacheEnv *)(copy + e.off))->check ^= 1ull << (i % 64);
+        checked++;
+    }
+    {
+        uint64_t counts[TCG_CACHE_V_MAX] = { };
+
+        /* Every one refused, as a checksum mismatch. */
+        tcg_cache_check_file(copy, size, true, counts);
+        if (counts[TCG_CACHE_V_OK] || counts[TCG_CACHE_V_CHECK] != checked) {
+            fprintf(stderr, "xtcg-cache fuzz: checksums with a bit flipped: "
+                    "%" PRIu64 " accepted, %" PRIu64 " refused as such of "
+                    "%u\n", counts[TCG_CACHE_V_OK],
+                    counts[TCG_CACHE_V_CHECK], checked);
+            fails++;
+        }
+    }
+    memcpy(copy, snap, size);
+    ((TCGCacheFileHdr *)copy)->version = TCG_CACHE_FILE_VERSION - 1;
+    ((TCGCacheFileHdr *)copy)->check = hdr_check((TCGCacheFileHdr *)copy);
+    if (tcg_cache_file_open(&g, copy, size, tcg_cache_gcopy,
+                            tcg_cache_nofault) != TCG_CACHE_V_HEADER) {
+        fprintf(stderr, "xtcg-cache fuzz: a version-%d file not refused\n",
+                TCG_CACHE_FILE_VERSION - 1);
+        fails++;
+    }
+    fprintf(stderr, "xtcg-cache fuzz: %u envelopes' xxh3 values checked, %d "
+            "failures\n", checked, fails);
+    return fails;
+}
+
 int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
                         unsigned arts)
 {
@@ -2729,6 +2855,7 @@ int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
     base_ok = base_counts[TCG_CACHE_V_OK];
     n = f.hdr.magic == TCG_CACHE_PACK_MAGIC ? 1u << f.hdr.slot_log2
                                              : f.hdr.n_index;
+    fails += fuzz_envelopes(&f, snap, size, n);
 
     /* Every artifact is found by its key, through the lookup's path. */
     for (uint32_t i = 0; i < n; i++) {

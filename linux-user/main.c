@@ -519,6 +519,15 @@ static void cache_file_switches(void)
     f = getenv("XTCG_CACHE_CHECKFILE");
     if (f) {
         p = cache_map(f, &size);
+        if (size >= sizeof(TCGCacheFileHdr)) {
+            TCGCacheFileHdr h;
+
+            /* As for XTCG_CACHE_FUZZ: the file's fingerprint, read guarded. */
+            if (!tcg_cache_gcopy(&h, p, sizeof(h))) {
+                memcpy(tcg_cache_fingerprint, h.fp,
+                       sizeof(tcg_cache_fingerprint));
+            }
+        }
         exit(tcg_cache_check_file(p, size, false, NULL) ? 1 : 0);
     }
     f = getenv("XTCG_CACHE_FUZZ");
