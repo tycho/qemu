@@ -837,6 +837,9 @@ static TCGCacheSnap *dir_snap_build(void)
                                 dir_map_max - mapped)) {
             if (f->hdr.check == sc->pack.hdr.check) {
                 f->level = TCG_CACHE_LEVEL_PACK;
+                if (tcg_cache_pages) {
+                    tcg_cache_pages_track(f);
+                }
                 mapped += f->size;
                 dir_claims_add(&mc, &nmc, f, snap->n++);
             } else {
@@ -865,6 +868,9 @@ static TCGCacheSnap *dir_snap_build(void)
             continue;
         }
         f->level = TCG_CACHE_LEVEL_PART;
+        if (tcg_cache_pages) {
+            tcg_cache_pages_track(f);
+        }
         mapped += f->size;
         nparts++;
         dir_claims_add(&mc, &nmc, f, snap->n++);
@@ -896,6 +902,9 @@ static TCGCacheSnap *dir_snap_build(void)
             continue;
         }
         f->level = TCG_CACHE_LEVEL_SEG;
+        if (tcg_cache_pages) {
+            tcg_cache_pages_track(f);
+        }
         mapped += f->size;
         snap->n++;
         nloose++;
@@ -1127,6 +1136,19 @@ typedef struct DirCompact {
  */
 static unsigned dir_test_probes = TCG_CACHE_PROBES;
 static uint64_t dir_compact_arts = DIR_COMPACT_ARTS;
+/*
+ * Testing: XTCG_CACHE_TEST_IMG_MAX and XTCG_CACHE_TEST_SLOTS_MAX, a merge's
+ * image records and slots (at most the readers' limits);
+ * XTCG_CACHE_TEST_SAMEHASH, a merge plans its index as if every key had
+ * one hash, then gives up whether or not the plan fit (counted as the
+ * plan's refusal, or as probes): nothing it would write could be found;
+ * XTCG_CACHE_PAUSE_PLAN_MS, a pause at the plan's first checkpoint,
+ * publication served throughout.
+ */
+static uint32_t dir_test_img_max = TCG_CACHE_IMG_MAX;
+static uint32_t dir_test_slots_max = TCG_CACHE_SLOTS_MAX;
+static bool dir_test_samehash, dir_plan_paused;
+static unsigned dir_pause_plan_ms;
 
 /*
  * @len bytes at @off of input @src, within its data, through the window;
@@ -1453,45 +1475,87 @@ static size_t dir_compact_select(DirArt *a, size_t n, uint64_t max_data,
     return k;
 }
 
+/* A merge's checkpoint while it builds its index: publication served. */
+static bool dir_plan_checkpoint(void)
+{
+    if (dir_pause_plan_ms && !dir_plan_paused) {
+        dir_plan_paused = true;
+        for (unsigned i = 0; i < dir_pause_plan_ms && !dir_ending(); i++) {
+            g_usleep(1000);
+            dir_compact_yield();
+        }
+    }
+    dir_compact_yield();
+    return !dir_ending();
+}
+
 /*
- * The slot table for @a's @n envelopes laid out in order after the
- * header, every entry within the reader's probes of its home: the table
- * doubles until they are, up to the reader's limit.  NULL if it can't.
+ * The index of @a's @n envelopes (@data bytes) laid out in order after the
+ * header, image records, index and @n_cover cover entries: planned by
+ * image, the file laid out, the index filled (every entry within the
+ * reader's probes of its home).  NULL if it can't be, the reason counted;
+ * @plan holds the image records.
  */
 static TCGCacheIdx *dir_compact_table(DirArt *a, size_t n, uint64_t data,
                                       uint32_t n_cover, uint64_t gen,
-                                      TCGCacheFileHdr *h, size_t *out_len)
+                                      TCGCacheFileHdr *h, size_t *out_len,
+                                      TCGCacheIdxPlan *plan)
 {
-    for (uint32_t log2 = 4; log2 <= TCG_CACHE_SLOT_LOG2_MAX; log2++) {
-        TCGCacheIdx *slots;
-        uint64_t at;
-        size_t i;
+    g_autofree uint64_t *id = g_new(uint64_t, MAX(n, 1));
+    g_autofree uint64_t *kh = g_new(uint64_t, MAX(n, 1));
+    g_autofree uint32_t *rel = g_new(uint32_t, MAX(n, 1));
+    g_autofree uint32_t *len = g_new(uint32_t, MAX(n, 1));
+    TCGCacheIdx *slots;
+    uint64_t at = 0;
+    int r;
 
-        if (dir_ending()) {
+    dir_plan_paused = false;
+    for (size_t i = 0; i < n; i++) {
+        const TCGCacheEnv *k = &a[i].key;
+
+        if (!(i % 4096) && !dir_plan_checkpoint()) {
+            tcg_cache_stats.merge_refused_index[TCG_CACHE_PLAN_CANCEL]++;
             return NULL;
         }
-        *out_len = tcg_cache_pack_layout(h, gen, n, n_cover, data, log2);
-        if (!*out_len) {
-            return NULL;
-        }
-        log2 = h->slot_log2;
-        slots = g_new0(TCGCacheIdx, 1u << log2);
-        at = h->data_off;
-        for (i = 0; i < n; i++) {
-            TCGCacheIdx x = tcg_cache_env_idx(&a[i].key, at);
-
-            if (!tcg_cache_pack_slot(slots, log2, x, dir_test_probes)) {
-                break;
-            }
-            at += ROUND_UP(a[i].key.len, 8);
-        }
-        if (i == n) {
-            return slots;
-        }
-        g_free(slots);
-        tcg_cache_stats.compact_regrow++;
+        id[i] = k->id;
+        kh[i] = tcg_cache_key_hash(k->id, k->rva, k->flags, k->cs_base,
+                                   k->cflags);
+        rel[i] = at;
+        len[i] = k->len;
+        at += ROUND_UP(k->len, 8);
     }
-    return NULL;
+    if (dir_test_samehash) {
+        /* Planned with one hash for every key: never written. */
+        g_autofree uint64_t *one = g_new(uint64_t, MAX(n, 1));
+
+        for (size_t i = 0; i < n; i++) {
+            one[i] = 1;
+        }
+        r = tcg_cache_index_plan(id, one, n, dir_test_probes, dir_test_img_max,
+                                 dir_test_slots_max, dir_plan_checkpoint,
+                                 plan);
+        tcg_cache_index_plan_free(plan);
+        tcg_cache_stats.merge_refused_index[r ? r : TCG_CACHE_PLAN_PROBES]++;
+        return NULL;
+    }
+    r = tcg_cache_index_plan(id, kh, n, dir_test_probes, dir_test_img_max,
+                             dir_test_slots_max, dir_plan_checkpoint, plan);
+    if (r) {
+        tcg_cache_stats.merge_refused_index[r]++;
+        return NULL;
+    }
+    tcg_cache_stats.compact_regrow += plan->growths;
+    *out_len = tcg_cache_pack_layout(h, gen, n, plan, n_cover, data);
+    if (!*out_len) {
+        return NULL;
+    }
+    slots = g_new(TCGCacheIdx, MAX(plan->n_slots, 1));
+    if (!tcg_cache_index_fill(plan, kh, h->data_off, rel, len,
+                              dir_plan_checkpoint, slots)) {
+        g_free(slots);
+        return NULL;
+    }
+    return slots;
 }
 
 static bool dir_remove(const char *name)
@@ -1827,6 +1891,7 @@ static int dir_compact_merge(DirScan *sc, DirCompact *c, int kind,
     g_autoptr(GHashTable) by_name = g_hash_table_new(g_str_hash,
                                                      g_str_equal);
     g_autofree TCGCacheIdx *slots = NULL;
+    g_auto(TCGCacheIdxPlan) plan = { };
     DirCover dc = { .e = cover, .direct = direct, .by_name = by_name };
     DirAdmit ad = { .budget = dir_merge_budget() };
     bool pack_out = kind == DIR_MAJOR || kind == DIR_FIRST;
@@ -1885,15 +1950,18 @@ static int dir_compact_merge(DirScan *sc, DirCompact *c, int kind,
     }
     /*
      * The envelopes' room: the file less its header, its padding, its
-     * cover list and the largest slot table a reader allows (growth for
-     * probe clusters may need more than the count suggests).
+     * cover list, the most image records and the largest index a reader
+     * allows (growth for probe clusters may need more than the count
+     * suggests).
      */
     budget = TCG_CACHE_FILE_MAX - sizeof(TCGCacheFileHdr) - 8
              - (uint64_t)dc.n * sizeof(TCGCacheCover)
-             - (sizeof(TCGCacheIdx) << TCG_CACHE_SLOT_LOG2_MAX);
+             - (uint64_t)TCG_CACHE_IMG_MAX * sizeof(TCGCacheImg)
+             - (uint64_t)TCG_CACHE_SLOTS_MAX * sizeof(TCGCacheIdx);
     kept = dir_compact_select(c->arts, c->n, budget,
                               dir_compact_arts / 4 * 3, &data);
-    slots = dir_compact_table(c->arts, kept, data, dc.n, gen, &h, &out_len);
+    slots = dir_compact_table(c->arts, kept, data, dc.n, gen, &h, &out_len,
+                              &plan);
     if (!slots) {
         tcg_cache_stats.compact_skip++;
         return DIR_M_FAILED;
@@ -1931,11 +1999,16 @@ static int dir_compact_merge(DirScan *sc, DirCompact *c, int kind,
         written += ROUND_UP(env->len, 8);
         at += ROUND_UP(env->len, 8);
     }
-    tcg_cache_pack_seal(&h, cover);
-    if (!dir_ops->write(wh, slots, sizeof(TCGCacheIdx) << h.slot_log2,
-                        h.index_off)
-        || (h.cover_len && !dir_ops->write(wh, cover, h.cover_len,
-                                           h.cover_off))
+    tcg_cache_pack_seal(&h, plan.img, cover);
+    if (!dir_ops->write(wh, slots, sizeof(TCGCacheIdx) * h.n_slots,
+                        h.index_off)) {
+        goto abort;
+    }
+    if (h.n_img && !dir_ops->write(wh, plan.img,
+                                   sizeof(TCGCacheImg) * h.n_img, h.img_off)) {
+        goto abort;
+    }
+    if ((h.cover_len && !dir_ops->write(wh, cover, h.cover_len, h.cover_off))
         || !dir_ops->write(wh, &h, sizeof(h), 0)) {
         goto abort;
     }
@@ -2458,8 +2531,16 @@ void tcg_cache_dir_start(const TCGCacheDirOps *ops, int64_t t0)
     dir_age_extra = dir_env_ms("XTCG_CACHE_AGE_MS") * SCALE_MS;
     dir_start_clock = t0;
     if (getenv("XTCG_CACHE_TEST_PROBES")) {
-        dir_test_probes = MAX(atoi(getenv("XTCG_CACHE_TEST_PROBES")), 1);
+        dir_test_probes = MIN(MAX(atoi(getenv("XTCG_CACHE_TEST_PROBES")), 1),
+                              TCG_CACHE_PROBES);
     }
+    dir_test_img_max = MIN(dir_env_u64("XTCG_CACHE_TEST_IMG_MAX",
+                                       TCG_CACHE_IMG_MAX), TCG_CACHE_IMG_MAX);
+    dir_test_slots_max = MIN(dir_env_u64("XTCG_CACHE_TEST_SLOTS_MAX",
+                                         TCG_CACHE_SLOTS_MAX),
+                             TCG_CACHE_SLOTS_MAX);
+    dir_test_samehash = getenv("XTCG_CACHE_TEST_SAMEHASH");
+    dir_pause_plan_ms = dir_env_ms("XTCG_CACHE_PAUSE_PLAN_MS");
     dir_exit_cap = tcg_cache_segment_bound(TCG_CACHE_BUF_SIZE);
     dir_exit_buf = g_malloc(dir_exit_cap);
     if (getenv("XTCG_CACHE_CHECKALL")) {

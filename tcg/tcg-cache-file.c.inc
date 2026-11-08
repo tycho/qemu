@@ -87,18 +87,13 @@ uint64_t tcg_cache_hash64(uint64_t seed, const void *data, size_t len)
 }
 
 /* A key's hash in an index: never 0, which marks an empty pack slot. */
-static uint64_t key_hash(uint64_t id, uint64_t rva, uint32_t flags,
-                         uint64_t cs_base, uint32_t cflags)
+uint64_t tcg_cache_key_hash(uint64_t id, uint64_t rva, uint32_t flags,
+                            uint64_t cs_base, uint32_t cflags)
 {
     uint64_t k[4] = { id, rva, cs_base, (uint64_t)flags << 32 | cflags };
-    uint64_t h = tcg_cache_hash64(0, k, sizeof(k));
+    uint64_t h = qemu_xxh3_64(k, sizeof(k));
 
     return h ? h : 1;
-}
-
-static uint32_t key_check(uint64_t rva, uint32_t flags)
-{
-    return (uint32_t)(rva ^ (rva >> 32)) ^ flags;
 }
 
 static const char *const tcg_cache_v_names[TCG_CACHE_V_MAX] = {
@@ -120,6 +115,7 @@ static const char *const tcg_cache_v_names[TCG_CACHE_V_MAX] = {
     [TCG_CACHE_V_CHECK] = "checksum",
     [TCG_CACHE_V_FAULT] = "fault",
     [TCG_CACHE_V_INSN] = "insn-state",
+    [TCG_CACHE_V_INDEX] = "index",
 };
 
 const char *tcg_cache_v_name(int v)
@@ -700,6 +696,113 @@ static uint64_t hdr_check(const TCGCacheFileHdr *h)
 }
 
 /* Copy @len bytes at @off of @f into @dst, guarded; false on a fault. */
+bool tcg_cache_pages;
+
+enum { PAGES_INDEX, PAGES_DATA, PAGES_OTHER, PAGES_KINDS };
+#define PAGES_SHIFT 12
+
+typedef struct TCGCachePages {
+    struct TCGCachePages *next;
+    size_t size;
+    int level;
+    uint64_t index_off, index_bytes, data_off, data_len;
+    unsigned long *bits[PAGES_KINDS];
+    unsigned long *env;         /* envelopes read whole, by offset / 8 */
+    uint64_t env_n, env_bytes;
+} TCGCachePages;
+
+static TCGCachePages *pages_list;
+
+void tcg_cache_pages_track(TCGCacheFile *f)
+{
+    TCGCachePages *p = g_new0(TCGCachePages, 1);
+    size_t np = DIV_ROUND_UP(f->size, 1 << PAGES_SHIFT);
+
+    p->size = f->size;
+    p->level = f->level;
+    p->index_off = f->hdr.index_off;
+    p->index_bytes = f->index_bytes;
+    p->data_off = f->hdr.data_off;
+    p->data_len = f->hdr.data_len;
+    for (int k = 0; k < PAGES_KINDS; k++) {
+        p->bits[k] = bitmap_new(np);
+    }
+    p->env = bitmap_new(f->size / 8 + 1);
+    do {
+        p->next = qatomic_read(&pages_list);
+    } while (qatomic_cmpxchg(&pages_list, p->next, p) != p->next);
+    f->pages = p;
+}
+
+static void pages_mark(TCGCachePages *p, uint64_t off, size_t len)
+{
+    int k = off >= p->index_off && off < p->index_off + p->index_bytes
+            ? PAGES_INDEX
+            : off >= p->data_off && off < p->data_off + p->data_len
+            ? PAGES_DATA : PAGES_OTHER;
+
+    for (uint64_t pg = off >> PAGES_SHIFT;
+         len && pg <= (off + len - 1) >> PAGES_SHIFT; pg++) {
+        set_bit_atomic(pg, p->bits[k]);
+    }
+}
+
+static void pages_env(TCGCachePages *p, uint64_t off, size_t len)
+{
+    unsigned long m = BIT_MASK(off / 8);
+
+    if (!(qatomic_fetch_or(&p->env[BIT_WORD(off / 8)], m) & m)) {
+        qatomic_inc(&p->env_n);
+        qatomic_add(&p->env_bytes, len);
+    }
+}
+
+void tcg_cache_pages_print(void)
+{
+    static const char *const names[] = { "pack", "parts", "loose" };
+    uint64_t t[3][10] = { };
+
+    for (TCGCachePages *p = qatomic_read(&pages_list); p; p = p->next) {
+        uint64_t *v = t[p->level];
+        size_t np = DIV_ROUND_UP(p->size, 1 << PAGES_SHIFT);
+        uint64_t i0 = p->index_off >> PAGES_SHIFT;
+        uint64_t i1 = DIV_ROUND_UP(p->index_off + p->index_bytes,
+                                   1 << PAGES_SHIFT);
+        uint64_t d0 = p->data_off >> PAGES_SHIFT;
+        uint64_t d1 = DIV_ROUND_UP(p->data_off + p->data_len,
+                                   1 << PAGES_SHIFT);
+
+        v[0]++;
+        v[1] += np;
+        v[2] += i1 - i0;
+        v[4] += d1 - d0;
+        for (size_t pg = 0; pg < np; pg++) {
+            bool a = test_bit(pg, p->bits[PAGES_INDEX]);
+            bool b = test_bit(pg, p->bits[PAGES_DATA]);
+            bool c = test_bit(pg, p->bits[PAGES_OTHER]);
+
+            v[3] += a;
+            v[5] += b;
+            v[6] += c;
+            v[7] += a || b || c;
+        }
+        v[8] += p->env_n;
+        v[9] += p->env_bytes;
+    }
+    fprintf(stderr, "xtcg-cache: pages (4 KiB):");
+    for (int l = 0; l < 3; l++) {
+        uint64_t *v = t[l];
+
+        fprintf(stderr, "%s %s files %" PRIu64 " pages %" PRIu64
+                " index %" PRIu64 "/%" PRIu64 " data %" PRIu64 "/%" PRIu64
+                " other %" PRIu64 " touched %" PRIu64 "; envelopes read %"
+                PRIu64 " (%" PRIu64 " bytes, %" PRIu64 " pages packed)",
+                l ? " |" : "", names[l], v[0], v[1], v[3], v[2], v[5], v[4],
+                v[6], v[7], v[8], v[9], DIV_ROUND_UP(v[9], 1 << PAGES_SHIFT));
+    }
+    fprintf(stderr, "\n");
+}
+
 static bool file_read(const TCGCacheFile *f, uint64_t off, void *dst,
                       size_t len)
 {
@@ -707,6 +810,9 @@ static bool file_read(const TCGCacheFile *f, uint64_t off, void *dst,
 
     if (off > f->size || len > f->size - off) {
         return false;
+    }
+    if (unlikely(f->pages)) {
+        pages_mark(f->pages, off, len);
     }
     r = f->copy((void *)dst, (const uint8_t *)f->map + off, len);
     if (r) {
@@ -804,12 +910,38 @@ bool tcg_cache_segment_name_ok(const char name[64])
     return true;
 }
 
+/*
+ * A pack's image records, copied out: in id order, their tables back to
+ * back from slot 0 and filling the index, their entries summing to the
+ * pack's.  0, or why not.
+ */
+static int img_records_ok(const TCGCacheFileHdr *h, const TCGCacheImg *img)
+{
+    uint64_t slot = 0, n = 0;
+
+    for (uint32_t i = 0; i < h->n_img; i++) {
+        if ((i && img[i].id <= img[i - 1].id) || img[i].pad
+            || !img[i].n_slots || img[i].n > img[i].n_slots
+            || img[i].slot != slot) {
+            return TCG_CACHE_V_HEADER;
+        }
+        slot += img[i].n_slots;
+        n += img[i].n;
+    }
+    return slot == h->n_slots && n == h->n_index ? TCG_CACHE_V_OK
+                                                  : TCG_CACHE_V_HEADER;
+}
+
 int tcg_cache_file_open(TCGCacheFile *f, const void *map, size_t size,
                         int64_t (*copy)(void *, const void *, size_t),
                         void (*fault)(int64_t))
 {
     TCGCacheFileHdr *h = &f->hdr;
-    uint64_t data_end, index_bytes;
+    g_autofree TCGCacheCover *cover = NULL;
+    g_autofree TCGCacheImg *img = NULL;
+    uint64_t data_end, index_bytes, img_bytes, index_end;
+    int64_t t0 = TCG_CACHE_CLOCK();
+    int r;
 
     memset(f, 0, sizeof(*f));
     f->map = map;
@@ -830,48 +962,70 @@ int tcg_cache_file_open(TCGCacheFile *f, const void *map, size_t size,
     if (memcmp(h->fp, tcg_cache_fingerprint, sizeof(h->fp))) {
         return TCG_CACHE_V_KEY;
     }
-    if (h->magic == TCG_CACHE_PACK_MAGIC) {
-        if (h->slot_log2 < 4 || h->slot_log2 > TCG_CACHE_SLOT_LOG2_MAX
-            || h->n_index > (1u << (h->slot_log2 - 1))) {
-            return TCG_CACHE_V_LIMIT;
-        }
-        index_bytes = (uint64_t)sizeof(TCGCacheIdx) << h->slot_log2;
-    } else {
-        if (h->slot_log2 || h->n_index > TCG_CACHE_SEG_ENTRIES_MAX) {
-            return TCG_CACHE_V_LIMIT;
-        }
-        index_bytes = (uint64_t)sizeof(TCGCacheIdx) * h->n_index;
+    if (h->n_index > TCG_CACHE_SEG_ENTRIES_MAX) {
+        return TCG_CACHE_V_LIMIT;
     }
+    img_bytes = (uint64_t)h->n_img * sizeof(TCGCacheImg);
+    index_bytes = (uint64_t)h->n_slots * sizeof(TCGCacheIdx);
+    if (h->magic == TCG_CACHE_PACK_MAGIC) {
+        /* Header, image records, index, cover list, data, in order. */
+        if (h->n_img > TCG_CACHE_IMG_MAX || h->n_slots > TCG_CACHE_SLOTS_MAX
+            || h->n_index > h->n_slots || !h->n_index != !h->n_img
+            || (!h->n_img && (h->n_slots || h->img_check))
+            || h->img_off != sizeof(*h)
+            || h->index_off != h->img_off + img_bytes) {
+            return TCG_CACHE_V_LIMIT;
+        }
+    } else if (h->n_img || h->img_off || h->img_check
+               || h->n_slots != h->n_index || h->n_cover
+               || h->index_off < sizeof(*h) || (h->index_off & 7)) {
+        return TCG_CACHE_V_LIMIT;
+    }
+    index_end = h->index_off + index_bytes;
     data_end = (uint64_t)h->data_off + h->data_len;
-    if (h->index_off < sizeof(*h) || (h->index_off & 7)
-        || h->index_off + index_bytes > size || (h->data_off & 7)
+    if (index_end > size || (h->data_off & 7) || h->data_off < index_end
         || data_end > size || h->n_cover > TCG_CACHE_COVER_MAX
-        || (h->magic == TCG_CACHE_SEG_MAGIC && h->n_cover)
         || (h->n_cover
-            && ((uint64_t)h->cover_off + h->cover_len > size
+            && (h->cover_off < index_end || (h->cover_off & 7)
+                || (uint64_t)h->cover_off + h->cover_len > h->data_off
                 || h->cover_len
                    != (uint64_t)h->n_cover * sizeof(TCGCacheCover)))) {
         return TCG_CACHE_V_LIMIT;
     }
-    if (h->n_cover) {
-        size_t n = h->cover_len;
-        void *buf = g_malloc(n);
-
-        if (!file_read(f, h->cover_off, buf, n)) {
-            g_free(buf);
+    if (h->n_img) {
+        img = g_malloc(img_bytes);
+        if (!file_read(f, h->img_off, img, img_bytes)) {
             return TCG_CACHE_V_FAULT;
         }
-        if (tcg_cache_hash64(3, buf, n) != h->cover_check) {
-            g_free(buf);
+        if (tcg_cache_hash64(4, img, img_bytes) != h->img_check) {
             return TCG_CACHE_V_CHECK;
         }
-        if (!cover_list_ok(buf, h->n_cover, h->tick)) {
-            g_free(buf);
+        r = img_records_ok(h, img);
+        if (r) {
+            return r;
+        }
+    }
+    if (h->n_cover) {
+        size_t n = h->cover_len;
+
+        cover = g_malloc(n);
+        if (!file_read(f, h->cover_off, cover, n)) {
+            return TCG_CACHE_V_FAULT;
+        }
+        if (tcg_cache_hash64(3, cover, n) != h->cover_check) {
+            return TCG_CACHE_V_CHECK;
+        }
+        if (!cover_list_ok(cover, h->n_cover, h->tick)) {
             return TCG_CACHE_V_HEADER;
         }
-        f->cover = buf;
     }
+    /* Owned by @f only once it opened. */
+    f->cover = g_steal_pointer(&cover);
+    f->img = g_steal_pointer(&img);
     f->index_bytes = index_bytes;
+    tcg_cache_stats.opens++;
+    tcg_cache_stats.open_img_bytes += img_bytes;
+    tcg_cache_part(&tcg_cache_stats.open_ns, &t0);
     return TCG_CACHE_V_OK;
 }
 
@@ -879,6 +1033,8 @@ void tcg_cache_file_close(TCGCacheFile *f)
 {
     g_free(f->cover);
     f->cover = NULL;
+    g_free(f->img);
+    f->img = NULL;
 }
 
 /* Index entry @i, copied out and bounds-checked: why not, or 0. */
@@ -903,30 +1059,64 @@ static bool file_entry(const TCGCacheFile *f, uint32_t i, TCGCacheIdx *e)
     return file_entry_r(f, i, e) == TCG_CACHE_V_OK;
 }
 
-int tcg_cache_file_find(const TCGCacheFile *f, uint64_t id, uint64_t rva,
-                        uint32_t flags, uint64_t cs_base, uint32_t cflags,
+/* @f's image record for @id, or NULL. */
+static const TCGCacheImg *file_img(const TCGCacheFile *f, uint64_t id)
+{
+    uint32_t lo = 0, hi = f->hdr.n_img;
+
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+
+        if (f->img[mid].id < id) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo < f->hdr.n_img && f->img[lo].id == id ? &f->img[lo] : NULL;
+}
+
+/* An entry's first slot in a table of @n: the high half of @kh * @n. */
+static uint32_t slot_home(uint64_t kh, uint32_t n)
+{
+    uint64_t lo, hi;
+
+    mulu64(&lo, &hi, kh, n);
+    return hi;
+}
+
+int tcg_cache_file_find(const TCGCacheFile *f, uint64_t id, uint64_t kh,
                         TCGCacheIdx *out, int max)
 {
-    uint64_t kh = key_hash(id, rva, flags, cs_base, cflags);
-    uint32_t kc = key_check(rva, flags);
     TCGCacheIdx e;
     int n = 0;
 
     if (f->hdr.magic == TCG_CACHE_PACK_MAGIC) {
-        uint32_t mask = (1u << f->hdr.slot_log2) - 1;
+        const TCGCacheImg *img = file_img(f, id);
+        uint32_t lim, k, i;
 
-        for (uint32_t i = 0, k = kh & mask; i < TCG_CACHE_PROBES && n < max;
-             i++, k = (k + 1) & mask) {
-            if (!file_entry(f, k, &e)) {
+        if (!img) {
+            return 0;
+        }
+        /* Each slot of the image's table at most once. */
+        lim = MIN(TCG_CACHE_PROBES, img->n_slots);
+        k = slot_home(kh, img->n_slots);
+        for (i = 0; i < lim && n < max; i++) {
+            if (!file_entry(f, img->slot + k, &e)) {
                 return n ? n : -1;
             }
             if (!e.khash) {
+                i++;
                 break;
             }
-            if (e.khash == kh && e.check == kc) {
+            if (e.khash == kh) {
                 out[n++] = e;
             }
+            k = k + 1 == img->n_slots ? 0 : k + 1;
         }
+        tcg_cache_stats.find_slots += i;
+        tcg_cache_stats.find_slots_max = MAX(tcg_cache_stats.find_slots_max,
+                                             i);
         return n;
     }
 
@@ -954,9 +1144,7 @@ int tcg_cache_file_find(const TCGCacheFile *f, uint64_t id, uint64_t rva,
             if (e.khash != kh) {
                 break;
             }
-            if (e.check == kc) {
-                out[n++] = e;
-            }
+            out[n++] = e;
         }
         return n;
     }
@@ -983,6 +1171,9 @@ int tcg_cache_file_get(const TCGCacheFile *f, const TCGCacheIdx *e,
     }
     if (!file_read(f, e->off, buf, e->len)) {
         return TCG_CACHE_V_FAULT;
+    }
+    if (unlikely(f->pages)) {
+        pages_env(f->pages, e->off, e->len);
     }
     alen = env->len - sizeof(*env);
     if (memcmp(env, &hdr, sizeof(hdr))
@@ -1023,7 +1214,7 @@ typedef struct SelSeen {
 /* One file's candidates for a key; true if @use stopped the lookup. */
 static bool file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
                         uint32_t flags, uint64_t cs_base, uint32_t cflags,
-                        void *buf, size_t bufsz,
+                        uint64_t kh, void *buf, size_t bufsz,
                         bool (*use)(const TCGCacheEnv *env, void *opaque),
                         void *opaque, uint64_t *rejects, SelSeen *seen)
 {
@@ -1031,8 +1222,7 @@ static bool file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
     int64_t tp = tcg_cache_costs ? get_clock() : 0;
     int fn;
 
-    fn = tcg_cache_file_find(f, id, rva, flags, cs_base, cflags, fe,
-                             TCG_CACHE_PROBES);
+    fn = tcg_cache_file_find(f, id, kh, fe, TCG_CACHE_PROBES);
     tcg_cache_stats.sel_finds++;
     tcg_cache_part(&tcg_cache_stats.sel_find_ns, &tp);
     if (fn < 0 && rejects) {
@@ -1122,8 +1312,9 @@ int tcg_cache_file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
     SelSeen seen = { .limit = TCG_CACHE_CANDS };
     int n;
 
-    file_select(f, id, rva, flags, cs_base, cflags, buf, bufsz, use, opaque,
-                rejects, &seen);
+    file_select(f, id, rva, flags, cs_base, cflags,
+                tcg_cache_key_hash(id, rva, flags, cs_base, cflags), buf, bufsz,
+                use, opaque, rejects, &seen);
     n = seen.n;
     sel_seen_free(&seen);
     return n;
@@ -1145,6 +1336,7 @@ int tcg_cache_snap_select(const TCGCacheSnap *snap, uint64_t id, uint64_t rva,
 {
     SelSeen seen = { .limit = TCG_CACHE_CANDS };
     int level = TCG_CACHE_LEVEL_PACK;
+    uint64_t kh = tcg_cache_key_hash(id, rva, flags, cs_base, cflags);
     int n;
 
     for (int i = 0; i < snap->n; i++) {
@@ -1155,8 +1347,8 @@ int tcg_cache_snap_select(const TCGCacheSnap *snap, uint64_t id, uint64_t rva,
         if (seen.n >= seen.limit) {
             continue;
         }
-        if (file_select(&snap->f[i], id, rva, flags, cs_base, cflags, buf,
-                        bufsz, use, opaque, rejects, &seen)) {
+        if (file_select(&snap->f[i], id, rva, flags, cs_base, cflags, kh,
+                        buf, bufsz, use, opaque, rejects, &seen)) {
             break;
         }
     }
@@ -1468,26 +1660,234 @@ static void idx_sort(TCGCacheIdx *a, uint32_t n)
 static TCGCacheIdx env_idx(const TCGCacheEnv *e, uint32_t off)
 {
     return (TCGCacheIdx){
-        .khash = key_hash(e->id, e->rva, e->flags, e->cs_base, e->cflags),
-        .off = off, .len = e->len, .check = key_check(e->rva, e->flags),
+        .khash = tcg_cache_key_hash(e->id, e->rva, e->flags, e->cs_base,
+                                    e->cflags),
+        .off = off, .len = e->len,
     };
+}
+
+/*
+ * A pack's index plan.  Positions are grouped by image in linear passes (a
+ * table of ids, their sorted list, a counting pass), so that a merge's
+ * checkpoint runs throughout; each image's table is then filled by trial,
+ * doubled while an entry can't be placed within the probes.
+ */
+#define PLAN_STEP 4096
+
+static int plan_id_cmp(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+    return x < y ? -1 : x > y;
+}
+
+void tcg_cache_index_plan_free(TCGCacheIdxPlan *p)
+{
+    g_free(p->img);
+    g_free(p->slot_entry);
+    memset(p, 0, sizeof(*p));
+}
+
+static bool plan_step(bool (*checkpoint)(void), uint64_t i)
+{
+    return !checkpoint || i % PLAN_STEP || checkpoint();
+}
+
+/*
+ * An image's @cnt entries at @pos into a table of @ns, @checkpoint called
+ * every PLAN_STEP insertions (counted in *@steps): TCG_CACHE_PLAN_OK,
+ * TCG_CACHE_PLAN_PROBES if one can't fit, or TCG_CACHE_PLAN_CANCEL.
+ */
+static int plan_try(uint32_t *t, uint32_t ns, const uint32_t *pos,
+                    uint32_t cnt, const uint64_t *kh, unsigned probes,
+                    bool (*checkpoint)(void), uint64_t *steps)
+{
+    memset(t, 0, ns * sizeof(*t));
+    for (uint32_t x = 0; x < cnt; x++) {
+        uint32_t e = pos[x], k = slot_home(kh[e], ns), d = 1;
+
+        if (!plan_step(checkpoint, ++*steps)) {
+            return TCG_CACHE_PLAN_CANCEL;
+        }
+        while (t[k]) {
+            if (++d > probes) {
+                return TCG_CACHE_PLAN_PROBES;
+            }
+            k = k + 1 == ns ? 0 : k + 1;
+        }
+        t[k] = e + 1;
+    }
+    return TCG_CACHE_PLAN_OK;
+}
+
+int tcg_cache_index_plan(const uint64_t *id, const uint64_t *kh, size_t n,
+                         unsigned probes, uint32_t img_max, uint32_t slots_max,
+                         bool (*checkpoint)(void), TCGCacheIdxPlan *p)
+{
+    g_autoptr(GHashTable) ids = NULL;
+    g_autofree uint64_t *sorted = NULL;
+    g_autofree uint32_t *cnt = NULL, *start = NULL, *cur = NULL;
+    g_autofree uint32_t *pos = NULL, *t = NULL;
+    uint64_t total = 0, cap = 0, at = 0, steps = 0;
+    uint32_t n_img, j;
+    int r = TCG_CACHE_PLAN_CANCEL;
+
+    memset(p, 0, sizeof(*p));
+    assert(n <= TCG_CACHE_SEG_ENTRIES_MAX);
+    assert(probes >= 1 && probes <= TCG_CACHE_PROBES);
+    assert(img_max <= TCG_CACHE_IMG_MAX && slots_max <= TCG_CACHE_SLOTS_MAX);
+    if (!n) {
+        return TCG_CACHE_PLAN_OK;
+    }
+
+    /* The images and their entries; an image's index is its value - 1. */
+    ids = g_hash_table_new(g_int64_hash, g_int64_equal);
+    for (size_t i = 0; i < n; i++) {
+        gpointer v = g_hash_table_lookup(ids, &id[i]);
+
+        assert(kh[i]);
+        if (!v && g_hash_table_size(ids) == img_max) {
+            return TCG_CACHE_PLAN_IMG;
+        }
+        g_hash_table_insert(ids, (gpointer)&id[i],
+                            GUINT_TO_POINTER(GPOINTER_TO_UINT(v) + 1));
+        if (!plan_step(checkpoint, ++steps)) {
+            return TCG_CACHE_PLAN_CANCEL;
+        }
+    }
+    n_img = g_hash_table_size(ids);
+    sorted = g_new(uint64_t, n_img);
+    cnt = g_new(uint32_t, n_img);
+    start = g_new(uint32_t, n_img);
+    cur = g_new(uint32_t, n_img);
+    {
+        GHashTableIter it;
+        gpointer key, v;
+
+        j = 0;
+        g_hash_table_iter_init(&it, ids);
+        while (g_hash_table_iter_next(&it, &key, &v)) {
+            sorted[j++] = *(const uint64_t *)key;
+        }
+    }
+    qsort(sorted, n_img, sizeof(*sorted), plan_id_cmp);
+    for (j = 0; j < n_img; j++) {
+        cnt[j] = GPOINTER_TO_UINT(g_hash_table_lookup(ids, &sorted[j]));
+        start[j] = j ? start[j - 1] + cnt[j - 1] : 0;
+        cur[j] = start[j];
+        g_hash_table_insert(ids, &sorted[j], GUINT_TO_POINTER(j + 1));
+        total += MAX(4, 2 * (uint64_t)cnt[j]);
+    }
+    if (total > slots_max) {
+        return TCG_CACHE_PLAN_SLOTS;
+    }
+    pos = g_new(uint32_t, n);
+    for (size_t i = 0; i < n; i++) {
+        j = GPOINTER_TO_UINT(g_hash_table_lookup(ids, &id[i])) - 1;
+        pos[cur[j]++] = i;
+        if (!plan_step(checkpoint, ++steps)) {
+            return TCG_CACHE_PLAN_CANCEL;
+        }
+    }
+
+    p->img = g_new0(TCGCacheImg, n_img);
+    for (j = 0; j < n_img; j++) {
+        uint32_t ns = MAX(4, 2 * cnt[j]);
+
+        if (checkpoint && !checkpoint()) {
+            goto refuse;
+        }
+        for (;;) {
+            int got;
+
+            t = g_renew(uint32_t, t, ns);
+            got = plan_try(t, ns, pos + start[j], cnt[j], kh, probes,
+                           checkpoint, &steps);
+            if (got == TCG_CACHE_PLAN_OK) {
+                break;
+            }
+            if (got == TCG_CACHE_PLAN_CANCEL) {
+                goto refuse;
+            }
+            /* Doubled: at most 64 slots an entry, within the file's slots. */
+            if (2 * (uint64_t)ns > 64 * (uint64_t)MAX(cnt[j], 1)) {
+                r = TCG_CACHE_PLAN_PROBES;
+                goto refuse;
+            }
+            if (total + ns > slots_max) {
+                r = TCG_CACHE_PLAN_SLOTS;
+                goto refuse;
+            }
+            total += ns;
+            ns *= 2;
+            p->growths++;
+            if (checkpoint && !checkpoint()) {
+                goto refuse;
+            }
+        }
+        if (at + ns > cap) {
+            cap = MAX(cap * 2, at + ns);
+            p->slot_entry = g_renew(uint32_t, p->slot_entry, cap);
+        }
+        memcpy(p->slot_entry + at, t, ns * sizeof(*t));
+        p->img[j] = (TCGCacheImg){
+            .id = sorted[j], .slot = at, .n_slots = ns, .n = cnt[j],
+        };
+        at += ns;
+    }
+    p->n_img = n_img;
+    p->n_slots = at;
+    return TCG_CACHE_PLAN_OK;
+
+refuse:
+    tcg_cache_index_plan_free(p);
+    return r;
+}
+
+bool tcg_cache_index_fill(const TCGCacheIdxPlan *p, const uint64_t *kh,
+                          uint64_t data_off, const uint32_t *rel,
+                          const uint32_t *len, bool (*checkpoint)(void),
+                          TCGCacheIdx *out)
+{
+    for (uint32_t k = 0; k < p->n_slots; k++) {
+        uint32_t e = p->slot_entry[k];
+
+        if (!plan_step(checkpoint, k + 1)) {
+            return false;
+        }
+        if (!e) {
+            out[k] = (TCGCacheIdx){ 0 };
+            continue;
+        }
+        e--;
+        assert(data_off + rel[e] + len[e] <= TCG_CACHE_FILE_MAX);
+        out[k] = (TCGCacheIdx){
+            .khash = kh[e], .off = data_off + rel[e], .len = len[e],
+        };
+    }
+    return true;
 }
 
 /*
  * A file from @data's envelopes into @out (@cap bytes; NULL to allocate
  * one); its length, or 0 if they don't make a file a reader would take.
+ * A segment's index is built in @out and sorted in place, allocating
+ * nothing (the exit's writer); a pack's is planned.
  */
 static size_t write_file(void **outp, size_t cap, bool pack, uint64_t tick,
                          const void *data, size_t data_len,
                          const TCGCacheCover *cover, uint32_t n_cover)
 {
     TCGCacheFileHdr h = {
-        .magic = pack ? TCG_CACHE_PACK_MAGIC : TCG_CACHE_SEG_MAGIC,
+        .magic = TCG_CACHE_SEG_MAGIC,
         .version = TCG_CACHE_FILE_VERSION, .hdr_len = sizeof(h),
         .tick = tick,
     };
-    uint32_t n = 0, slots;
-    size_t index_bytes, at, out_len;
+    TCGCacheIdxPlan plan = { };
+    g_autofree uint64_t *ids = NULL, *khs = NULL;
+    g_autofree uint32_t *rel = NULL, *lens = NULL;
+    uint32_t n = 0, at;
+    size_t out_len;
     uint8_t *out;
     TCGCacheIdx *idx;
 
@@ -1507,30 +1907,43 @@ static size_t write_file(void **outp, size_t cap, bool pack, uint64_t tick,
     /* Nothing a reader would refuse. */
     if ((!pack && n_cover)
         || n > TCG_CACHE_SEG_ENTRIES_MAX || n_cover > TCG_CACHE_COVER_MAX
-        || data_len > TCG_CACHE_FILE_MAX
-        || (pack && 2ull * n > 1ull << TCG_CACHE_SLOT_LOG2_MAX)) {
+        || data_len > TCG_CACHE_FILE_MAX) {
         return 0;
     }
-    memcpy(h.fp, tcg_cache_fingerprint, sizeof(h.fp));
     if (pack) {
-        h.slot_log2 = 4;
-        while ((1u << h.slot_log2) < 2 * n) {
-            h.slot_log2++;
+        ids = g_new(uint64_t, n);
+        khs = g_new(uint64_t, n);
+        rel = g_new(uint32_t, n);
+        lens = g_new(uint32_t, n);
+        at = 0;
+        for (size_t o = 0; o < data_len; at++) {
+            const TCGCacheEnv *e = (const void *)((const uint8_t *)data + o);
+
+            ids[at] = e->id;
+            khs[at] = tcg_cache_key_hash(e->id, e->rva, e->flags, e->cs_base,
+                                         e->cflags);
+            rel[at] = o;
+            lens[at] = e->len;
+            o += ROUND_UP(e->len, 8);
         }
-        slots = 1u << h.slot_log2;
+        if (tcg_cache_index_plan(ids, khs, n, TCG_CACHE_PROBES,
+                                 TCG_CACHE_IMG_MAX, TCG_CACHE_SLOTS_MAX, NULL,
+                                 &plan)) {
+            return 0;
+        }
+        out_len = tcg_cache_pack_layout(&h, tick, n, &plan, n_cover,
+                                        data_len);
     } else {
-        slots = n;
+        memcpy(h.fp, tcg_cache_fingerprint, sizeof(h.fp));
+        h.n_index = h.n_slots = n;
+        h.index_off = sizeof(h);
+        h.data_off = ROUND_UP(h.index_off + (uint64_t)n * sizeof(*idx), 8);
+        h.data_len = data_len;
+        out_len = (uint64_t)h.data_off + data_len;
+        out_len = out_len > TCG_CACHE_FILE_MAX ? 0 : out_len;
     }
-    index_bytes = (size_t)slots * sizeof(TCGCacheIdx);
-    h.n_index = n;
-    h.index_off = sizeof(h);
-    h.n_cover = n_cover;
-    h.cover_off = h.index_off + index_bytes;
-    h.cover_len = n_cover * sizeof(TCGCacheCover);
-    h.data_off = ROUND_UP(h.cover_off + h.cover_len, 8);
-    h.data_len = data_len;
-    out_len = h.data_off + data_len;
-    if (out_len > TCG_CACHE_FILE_MAX || (*outp && out_len > cap)) {
+    if (!out_len || (*outp && out_len > cap)) {
+        tcg_cache_index_plan_free(&plan);
         return 0;
     }
     if (*outp) {
@@ -1540,32 +1953,26 @@ static size_t write_file(void **outp, size_t cap, bool pack, uint64_t tick,
         out = *outp = g_malloc0(out_len);
     }
     idx = (TCGCacheIdx *)(out + h.index_off);
-    at = 0;
-    for (size_t o = 0; o < data_len;) {
-        const TCGCacheEnv *e = (const void *)((const uint8_t *)data + o);
-        TCGCacheIdx x = env_idx(e, h.data_off + o);
-
-        if (pack) {
-            uint32_t k = x.khash & (slots - 1);
-
-            while (idx[k].khash) {
-                k = (k + 1) & (slots - 1);
-            }
-            idx[k] = x;
-        } else {
-            idx[at++] = x;
+    if (pack) {
+        tcg_cache_index_fill(&plan, khs, h.data_off, rel, lens, NULL, idx);
+        memcpy(out + h.img_off, plan.img, h.n_img * sizeof(TCGCacheImg));
+        if (n_cover) {
+            memcpy(out + h.cover_off, cover, h.cover_len);
         }
-        o += ROUND_UP(e->len, 8);
-    }
-    if (!pack) {
+        tcg_cache_pack_seal(&h, plan.img, cover);
+        tcg_cache_index_plan_free(&plan);
+    } else {
+        at = 0;
+        for (size_t o = 0; o < data_len;) {
+            const TCGCacheEnv *e = (const void *)((const uint8_t *)data + o);
+
+            idx[at++] = env_idx(e, h.data_off + o);
+            o += ROUND_UP(e->len, 8);
+        }
         idx_sort(idx, n);
-    }
-    if (n_cover) {
-        memcpy(out + h.cover_off, cover, h.cover_len);
-        h.cover_check = tcg_cache_hash64(3, cover, h.cover_len);
+        h.check = hdr_check(&h);
     }
     memcpy(out + h.data_off, data, data_len);
-    h.check = hdr_check(&h);
     memcpy(out, &h, sizeof(h));
     return out_len;
 }
@@ -1621,51 +2028,43 @@ int tcg_cache_env_verify(const TCGCacheEnv *env, size_t len)
 }
 
 size_t tcg_cache_pack_layout(TCGCacheFileHdr *h, uint64_t generation,
-                             uint32_t n, uint32_t n_cover, size_t data_len,
-                             uint32_t min_log2)
+                             uint32_t n, const TCGCacheIdxPlan *p,
+                             uint32_t n_cover, size_t data_len)
 {
-    size_t out_len;
+    uint64_t at;
 
     if (n > TCG_CACHE_SEG_ENTRIES_MAX || n_cover > TCG_CACHE_COVER_MAX
-        || 2ull * n > 1ull << TCG_CACHE_SLOT_LOG2_MAX
-        || min_log2 > TCG_CACHE_SLOT_LOG2_MAX) {
+        || p->n_img > TCG_CACHE_IMG_MAX || p->n_slots > TCG_CACHE_SLOTS_MAX
+        || data_len > TCG_CACHE_FILE_MAX) {
         return 0;
     }
     *h = (TCGCacheFileHdr){
         .magic = TCG_CACHE_PACK_MAGIC,
         .version = TCG_CACHE_FILE_VERSION, .hdr_len = sizeof(*h),
-        .tick = generation, .n_index = n, .slot_log2 = MAX(min_log2, 4),
+        .tick = generation, .n_index = n, .n_slots = p->n_slots,
+        .n_img = p->n_img, .n_cover = n_cover,
     };
     memcpy(h->fp, tcg_cache_fingerprint, sizeof(h->fp));
-    while ((1u << h->slot_log2) < 2 * n) {
-        h->slot_log2++;
-    }
-    h->index_off = sizeof(*h);
-    h->n_cover = n_cover;
-    h->cover_off = h->index_off + (sizeof(TCGCacheIdx) << h->slot_log2);
+    at = sizeof(*h);
+    h->img_off = at;
+    at += (uint64_t)p->n_img * sizeof(TCGCacheImg);
+    h->index_off = at;
+    at += (uint64_t)p->n_slots * sizeof(TCGCacheIdx);
+    h->cover_off = at;
     h->cover_len = n_cover * sizeof(TCGCacheCover);
-    h->data_off = ROUND_UP(h->cover_off + h->cover_len, 8);
+    at = ROUND_UP(at + h->cover_len, 8);
+    h->data_off = at;
     h->data_len = data_len;
-    out_len = (size_t)h->data_off + data_len;
-    return out_len > TCG_CACHE_FILE_MAX ? 0 : out_len;
+    at += data_len;
+    return at > TCG_CACHE_FILE_MAX ? 0 : at;
 }
 
-bool tcg_cache_pack_slot(TCGCacheIdx *slots, uint32_t slot_log2,
-                         TCGCacheIdx x, unsigned probes)
+void tcg_cache_pack_seal(TCGCacheFileHdr *h, const TCGCacheImg *img,
+                         const TCGCacheCover *cover)
 {
-    uint32_t mask = (1u << slot_log2) - 1, k = x.khash & mask;
-
-    for (unsigned i = 0; i < probes; i++, k = (k + 1) & mask) {
-        if (!slots[k].khash) {
-            slots[k] = x;
-            return true;
-        }
-    }
-    return false;
-}
-
-void tcg_cache_pack_seal(TCGCacheFileHdr *h, const TCGCacheCover *cover)
-{
+    h->img_check = h->n_img ? tcg_cache_hash64(4, img, h->n_img
+                                                    * sizeof(TCGCacheImg))
+                            : 0;
     if (h->n_cover) {
         h->cover_check = tcg_cache_hash64(3, cover, h->cover_len);
     }
@@ -1695,6 +2094,108 @@ static int check_one(const TCGCacheFile *f, const TCGCacheIdx *e,
     return tcg_cache_validate(env + 1, env->len - sizeof(*env));
 }
 
+static int off_cmp(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+
+    return x < y ? -1 : x > y;
+}
+
+/*
+ * The index against the data, one for one: every envelope (the data
+ * region walked back to back, ending exactly at its end) referenced by
+ * exactly one entry; each entry's hash its envelope's key's; a segment's
+ * entries in hash order; a pack's entries in their image's table, as many
+ * as its record says, each reachable from its home within the reader's
+ * probes.  The number of inconsistencies.
+ */
+static uint64_t check_index(const TCGCacheFile *f)
+{
+    const TCGCacheFileHdr *h = &f->hdr;
+    g_autofree uint32_t *offs = g_new(uint32_t, h->n_index + 1);
+    g_autofree unsigned long *seen = bitmap_new(h->n_index + 1);
+    uint64_t end = (uint64_t)h->data_off + h->data_len;
+    uint64_t bad = 0, occ = 0, prev = 0;
+    uint32_t m = 0;
+
+    for (uint64_t o = h->data_off; o < end;) {
+        TCGCacheEnv e;
+
+        if (m == h->n_index || !file_read(f, o, &e, sizeof(e))
+            || e.len < sizeof(e) || e.len > sizeof(e) + TCG_CACHE_ART_MAX
+            || ROUND_UP(e.len, 8) > end - o) {
+            return bad + 1;
+        }
+        offs[m++] = o;
+        o += ROUND_UP(e.len, 8);
+    }
+    if (m != h->n_index) {
+        bad++;
+    }
+    for (uint32_t k = 0; k < h->n_slots; k++) {
+        const TCGCacheImg *img = NULL;
+        uint32_t *at, home;
+        TCGCacheIdx x;
+        TCGCacheEnv e;
+
+        if (file_entry_r(f, k, &x) || !x.khash) {
+            continue;
+        }
+        occ++;
+        at = bsearch(&x.off, offs, m, sizeof(*offs), off_cmp);
+        if (!at || test_and_set_bit(at - offs, seen)
+            || !file_read(f, x.off, &e, sizeof(e)) || e.len != x.len
+            || tcg_cache_key_hash(e.id, e.rva, e.flags, e.cs_base, e.cflags)
+               != x.khash) {
+            bad++;
+            continue;
+        }
+        if (h->magic != TCG_CACHE_PACK_MAGIC) {
+            /* Bisection needs the hashes in order. */
+            bad += x.khash < prev;
+            prev = x.khash;
+            continue;
+        }
+        img = file_img(f, e.id);
+        if (!img || k < img->slot || k - img->slot >= img->n_slots) {
+            bad++;
+            continue;
+        }
+        /* From its home to it: no empty slot, within the probes. */
+        home = slot_home(x.khash, img->n_slots);
+        for (uint32_t d = 0, j = home;; d++) {
+            TCGCacheIdx y;
+
+            if (d >= MIN(TCG_CACHE_PROBES, img->n_slots)) {
+                bad++;
+                break;
+            }
+            if (j == k - img->slot) {
+                break;
+            }
+            if (file_entry_r(f, img->slot + j, &y) || !y.khash) {
+                bad++;
+                break;
+            }
+            j = j + 1 == img->n_slots ? 0 : j + 1;
+        }
+    }
+    if (occ != h->n_index || bitmap_count_one(seen, m) != m) {
+        bad++;
+    }
+    for (uint32_t i = 0; i < h->n_img; i++) {
+        uint32_t used = 0;
+
+        for (uint32_t k = 0; k < f->img[i].n_slots; k++) {
+            TCGCacheIdx x;
+
+            used += !file_entry_r(f, f->img[i].slot + k, &x) && x.khash;
+        }
+        bad += used != f->img[i].n;
+    }
+    return bad;
+}
+
 int tcg_cache_check_file(const void *map, size_t size, bool quiet,
                          uint64_t *counts)
 {
@@ -1715,8 +2216,7 @@ int tcg_cache_check_file(const void *map, size_t size, bool quiet,
         }
         return 1;
     }
-    n = f.hdr.magic == TCG_CACHE_PACK_MAGIC ? 1u << f.hdr.slot_log2
-                                             : f.hdr.n_index;
+    n = f.hdr.n_slots;
     for (uint32_t i = 0; i < n; i++) {
         TCGCacheIdx e;
 
@@ -1732,6 +2232,12 @@ int tcg_cache_check_file(const void *map, size_t size, bool quiet,
         r = check_one(&f, &e, buf, sizeof(TCGCacheEnv) + TCG_CACHE_ART_MAX);
         c[r]++;
         bad += r != 0;
+    }
+    {
+        uint64_t ib = check_index(&f);
+
+        c[TCG_CACHE_V_INDEX] += ib;
+        bad += ib;
     }
     if (!quiet) {
         fprintf(stderr, "xtcg-cache check: %s, %u entries:",
@@ -2633,6 +3139,12 @@ static int fuzz_known(void)
         fails++;
     }
     fails += xxh3_known_answers();
+    /* The key's serialization: xxHash's XXH3_64bits of the four words. */
+    if (tcg_cache_key_hash(0x0123456789abcdefull, 0x1000, 0x40, 0x23, 0x7)
+        != 0x653c9bea24377034ull) {
+        fprintf(stderr, "xtcg-cache fuzz: key hash wrong\n");
+        fails++;
+    }
     fprintf(stderr, "xtcg-cache fuzz: known answers: %d failures\n", fails);
     return fails;
 }
@@ -2686,7 +3198,8 @@ static int fuzz_select(const TCGCacheEnv *e, const TCGCacheEnv *other)
     TCGCacheIdx *idx;
     FuzzSel u = { };
     void *file, *buf = g_malloc(sizeof(TCGCacheEnv) + TCG_CACHE_ART_MAX);
-    uint64_t kh = key_hash(e->id, e->rva, e->flags, e->cs_base, e->cflags);
+    uint64_t kh = tcg_cache_key_hash(e->id, e->rva, e->flags, e->cs_base,
+                                     e->cflags);
     int fails = 0;
 
     for (int i = 0; i < 5; i++) {
@@ -2717,7 +3230,6 @@ static int fuzz_select(const TCGCacheEnv *e, const TCGCacheEnv *other)
 
         if (x->id == other->id && x->rva == other->rva) {
             idx[i].khash = kh;
-            idx[i].check = key_check(e->rva, e->flags);
         }
     }
     /* The forged entries first in the key's run, so they're met first. */
@@ -2745,8 +3257,8 @@ out:
 /*
  * Each envelope's checksum and content identity against XXH3_64 computed
  * here over their inputs; a checksum with one bit flipped refused by the
- * reader; the file with version 2 (its header's checksum made good)
- * refused.  @f is @snap opened, with @n index slots.  The number of
+ * reader; the file with the previous version (its header's checksum made
+ * good) refused.  @f is @snap opened, with @n index slots.  The number of
  * failures.
  */
 static int fuzz_envelopes(const TCGCacheFile *f, const uint8_t *snap,
@@ -2814,6 +3326,398 @@ static int fuzz_envelopes(const TCGCacheFile *f, const uint8_t *snap,
     return fails;
 }
 
+/*
+ * The whole-file check given what it must report (V_INDEX): an occupied
+ * entry zeroed; one duplicated into an empty slot; one moved to another
+ * image's table; a key hash changed; an entry moved past an empty slot,
+ * out of its home's reach; a segment's entries out of hash order; the
+ * data region ending short of its last envelope's end (its padding cut,
+ * or 8 bytes if it has none).  Each on a copy of
+ * @snap (@f opened), skipped where the file has nothing to break.  The
+ * number of failures.
+ */
+static int fuzz_index_damage(const TCGCacheFile *f, const uint8_t *snap,
+                             size_t size)
+{
+    static const char *const names[] = {
+        "zeroed", "duplicated", "other-image", "hash", "unreachable",
+        "segment-order", "short-data",
+    };
+    const TCGCacheFileHdr *h = &f->hdr;
+    g_autofree uint8_t *copy = g_malloc(size);
+    TCGCacheIdx *idx = (TCGCacheIdx *)(copy + h->index_off);
+    int fails = 0, cases = 0;
+
+    for (int c = 0; c < ARRAY_SIZE(names); c++) {
+        uint64_t counts[TCG_CACHE_V_MAX] = { };
+        int64_t occ = -1, hole = -1;
+        bool pack = h->magic == TCG_CACHE_PACK_MAGIC, ok = false;
+
+        memcpy(copy, snap, size);
+        /* The first occupied slot, and an empty one in its image after it. */
+        for (uint32_t k = 0; k < h->n_slots && occ < 0; k++) {
+            occ = idx[k].khash ? (int64_t)k : -1;
+        }
+        if (pack && occ >= 0) {
+            const TCGCacheImg *im = &f->img[0];
+
+            for (uint32_t i = 0; i < h->n_img; i++) {
+                if (occ >= f->img[i].slot
+                    && occ < (int64_t)f->img[i].slot + f->img[i].n_slots) {
+                    im = &f->img[i];
+                }
+            }
+            /* An empty slot whose predecessor is empty too: unreachable. */
+            for (uint32_t k = im->slot + 1; k < im->slot + im->n_slots; k++) {
+                if (!idx[k].khash && !idx[k - 1].khash
+                    && k != im->slot + slot_home(idx[occ].khash,
+                                                 im->n_slots)) {
+                    hole = k;
+                    break;
+                }
+            }
+        }
+        switch (c) {
+        case 0:
+            if (occ >= 0) {
+                idx[occ] = (TCGCacheIdx){ 0 };
+                ok = true;
+            }
+            break;
+        case 1:
+        case 4:
+            if (pack && occ >= 0 && hole >= 0) {
+                idx[hole] = idx[occ];
+                if (c == 4) {
+                    idx[occ] = (TCGCacheIdx){ 0 };
+                }
+                ok = true;
+            }
+            break;
+        case 2:
+            if (pack && occ >= 0 && h->n_img >= 2) {
+                for (uint32_t k = f->img[1].slot;
+                     k < f->img[1].slot + f->img[1].n_slots && !ok; k++) {
+                    if (!idx[k].khash && occ < f->img[1].slot) {
+                        idx[k] = idx[occ];
+                        idx[occ] = (TCGCacheIdx){ 0 };
+                        ok = true;
+                    }
+                }
+            }
+            break;
+        case 3:
+            if (occ >= 0) {
+                idx[occ].khash ^= 2;
+                ok = true;
+            }
+            break;
+        case 5:
+            for (uint32_t k = 1; !pack && k < h->n_index && !ok; k++) {
+                if (idx[k].khash != idx[k - 1].khash) {
+                    TCGCacheIdx t = idx[k];
+
+                    idx[k] = idx[k - 1];
+                    idx[k - 1] = t;
+                    ok = true;
+                }
+            }
+            break;
+        case 6: {
+            TCGCacheFileHdr *ch = (TCGCacheFileHdr *)copy;
+            uint64_t o = h->data_off, last = 0;
+
+            while (o < (uint64_t)h->data_off + h->data_len) {
+                last = o;
+                o += ROUND_UP(((const TCGCacheEnv *)(copy + o))->len, 8);
+            }
+            if (last) {
+                uint32_t len = ((const TCGCacheEnv *)(copy + last))->len;
+
+                /* Its padding, or 8 bytes of it if it has none. */
+                ch->data_len -= len % 8 ? ROUND_UP(len, 8) - len : 8;
+                ch->check = hdr_check(ch);
+                ok = true;
+            }
+            break;
+        }
+        }
+        if (!ok) {
+            continue;
+        }
+        cases++;
+        tcg_cache_check_file(copy, size, true, counts);
+        if (!counts[TCG_CACHE_V_INDEX]) {
+            fprintf(stderr, "xtcg-cache fuzz: index %s not reported\n",
+                    names[c]);
+            fails++;
+        }
+    }
+    fprintf(stderr, "xtcg-cache fuzz: index damage: %d cases, %d failures\n",
+            cases, fails);
+    return fails;
+}
+
+/*
+ * The planner, directly: entries of two images, random hashes; a plan
+ * given up at any of its checkpoints (including after a table doubled,
+ * with 4 probes) returns CANCEL owning nothing; a complete one places every
+ * entry once, within its probes of its home.  The number of failures.
+ */
+static int plan_cancel_at, plan_calls;
+
+static bool plan_test_checkpoint(void)
+{
+    return ++plan_calls != plan_cancel_at;
+}
+
+static int fuzz_plan(void)
+{
+    enum { N = 20000 };
+    g_autofree uint64_t *id = g_new(uint64_t, N), *kh = g_new(uint64_t, N);
+    uint64_t rng = 12345;
+    int fails = 0;
+
+    for (int i = 0; i < N; i++) {
+        id[i] = i % 3 ? 7 : 1ull << 40;
+        kh[i] = fuzz_rng(&rng) | 1;
+    }
+    for (int pi = 0; pi < 2; pi++) {
+        unsigned probes = pi ? TCG_CACHE_PROBES : 4;
+        TCGCacheIdxPlan p;
+        uint64_t growths;
+        int total;
+
+        plan_calls = 0;
+        plan_cancel_at = -1;
+        if (tcg_cache_index_plan(id, kh, N, probes, TCG_CACHE_IMG_MAX,
+                                 TCG_CACHE_SLOTS_MAX, plan_test_checkpoint,
+                                 &p)) {
+            fprintf(stderr, "xtcg-cache fuzz: plan (%u probes) refused\n",
+                    probes);
+            fails++;
+            continue;
+        }
+        total = plan_calls;
+        /* Each entry once, within its probes. */
+        {
+            g_autofree unsigned long *seen = bitmap_new(N);
+            int placed = 0;
+
+            for (uint32_t i = 0; i < p.n_img; i++) {
+                for (uint32_t k = 0; k < p.img[i].n_slots; k++) {
+                    uint32_t e = p.slot_entry[p.img[i].slot + k];
+                    uint32_t home;
+
+                    if (!e--) {
+                        continue;
+                    }
+                    home = slot_home(kh[e], p.img[i].n_slots);
+                    placed++;
+                    if (test_and_set_bit(e, seen) || id[e] != p.img[i].id
+                        || (k + p.img[i].n_slots - home) % p.img[i].n_slots
+                           >= probes) {
+                        fails++;
+                    }
+                }
+            }
+            fails += placed != N;
+        }
+        growths = p.growths;
+        tcg_cache_index_plan_free(&p);
+        /* Given up at each checkpoint, the last included. */
+        for (int at = 1; at <= total; at++) {
+            plan_calls = 0;
+            plan_cancel_at = at;
+            if (tcg_cache_index_plan(id, kh, N, probes, TCG_CACHE_IMG_MAX,
+                                     TCG_CACHE_SLOTS_MAX,
+                                     plan_test_checkpoint, &p)
+                != TCG_CACHE_PLAN_CANCEL
+                || p.img || p.slot_entry || p.n_img || p.n_slots) {
+                fprintf(stderr, "xtcg-cache fuzz: plan (%u probes) not "
+                        "given up at checkpoint %d of %d\n", probes, at,
+                        total);
+                fails++;
+            }
+            tcg_cache_index_plan_free(&p);
+        }
+        fprintf(stderr, "xtcg-cache fuzz: plan, %u probes: %" PRIu64
+                " growths, %d checkpoints\n", probes, growths, total);
+    }
+    fprintf(stderr, "xtcg-cache fuzz: plan: %d failures\n", fails);
+    return fails;
+}
+
+/*
+ * A pack's image records damaged, one rule broken at a time, the records'
+ * and the header's checksums made good: each refused at open; the records'
+ * checksum alone wrong: refused as such.  Keys not in the pack: no
+ * candidates.  @f is @snap opened.  The number of failures.
+ */
+static int fuzz_images(const TCGCacheFile *f, const uint8_t *snap,
+                       size_t size)
+{
+    static const char *const names[] = {
+        "id-repeated", "first-slot", "overlap", "past-index", "n-past-slots",
+        "n-sum", "pad", "img-max", "no-img", "img-over-index",
+        "img-checksum", "empty-table",
+    };
+    const TCGCacheFileHdr *h = &f->hdr;
+    g_autofree uint8_t *copy = g_malloc(size);
+    uint64_t rng = 0x9e3779b97f4a7c15ull;
+    size_t ibytes = (size_t)h->n_img * sizeof(TCGCacheImg);
+    int fails = 0, cases = 0;
+
+    if (h->magic != TCG_CACHE_PACK_MAGIC || !h->n_img) {
+        return 0;
+    }
+    for (int c = 0; c < ARRAY_SIZE(names); c++) {
+        TCGCacheFileHdr *ch = (TCGCacheFileHdr *)copy;
+        TCGCacheImg *im = (TCGCacheImg *)(copy + h->img_off);
+        int want = TCG_CACHE_V_HEADER, r;
+        TCGCacheFile g;
+
+        memcpy(copy, snap, size);
+        switch (c) {
+        case 0:
+            if (h->n_img < 2) {
+                continue;
+            }
+            im[1].id = im[0].id;
+            break;
+        case 1:
+            im[0].slot = 1;
+            break;
+        case 2:
+            if (h->n_img < 2) {
+                continue;
+            }
+            im[1].slot--;
+            im[1].n_slots++;
+            break;
+        case 3:
+            im[h->n_img - 1].n_slots++;
+            break;
+        case 4:
+            im[0].n = im[0].n_slots + 1;
+            break;
+        case 5:
+            im[0].n += im[0].n < im[0].n_slots ? 1 : -1;
+            break;
+        case 6:
+            im[0].pad = 1;
+            break;
+        case 7:
+            ch->n_img = TCG_CACHE_IMG_MAX + 1;
+            want = TCG_CACHE_V_LIMIT;
+            break;
+        case 8:
+            ch->n_img = 0;
+            want = TCG_CACHE_V_LIMIT;
+            break;
+        case 9:
+            ch->index_off -= 8;
+            want = TCG_CACHE_V_LIMIT;
+            break;
+        case 10:
+            im[0].id ^= 1;
+            want = TCG_CACHE_V_CHECK;
+            break;
+        case 11:
+            im[0].n_slots = 0;
+            break;
+        }
+        if (c != 10) {
+            ch->img_check = tcg_cache_hash64(4, im, ibytes);
+        }
+        ch->check = hdr_check(ch);
+        r = tcg_cache_file_open(&g, copy, size, tcg_cache_gcopy,
+                                tcg_cache_nofault);
+        tcg_cache_file_close(&g);
+        cases++;
+        if (r != want) {
+            fprintf(stderr, "xtcg-cache fuzz: image records %s: %s, not %s\n",
+                    names[c], tcg_cache_v_name(r), tcg_cache_v_name(want));
+            fails++;
+        }
+    }
+    /* Keys not in the pack, in its images and in none. */
+    for (int i = 0; i < 4096; i++) {
+        TCGCacheIdx got[TCG_CACHE_PROBES];
+        uint64_t id = f->img[i % h->n_img].id;
+
+        if (i & 1) {
+            id = fuzz_rng(&rng);
+            if (file_img(f, id)) {
+                continue;
+            }
+        }
+        if (tcg_cache_file_find(f, id, fuzz_rng(&rng) | 1, got,
+                                TCG_CACHE_PROBES)) {
+            fails++;
+        }
+    }
+    fprintf(stderr, "xtcg-cache fuzz: image records: %d cases, absent keys; "
+            "%d failures\n", cases, fails);
+    return fails;
+}
+
+/*
+ * A table whose every slot is full, all with one key hash: a find of it
+ * examines each slot once, finding exactly as many entries as slots.  The
+ * pack is written from two copies of @e, then its two empty slots forged.
+ */
+static int fuzz_full_table(const TCGCacheEnv *e)
+{
+    size_t al = e->len - sizeof(*e), dl = 0, flen;
+    g_autofree uint8_t *data = g_malloc(2 * ROUND_UP(e->len, 8));
+    g_autofree uint8_t *file = NULL;
+    TCGCacheIdx got[TCG_CACHE_PROBES], *idx, x = { };
+    TCGCacheFileHdr *h;
+    TCGCacheImg *img;
+    TCGCacheFile f;
+    int k, fails = 0;
+
+    for (int i = 0; i < 2; i++) {
+        dl += tcg_cache_envelope(data + dl, e->id, e->rva, e->born + i, e + 1,
+                                 al);
+    }
+    file = tcg_cache_write_file(true, 1, data, dl, NULL, 0, &flen);
+    h = (TCGCacheFileHdr *)file;
+    if (!file || h->n_img != 1 || h->n_slots != 4) {
+        fprintf(stderr, "xtcg-cache fuzz: full table: no file\n");
+        return 1;
+    }
+    img = (TCGCacheImg *)(file + h->img_off);
+    idx = (TCGCacheIdx *)(file + h->index_off);
+    for (int i = 0; i < 4; i++) {
+        if (idx[i].khash) {
+            x = idx[i];
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        idx[i] = x;
+    }
+    img->n = h->n_index = 4;
+    h->img_check = tcg_cache_hash64(4, img, sizeof(*img));
+    h->check = hdr_check(h);
+    if (tcg_cache_file_open(&f, file, flen, tcg_cache_gcopy,
+                            tcg_cache_nofault)) {
+        fprintf(stderr, "xtcg-cache fuzz: full table: refused\n");
+        return 1;
+    }
+    k = tcg_cache_file_find(&f, e->id, x.khash, got, TCG_CACHE_PROBES);
+    if (k != 4) {
+        fprintf(stderr, "xtcg-cache fuzz: full table: %d entries, not 4\n", k);
+        fails++;
+    }
+    k = tcg_cache_file_find(&f, e->id, x.khash ^ 1, got, TCG_CACHE_PROBES);
+    fails += k != 0;
+    tcg_cache_file_close(&f);
+    fprintf(stderr, "xtcg-cache fuzz: full table: %d failures\n", fails);
+    return fails;
+}
+
 int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
                         unsigned arts)
 {
@@ -2853,9 +3757,11 @@ int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
     copy = g_malloc(size);
     buf = g_malloc(bufsz);
     base_ok = base_counts[TCG_CACHE_V_OK];
-    n = f.hdr.magic == TCG_CACHE_PACK_MAGIC ? 1u << f.hdr.slot_log2
-                                             : f.hdr.n_index;
+    n = f.hdr.n_slots;
     fails += fuzz_envelopes(&f, snap, size, n);
+    fails += fuzz_images(&f, snap, size);
+    fails += fuzz_index_damage(&f, snap, size);
+    fails += fuzz_plan();
 
     /* Every artifact is found by its key, through the lookup's path. */
     for (uint32_t i = 0; i < n; i++) {
@@ -2868,8 +3774,10 @@ int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
             || !file_read(&f, e.off, &hdr, sizeof(hdr))) {
             continue;
         }
-        k = tcg_cache_file_find(&f, hdr.id, hdr.rva, hdr.flags, hdr.cs_base,
-                                hdr.cflags, got, TCG_CACHE_PROBES);
+        k = tcg_cache_file_find(&f, hdr.id,
+                                tcg_cache_key_hash(hdr.id, hdr.rva, hdr.flags,
+                                                   hdr.cs_base, hdr.cflags),
+                                got, TCG_CACHE_PROBES);
         for (int j = 0; j < k; j++) {
             found |= got[j].off == e.off;
         }
@@ -2901,6 +3809,9 @@ int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
         }
         if (got == 2) {
             fails += fuzz_select(two[0], two[1]);
+        }
+        if (got) {
+            fails += fuzz_full_table(two[0]);
         }
         g_free(two[0]);
         g_free(two[1]);
