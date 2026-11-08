@@ -437,6 +437,7 @@ typedef struct TCGCacheFile {
     size_t size;
     uint64_t index_bytes;
     TCGCacheCover *cover;   /* copied out, checked */
+    int level;              /* in a snapshot: TCG_CACHE_LEVEL_* */
     int64_t (*copy)(void *dst, const void *src, size_t len);
     void (*fault)(int64_t code);
 } TCGCacheFile;
@@ -512,12 +513,15 @@ int tcg_cache_file_get(const TCGCacheFile *f, const TCGCacheIdx *e,
                        size_t buf_size, const TCGCacheEnv **envp);
 void tcg_cache_nofault(int64_t code);
 bool tcg_cache_segment_name_ok(const char name[64]);
+bool tcg_cache_part_name_gen(const char name[64], uint64_t *genp);
 /*
- * The files a process reads: the pack first, then loose segments newest
- * first, the order lookups take them in.  Immutable once published;
- * @release unmaps them, after a grace period.
+ * The files a process reads: the pack first, then parts newest first,
+ * then loose segments newest first, the order lookups take them in, each
+ * file's level recorded.  Immutable once published; @release unmaps them,
+ * after a grace period.
  */
-#define TCG_CACHE_SNAP_FILES 17
+#define TCG_CACHE_SNAP_FILES 25
+enum { TCG_CACHE_LEVEL_PACK, TCG_CACHE_LEVEL_PART, TCG_CACHE_LEVEL_SEG };
 
 typedef struct TCGCacheSnap {
     struct rcu_head rcu;
@@ -710,6 +714,13 @@ typedef struct TCGCacheStats {
     uint64_t compact_damaged, compact_bytes, removed, remove_fail;
     uint64_t compact_dups, compact_skip, compact_regrow;
     uint64_t compact_exit, compact_collide;
+    /* Merges by kind: minor, parts, major, first (tcg-cache-dir.c.inc). */
+    uint64_t merge_done[4], merge_fail[4], merge_exit[4];
+    uint64_t merge_est_ns[4], merge_act_ns[4], merge_age_ns[4];
+    uint64_t merge_in_bytes[4], merge_emergency, merge_saturated;
+    uint64_t merge_tmp_bytes, parts_overflow;
+    uint64_t parts_live, parts_unresolved, parts_covered, scan_loose;
+    uint64_t merge_entries[4], scan_mem_max, merge_deferred;
     uint64_t look_ns, copy_ns, check_ns, hit_ns;
     /* A file lookup's parts, and an install's (XTCG_CACHE_COSTS). */
     uint64_t sel_finds, sel_find_ns, sel_gets, sel_get_bytes, sel_get_ns;

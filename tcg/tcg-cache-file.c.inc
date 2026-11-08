@@ -704,6 +704,70 @@ static bool file_read(const TCGCacheFile *f, uint64_t off, void *dst,
 }
 
 /* "seg-" then [0-9a-z-] then ".xtc", NUL-terminated within the field. */
+/*
+ * "part-", the generation in 16 lower-case hexadecimal digits, ".xtp",
+ * zero-padded to 64 bytes; the generation in *@genp.
+ */
+bool tcg_cache_part_name_gen(const char name[64], uint64_t *genp)
+{
+    uint64_t gen = 0;
+
+    if (strnlen(name, 64) != 25 || memcmp(name, "part-", 5)
+        || memcmp(name + 21, ".xtp", 4)) {
+        return false;
+    }
+    for (int i = 5; i < 21; i++) {
+        char c = name[i];
+
+        if (c >= '0' && c <= '9') {
+            gen = gen << 4 | (c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            gen = gen << 4 | (c - 'a' + 10);
+        } else {
+            return false;
+        }
+    }
+    for (int i = 25; i < 64; i++) {
+        if (name[i]) {
+            return false;
+        }
+    }
+    *genp = gen;
+    return true;
+}
+
+static int cover_name_cmp(const void *a, const void *b)
+{
+    return strncmp(((const TCGCacheCover *)a)->name,
+                   ((const TCGCacheCover *)b)->name, 64);
+}
+
+/*
+ * A cover list's entries: each names a segment, or a part of a lower
+ * generation than @tick (its holder's), and no name twice.
+ */
+static bool cover_list_ok(const TCGCacheCover *c, uint32_t n, uint64_t tick)
+{
+    g_autofree TCGCacheCover *s = NULL;
+
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t gen;
+
+        if (!tcg_cache_segment_name_ok(c[i].name)
+            && !(tcg_cache_part_name_gen(c[i].name, &gen) && gen < tick)) {
+            return false;
+        }
+    }
+    s = g_memdup2(c, (size_t)n * sizeof(*c));
+    qsort(s, n, sizeof(*s), cover_name_cmp);
+    for (uint32_t i = 1; i < n; i++) {
+        if (!cover_name_cmp(&s[i - 1], &s[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool tcg_cache_segment_name_ok(const char name[64])
 {
     size_t n = strnlen(name, 64);
@@ -788,11 +852,9 @@ int tcg_cache_file_open(TCGCacheFile *f, const void *map, size_t size,
             g_free(buf);
             return TCG_CACHE_V_CHECK;
         }
-        for (uint32_t i = 0; i < h->n_cover; i++) {
-            if (!tcg_cache_segment_name_ok(((TCGCacheCover *)buf)[i].name)) {
-                g_free(buf);
-                return TCG_CACHE_V_HEADER;
-            }
+        if (!cover_list_ok(buf, h->n_cover, h->tick)) {
+            g_free(buf);
+            return TCG_CACHE_V_HEADER;
         }
         f->cover = buf;
     }
@@ -934,14 +996,14 @@ int tcg_cache_file_get(const TCGCacheFile *f, const TCGCacheIdx *e,
  * bytes equal the earlier one's as got again: if that file changed
  * meanwhile, a candidate may be skipped that was never tried, or tried
  * twice, a miss or a wasted try, never an unchecked install.  At most
- * @limit passed: TCG_CACHE_CANDS from a snapshot's pack, as many again
- * from its loose segments.
+ * @limit passed: TCG_CACHE_CANDS from each of a snapshot's levels (its
+ * pack, its parts, its loose segments).
  */
 typedef struct SelSeen {
-    const TCGCacheFile *f[2 * TCG_CACHE_CANDS];
-    TCGCacheIdx e[2 * TCG_CACHE_CANDS];
-    uint64_t content[2 * TCG_CACHE_CANDS];
-    uint32_t len[2 * TCG_CACHE_CANDS];
+    const TCGCacheFile *f[3 * TCG_CACHE_CANDS];
+    TCGCacheIdx e[3 * TCG_CACHE_CANDS];
+    uint64_t content[3 * TCG_CACHE_CANDS];
+    uint32_t len[3 * TCG_CACHE_CANDS];
     void *buf2;
     int n, limit;
 } SelSeen;
@@ -1057,7 +1119,11 @@ int tcg_cache_file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
 
 /*
  * The same over a snapshot's files, in order: up to TCG_CACHE_CANDS
- * passed from its pack, then up to as many again from its loose segments.
+ * passed from each level, the pack's, the parts' (newest first), then the
+ * loose segments' (newest first).  A capture at a lower level of a key a
+ * higher one holds means the higher one's candidates failed where it was
+ * captured, so each level has its own budget.  Newer files of a level
+ * can use its budget up before an older usable candidate: a bounded miss.
  */
 int tcg_cache_snap_select(const TCGCacheSnap *snap, uint64_t id, uint64_t rva,
                           uint32_t flags, uint64_t cs_base, uint32_t cflags,
@@ -1066,23 +1132,15 @@ int tcg_cache_snap_select(const TCGCacheSnap *snap, uint64_t id, uint64_t rva,
                           void *opaque, uint64_t *rejects)
 {
     SelSeen seen = { .limit = TCG_CACHE_CANDS };
-    bool loose = false;
+    int level = TCG_CACHE_LEVEL_PACK;
     int n;
 
     for (int i = 0; i < snap->n; i++) {
-        /*
-         * The pack's candidates don't use up the loose segments': a loose
-         * capture of a key the pack holds means the pack's failed where
-         * it was captured.
-         */
-        if (!loose && snap->f[i].hdr.magic != TCG_CACHE_PACK_MAGIC) {
-            loose = true;
+        if (snap->f[i].level != level) {
+            level = snap->f[i].level;
             seen.limit = seen.n + TCG_CACHE_CANDS;
         }
         if (seen.n >= seen.limit) {
-            if (loose) {
-                break;
-            }
             continue;
         }
         if (file_select(&snap->f[i], id, rva, flags, cs_base, cflags, buf,

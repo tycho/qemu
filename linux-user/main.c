@@ -543,6 +543,13 @@ static void cache_file_switches(void)
             fprintf(stderr, "xtcg-cache: %s: changed under its mapping\n", f);
             exit(1);
         }
+        /*
+         * This hook runs before the process's fingerprint is known: the
+         * file's is taken (from the snapshot), so that the readers check
+         * everything else.
+         */
+        memcpy(tcg_cache_fingerprint, ((const TCGCacheFileHdr *)snap)->fp,
+               sizeof(tcg_cache_fingerprint));
         r = tcg_cache_fuzz_file(snap, size, sv, arts ? atoi(arts) : 1000000);
         /* The snapshot is known good once the fuzzer passed it. */
         r += r ? 0 : cache_truncate_test(snap, size);
