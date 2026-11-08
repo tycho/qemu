@@ -16,7 +16,19 @@
 
 static const TCGCacheDirOps *dir_ops;
 static bool dir_child;              /* a fork's child: read only */
-static bool dir_quiesced;           /* this thread holds dir_wwork */
+/*
+ * Who ends the back end: one terminating thread takes it, by
+ * compare-and-exchange from DIR_RUNNING, to quiesce it (DIR_QUIESCED) or
+ * to publish at exit (DIR_EXITING).  Once it is taken the writer starts no
+ * refresh; one already started is waited for by the quiesce.  The OS runs
+ * these calls where a terminating thread can't be suspended inside them,
+ * so none is left holding a lock.
+ */
+enum { DIR_RUNNING, DIR_QUIESCED, DIR_EXITING };
+static int dir_shutdown;
+static int dir_shutdown_tid;        /* DIR_QUIESCED's thread, holding wwork */
+static bool dir_quiescing;          /* a quiesce has begun */
+static bool dir_quiet;              /* and is complete */
 static QemuThread dir_writer;
 static QemuMutex dir_wlock;
 static QemuCond dir_wcond;
@@ -43,14 +55,17 @@ static QemuMutex dir_wwork;
 
 /*
  * Testing: XTCG_CACHE_HOLD_MS, each of the writer's locks held;
- * XTCG_CACHE_PAUSE_<where>_MS, a pause at a point of the work;
+ * XTCG_CACHE_PAUSE_<where>_MS, a pause at a point of the work (CLAIM:
+ * the exit's, once it has taken the shutdown);
  * XTCG_CACHE_REFRESH_ALWAYS, a refresh every second regardless;
  * XTCG_CACHE_EXIT_NOLOCK, the exit's publication without dir_wwork.
  * Read at start, so that the writer never reads the environment.
  */
 static unsigned dir_hold_ms, dir_pause_publish_ms, dir_pause_snap_ms;
-static unsigned dir_pause_mapped_ms, dir_pause_exit_ms;
+static unsigned dir_pause_mapped_ms, dir_pause_exit_ms, dir_pause_claim_ms;
 static bool dir_refresh_always, dir_exit_nolock;
+/* Testing (XTCG_CACHE_TEST_LOSE): quiesce as if an exit had the shutdown. */
+static bool dir_test_lose;
 
 static unsigned dir_env_ms(const char *name)
 {
@@ -373,7 +388,8 @@ static void *dir_writer_main(void *arg)
         }
         now = get_clock();
         if ((qatomic_read(&tcg_cache_file_missed) || dir_refresh_always)
-            && now - dir_last_refresh >= DIR_REFRESH_NS) {
+            && now - dir_last_refresh >= DIR_REFRESH_NS
+            && !qatomic_read(&dir_shutdown)) {
             qatomic_set(&tcg_cache_file_missed, false);
             dir_last_refresh = now;
             dir_refresh();
@@ -490,10 +506,12 @@ void tcg_cache_dir_start(const TCGCacheDirOps *ops, int64_t t0)
     dir_pause_snap_ms = dir_env_ms("XTCG_CACHE_PAUSE_SNAP_MS");
     dir_pause_exit_ms = dir_env_ms("XTCG_CACHE_PAUSE_EXIT_MS");
     dir_pause_mapped_ms = dir_env_ms("XTCG_CACHE_PAUSE_MAPPED_MS");
+    dir_pause_claim_ms = dir_env_ms("XTCG_CACHE_PAUSE_CLAIM_MS");
     tcg_cache_retire_pause_ms = dir_env_ms("XTCG_CACHE_PAUSE_RETIRE_MS");
     tcg_cache_sink_pause_ms = dir_env_ms("XTCG_CACHE_PAUSE_PUT_MS");
     dir_refresh_always = getenv("XTCG_CACHE_REFRESH_ALWAYS");
     dir_exit_nolock = getenv("XTCG_CACHE_EXIT_NOLOCK");
+    dir_test_lose = getenv("XTCG_CACHE_TEST_LOSE");
     dir_exit_cap = tcg_cache_segment_bound(TCG_CACHE_BUF_SIZE);
     dir_exit_buf = g_malloc(dir_exit_cap);
     if (getenv("XTCG_CACHE_CHECKALL")) {
@@ -520,29 +538,72 @@ void tcg_cache_dir_start(const TCGCacheDirOps *ops, int64_t t0)
 /*
  * The writer finishes its round, if it is in one, and never starts
  * another: from here this thread holds dir_wwork, so that the writer
- * holds none of the back end's locks when the process kills it.  Only
- * while the process's other threads are still alive.
+ * holds none of the back end's locks when the process kills it.  Then
+ * what the sink holds is published, and the snapshots already retired are
+ * reclaimed, so that QEMU's RCU thread, which reclaims them, holds none of
+ * its locks either (a thread that enters the engine later registers with
+ * it); nothing retires another.  Only while the process's other threads
+ * are alive, and none of them in the engine; not inside an RCU read-side
+ * section.
+ *
+ * If a thread is publishing at exit (DIR_EXITING), this one still stops
+ * the writer, after that publication, but publishes nothing.  Once done,
+ * a quiesce returns at once.  Two never overlap: a process ends by
+ * ExitProcess on one thread at a time.  A call that finds one in progress
+ * nonetheless only stops captures, and submits no work to the RCU thread.
  */
 void tcg_cache_dir_quiesce(void)
 {
-    if (!dir_ops || dir_child || dir_quiesced) {
+    int64_t t0;
+    int was;
+
+    if (!dir_ops || dir_child) {
         return;
     }
+    if (qatomic_read(&dir_quiet)) {
+        return;
+    }
+    if (qatomic_xchg(&dir_quiescing, true)) {
+        qatomic_set(&tcg_cache_sink_on, false);
+        return;
+    }
+    if (dir_test_lose) {
+        qatomic_cmpxchg(&dir_shutdown, DIR_RUNNING, DIR_EXITING);
+    }
+    was = qatomic_cmpxchg(&dir_shutdown, DIR_RUNNING, DIR_QUIESCED);
+    t0 = get_clock();
     qemu_mutex_lock(&dir_wwork);
-    dir_quiesced = true;
+    if (was == DIR_RUNNING) {
+        qatomic_set(&dir_shutdown_tid, qemu_get_thread_id());
+    } else {
+        qatomic_set(&tcg_cache_sink_on, false);
+    }
     qemu_mutex_lock(&dir_wlock);
     dir_writer_on = false;
     qemu_cond_signal(&dir_wcond);
     qemu_mutex_unlock(&dir_wlock);
-    for (int i = 0; i < TCG_CACHE_BUFS; i++) {
+    if (tcg_cache_debug) {
+        fprintf(stderr, "xtcg-cache: quiesce (%s): the writer stopped after "
+                "%.3f ms\n", was == DIR_RUNNING ? "owner" : "after an exit",
+                (get_clock() - t0) / 1e6);
+    }
+    for (int i = 0; was == DIR_RUNNING && i < TCG_CACHE_BUFS; i++) {
         dir_drain(true);
+    }
+    t0 = get_clock();
+    drain_call_rcu();
+    qatomic_set(&dir_quiet, true);
+    if (tcg_cache_debug) {
+        fprintf(stderr, "xtcg-cache: quiesced, reclamation %.3f ms\n",
+                (get_clock() - t0) / 1e6);
     }
 }
 
 /*
  * A clean exit: captures stop here, and what the buffers hold is
- * published from this thread, allocating nothing and waiting for no lock.
- * If the sink's lock or the writer's work is busy, nothing.
+ * published from this thread, allocating nothing and waiting for no lock:
+ * by the thread that quiesced the back end, or else by the first to end
+ * it, if the sink's lock and the writer's work are free.
  */
 void tcg_cache_dir_exit(void)
 {
@@ -554,13 +615,28 @@ void tcg_cache_dir_exit(void)
     if (!dir_ops || dir_child) {
         return;
     }
+    if (qatomic_read(&dir_shutdown) == DIR_QUIESCED) {
+        if (qatomic_read(&dir_shutdown_tid) != qemu_get_thread_id()) {
+            qatomic_set(&tcg_cache_sink_on, false);
+            return;
+        }
+    } else if (qatomic_cmpxchg(&dir_shutdown, DIR_RUNNING, DIR_EXITING)
+               != DIR_RUNNING) {
+        qatomic_set(&tcg_cache_sink_on, false);
+        return;
+    }
+    dir_pause(dir_pause_claim_ms);
     n = tcg_cache_sink_close(data, lens);
     if (!n) {
         return;
     }
     /* Testing (XTCG_CACHE_EXIT_NOLOCK): without dir_wwork, as a hazard. */
-    if (!dir_quiesced && !dir_exit_nolock) {
+    if (qatomic_read(&dir_shutdown) == DIR_EXITING && !dir_exit_nolock) {
         if (qemu_mutex_trylock(&dir_wwork)) {
+            if (tcg_cache_debug) {
+                fprintf(stderr, "xtcg-cache: exit: the writer is busy, "
+                        "nothing published\n");
+            }
             return;
         }
         locked = true;
@@ -592,7 +668,7 @@ void tcg_cache_dir_exit(void)
  */
 void tcg_cache_dir_fork_start(void)
 {
-    if (!dir_ops || dir_quiesced) {
+    if (!dir_ops || qatomic_read(&dir_shutdown) == DIR_QUIESCED) {
         return;
     }
     qemu_mutex_lock(&dir_wwork);
@@ -602,7 +678,7 @@ void tcg_cache_dir_fork_start(void)
 
 void tcg_cache_dir_fork_end(bool child)
 {
-    if (!dir_ops || dir_quiesced) {
+    if (!dir_ops || qatomic_read(&dir_shutdown) == DIR_QUIESCED) {
         return;
     }
     tcg_cache_sink_fork_end(child);

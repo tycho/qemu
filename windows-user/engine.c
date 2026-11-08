@@ -894,5 +894,6 @@ bool xt_exit_strict, xt_exit_report, xt_lock_check, xt_gate_check;
     }
     tcg_prologue_init();
     xt_spare_cpu = first;
+    xt_cache_files_init(first);
     return 0;
 }
