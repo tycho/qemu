@@ -926,10 +926,24 @@ int tcg_cache_file_get(const TCGCacheFile *f, const TCGCacheIdx *e,
     return TCG_CACHE_V_OK;
 }
 
-/* Candidates already passed, across the files of one lookup. */
+/*
+ * Candidates already passed, across the files of one lookup: where each
+ * is and its identity, so that a later one of the same identity and
+ * length can be compared with it by its bytes (got again, which is rare:
+ * the first candidate usually installs).  A copy is skipped only if its
+ * bytes equal the earlier one's as got again: if that file changed
+ * meanwhile, a candidate may be skipped that was never tried, or tried
+ * twice, a miss or a wasted try, never an unchecked install.  At most
+ * @limit passed: TCG_CACHE_CANDS from a snapshot's pack, as many again
+ * from its loose segments.
+ */
 typedef struct SelSeen {
-    void *env[TCG_CACHE_CANDS];
-    int n;
+    const TCGCacheFile *f[2 * TCG_CACHE_CANDS];
+    TCGCacheIdx e[2 * TCG_CACHE_CANDS];
+    uint64_t content[2 * TCG_CACHE_CANDS];
+    uint32_t len[2 * TCG_CACHE_CANDS];
+    void *buf2;
+    int n, limit;
 } SelSeen;
 
 /* One file's candidates for a key; true if @use stopped the lookup. */
@@ -940,34 +954,56 @@ static bool file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
                         void *opaque, uint64_t *rejects, SelSeen *seen)
 {
     TCGCacheIdx fe[TCG_CACHE_PROBES];
+    int64_t tp = tcg_cache_costs ? get_clock() : 0;
     int fn;
 
     fn = tcg_cache_file_find(f, id, rva, flags, cs_base, cflags, fe,
                              TCG_CACHE_PROBES);
+    tcg_cache_stats.sel_finds++;
+    tcg_cache_part(&tcg_cache_stats.sel_find_ns, &tp);
     if (fn < 0 && rejects) {
         rejects[TCG_CACHE_V_LIMIT]++;
     }
-    for (int i = 0; i < fn && seen->n < TCG_CACHE_CANDS; i++) {
+    for (int i = 0; i < fn && seen->n < seen->limit; i++) {
         const TCGCacheEnv *env;
         bool dup = false;
         int r;
 
         r = tcg_cache_file_get(f, &fe[i], id, rva, flags, cs_base, cflags,
                                buf, bufsz, &env);
+        tcg_cache_stats.sel_gets++;
+        tcg_cache_part(&tcg_cache_stats.sel_get_ns, &tp);
         if (r == TCG_CACHE_V_KEY) {
             continue;
         }
         if (!r) {
+            tcg_cache_stats.sel_get_bytes += env->len;
             for (int k = 0; k < seen->n && !dup; k++) {
-                const TCGCacheEnv *o = seen->env[k];
+                const TCGCacheEnv *o;
 
-                dup = o->content == env->content && o->len == env->len
+                if (seen->content[k] != env->content
+                    || seen->len[k] != env->len) {
+                    continue;
+                }
+                if (!seen->buf2) {
+                    seen->buf2 = g_malloc(bufsz);
+                }
+                /* Changed since: not known to be a copy. */
+                dup = !tcg_cache_test_reget_fail
+                      && !tcg_cache_file_get(seen->f[k], &seen->e[k], id, rva,
+                                          flags, cs_base, cflags, seen->buf2,
+                                          bufsz, &o)
+                      && o->len == env->len
                       && !memcmp(o + 1, env + 1, env->len - sizeof(*env));
             }
+            tcg_cache_part(&tcg_cache_stats.sel_dup_ns, &tp);
             if (dup) {
+                tcg_cache_stats.sel_dups++;
                 continue;
             }
             r = tcg_cache_validate(env + 1, env->len - sizeof(*env));
+            tcg_cache_stats.sel_vals++;
+            tcg_cache_part(&tcg_cache_stats.sel_val_ns, &tp);
         }
         if (r) {
             if (rejects) {
@@ -975,9 +1011,16 @@ static bool file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
             }
             continue;
         }
-        seen->env[seen->n++] = g_memdup2(env, env->len);
+        seen->f[seen->n] = f;
+        seen->e[seen->n] = fe[i];
+        seen->content[seen->n] = env->content;
+        seen->len[seen->n++] = env->len;
+        tcg_cache_part(&tcg_cache_stats.sel_dup_ns, &tp);
         if (use(env, opaque)) {
             return true;
+        }
+        if (tcg_cache_costs) {
+            tp = get_clock();
         }
     }
     return false;
@@ -985,9 +1028,7 @@ static bool file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
 
 static void sel_seen_free(SelSeen *seen)
 {
-    for (int k = 0; k < seen->n; k++) {
-        g_free(seen->env[k]);
-    }
+    g_free(seen->buf2);
 }
 
 /*
@@ -1004,7 +1045,7 @@ int tcg_cache_file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
                           bool (*use)(const TCGCacheEnv *env, void *opaque),
                           void *opaque, uint64_t *rejects)
 {
-    SelSeen seen = { };
+    SelSeen seen = { .limit = TCG_CACHE_CANDS };
     int n;
 
     file_select(f, id, rva, flags, cs_base, cflags, buf, bufsz, use, opaque,
@@ -1014,17 +1055,36 @@ int tcg_cache_file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
     return n;
 }
 
-/* The same over a snapshot's files, in order, with one budget. */
+/*
+ * The same over a snapshot's files, in order: up to TCG_CACHE_CANDS
+ * passed from its pack, then up to as many again from its loose segments.
+ */
 int tcg_cache_snap_select(const TCGCacheSnap *snap, uint64_t id, uint64_t rva,
                           uint32_t flags, uint64_t cs_base, uint32_t cflags,
                           void *buf, size_t bufsz,
                           bool (*use)(const TCGCacheEnv *env, void *opaque),
                           void *opaque, uint64_t *rejects)
 {
-    SelSeen seen = { };
+    SelSeen seen = { .limit = TCG_CACHE_CANDS };
+    bool loose = false;
     int n;
 
-    for (int i = 0; i < snap->n && seen.n < TCG_CACHE_CANDS; i++) {
+    for (int i = 0; i < snap->n; i++) {
+        /*
+         * The pack's candidates don't use up the loose segments': a loose
+         * capture of a key the pack holds means the pack's failed where
+         * it was captured.
+         */
+        if (!loose && snap->f[i].hdr.magic != TCG_CACHE_PACK_MAGIC) {
+            loose = true;
+            seen.limit = seen.n + TCG_CACHE_CANDS;
+        }
+        if (seen.n >= seen.limit) {
+            if (loose) {
+                break;
+            }
+            continue;
+        }
         if (file_select(&snap->f[i], id, rva, flags, cs_base, cflags, buf,
                         bufsz, use, opaque, rejects, &seen)) {
             break;
@@ -1144,6 +1204,9 @@ void tcg_cache_sink_put(uint64_t id, uint64_t rva, uint32_t born,
     size_t need = ROUND_UP(sizeof(TCGCacheEnv) + len, 8);
     bool queued = false;
 
+    if (tcg_cache_no_write) {
+        return;
+    }
     if (!qatomic_read(&tcg_cache_sink_on) || need > TCG_CACHE_BUF_SIZE) {
         tcg_cache_stats.sink_dropped++;
         return;

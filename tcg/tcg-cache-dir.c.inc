@@ -533,7 +533,7 @@ static bool dir_pack_owed;
  * budget, counted with the current snapshot (which this one retires; no
  * build runs while a retired one is pending, and a fork's child builds
  * none): the pack first, then segments newest first, until one doesn't
- * fit.
+ * fit.  Lookups take the files in that order too.
  */
 static TCGCacheSnap *dir_snap_build(void)
 {
@@ -569,7 +569,14 @@ static TCGCacheSnap *dir_snap_build(void)
             }
         }
     }
-    while (snap->n < DIR_LOOSE_MAX
+    /*
+     * The pack first: in steady state it holds nearly every hit, and a
+     * lookup stops at the first candidate that installs.
+     */
+    if (have_pack) {
+        snap->f[snap->n++] = pack;
+    }
+    while (snap->n - have_pack < DIR_LOOSE_MAX
            && (i < sc->nnewest || j < sc->nnewest_cov)) {
         bool cov = i == sc->nnewest
                    || (j < sc->nnewest_cov
@@ -586,16 +593,13 @@ static TCGCacheSnap *dir_snap_build(void)
         if (!dir_map_file(d->name, f, dir_map_max - mapped)) {
             continue;
         }
-        c = cov && have_pack ? dir_cover_find(&pack, d->name) : -1;
-        if (c >= 0 && pack.cover[c].hdr_check == f->hdr.check) {
+        c = cov && have_pack ? dir_cover_find(&snap->f[0], d->name) : -1;
+        if (c >= 0 && snap->f[0].cover[c].hdr_check == f->hdr.check) {
             dir_unmap_file(f);
             continue;
         }
         mapped += f->size;
         snap->n++;
-    }
-    if (have_pack) {
-        snap->f[snap->n++] = pack;
     }
 done:
     dir_scan_done(sc);
@@ -670,6 +674,7 @@ static bool dir_publish(const void *data, size_t len, unsigned pause_ms)
     dir_pub_since++;
     dir_pub_bytes_since += flen;
     tcg_cache_stats.published++;
+    tcg_cache_stats.publish_bytes += flen;
     tcg_cache_stats.publish_ns += get_clock() - t0;
     return true;
 }
@@ -762,7 +767,7 @@ static void dir_refresh(void)
 }
 
 /*
- * Compaction and cleanup (the design's phase 3, step 4, revision 8), on
+ * Compaction and cleanup, on
  * the writer thread, under dir_wwork and the directory's lock, giving up
  * once the process starts ending.
  *
@@ -1595,7 +1600,7 @@ static void *dir_writer_main(void *arg)
             dir_last_refresh = now;
             dir_refresh();
         }
-        if (!dir_ending()) {
+        if (!dir_ending() && !tcg_cache_no_write) {
             uint64_t loose = dir_seen_loose + dir_pub_since;
             bool merge = loose > dir_compact_loose
                          || dir_seen_loose_bytes + dir_pub_bytes_since
@@ -1931,6 +1936,7 @@ void tcg_cache_dir_exit(void)
         if (flen && dir_ops->publish(dir_exit_buf, flen, name,
                                      dir_pause_exit_ms)) {
             tcg_cache_stats.published++;
+            tcg_cache_stats.publish_bytes += flen;
         } else {
             tcg_cache_stats.publish_fail++;
         }

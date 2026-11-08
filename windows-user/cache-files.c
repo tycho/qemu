@@ -106,6 +106,12 @@ typedef struct XtFileDisposition {
                          FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD)
 
 bool xt_cache_files;
+/*
+ * Development (the cachefresh setting): the files in a directory of this
+ * process's own under the cache's, "fresh-" and the process id in hex, so
+ * that every run starts cold and writes as a first run does.
+ */
+bool xt_cache_fresh;
 
 static HANDLE dir_h;
 static union {
@@ -823,6 +829,18 @@ void xt_cache_files_init(CPUState *first)
         if (h) {
             NtClose(h);
         }
+    }
+    if (b && xt_cache_fresh) {
+        WCHAR fresh[16] = L"fresh-";
+        DWORD pid = GetCurrentProcessId();
+        size_t k = 6;
+
+        for (int sh = 28; sh >= 0; sh -= 4) {
+            fresh[k++] = L"0123456789abcdef"[(pid >> sh) & 0xf];
+        }
+        h = nt_open_dir(b, fresh, k);
+        NtClose(b);
+        b = h;
     }
     if (!b) {
         fprintf(stderr, "xtcg-cache: no directory of ours: files off\n");

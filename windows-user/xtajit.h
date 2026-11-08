@@ -409,6 +409,7 @@ void xt_cache_selftest(void);
 /* cache-files.c: the translation cache's files (cachefiles) */
 extern IMAGE_DOS_HEADER __ImageBase;
 extern bool xt_cache_files;
+extern bool xt_cache_fresh;
 void xt_cache_files_init(CPUState *first);
 
 /* fault.c */
