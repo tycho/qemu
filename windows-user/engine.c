@@ -681,6 +681,15 @@ static void set_settings(Object *accel, const char *settings)
                 applied++;
             } else if (!strcmp(kv[i], "cachestats")) {
                 tcg_cache_stats_at_exit = true;
+                tcg_cache_timing = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cachenowrite")) {
+                /* Files read, never written (development). */
+                tcg_cache_no_write = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cachefresh")) {
+                /* A new directory for each process (development). */
+                xt_cache_fresh = true;
                 applied++;
 #ifdef TARGET_X86_64
             } else if (!strcmp(kv[i], "rcustress")) {
