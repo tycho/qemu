@@ -17,6 +17,7 @@
  *  along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include "tcg/tcg-cache.h"
 #include "qemu/bitops.h"
 #include "qemu/cutils.h"
 #include "gdbstub/user.h"
@@ -1145,6 +1146,20 @@ static void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
             host_signal_smc_inline(info, uc)) {
             return;
         }
+#if defined(__aarch64__)
+        /*
+         * A guarded routine's source load (tcg-cache.h): back to its
+         * caller with a fault code.
+         */
+        if ((host_sig == SIGSEGV || host_sig == SIGBUS) &&
+            tcg_cache_guard_pc(host_signal_pc(uc))) {
+            host_signal_set_xreg(uc, 0, TCG_CACHE_GFAULT |
+                                 ((uintptr_t)info->si_addr &
+                                  (TCG_CACHE_GFAULT_GUARD - 1)));
+            host_signal_set_pc(uc, uc->uc_mcontext.regs[30]);
+            return;
+        }
+#endif
         switch (host_sig) {
         case SIGSEGV:
 #ifdef HOST_SIGNAL_SET_XREG

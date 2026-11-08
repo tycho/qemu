@@ -200,6 +200,11 @@ static void refresh_region_flags(vaddr start, vaddr last, int flags)
     }
 }
 
+bool xt_is_own_image(const void *alloc_base)
+{
+    return alloc_base == (const void *)&__ImageBase;
+}
+
 /*
  * Bring QEMU's page flags for ADDR's page up to date with Windows; true if
  * the access is allowed now, by the flags as they stand under the mmap
@@ -623,6 +628,8 @@ void xt_invalidate(vaddr start, vaddr len)
 
 CPUState *xt_spare_cpu;
 static int applied, rejected;
+/* The translation cache (testing): cachedump, cacheselftest. */
+bool cache_dump, cache_selftest;
 /*
  * crossinline: keep ordered accesses' inline crossing test (measuring);
  * crossprobefault: the probe meets a fault (testing xt_cross_probe).
@@ -668,6 +675,45 @@ static void set_settings(Object *accel, const char *settings)
                 applied++;
             } else if (!strcmp(kv[i], "cachestats")) {
                 tcg_cache_stats_at_exit = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cache")) {
+                /* Keep image code's artifacts; install before translating. */
+                tcg_cache_mode = TCG_CACHE_ON;
+                applied++;
+            } else if (!strcmp(kv[i], "cachetrace")) {
+                tcg_cache_trace = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cachedump")) {
+                cache_dump = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cacheinjpromote")) {
+                tcg_cache_inj_promote = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cacheselftest")) {
+                cache_selftest = true;
+                applied++;
+            } else {
+                rejected++;
+            }
+            continue;
+        }
+        /* The translation cache's settings with a value (testing). */
+        if (!strncmp(kv[i], "cacheflush=", 11)) {
+            tcg_cache_flush_every = atoi(eq + 1);
+            applied++;
+            continue;
+        }
+        if (!strncmp(kv[i], "cachemax=", 9)) {
+            tcg_cache_max = (size_t)atoi(eq + 1) << 20;
+            applied++;
+            continue;
+        }
+        if (!strncmp(kv[i], "cacheinj=", 9)) {
+            xt_cache_inj = !strcmp(eq + 1, "noaccess") ? XT_CACHE_INJ_NOACCESS
+                         : !strcmp(eq + 1, "guard") ? XT_CACHE_INJ_GUARD
+                         : !strcmp(eq + 1, "byte") ? XT_CACHE_INJ_BYTE
+                         : XT_CACHE_INJ_NONE;
+            if (xt_cache_inj) {
                 applied++;
             } else {
                 rejected++;
@@ -794,6 +840,9 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
                            !cross_inline;
     ac->init_machine(accel, NULL);
     log_settings(OBJECT(accel));
+    if (tcg_cache_mode) {
+        xt_cache_init();
+    }
     if (n_applied) {
         *n_applied = applied;
         *n_rejected = rejected;

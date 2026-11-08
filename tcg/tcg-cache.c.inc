@@ -11,6 +11,18 @@ static bool tcg_cache_verify_on;
 unsigned tcg_cache_skew;
 bool tcg_cache_stats_at_exit;
 bool tcg_cache_debug;
+unsigned tcg_cache_flush_every;
+size_t tcg_cache_max = 256 * MiB;
+bool tcg_cache_inj_promote;
+const TCGCacheHost *tcg_cache_host;
+bool tcg_cache_trace;
+
+static void tcg_cache_out_stderr(const char *line)
+{
+    fputs(line, stderr);
+}
+
+void (*tcg_cache_out)(const char *line) = tcg_cache_out_stderr;
 TCGCacheStats tcg_cache_stats;
 
 const char *const tcg_cache_x_names[TCG_CACHE_X_MAX] = {
@@ -35,9 +47,13 @@ const char *const tcg_cache_x_names[TCG_CACHE_X_MAX] = {
 };
 
 /*
- * XTCG_CACHE=capture|stress (development): record and check every
- * translation, or also install each from its artifact.  XTCG_CACHE_SKEW=n
- * moves each install by up to n 16-byte steps in each part.
+ * XTCG_CACHE=capture|stress|on (development): record and check every
+ * translation, or also install each from its artifact, or keep eligible
+ * artifacts and install from them before translating.  XTCG_CACHE_SKEW=n
+ * moves each install by up to n 16-byte steps in each part;
+ * XTCG_CACHE_FLUSH=n flushes the code buffer every n translations;
+ * XTCG_CACHE_MAX=n bounds the store at n MiB; XTCG_CACHE_INJPROMOTE
+ * promotes an install's first acquire/release site after its check.
  */
 static void tcg_cache_init(void)
 {
@@ -48,6 +64,8 @@ static void tcg_cache_init(void)
         tcg_cache_mode = TCG_CACHE_CAPTURE;
     } else if (m && !strcmp(m, "stress")) {
         tcg_cache_mode = TCG_CACHE_STRESS;
+    } else if (m && !strcmp(m, "on")) {
+        tcg_cache_mode = TCG_CACHE_ON;
     }
     tcg_cache_verify_on = tcg_cache_mode != TCG_CACHE_OFF
                           && !getenv("XTCG_CACHE_NOVERIFY");
@@ -56,6 +74,20 @@ static void tcg_cache_init(void)
     }
     if (getenv("XTCG_CACHE_DEBUG")) {
         tcg_cache_debug = true;
+    }
+    k = getenv("XTCG_CACHE_FLUSH");
+    if (k) {
+        tcg_cache_flush_every = atoi(k);
+    }
+    k = getenv("XTCG_CACHE_MAX");
+    if (k) {
+        tcg_cache_max = (size_t)atoi(k) * MiB;
+    }
+    if (getenv("XTCG_CACHE_INJPROMOTE")) {
+        tcg_cache_inj_promote = true;
+    }
+    if (getenv("XTCG_CACHE_TRACE")) {
+        tcg_cache_trace = true;
     }
 }
 
@@ -157,6 +189,9 @@ void tcg_cache_acqrel(TCGContext *s, uint64_t pc)
     }
     s->cap_acq[s->cap_nacq++] = pc;
 }
+
+/* The last capture's exclusion (statistics). */
+unsigned tcg_cache_last_reason;
 
 #ifdef TCG_TARGET_HAS_CACHE
 
@@ -526,6 +561,7 @@ static void cap_buf_add(CapBuf *b, const void *p, size_t n)
 static void cap_reject(TCGContext *s, unsigned reason)
 {
     tcg_cache_stats.excluded[reason]++;
+    tcg_cache_last_reason = reason;
 }
 
 void *tcg_cache_capture(TCGContext *s, TranslationBlock *tb,
@@ -1063,6 +1099,188 @@ void tcg_cache_commit(TCGContext *s, const TCGCacheRes *r)
     qatomic_set(&s->code_gen_ptr, r->code_gen_ptr);
 }
 
+/*
+ * The store (TCG_CACHE_ON): an open-addressed table of keys, each with its
+ * candidates newest first.  The caller holds mmap_lock.
+ */
+typedef struct CacheEnt {
+    struct CacheEnt *older;
+    uint64_t id, rva, cs_base, base;
+    uint32_t flags, cflags;
+    size_t len;
+    void *art;
+} CacheEnt;
+
+static CacheEnt **cache_tab;
+static size_t cache_size, cache_keys, cache_bytes;
+
+static uint32_t cache_hash(uint64_t id, uint64_t rva, uint32_t flags,
+                           uint64_t cs_base, uint32_t cflags)
+{
+    return qemu_xxhash8(id, rva, cs_base, flags, cflags);
+}
+
+static bool cache_key_eq(const CacheEnt *e, uint64_t id, uint64_t rva,
+                         uint32_t flags, uint64_t cs_base, uint32_t cflags)
+{
+    return e->id == id && e->rva == rva && e->flags == flags &&
+           e->cs_base == cs_base && e->cflags == cflags;
+}
+
+static CacheEnt **cache_slot(uint64_t id, uint64_t rva, uint32_t flags,
+                             uint64_t cs_base, uint32_t cflags)
+{
+    size_t i = cache_hash(id, rva, flags, cs_base, cflags) & (cache_size - 1);
+
+    while (cache_tab[i] &&
+           !cache_key_eq(cache_tab[i], id, rva, flags, cs_base, cflags)) {
+        i = (i + 1) & (cache_size - 1);
+    }
+    return &cache_tab[i];
+}
+
+static void cache_grow(void)
+{
+    CacheEnt **old = cache_tab;
+    size_t n = cache_size;
+
+    cache_size = n ? n * 2 : 4096;
+    cache_tab = g_new0(CacheEnt *, cache_size);
+    for (size_t i = 0; i < n; i++) {
+        CacheEnt *e = old[i];
+
+        if (e) {
+            *cache_slot(e->id, e->rva, e->flags, e->cs_base, e->cflags) = e;
+        }
+    }
+    g_free(old);
+}
+
+const char *tcg_cache_store_put(const TCGCacheImage *img, void *art,
+                                size_t len)
+{
+    const TCGCacheArt *h = art;
+    uint64_t rva = h->pc - img->base;
+    CacheEnt **slot, *e, **pp;
+    int n;
+
+    if (cache_bytes + len + sizeof(CacheEnt) > tcg_cache_max) {
+        tcg_cache_stats.store_full++;
+        g_free(art);
+        return "full";
+    }
+    if (cache_keys * 2 >= cache_size) {
+        cache_grow();
+    }
+    slot = cache_slot(img->id, rva, h->tb_flags, h->cs_base, h->cflags);
+    for (e = *slot; e; e = e->older) {
+        if (e->base == img->base && e->len == len &&
+            !memcmp(e->art, art, len)) {
+            tcg_cache_stats.store_dup++;
+            g_free(art);
+            return "dup";
+        }
+    }
+    e = g_new(CacheEnt, 1);
+    *e = (CacheEnt){
+        .older = *slot, .id = img->id, .rva = rva, .cs_base = h->cs_base,
+        .base = img->base, .flags = h->tb_flags, .cflags = h->cflags,
+        .len = len, .art = art,
+    };
+    if (!*slot) {
+        cache_keys++;
+    }
+    *slot = e;
+    cache_bytes += len + sizeof(CacheEnt);
+    tcg_cache_stats.stored++;
+    tcg_cache_stats.store_bytes = cache_bytes;
+
+    /* The oldest candidate past the limit goes. */
+    for (n = 1, pp = &e->older; *pp; pp = &(*pp)->older, n++) {
+        if (n == TCG_CACHE_CANDS) {
+            CacheEnt *x = *pp;
+
+            *pp = NULL;
+            while (x) {
+                CacheEnt *next = x->older;
+
+                cache_bytes -= x->len + sizeof(CacheEnt);
+                g_free(x->art);
+                g_free(x);
+                x = next;
+            }
+            break;
+        }
+    }
+    return "stored";
+}
+
+int tcg_cache_store_find(uint64_t id, uint64_t rva, uint32_t flags,
+                         uint64_t cs_base, uint32_t cflags, TCGCacheCand *c)
+{
+    CacheEnt *e;
+    int n = 0;
+
+    if (!cache_size) {
+        return 0;
+    }
+    for (e = *cache_slot(id, rva, flags, cs_base, cflags);
+         e && n < TCG_CACHE_CANDS; e = e->older) {
+        c[n++] = (TCGCacheCand){ .art = e->art, .len = e->len,
+                                 .base = e->base };
+    }
+    return n;
+}
+
+void tcg_cache_store_foreach(void (*fn)(void *opaque, uint64_t id,
+                                        uint64_t rva, uint64_t base,
+                                        const void *art, size_t len),
+                             void *opaque)
+{
+    for (size_t i = 0; i < cache_size; i++) {
+        for (CacheEnt *e = cache_tab[i]; e; e = e->older) {
+            fn(opaque, e->id, e->rva, e->base, e->art, e->len);
+        }
+    }
+}
+
+static uint64_t fnv64(uint64_t h, const void *p, size_t n)
+{
+    const uint8_t *b = p;
+
+    for (size_t i = 0; i < n; i++) {
+        h = (h ^ b[i]) * 0x100000001b3ull;
+    }
+    return h;
+}
+
+uint64_t tcg_cache_art_ghash(const void *art, size_t len)
+{
+    TCGCacheArtView v;
+    uint64_t gh = 0xcbf29ce484222325ull;
+
+    if (!tcg_cache_art_view(art, len, &v)) {
+        return 0;
+    }
+    gh = fnv64(gh, v.ext, v.h->n_ext * sizeof(*v.ext));
+    return fnv64(gh, v.ext_bytes, v.h->ext_bytes);
+}
+
+int tcg_cache_dump_line(char *buf, size_t size, uint64_t id, uint64_t rva,
+                        uint64_t base, const void *art, size_t len)
+{
+    const TCGCacheArt *h = art;
+
+    if (len < sizeof(*h)) {
+        return 0;
+    }
+    return snprintf(buf, size, "cache %016" PRIx64 " %" PRIx64 " %" PRIx64
+                    " %x %" PRIx64 " %x %016" PRIx64 " %016" PRIx64 " %zu\n",
+                    id, rva, base, h->tb_flags, h->cs_base, h->cflags,
+                    tcg_cache_art_ghash(art, len),
+                    fnv64(0xcbf29ce484222325ull, art, len), len);
+}
+
 void tcg_cache_print_stats(void)
 {
     TCGCacheStats *t = &tcg_cache_stats;
@@ -1106,4 +1324,28 @@ void tcg_cache_print_stats(void)
             t->installs, t->install_ns / 1e6, t->inst_fail_reserve,
             t->inst_fail_reloc, t->inst_fail_bytes, t->inst_fail_con,
             t->inst_fail_promoted, t->inst_fail_key, t->inst_dup);
+    if (tcg_cache_mode != TCG_CACHE_ON) {
+        return;
+    }
+    fprintf(stderr, "xtcg-cache: on: translations %" PRIu64
+            " ineligible %" PRIu64 " stored %" PRIu64 " (%" PRIu64
+            " bytes) dup %" PRIu64 " full %" PRIu64 " flushes %" PRIu64
+            "\n", t->translations, t->inel_capture, t->stored,
+            t->store_bytes, t->store_dup, t->store_full, t->flushes);
+    fprintf(stderr, "xtcg-cache: on: lookups %" PRIu64 " ineligible %"
+            PRIu64 " none %" PRIu64 " hits %" PRIu64 " miss: base=%" PRIu64
+            " struct=%" PRIu64 " region=%" PRIu64 " inel=%" PRIu64
+            " fault=%" PRIu64 " inj-promote=%" PRIu64 "\n",
+            t->lookups, t->look_inel, t->look_none, t->hits, t->miss_base,
+            t->miss_struct, t->miss_region, t->miss_inel, t->miss_fault,
+            t->inj_promote);
+    fprintf(stderr, "xtcg-cache: on: guard not restored %" PRIu64 "\n",
+            t->guard_lost);
+    fprintf(stderr, "xtcg-cache: on: ns lookup %.0f copy %.0f check %.0f"
+            " hit %.0f (per lookup, per copy, per guest-byte check,"
+            " per hit)\n",
+            t->lookups ? (double)t->look_ns / t->lookups : 0,
+            t->copies ? (double)t->copy_ns / t->copies : 0,
+            t->checks ? (double)t->check_ns / t->checks : 0,
+            t->hits ? (double)t->hit_ns / t->hits : 0);
 }

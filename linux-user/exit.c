@@ -23,10 +23,22 @@
 #include "user-internals.h"
 #include "qemu/plugin.h"
 #include "tcg/tcg-cache.h"
+#include "accel/tcg/tb-context.h"
 
 #ifdef CONFIG_GCOV
 extern void __gcov_dump(void);
 #endif
+
+/* XTCG_CACHE_DUMP: a line for each stored artifact, on stderr. */
+static void cache_dump(void *opaque, uint64_t id, uint64_t rva, uint64_t base,
+                       const void *art, size_t len)
+{
+    char line[200];
+
+    if (tcg_cache_dump_line(line, sizeof(line), id, rva, base, art, len)) {
+        fputs(line, stderr);
+    }
+}
 
 void preexit_cleanup(CPUArchState *env, int code)
 {
@@ -38,5 +50,10 @@ void preexit_cleanup(CPUArchState *env, int code)
         perf_exit();
         if (tcg_cache_mode && getenv("XTCG_CACHE_STATS")) {
             tcg_cache_print_stats();
+            fprintf(stderr, "xtcg-cache: flushes completed %u\n",
+                    qatomic_read(&tb_ctx.tb_flush_count));
+        }
+        if (tcg_cache_mode == TCG_CACHE_ON && getenv("XTCG_CACHE_DUMP")) {
+            tcg_cache_store_foreach(cache_dump, NULL);
         }
 }

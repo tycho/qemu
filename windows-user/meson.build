@@ -5,6 +5,7 @@ endif
 windows_user_ss = ss.source_set()
 
 windows_user_ss.add(files(
+  'cache.c',
   'engine.c',
   'exec.c',
   'fault.c',

@@ -279,6 +279,11 @@ XTEXPORT void WINAPI BTCpuProcessTerm(HANDLE h, BOOL after, ULONG status)
         && (tcg_cache_stats_at_exit || getenv("XTCG_CACHE_STATS"))) {
         cache_stats_done = true;
         tcg_cache_print_stats();
+        xt_cache_print_stats();
+    }
+    if (!h && tcg_cache_mode == TCG_CACHE_ON && cache_dump && xt_tls_ready()) {
+        cache_dump = false;
+        xt_cache_dump();
     }
     /* A process ending itself never returns from the "before" call. */
     if (xt_log_handle() && xt_tls_ready()) {
@@ -476,6 +481,9 @@ XTEXPORT void WINAPI BTCpuSimulate(void)
     WOW64_CONTEXT *c = cpu_area_context();
     XtExit x;
 
+    if (cache_selftest && qatomic_xchg(&cache_selftest, false)) {
+        xt_cache_selftest();
+    }
     t->activation++;
     xt_event(t, XT_EV_ACTIVATE, t->activation, c->Eip);
     xt_acquire(t, c);

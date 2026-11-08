@@ -59,6 +59,7 @@
 #include "tcg/tcg-temp-internal.h"
 #include "tcg-internal.h"
 #include "tcg-cache-rec.h"
+#include "qemu/xxhash.h"
 
 static void tcg_cache_init(void);
 #include "tcg/perf.h"
