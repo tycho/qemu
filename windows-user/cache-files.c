@@ -72,8 +72,12 @@ NTSTATUS NTAPI RtlGetAce(PACL, ULONG, void **ace);
 BOOLEAN NTAPI RtlEqualSid(PSID, PSID);
 ULONG NTAPI RtlLengthSid(PSID);
 BOOLEAN NTAPI RtlValidSid(PSID);
+NTSTATUS NTAPI NtLockFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK,
+                          PLARGE_INTEGER, PLARGE_INTEGER, ULONG, BOOLEAN,
+                          BOOLEAN);
 
 #define XT_STATUS_OBJECT_NAME_COLLISION ((NTSTATUS)0xC0000035)
+#define XT_STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006)
 #define XT_FILE_OPEN 1
 #define XT_FILE_CREATE 2
 #define XT_FILE_OPEN_IF 3
@@ -86,6 +90,14 @@ BOOLEAN NTAPI RtlValidSid(PSID);
 typedef struct XtFileDisposition {
     BOOLEAN DeleteFile;
 } XtFileDisposition;
+
+/* FileDispositionInformationEx: delete, POSIX semantics. */
+#define XT_FILE_DISPOSITION_INFORMATION_EX ((FILE_INFORMATION_CLASS)64)
+#define XT_FILE_DISPOSITION_DELETE 0x1
+#define XT_FILE_DISPOSITION_POSIX_SEMANTICS 0x2
+
+/* Seconds between 1601 and 1970, in 100-nanosecond units. */
+#define XT_EPOCH_DIFF 116444736000000000ll
 
 /* Anything that changes a file or a directory's entries, or its rights. */
 #define XT_WRITE_RIGHTS (GENERIC_WRITE | GENERIC_ALL | WRITE_DAC |      \
@@ -254,14 +266,14 @@ static HANDLE nt_open_dir(HANDLE root, const WCHAR *name, size_t len)
 
 /* The NT side of the directory back end. */
 
-static int nt_list(char (*names)[64], int max)
+static int nt_list(TCGCacheDirEntryFn *fn, void *opaque, int max)
 {
     UNICODE_STRING us = { 0 };
     OBJECT_ATTRIBUTES oa;
     IO_STATUS_BLOCK io;
     uint64_t buf[2048];
     BOOLEAN restart = TRUE;
-    int n = 0, seen = 0;
+    int seen = 0;
     HANDLE h;
 
     /* Its own handle: the directory's scan position is the handle's. */
@@ -270,41 +282,47 @@ static int nt_list(char (*names)[64], int max)
                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                    XT_FILE_DIRECTORY_FILE | XT_FILE_SYNCHRONOUS_IO_NONALERT |
                    XT_FILE_OPEN_REPARSE_POINT) < 0) {
-        return 0;
+        return -1;
     }
-    while (n < max && seen < max) {
+    while (seen < max) {
         FILE_DIRECTORY_INFORMATION *e = (void *)buf;
+        NTSTATUS st = NtQueryDirectoryFile(h, NULL, NULL, NULL, &io, buf,
+                                           sizeof(buf),
+                                           FileDirectoryInformation, FALSE,
+                                           NULL, restart);
 
-        if (NtQueryDirectoryFile(h, NULL, NULL, NULL, &io, buf, sizeof(buf),
-                                 FileDirectoryInformation, FALSE, NULL,
-                                 restart) < 0) {
+        if (st == XT_STATUS_NO_MORE_FILES) {
+            break;
+        }
+        if (st < 0) {
+            seen = -1;
             break;
         }
         restart = FALSE;
         for (;;) {
             ULONG len = e->FileNameLength / sizeof(WCHAR);
-            bool ok = !(e->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            bool ok = !(e->FileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
+                                             FILE_ATTRIBUTE_REPARSE_POINT)) &&
                       len < 64;
+            char name[64] = "";
 
             seen++;
             for (ULONG i = 0; ok && i < len; i++) {
                 ok = e->FileName[i] > ' ' && e->FileName[i] < 0x7f;
+                name[i] = e->FileName[i];
             }
             if (ok) {
-                memset(names[n], 0, 64);
-                for (ULONG i = 0; i < len; i++) {
-                    names[n][i] = e->FileName[i];
-                }
-                n++;
+                fn(opaque, name, e->EndOfFile.QuadPart,
+                   (e->LastWriteTime.QuadPart - XT_EPOCH_DIFF) / 10000000);
             }
-            if (!e->NextEntryOffset || n >= max || seen >= max) {
+            if (!e->NextEntryOffset || seen >= max) {
                 break;
             }
             e = (void *)((uint8_t *)e + e->NextEntryOffset);
         }
     }
     NtClose(h);
-    return n;
+    return seen;
 }
 
 static void *nt_open(const char *name, size_t *sizep)
@@ -392,26 +410,18 @@ static void nt_unmap(const void *map, size_t size)
 
 static TCGCacheDirOps nt_ops;
 
-static bool nt_publish(const void *data, size_t len, const char *name,
-                       unsigned pause_ms)
+/* A temporary, created exclusively: a name taken, the next, then none. */
+static HANDLE nt_tmp(void)
 {
     static uint64_t counter;
-    union {
-        FILE_RENAME_INFORMATION r;
-        uint8_t b[sizeof(FILE_RENAME_INFORMATION) + 64 * sizeof(WCHAR)];
-    } ri;
-    XtFileDisposition del = { TRUE };
     UNICODE_STRING us;
     OBJECT_ATTRIBUTES oa;
     IO_STATUS_BLOCK io;
     char tmp[64];
     WCHAR w[64];
-    size_t done = 0;
     HANDLE h = NULL;
     NTSTATUS st = -1;
-    int n;
 
-    /* Created exclusively: a name taken, the next, then give up. */
     for (int i = 0; i < 4; i++) {
         snprintf(tmp, sizeof(tmp), "tmp-%x-%" PRIx64, nt_ops.pid,
                  qatomic_fetch_inc(&counter));
@@ -426,41 +436,162 @@ static bool nt_publish(const void *data, size_t len, const char *name,
             break;
         }
     }
-    if (st < 0) {
-        return false;
-    }
+    return st < 0 ? NULL : h;
+}
+
+static bool nt_write(void *wh, const void *data, size_t len, uint64_t off)
+{
+    IO_STATUS_BLOCK io;
+    size_t done = 0;
+
     while (done < len) {
-        LARGE_INTEGER at = { .QuadPart = done };
+        LARGE_INTEGER at = { .QuadPart = off + done };
         ULONG chunk = MIN(len - done, 1u << 20);
 
-        if (NtWriteFile(h, NULL, NULL, NULL, &io, (uint8_t *)data + done,
+        if (NtWriteFile(wh, NULL, NULL, NULL, &io, (uint8_t *)data + done,
                         chunk, &at, NULL) < 0 || !io.Information) {
-            break;
+            return false;
         }
         done += io.Information;
+    }
+    return true;
+}
+
+static void nt_drop(void *wh)
+{
+    XtFileDisposition del = { TRUE };
+    IO_STATUS_BLOCK io;
+
+    NtSetInformationFile(wh, &io, &del, sizeof(del),
+                         FileDispositionInformation);
+    NtClose(wh);
+}
+
+/* Renamed to @name, never replacing; else deleted.  Closed either way. */
+static bool nt_commit(void *wh, const char *name)
+{
+    union {
+        FILE_RENAME_INFORMATION r;
+        uint8_t b[sizeof(FILE_RENAME_INFORMATION) + 64 * sizeof(WCHAR)];
+    } ri;
+    IO_STATUS_BLOCK io;
+    NTSTATUS st;
+    int n;
+
+    memset(&ri, 0, sizeof(ri));
+    ri.r.ReplaceIfExists = FALSE;
+    ri.r.RootDirectory = dir_h;
+    for (n = 0; name[n] && n < 63; n++) {
+        ri.r.FileName[n] = (unsigned char)name[n];
+    }
+    ri.r.FileNameLength = n * sizeof(WCHAR);
+    st = NtSetInformationFile(wh, &io, &ri,
+                              offsetof(FILE_RENAME_INFORMATION, FileName) +
+                              ri.r.FileNameLength, FileRenameInformation);
+    if (st < 0) {
+        nt_drop(wh);
+        return false;
+    }
+    NtClose(wh);
+    return true;
+}
+
+static void *nt_create(void)
+{
+    return nt_tmp();
+}
+
+static bool nt_publish(const void *data, size_t len, const char *name,
+                       unsigned pause_ms)
+{
+    HANDLE h = nt_tmp();
+
+    if (!h) {
+        return false;
+    }
+    if (!nt_write(h, data, len, 0)) {
+        nt_drop(h);
+        return false;
     }
     if (pause_ms) {
         g_usleep(pause_ms * 1000);
     }
-    st = -1;
-    if (done == len) {
-        memset(&ri, 0, sizeof(ri));
-        ri.r.ReplaceIfExists = FALSE;
-        ri.r.RootDirectory = dir_h;
-        for (n = 0; name[n] && n < 63; n++) {
-            ri.r.FileName[n] = (unsigned char)name[n];
-        }
-        ri.r.FileNameLength = n * sizeof(WCHAR);
-        st = NtSetInformationFile(h, &io, &ri,
-                                  offsetof(FILE_RENAME_INFORMATION, FileName) +
-                                  ri.r.FileNameLength, FileRenameInformation);
+    return nt_commit(h, name);
+}
+
+/*
+ * Deleted with POSIX semantics, so that the name goes at once even while
+ * a view of the file is mapped (the classic disposition waits for the
+ * last view, and refuses while one is mapped); the classic one where
+ * that class is refused.
+ */
+static bool nt_remove(const char *name)
+{
+    struct {
+        ULONG Flags;
+    } dx = { XT_FILE_DISPOSITION_DELETE | XT_FILE_DISPOSITION_POSIX_SEMANTICS };
+    XtFileDisposition del = { TRUE };
+    UNICODE_STRING us;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK io;
+    WCHAR w[64];
+    HANDLE h;
+    NTSTATUS st;
+
+    nt_name(&us, w, name);
+    InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, dir_h, NULL);
+    if (NtCreateFile(&h, DELETE | SYNCHRONIZE, &oa, &io, NULL, 0,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     XT_FILE_OPEN, XT_FILE_NON_DIRECTORY_FILE |
+                     XT_FILE_SYNCHRONOUS_IO_NONALERT |
+                     XT_FILE_OPEN_REPARSE_POINT, NULL, 0) < 0) {
+        return false;
     }
+    st = NtSetInformationFile(h, &io, &dx, sizeof(dx),
+                              XT_FILE_DISPOSITION_INFORMATION_EX);
     if (st < 0) {
-        NtSetInformationFile(h, &io, &del, sizeof(del),
-                             FileDispositionInformation);
+        st = NtSetInformationFile(h, &io, &del, sizeof(del),
+                                  FileDispositionInformation);
     }
     NtClose(h);
     return st >= 0;
+}
+
+/* The lock file, created as the cache's files are, and checked as they are. */
+static void *nt_trylock(void)
+{
+    LARGE_INTEGER at = { .QuadPart = 0 }, len = { .QuadPart = 1 };
+    UNICODE_STRING us;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK io;
+    WCHAR w[64];
+    size_t size;
+    HANDLE h;
+
+    nt_name(&us, w, "lock");
+    InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, dir_h,
+                               &sd_file);
+    if (NtCreateFile(&h, FILE_READ_DATA | FILE_WRITE_DATA |
+                     FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE, &oa,
+                     &io, NULL, FILE_ATTRIBUTE_NORMAL,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE, XT_FILE_OPEN_IF,
+                     XT_FILE_NON_DIRECTORY_FILE |
+                     XT_FILE_SYNCHRONOUS_IO_NONALERT |
+                     XT_FILE_OPEN_REPARSE_POINT, NULL, 0) < 0) {
+        return NULL;
+    }
+    if (!nt_owned(h, false, &size)
+        || NtLockFile(h, NULL, NULL, NULL, &io, &at, &len, 0, TRUE,
+                      TRUE) < 0) {
+        NtClose(h);
+        return NULL;
+    }
+    return h;
+}
+
+static void nt_unlock(void *lh)
+{
+    NtClose(lh);
 }
 
 static TCGCacheDirOps nt_ops = {
@@ -471,6 +602,13 @@ static TCGCacheDirOps nt_ops = {
     .close = nt_close,
     .unmap = nt_unmap,
     .publish = nt_publish,
+    .create = nt_create,
+    .write = nt_write,
+    .commit = nt_commit,
+    .drop = nt_drop,
+    .remove = nt_remove,
+    .trylock = nt_trylock,
+    .unlock = nt_unlock,
 };
 
 /* The module's own build: the 8 bytes lld's CodeView record hashes. */
