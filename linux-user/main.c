@@ -510,6 +510,27 @@ static int cache_truncate_test(const void *snap, size_t size)
            ? 0 : 1;
 }
 
+/*
+ * The translation cache's immediate end (tcg_cache_terminate), from a
+ * host signal handler too: the host's SIGABRT is QEMU's own (the guest's
+ * is mapped away from it), reset to its default and unblocked, then
+ * abort().  All async-signal-safe.
+ */
+static void G_NORETURN cache_terminate(void)
+{
+    struct sigaction sa;
+    sigset_t set;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGABRT, &sa, NULL);
+    sigemptyset(&set);
+    sigaddset(&set, SIGABRT);
+    pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+    abort();
+}
+
 static void cache_file_switches(void)
 {
     const char *f;
@@ -1216,6 +1237,9 @@ int main(int argc, char **argv, char **envp)
        generating the prologue until now so that the prologue can take
        the real value of GUEST_BASE into account.  */
     tcg_prologue_init();
+    /* Before anything is translated or validated, in every cache mode. */
+    tcg_cache_wb_init();
+    tcg_cache_terminate = cache_terminate;
     if (getenv("XTCG_CACHE_SELFTEST")) {
         /* Testing the cache's guarded routines (tcg-cache.h). */
         size_t pg = qemu_real_host_page_size();
