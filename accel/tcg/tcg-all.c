@@ -276,6 +276,32 @@ static void tcg_set_alignfold(Object *obj, bool value, Error **errp)
     tcg_alignfold = value;
 }
 
+static char *tcg_get_zext32(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_zext32 == TCG_ZEXT32_ON ? "on" : "off");
+}
+
+static void tcg_set_zext32(Object *obj, const char *value, Error **errp)
+{
+    TCGZext32Mode mode;
+
+    if (!strcmp(value, "off")) {
+        tcg_zext32 = TCG_ZEXT32_OFF;
+        return;
+    } else if (!strcmp(value, "on")) {
+        mode = TCG_ZEXT32_ON;
+    } else {
+        error_setg(errp, "x-zext32 must be off or on");
+        return;
+    }
+    if (!tcg_can_zext32()) {
+        error_setg(errp, "x-zext32=%s: only in user mode on an aarch64 host",
+                   value);
+        return;
+    }
+    tcg_zext32 = mode;
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -318,6 +344,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-alignfold",
         "Drop guest alignment checks implied by an earlier check on the "
         "same address registers");
+
+    object_class_property_add_str(oc, "x-zext32", tcg_get_zext32,
+                                  tcg_set_zext32);
+    object_class_property_set_description(oc, "x-zext32",
+        "User mode, aarch64 hosts, no guest base: a 32-bit guest address "
+        "register is the host address, since 32-bit values are kept "
+        "zero-extended: off or on");
 }
 
 static const TypeInfo tcg_accel_type = {

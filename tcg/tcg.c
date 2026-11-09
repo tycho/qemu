@@ -239,6 +239,9 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
 TCGContext tcg_init_ctx;
 bool tcg_lean;
 bool tcg_alignfold;
+TCGZext32Mode tcg_zext32;
+bool tcg_guest_addr32;
+bool tcg_zext32_active;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
@@ -1907,6 +1910,11 @@ void tcg_prologue_init(void)
 #endif
 
     s->pool_labels = NULL;
+
+#ifdef CONFIG_USER_ONLY
+    tcg_zext32_active = tcg_zext32 != TCG_ZEXT32_OFF && tcg_guest_addr32 &&
+                        !guest_base;
+#endif
 
     qemu_thread_jit_write();
     /* Generate the prologue.  */
@@ -5225,6 +5233,17 @@ static void tcg_reg_alloc_do_movi(TCGContext *s, TCGTemp *ots,
 }
 
 /*
+ * x-zext32: zero-extend a 32-bit value that @reg received from outside
+ * the 32-bit operations, which may leave other bits above it: the low
+ * half of a 64-bit register, or a helper's result (the calling
+ * convention doesn't define the high half).
+ */
+static void tcg_zext32_normalize(TCGContext *s, TCGReg reg)
+{
+    tcg_out_ext32u(s, reg, reg);
+}
+
+/*
  * Specialized code generation for INDEX_op_mov_*.
  */
 static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
@@ -5291,6 +5310,11 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
          */
         temp_dead(s, ts);
         oreg = ireg;
+        if (tcg_zext32_active && otype == TCG_TYPE_I32 &&
+            itype == TCG_TYPE_I64) {
+            /* extrl_i64_i32 taking over the 64-bit value's register. */
+            tcg_zext32_normalize(s, oreg);
+        }
     } else {
         if (ots->val_type == TEMP_VAL_REG) {
             oreg = ots->reg;
@@ -6293,6 +6317,10 @@ static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
             /* ENV should not be modified.  */
             tcg_debug_assert(!temp_readonly(ts));
 
+            if (tcg_zext32_active && ts->type == TCG_TYPE_I32 &&
+                !IS_DEAD_ARG(i)) {
+                tcg_zext32_normalize(s, reg);
+            }
             set_temp_val_reg(s, ts, reg);
             ts->mem_coherent = 0;
         }
@@ -7084,6 +7112,15 @@ static void ldst_fold_pass(TCGContext *s)
 }
 
 #endif
+
+bool tcg_can_zext32(void)
+{
+#if defined(CONFIG_USER_ONLY) && defined(TCG_TARGET_HAS_ZEXT32)
+    return true;
+#else
+    return false;
+#endif
+}
 
 bool tcg_lean_narrow32(void)
 {

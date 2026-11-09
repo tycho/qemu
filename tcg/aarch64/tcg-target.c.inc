@@ -1669,6 +1669,19 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 #define MIN_TLB_MASK_TABLE_OFS  -512
 
 /*
+ * x-zext32: with no guest base, a 32-bit guest address register is the
+ * host address, since the backend keeps it zero-extended (the 32-bit
+ * operations zero-extend; tcg.c extends the rest).
+ */
+#define TCG_TARGET_HAS_ZEXT32
+
+/* Whether a 32-bit guest address register is the host address. */
+static bool zext32_addr(TCGType addr_type)
+{
+    return addr_type == TCG_TYPE_I32 && tcg_zext32_active;
+}
+
+/*
  * For system-mode, perform the TLB load and compare.
  * For user-mode, perform any required alignment tests.
  * In both cases, return a TCGLabelQemuLdst structure if the slow path
@@ -1770,7 +1783,8 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
             tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
         }
 
-        if (guest_base || addr_type == TCG_TYPE_I32) {
+        if (guest_base ||
+            (addr_type == TCG_TYPE_I32 && !zext32_addr(addr_type))) {
             h->base = TCG_REG_GUEST_BASE;
             h->index = addr_reg;
             h->index_ext = addr_type;
@@ -1809,6 +1823,7 @@ static void tcg_out_qemu_ld_direct(TCGContext *s, MemOp memop, TCGType ext,
                               h.index);
         break;
     case MO_SL:
+        tcg_debug_assert(ext == TCG_TYPE_I64);
         tcg_out_insn_ldst_reg(s, Ildst_imm_LDRSWX, data_r, h.base, h.index_ext,
                               h.index);
         break;
@@ -1925,6 +1940,7 @@ static AArch64Insn ld_insn(MemOp mop, TCGType ext)
     case MO_UL:
         return Ildst_imm_LDRW;
     case MO_SL:
+        tcg_debug_assert(ext);
         return Ildst_imm_LDRSWX;
     case MO_UQ:
         return Ildst_imm_LDRX;
@@ -2890,6 +2906,8 @@ static void tgen_bswap32(TCGContext *s, TCGType type,
 {
     tcg_out_rev(s, TCG_TYPE_I32, MO_32, a0, a1);
     if (flags & TCG_BSWAP_OS) {
+        /* A 32-bit value's register stays zero-extended (x-zext32). */
+        tcg_debug_assert(type == TCG_TYPE_I64);
         tcg_out_ext32s(s, a0, a0);
     }
 }
@@ -2918,6 +2936,7 @@ static void tgen_revbit32(TCGContext *s, TCGType type,
 {
     tcg_out_insn(s, rr_sf, RBIT, TCG_TYPE_I32, a0, a1);
     if (flags & TCG_BSWAP_OS) {
+        tcg_debug_assert(type == TCG_TYPE_I64);
         tcg_out_ext32s(s, a0, a0);
     }
 }
@@ -3163,6 +3182,7 @@ static const TCGOutOpLoad outop_ld32u = {
 static void tgen_ld32s(TCGContext *s, TCGType type, TCGReg dest,
                        TCGReg base, ptrdiff_t offset)
 {
+    tcg_debug_assert(type == TCG_TYPE_I64);
     tcg_out_ldst(s, Ildst_imm_LDRSWX, dest, base, offset, 2);
 }
 
