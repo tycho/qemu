@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "tcg/tcg-cache.h"
 #include "tcg/tcg.h"
 #include "tcg/startup.h"
 #include "tcg/tcg-temp-internal.h"
@@ -257,8 +258,10 @@ static MemOp tcg_gen_ldst_order(TCGBar type)
             return 0;
         }
         if (tcg_tso_cross_promoted(tcg_ctx->insn_pc)) {
+            tcg_cache_exclude(tcg_ctx, TCG_CACHE_X_PROMOTED);
             return MO_ACQ_REL | MO_ACQ_REL_CROSS;
         }
+        tcg_cache_acqrel(tcg_ctx, tcg_ctx->insn_pc);
         return MO_ACQ_REL;
     }
     tcg_gen_mb(type | TCG_BAR_SC);

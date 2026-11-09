@@ -231,4 +231,7 @@ CPUArchState *cpu_copy(CPUArchState *env);
 #include "target_cpu.h"
 #include "target_structs.h"
 
+/* cache.c: the translation cache's files (testing) */
+void tcg_cache_dir_init(const char *cpu_model);
+
 #endif

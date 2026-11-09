@@ -19,6 +19,7 @@
 #include "user/cpu_loop.h"
 #include "user/page-protection.h"
 #include "host/cpuinfo.h"
+#include "tcg/tcg-cache.h"
 #include "xtajit.h"
 
 extern IMAGE_DOS_HEADER __ImageBase;
@@ -216,7 +217,7 @@ static void G_NORETURN xt_fault_entry(XtThread *t, uint64_t prev)
  */
 bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx)
 {
-    XtThread *t = xt_self;
+    XtThread *t;
     XtFault *f;
     XtFaultKind kind;
     MMUAccessType access;
@@ -224,6 +225,25 @@ bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx)
     vaddr addr;
     bool is_write, cross = false;
 
+    /*
+     * A read by one of the translation cache's guarded routines
+     * (tcg-cache.h), wherever it reads: back to its caller with a fault
+     * code.  Before anything else, the thread's own state included.
+     */
+    if ((er->ExceptionCode == STATUS_ACCESS_VIOLATION ||
+         er->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION ||
+         er->ExceptionCode == STATUS_IN_PAGE_ERROR) &&
+        er->NumberParameters >= 2 && er->ExceptionInformation[0] == 0 &&
+        tcg_cache_guard_pc(ctx->Pc)) {
+        ctx->X0 = TCG_CACHE_GFAULT |
+                  (er->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION ?
+                   TCG_CACHE_GFAULT_GUARD : 0) |
+                  (er->ExceptionInformation[1] &
+                   (TCG_CACHE_GFAULT_GUARD - 1));
+        ctx->Pc = ctx->Lr;
+        return true;
+    }
+    t = xt_self;
     if (!t || t->fault.busy) {
         return false;
     }

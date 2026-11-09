@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "tcg/tcg-cache.h"
 #include "qemu/help-texts.h"
 #include "qemu/units.h"
 #include "qemu/accel.h"
@@ -149,12 +150,14 @@ void fork_start(void)
     qemu_plugin_user_prefork_lock();
     gdbserver_fork_start();
     fd_trans_prefork();
+    tcg_cache_dir_fork_start();
 }
 
 void fork_end(pid_t pid)
 {
     bool child = pid == 0;
 
+    tcg_cache_dir_fork_end(child);
     fd_trans_postfork();
     qemu_plugin_user_postfork(child);
     mmap_fork_end(child);
@@ -420,6 +423,180 @@ static void handle_arg_tb_size(const char *arg)
 {
     if (qemu_strtoul(arg, NULL, 0, &opt_tb_size)) {
         usage(EXIT_FAILURE);
+    }
+}
+
+/*
+ * Testing the translation cache's files (tcg-cache.h):
+ * XTCG_CACHE_CHECKFILE=f validates every artifact of f and exits;
+ * XTCG_CACHE_FUZZ=f damages f every way the readers must survive and
+ * exits (XTCG_CACHE_FUZZ_SEED, XTCG_CACHE_FUZZ_ARTS); XTCG_CACHE_LOAD=f
+ * makes lookups read f's artifacts.
+ */
+static const void *cache_map(const char *path, size_t *size)
+{
+    struct stat st;
+    void *p;
+    int fd = open(path, O_RDONLY);
+
+    if (fd < 0 || fstat(fd, &st) || !st.st_size) {
+        fprintf(stderr, "xtcg-cache: %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+    p = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "xtcg-cache: %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+    *size = st.st_size;
+    return p;
+}
+
+/*
+ * A copy of the file (@snap, already validated), mapped, then truncated
+ * under the mapping a page past its header, coverage and index: each
+ * envelope wholly before the cut must still read, each other one fault
+ * in the reader's guarded reads and be refused, and QEMU must not die.
+ * The number of failures (a file too small to cut so is skipped).
+ */
+static int cache_truncate_test(const void *snap, size_t size)
+{
+    char path[] = "/tmp/xtcg-cache-truncXXXXXX";
+    uint64_t c[TCG_CACHE_V_MAX] = { }, want_ok = 0, want_fault = 0;
+    const TCGCacheFileHdr *h = snap;
+    const TCGCacheIdx *idx = (const void *)((const uint8_t *)snap
+                                            + h->index_off);
+    uint32_t n = h->n_slots;
+    size_t pg = qemu_real_host_page_size(), cut, meta;
+    int fd;
+    void *m;
+
+    /* Header, image records, index and cover list all precede the data. */
+    meta = h->data_off;
+    cut = ROUND_UP(meta, pg) + pg;
+    if (cut + 2 * pg > size) {
+        fprintf(stderr, "xtcg-cache truncate: skipped, file too small\n");
+        return 0;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (idx[i].khash) {
+            if ((uint64_t)idx[i].off + idx[i].len <= cut) {
+                want_ok++;
+            } else {
+                want_fault++;
+            }
+        }
+    }
+    fd = mkstemp(path);
+    if (fd < 0 || write(fd, snap, size) != size) {
+        fprintf(stderr, "xtcg-cache truncate: %s\n", strerror(errno));
+        return 1;
+    }
+    unlink(path);
+    m = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED || ftruncate(fd, cut)) {
+        fprintf(stderr, "xtcg-cache truncate: %s\n", strerror(errno));
+        return 1;
+    }
+    tcg_cache_check_file(m, size, true, c);
+    fprintf(stderr, "xtcg-cache truncate: cut at %zu of %zu: %" PRIu64
+            " ok (want %" PRIu64 "), %" PRIu64 " faults (want %" PRIu64
+            ")\n", cut, size, c[TCG_CACHE_V_OK], want_ok,
+            c[TCG_CACHE_V_FAULT], want_fault);
+    munmap(m, size);
+    close(fd);
+    return c[TCG_CACHE_V_OK] == want_ok && c[TCG_CACHE_V_FAULT] == want_fault
+           ? 0 : 1;
+}
+
+/*
+ * The translation cache's immediate end (tcg_cache_terminate), from a
+ * host signal handler too: the host's SIGABRT is QEMU's own (the guest's
+ * is mapped away from it), reset to its default and unblocked, then
+ * abort().  All async-signal-safe.
+ */
+static void G_NORETURN cache_terminate(void)
+{
+    struct sigaction sa;
+    sigset_t set;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGABRT, &sa, NULL);
+    sigemptyset(&set);
+    sigaddset(&set, SIGABRT);
+    pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+    abort();
+}
+
+static void cache_file_switches(void)
+{
+    const char *f;
+    const void *p;
+    size_t size;
+
+    f = getenv("XTCG_CACHE_CHECKFILE");
+    if (f) {
+        p = cache_map(f, &size);
+        if (size >= sizeof(TCGCacheFileHdr)) {
+            TCGCacheFileHdr h;
+
+            /* As for XTCG_CACHE_FUZZ: the file's fingerprint, read guarded. */
+            if (!tcg_cache_gcopy(&h, p, sizeof(h))) {
+                memcpy(tcg_cache_fingerprint, h.fp,
+                       sizeof(tcg_cache_fingerprint));
+            }
+        }
+        exit(tcg_cache_check_file(p, size, false, NULL) ? 1 : 0);
+    }
+    f = getenv("XTCG_CACHE_FUZZ");
+    if (f) {
+        const char *seed = getenv("XTCG_CACHE_FUZZ_SEED");
+        const char *arts = getenv("XTCG_CACHE_FUZZ_ARTS");
+        uint64_t sv = 1;
+        void *snap;
+        int r;
+
+        if (seed) {
+            qemu_strtou64(seed, NULL, 0, &sv);
+        }
+        p = cache_map(f, &size);
+        if (size > TCG_CACHE_FILE_MAX || size < sizeof(TCGCacheFileHdr)) {
+            fprintf(stderr, "xtcg-cache: %s: size\n", f);
+            exit(1);
+        }
+        /* One owned snapshot, read guarded, for both tests. */
+        snap = g_malloc(size);
+        if (tcg_cache_gcopy(snap, p, size)) {
+            fprintf(stderr, "xtcg-cache: %s: changed under its mapping\n", f);
+            exit(1);
+        }
+        /*
+         * This hook runs before the process's fingerprint is known: the
+         * file's is taken (from the snapshot), so that the readers check
+         * everything else.
+         */
+        memcpy(tcg_cache_fingerprint, ((const TCGCacheFileHdr *)snap)->fp,
+               sizeof(tcg_cache_fingerprint));
+        r = tcg_cache_fuzz_file(snap, size, sv, arts ? atoi(arts) : 1000000);
+        /* The snapshot is known good once the fuzzer passed it. */
+        r += r ? 0 : cache_truncate_test(snap, size);
+        exit(r ? 1 : 0);
+    }
+    f = getenv("XTCG_CACHE_LOAD");
+    if (f) {
+        int r;
+
+        p = cache_map(f, &size);
+        r = tcg_cache_file_open(&tcg_cache_loaded, p, size, tcg_cache_gcopy,
+                                tcg_cache_nofault);
+        if (r) {
+            fprintf(stderr, "xtcg-cache: %s: %s\n", f, tcg_cache_v_name(r));
+        } else {
+            tcg_cache_have_loaded = true;
+        }
     }
 }
 
@@ -1060,6 +1237,26 @@ int main(int argc, char **argv, char **envp)
        generating the prologue until now so that the prologue can take
        the real value of GUEST_BASE into account.  */
     tcg_prologue_init();
+    /* Before anything is translated or validated, in every cache mode. */
+    tcg_cache_wb_init();
+    tcg_cache_terminate = cache_terminate;
+    if (getenv("XTCG_CACHE_TEST_PT_SELFTEST")) {
+        tb_pending_selftest();
+    }
+    if (getenv("XTCG_CACHE_SELFTEST")) {
+        /* Testing the cache's guarded routines (tcg-cache.h). */
+        size_t pg = qemu_real_host_page_size();
+        uint8_t *p = mmap(NULL, 2 * pg, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        if (p == MAP_FAILED || mprotect(p + pg, pg, PROT_NONE) ||
+            tcg_cache_selftest(p, pg)) {
+            exit(1);
+        }
+        munmap(p, 2 * pg);
+    }
+    cache_file_switches();
+    tcg_cache_dir_init(cpu_model);
 
     init_main_thread(cpu, info);
 

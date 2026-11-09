@@ -17,6 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include "tcg/tcg-cache.h"
 
 #include "qemu/host-utils.h"
 #include "cpu.h"
@@ -4469,6 +4470,50 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
 
 #include "decode-new.c.inc"
 
+/*
+ * An insn's unwind data as x86_restore_state_to_opc and the fault path
+ * read it, from a cached translation (tcg-cache.h): a CC_OP that
+ * cc_compute_all implements at this target's width;
+ * X86_INSN_RMW the only flag below the mask of YMM registers, which must
+ * exist.
+ */
+static bool x86_cache_cc_op_ok(uint64_t op)
+{
+    /*
+     * The sized groups up to CCMP, at this target's widths; of POPCNT and
+     * SBB_SELF only their aliases.  Not by their low bits: the aliases
+     * restart the enum's count, so after them the groups aren't aligned
+     * to 4 on every target (on i386, CC_OP_DYNAMIC is CC_OP_SBB_SELFQ__).
+     */
+    if (op <= CC_OP_ADCOX || op == CC_OP_DYNAMIC || op == CC_OP_POPCNT
+        || op == CC_OP_SBB_SELF) {
+        return true;
+    }
+    return op >= CC_OP_FIRST_BWLQ && op <= CC_OP_CCMPQ && (op & 3) <= MO_TL;
+}
+
+/* Inside the numeric range, but not implemented (testing). */
+static const uint64_t x86_cache_bad_cc_ops[] = {
+    CC_OP_POPCNTB__, CC_OP_POPCNTW__, CC_OP_SBB_SELFB__, CC_OP_SBB_SELFW__,
+#ifdef TARGET_X86_64
+    CC_OP_POPCNTL__, CC_OP_SBB_SELFL__,
+#else
+    CC_OP_ADDQ, CC_OP_CCMPQ,
+#endif
+    CC_OP_DYNAMIC + 1, CC_OP_DECLQ,
+};
+
+static bool x86_cache_insn_ok(const uint64_t *data, bool pcrel)
+{
+    uint64_t ymmh = data[2] >> X86_INSN_YMMH_SHIFT;
+
+    return x86_cache_cc_op_ok(data[1])
+           && !(data[2] & ((1ull << X86_INSN_YMMH_SHIFT) - 1)
+                & ~(uint64_t)X86_INSN_RMW)
+           && ymmh < (1ull << CPU_NB_REGS)
+           && (!pcrel || data[0] < TARGET_PAGE_SIZE);
+}
+
 void tcg_x86_init(void)
 {
     static const char reg_names[CPU_NB_EREGS][4] = {
@@ -4684,6 +4729,9 @@ void tcg_x86_init(void)
     tcg_set_env_scratch(offsetof(CPUX86State, xmm_t0),
                         offsetof(CPUX86State, mmx_t0) + sizeof(MMXReg)
                         - offsetof(CPUX86State, xmm_t0));
+    tcg_cache_insn_ok = x86_cache_insn_ok;
+    tcg_cache_insn_bad = x86_cache_bad_cc_ops;
+    tcg_cache_insn_nbad = ARRAY_SIZE(x86_cache_bad_cc_ops);
 }
 
 static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)

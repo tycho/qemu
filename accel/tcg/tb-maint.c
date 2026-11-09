@@ -33,6 +33,7 @@
 #include "tb-internal.h"
 #include "system/tcg.h"
 #include "tcg/tcg.h"
+#include "tcg/tcg-cache.h"
 #include "tcg/tcg-ldst.h"
 #include "accel/tcg/probe.h"
 #include "tcg/startup.h"
@@ -105,6 +106,251 @@ static inline void tb_lock_pages(const TranslationBlock *tb) { }
  */
 static IntervalTreeRoot tb_root;
 
+/* The TB's new fields sit in padding: the struct doesn't grow. */
+#if HOST_LONG_BITS == 64
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, pt_state) !=
+                  offsetof(TranslationBlock, smc_inline) + 1);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, pt_index) !=
+                  offsetof(TranslationBlock, smc_crc) + 4);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, smc_stale) !=
+                  offsetof(TranslationBlock, smc_crc) + 8);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, jmp_lock) !=
+                  offsetof(TranslationBlock, smc_stale) + sizeof(void *));
+#endif
+
+/*
+ * TBs linked with @defer_pages (installed from a persistent cache) wait
+ * in a pending list instead of entering the tree: a start-up installs
+ * tens of thousands and queries page tracking for few of them.  Their
+ * pages are marked in a set; a query whose range meets a marked page
+ * first enters every pending TB in the tree ("catches up").  Removing a
+ * pending TB takes it off the list; its marks stay until the next
+ * catch-up, which is conservative.  All under mmap_lock.
+ */
+#define TB_PENDING_PAGES_MAX 16384
+
+static TranslationBlock **tb_pending;
+static size_t tb_pending_n, tb_pending_cap;
+/* Open addressing: page number + 1, 0 when empty; at most half full. */
+static uint64_t *tb_pending_pages;
+static size_t tb_pending_slots, tb_pending_npages;
+/* The last page marked, + 1; 0 for none. */
+static uint64_t tb_pending_memo;
+
+static size_t tb_pending_probe(uint64_t key)
+{
+    size_t mask = tb_pending_slots - 1;
+    size_t i = ((key * 0x9e3779b97f4a7c15ull) >> 32) & mask;
+
+    while (tb_pending_pages[i] && tb_pending_pages[i] != key) {
+        i = (i + 1) & mask;
+    }
+    return i;
+}
+
+static bool tb_pending_marked(uint64_t page)
+{
+    return tb_pending_slots &&
+           tb_pending_pages[tb_pending_probe(page + 1)] == page + 1;
+}
+
+static void tb_pending_mark(uint64_t page)
+{
+    uint64_t key = page + 1;
+    size_t i;
+
+    if (key == tb_pending_memo) {
+        return;
+    }
+    if (2 * (tb_pending_npages + 1) > tb_pending_slots) {
+        uint64_t *old = tb_pending_pages;
+        size_t old_slots = tb_pending_slots;
+
+        tb_pending_slots = old_slots ? old_slots * 2 : 1024;
+        tb_pending_pages = g_new0(uint64_t, tb_pending_slots);
+        for (size_t j = 0; j < old_slots; j++) {
+            if (old[j]) {
+                tb_pending_pages[tb_pending_probe(old[j])] = old[j];
+            }
+        }
+        g_free(old);
+    }
+    i = tb_pending_probe(key);
+    if (!tb_pending_pages[i]) {
+        tb_pending_pages[i] = key;
+        tb_pending_npages++;
+    }
+    tb_pending_memo = key;
+}
+
+static void tb_pending_clear(void)
+{
+    tb_pending_n = 0;
+    if (tb_pending_npages) {
+        memset(tb_pending_pages, 0, tb_pending_slots * sizeof(uint64_t));
+        tb_pending_npages = 0;
+    }
+    tb_pending_memo = 0;
+}
+
+size_t tb_pending_count(void)
+{
+    return tb_pending_n;
+}
+
+/*
+ * Testing (tcg_cache_test_pt_verify): a shadow of every TB in page
+ * tracking, pending or in the tree, with its interval computed from its
+ * start and size.  Each query's result from the tree, after its catch-up
+ * decision, must be exactly the shadow's TBs that overlap the range.
+ */
+typedef struct PtShadow {
+    vaddr start, last;
+} PtShadow;
+
+static GHashTable *pt_shadow;
+
+static void pt_shadow_add(TranslationBlock *tb)
+{
+    PtShadow *e;
+
+    if (!tcg_cache_test_pt_verify) {
+        return;
+    }
+    if (!pt_shadow) {
+        pt_shadow = g_hash_table_new_full(NULL, NULL, NULL, g_free);
+    }
+    e = g_new(PtShadow, 1);
+    e->start = tb_page_addr0(tb);
+    e->last = e->start + tb->size - 1;
+    g_hash_table_insert(pt_shadow, tb, e);
+}
+
+static void pt_shadow_remove(TranslationBlock *tb)
+{
+    if (pt_shadow) {
+        g_hash_table_remove(pt_shadow, tb);
+    }
+}
+
+static void G_NORETURN pt_verify_fail(const char *why, TranslationBlock *tb,
+                                      vaddr start, vaddr last)
+{
+    fprintf(stderr, "xtcg-cache: page tracking verify: %s: TB %p pc %"
+            VADDR_PRIx " [%" VADDR_PRIx ", %" VADDR_PRIx "] state %d,"
+            " query [%" VADDR_PRIx ", %" VADDR_PRIx "]\n", why, tb, tb->pc,
+            (vaddr)tb->itree.start, (vaddr)tb->itree.last, tb->pt_state,
+            start, last);
+    abort();
+}
+
+static void pt_verify(vaddr start, vaddr last)
+{
+    GHashTable *seen;
+    GHashTableIter it;
+    gpointer k, v;
+
+    if (!pt_shadow) {
+        return;
+    }
+    seen = g_hash_table_new(NULL, NULL);
+    for (IntervalTreeNode *n = interval_tree_iter_first(&tb_root, start, last);
+         n; n = interval_tree_iter_next(n, start, last)) {
+        TranslationBlock *tb = container_of(n, TranslationBlock, itree);
+        PtShadow *e = g_hash_table_lookup(pt_shadow, tb);
+
+        if (!e) {
+            pt_verify_fail("in the tree, not in the shadow", tb, start, last);
+        }
+        if (e->start != n->start || e->last != n->last) {
+            pt_verify_fail("interval differs", tb, start, last);
+        }
+        g_hash_table_add(seen, tb);
+    }
+    g_hash_table_iter_init(&it, pt_shadow);
+    while (g_hash_table_iter_next(&it, &k, &v)) {
+        PtShadow *e = v;
+
+        if (e->start <= last && e->last >= start &&
+            !g_hash_table_contains(seen, k)) {
+            pt_verify_fail("overlaps, not found", k, start, last);
+        }
+    }
+    g_hash_table_destroy(seen);
+    tcg_cache_stats.pt_verified++;
+}
+
+/* Enter every pending TB in the tree. */
+static void tb_pending_catch_up(void)
+{
+    tcg_cache_stats.pt_caught += tb_pending_n;
+    for (size_t i = 0; i < tb_pending_n; i++) {
+        TranslationBlock *tb = tb_pending[i];
+
+        tb->pt_state = TB_PT_IN_TREE;
+        interval_tree_insert(&tb->itree, &tb_root);
+    }
+    tb_pending_clear();
+}
+
+/* Whether [@start, @last] meets a page of a pending TB. */
+static bool tb_pending_meets(vaddr start, vaddr last)
+{
+    uint64_t p0 = start >> TARGET_PAGE_BITS, p1 = last >> TARGET_PAGE_BITS;
+
+    if (!tb_pending_n) {
+        /* Removals emptied the list: its marks are all stale. */
+        tb_pending_clear();
+        return false;
+    }
+    if (p1 - p0 < tb_pending_npages) {
+        for (uint64_t p = p0; p <= p1; p++) {
+            if (tb_pending_marked(p)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    for (size_t i = 0; i < tb_pending_slots; i++) {
+        uint64_t key = tb_pending_pages[i];
+
+        if (key && key - 1 >= p0 && key - 1 <= p1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void tb_pending_add(TranslationBlock *tb)
+{
+    if (!tb_pending_n) {
+        tb_pending_clear();
+    }
+    /*
+     * Admit the TB's pages whole, or catch up first.  Room for two pages
+     * is reserved whatever the TB needs: cheaper than counting which are
+     * new, at the cost of catching up a little early near the bound.
+     */
+    if (tb_pending_npages + 2 > (tcg_cache_test_pt_cap ?: TB_PENDING_PAGES_MAX)
+        || tb_pending_n >= UINT32_MAX) {
+        tcg_cache_stats.pt_catch_cap++;
+        tb_pending_catch_up();
+    }
+    if (tb_pending_n == tb_pending_cap) {
+        tb_pending_cap = tb_pending_cap ? tb_pending_cap * 2 : 1024;
+        tb_pending = g_renew(TranslationBlock *, tb_pending, tb_pending_cap);
+    }
+    tb->pt_state = TB_PT_PENDING;
+    tb->pt_index = tb_pending_n;
+    tb_pending[tb_pending_n++] = tb;
+    tb_pending_mark(tb->itree.start >> TARGET_PAGE_BITS);
+    tb_pending_mark(tb->itree.last >> TARGET_PAGE_BITS);
+    tcg_cache_stats.pt_pending_peak = MAX(tcg_cache_stats.pt_pending_peak,
+                                          tb_pending_n);
+    tcg_cache_stats.pt_pages_peak = MAX(tcg_cache_stats.pt_pages_peak,
+                                        tb_pending_npages);
+}
+
 static void tb_remove_all(void)
 {
     /*
@@ -112,10 +358,17 @@ static void tb_remove_all(void)
      * asserted that we're in an exclusive state.
      */
     memset(&tb_root, 0, sizeof(tb_root));
+    tb_pending_clear();
+    if (pt_shadow) {
+        g_hash_table_remove_all(pt_shadow);
+    }
 }
 
-/* Call with mmap_lock held. */
-static void tb_record(TranslationBlock *tb)
+/*
+ * Call with mmap_lock held.  With @defer, the TB waits in the pending
+ * list until a query meets its pages.
+ */
+static void tb_record(TranslationBlock *tb, bool defer)
 {
     vaddr addr;
     int flags;
@@ -137,14 +390,31 @@ static void tb_record(TranslationBlock *tb)
         assert(!(flags & PAGE_WRITE) || tb->smc_check);
     }
 
-    interval_tree_insert(&tb->itree, &tb_root);
+    if (defer) {
+        tb_pending_add(tb);
+    } else {
+        tb->pt_state = TB_PT_IN_TREE;
+        interval_tree_insert(&tb->itree, &tb_root);
+    }
 }
 
 /* Call with mmap_lock held. */
 static void tb_remove(TranslationBlock *tb)
 {
     assert_memory_lock();
-    interval_tree_remove(&tb->itree, &tb_root);
+    pt_shadow_remove(tb);
+    if (tb->pt_state == TB_PT_PENDING) {
+        TranslationBlock *moved = tb_pending[--tb_pending_n];
+
+        g_assert(tb_pending[tb->pt_index] == tb);
+        tcg_cache_stats.pt_pending_removed++;
+        tb_pending[tb->pt_index] = moved;
+        moved->pt_index = tb->pt_index;
+    } else {
+        g_assert(tb->pt_state == TB_PT_IN_TREE);
+        interval_tree_remove(&tb->itree, &tb_root);
+    }
+    tb->pt_state = TB_PT_ABSENT;
 }
 
 /* TODO: For now, still shared with translate-all.c for system mode. */
@@ -159,7 +429,16 @@ typedef TranslationBlock *PageForEachNext;
 static PageForEachNext foreach_tb_first(tb_page_addr_t start,
                                         tb_page_addr_t last)
 {
-    IntervalTreeNode *n = interval_tree_iter_first(&tb_root, start, last);
+    IntervalTreeNode *n;
+
+    if (tb_pending_meets(start, last)) {
+        tcg_cache_stats.pt_catch_query++;
+        tb_pending_catch_up();
+    }
+    if (unlikely(tcg_cache_test_pt_verify)) {
+        pt_verify(start, last);
+    }
+    n = interval_tree_iter_first(&tb_root, start, last);
     return n ? container_of(n, TranslationBlock, itree) : NULL;
 }
 
@@ -176,6 +455,122 @@ static PageForEachNext foreach_tb_next(PageForEachNext tb,
         }
     }
     return NULL;
+}
+
+/*
+ * Testing (XTCG_CACHE_TEST_PT_SELFTEST): the pending list's rules on
+ * synthetic TBs at unmapped pages, each query checked by the oracle:
+ * a two-page TB admitted past the cap; a TB on the remembered last page
+ * after a catch-up and after a flush; a non-last pending TB removed, then
+ * the one moved into its place; stale marks once every pending TB is gone.
+ */
+static TranslationBlock *st_tb;
+static vaddr st_base;
+
+static void st_add(int i, int page, int off, int size)
+{
+    TranslationBlock *tb = &st_tb[i];
+
+    memset(tb, 0, sizeof(*tb));
+    tb->pc = st_base + page * TARGET_PAGE_SIZE + off;
+    tb->size = size;
+    tb->itree.start = tb->pc;
+    tb_record(tb, true);
+    pt_shadow_add(tb);
+}
+
+static int st_query(int page0, int page1)
+{
+    TranslationBlock *tb;
+    PageForEachNext n;
+    int found = 0;
+
+    PAGE_FOR_EACH_TB(st_base + page0 * TARGET_PAGE_SIZE,
+                     st_base + (page1 + 1) * TARGET_PAGE_SIZE - 1,
+                     unused, tb, n) {
+        found++;
+    }
+    return found;
+}
+
+void tb_pending_selftest(void)
+{
+    unsigned cap = tcg_cache_test_pt_cap;
+    bool verify = tcg_cache_test_pt_verify;
+    uint64_t cu_cap, cu_query;
+
+    mmap_lock();
+    /* 128 unmapped pages. */
+    for (st_base = 0x20000000; ; st_base += 0x1000000) {
+        int i;
+
+        for (i = 0; i < 128; i++) {
+            if (page_get_flags(st_base + i * TARGET_PAGE_SIZE)) {
+                break;
+            }
+        }
+        if (i == 128) {
+            break;
+        }
+    }
+    st_tb = g_malloc0(16 * sizeof(TranslationBlock));
+    tb_remove_all();
+    tcg_cache_test_pt_verify = true;
+    tcg_cache_test_pt_cap = 6;
+
+    /* Four one-page TBs, a two-page TB to the cap, one more past it. */
+    for (int i = 0; i < 4; i++) {
+        st_add(i, i, 16, 32);
+    }
+    st_add(4, 10, TARGET_PAGE_SIZE - 8, 32);
+    g_assert(tb_pending_npages == 6 && tb_pending_n == 5);
+    cu_cap = tcg_cache_stats.pt_catch_cap;
+    st_add(5, 20, TARGET_PAGE_SIZE - 8, 32);
+    g_assert(tcg_cache_stats.pt_catch_cap == cu_cap + 1);
+    g_assert(st_tb[4].pt_state == TB_PT_IN_TREE);
+    g_assert(st_tb[5].pt_state == TB_PT_PENDING && tb_pending_n == 1);
+    g_assert(st_query(21, 21) == 1);
+    g_assert(st_tb[5].pt_state == TB_PT_IN_TREE);
+
+    /* The remembered page after a catch-up. */
+    st_add(6, 30, 16, 32);
+    g_assert(st_query(30, 30) == 1);
+    st_add(7, 30, 64, 32);
+    g_assert(st_tb[7].pt_state == TB_PT_PENDING);
+    g_assert(st_query(30, 30) == 2);
+
+    /* ... and after a flush. */
+    st_add(8, 40, 16, 32);
+    tb_remove_all();
+    st_add(9, 40, 64, 32);
+    g_assert(st_query(40, 40) == 1);
+
+    /* A non-last pending TB removed, then the one moved into its place. */
+    st_add(10, 60, 16, 32);
+    st_add(11, 61, 16, 32);
+    st_add(12, 62, 16, 32);
+    tb_remove(&st_tb[10]);
+    g_assert(st_tb[12].pt_index == 0 && tb_pending_n == 2);
+    tb_remove(&st_tb[12]);
+    g_assert(st_tb[11].pt_index == 0 && tb_pending_n == 1);
+    g_assert(st_query(60, 60) == 0 && st_query(62, 62) == 0);
+    g_assert(st_query(61, 61) == 1);
+
+    /* Stale marks with nothing pending: no catch-up. */
+    st_add(13, 70, 16, 32);
+    tb_remove(&st_tb[13]);
+    cu_query = tcg_cache_stats.pt_catch_query;
+    g_assert(st_query(70, 70) == 0);
+    g_assert(tcg_cache_stats.pt_catch_query == cu_query);
+    g_assert(tb_pending_npages == 0);
+
+    tb_remove_all();
+    g_free(st_tb);
+    tcg_cache_test_pt_cap = cap;
+    tcg_cache_test_pt_verify = verify;
+    mmap_unlock();
+    fprintf(stderr, "xtcg-cache: page tracking selftest ok, %" PRIu64
+            " queries verified\n", tcg_cache_stats.pt_verified);
 }
 
 #else
@@ -734,7 +1129,8 @@ static void tb_page_add(PageDesc *p, TranslationBlock *tb, unsigned int n)
     }
 }
 
-static void tb_record(TranslationBlock *tb)
+/* @defer: user mode only. */
+static void tb_record(TranslationBlock *tb, bool defer)
 {
     tb_page_addr_t paddr0 = tb_page_addr0(tb);
     tb_page_addr_t paddr1 = tb_page_addr1(tb);
@@ -956,6 +1352,10 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
     qemu_spin_lock(&tb->jmp_lock);
     qatomic_set(&tb->cflags, tb->cflags | CF_INVALID);
     qemu_spin_unlock(&tb->jmp_lock);
+    /* Testing: an invalidated TB stays found for unwinding. */
+    if (unlikely(tcg_tb_lookup_verify)) {
+        g_assert(tcg_tb_lookup((uintptr_t)tb->tc.ptr) == tb);
+    }
 
     /*
      * A vCPU may be running a loop inside this TB, which unlinking its
@@ -1030,13 +1430,16 @@ void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr)
 /*
  * Add a new TB and link it to the physical page tables.
  * Called with mmap_lock held for user-mode emulation.
+ * With @defer_pages, user mode enters the TB in page tracking only when a
+ * query meets its pages: for TBs that, like a persistent cache's, arrive
+ * in numbers few queries will need.
  *
  * Returns a pointer @tb, or a pointer to an existing TB that matches @tb.
  * Note that in !user-mode, another thread might have already added a TB
  * for the same block of guest code that @tb corresponds to. In that case,
  * the caller should discard the original @tb, and use instead the returned TB.
  */
-TranslationBlock *tb_link_page(TranslationBlock *tb)
+TranslationBlock *tb_link_page(TranslationBlock *tb, bool defer_pages)
 {
     void *existing_tb = NULL;
     uint32_t h;
@@ -1044,7 +1447,10 @@ TranslationBlock *tb_link_page(TranslationBlock *tb)
     assert_memory_lock();
     tcg_debug_assert(!(tb->cflags & CF_INVALID));
 
-    tb_record(tb);
+    tb_record(tb, defer_pages);
+#ifdef CONFIG_USER_ONLY
+    pt_shadow_add(tb);
+#endif
 
     /* add in the hash table */
     h = tb_hash_func(tb_page_addr0(tb), (tb->cflags & CF_PCREL ? 0 : tb->pc),
