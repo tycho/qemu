@@ -104,6 +104,158 @@ static inline void tb_lock_pages(const TranslationBlock *tb) { }
  */
 static IntervalTreeRoot tb_root;
 
+/* The TB's new fields sit in padding: the struct doesn't grow. */
+#if HOST_LONG_BITS == 64
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, pt_state) !=
+                  offsetof(TranslationBlock, smc_inline) + 1);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, pt_index) !=
+                  offsetof(TranslationBlock, smc_crc) + 4);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, smc_stale) !=
+                  offsetof(TranslationBlock, smc_crc) + 8);
+QEMU_BUILD_BUG_ON(offsetof(TranslationBlock, jmp_lock) !=
+                  offsetof(TranslationBlock, smc_stale) + sizeof(void *));
+#endif
+
+/*
+ * TBs linked with @defer_pages (installed from a persistent cache) wait
+ * in a pending list instead of entering the tree: a start-up installs
+ * tens of thousands and queries page tracking for few of them.  Their
+ * pages are marked in a set; a query whose range meets a marked page
+ * first enters every pending TB in the tree ("catches up").  Removing a
+ * pending TB takes it off the list; its marks stay until the next
+ * catch-up, which is conservative.  All under mmap_lock.
+ */
+#define TB_PENDING_PAGES_MAX 16384
+
+static TranslationBlock **tb_pending;
+static size_t tb_pending_n, tb_pending_cap;
+/* Open addressing: page number + 1, 0 when empty; at most half full. */
+static uint64_t *tb_pending_pages;
+static size_t tb_pending_slots, tb_pending_npages;
+/* The last page marked, + 1; 0 for none. */
+static uint64_t tb_pending_memo;
+
+static size_t tb_pending_probe(uint64_t key)
+{
+    size_t mask = tb_pending_slots - 1;
+    size_t i = ((key * 0x9e3779b97f4a7c15ull) >> 32) & mask;
+
+    while (tb_pending_pages[i] && tb_pending_pages[i] != key) {
+        i = (i + 1) & mask;
+    }
+    return i;
+}
+
+static bool tb_pending_marked(uint64_t page)
+{
+    return tb_pending_slots &&
+           tb_pending_pages[tb_pending_probe(page + 1)] == page + 1;
+}
+
+static void tb_pending_mark(uint64_t page)
+{
+    uint64_t key = page + 1;
+    size_t i;
+
+    if (key == tb_pending_memo) {
+        return;
+    }
+    if (2 * (tb_pending_npages + 1) > tb_pending_slots) {
+        uint64_t *old = tb_pending_pages;
+        size_t old_slots = tb_pending_slots;
+
+        tb_pending_slots = old_slots ? old_slots * 2 : 1024;
+        tb_pending_pages = g_new0(uint64_t, tb_pending_slots);
+        for (size_t j = 0; j < old_slots; j++) {
+            if (old[j]) {
+                tb_pending_pages[tb_pending_probe(old[j])] = old[j];
+            }
+        }
+        g_free(old);
+    }
+    i = tb_pending_probe(key);
+    if (!tb_pending_pages[i]) {
+        tb_pending_pages[i] = key;
+        tb_pending_npages++;
+    }
+    tb_pending_memo = key;
+}
+
+static void tb_pending_clear(void)
+{
+    tb_pending_n = 0;
+    if (tb_pending_npages) {
+        memset(tb_pending_pages, 0, tb_pending_slots * sizeof(uint64_t));
+        tb_pending_npages = 0;
+    }
+    tb_pending_memo = 0;
+}
+
+/* Enter every pending TB in the tree. */
+static void tb_pending_catch_up(void)
+{
+    for (size_t i = 0; i < tb_pending_n; i++) {
+        TranslationBlock *tb = tb_pending[i];
+
+        tb->pt_state = TB_PT_IN_TREE;
+        interval_tree_insert(&tb->itree, &tb_root);
+    }
+    tb_pending_clear();
+}
+
+/* Whether [@start, @last] meets a page of a pending TB. */
+static bool tb_pending_meets(vaddr start, vaddr last)
+{
+    uint64_t p0 = start >> TARGET_PAGE_BITS, p1 = last >> TARGET_PAGE_BITS;
+
+    if (!tb_pending_n) {
+        /* Removals emptied the list: its marks are all stale. */
+        tb_pending_clear();
+        return false;
+    }
+    if (p1 - p0 < tb_pending_npages) {
+        for (uint64_t p = p0; p <= p1; p++) {
+            if (tb_pending_marked(p)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    for (size_t i = 0; i < tb_pending_slots; i++) {
+        uint64_t key = tb_pending_pages[i];
+
+        if (key && key - 1 >= p0 && key - 1 <= p1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void tb_pending_add(TranslationBlock *tb)
+{
+    if (!tb_pending_n) {
+        tb_pending_clear();
+    }
+    /*
+     * Admit the TB's pages whole, or catch up first.  Room for two pages
+     * is reserved whatever the TB needs: cheaper than counting which are
+     * new, at the cost of catching up a little early near the bound.
+     */
+    if (tb_pending_npages + 2 > TB_PENDING_PAGES_MAX ||
+        tb_pending_n >= UINT32_MAX) {
+        tb_pending_catch_up();
+    }
+    if (tb_pending_n == tb_pending_cap) {
+        tb_pending_cap = tb_pending_cap ? tb_pending_cap * 2 : 1024;
+        tb_pending = g_renew(TranslationBlock *, tb_pending, tb_pending_cap);
+    }
+    tb->pt_state = TB_PT_PENDING;
+    tb->pt_index = tb_pending_n;
+    tb_pending[tb_pending_n++] = tb;
+    tb_pending_mark(tb->itree.start >> TARGET_PAGE_BITS);
+    tb_pending_mark(tb->itree.last >> TARGET_PAGE_BITS);
+}
+
 static void tb_remove_all(void)
 {
     /*
@@ -111,10 +263,14 @@ static void tb_remove_all(void)
      * asserted that we're in an exclusive state.
      */
     memset(&tb_root, 0, sizeof(tb_root));
+    tb_pending_clear();
 }
 
-/* Call with mmap_lock held. */
-static void tb_record(TranslationBlock *tb)
+/*
+ * Call with mmap_lock held.  With @defer, the TB waits in the pending
+ * list until a query meets its pages.
+ */
+static void tb_record(TranslationBlock *tb, bool defer)
 {
     vaddr addr;
     int flags;
@@ -136,14 +292,29 @@ static void tb_record(TranslationBlock *tb)
         assert(!(flags & PAGE_WRITE) || tb->smc_check);
     }
 
-    interval_tree_insert(&tb->itree, &tb_root);
+    if (defer) {
+        tb_pending_add(tb);
+    } else {
+        tb->pt_state = TB_PT_IN_TREE;
+        interval_tree_insert(&tb->itree, &tb_root);
+    }
 }
 
 /* Call with mmap_lock held. */
 static void tb_remove(TranslationBlock *tb)
 {
     assert_memory_lock();
-    interval_tree_remove(&tb->itree, &tb_root);
+    if (tb->pt_state == TB_PT_PENDING) {
+        TranslationBlock *moved = tb_pending[--tb_pending_n];
+
+        g_assert(tb_pending[tb->pt_index] == tb);
+        tb_pending[tb->pt_index] = moved;
+        moved->pt_index = tb->pt_index;
+    } else {
+        g_assert(tb->pt_state == TB_PT_IN_TREE);
+        interval_tree_remove(&tb->itree, &tb_root);
+    }
+    tb->pt_state = TB_PT_ABSENT;
 }
 
 /* TODO: For now, still shared with translate-all.c for system mode. */
@@ -158,7 +329,12 @@ typedef TranslationBlock *PageForEachNext;
 static PageForEachNext foreach_tb_first(tb_page_addr_t start,
                                         tb_page_addr_t last)
 {
-    IntervalTreeNode *n = interval_tree_iter_first(&tb_root, start, last);
+    IntervalTreeNode *n;
+
+    if (tb_pending_meets(start, last)) {
+        tb_pending_catch_up();
+    }
+    n = interval_tree_iter_first(&tb_root, start, last);
     return n ? container_of(n, TranslationBlock, itree) : NULL;
 }
 
@@ -733,7 +909,8 @@ static void tb_page_add(PageDesc *p, TranslationBlock *tb, unsigned int n)
     }
 }
 
-static void tb_record(TranslationBlock *tb)
+/* @defer: user mode only. */
+static void tb_record(TranslationBlock *tb, bool defer)
 {
     tb_page_addr_t paddr0 = tb_page_addr0(tb);
     tb_page_addr_t paddr1 = tb_page_addr1(tb);
@@ -1027,13 +1204,16 @@ void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr)
 /*
  * Add a new TB and link it to the physical page tables.
  * Called with mmap_lock held for user-mode emulation.
+ * With @defer_pages, user mode enters the TB in page tracking only when a
+ * query meets its pages: for TBs that, like a persistent cache's, arrive
+ * in numbers few queries will need.
  *
  * Returns a pointer @tb, or a pointer to an existing TB that matches @tb.
  * Note that in !user-mode, another thread might have already added a TB
  * for the same block of guest code that @tb corresponds to. In that case,
  * the caller should discard the original @tb, and use instead the returned TB.
  */
-TranslationBlock *tb_link_page(TranslationBlock *tb)
+TranslationBlock *tb_link_page(TranslationBlock *tb, bool defer_pages)
 {
     void *existing_tb = NULL;
     uint32_t h;
@@ -1041,7 +1221,7 @@ TranslationBlock *tb_link_page(TranslationBlock *tb)
     assert_memory_lock();
     tcg_debug_assert(!(tb->cflags & CF_INVALID));
 
-    tb_record(tb);
+    tb_record(tb, defer_pages);
 
     /* add in the hash table */
     h = tb_hash_func(tb_page_addr0(tb), (tb->cflags & CF_PCREL ? 0 : tb->pc),
