@@ -31,6 +31,7 @@
 #include "exec/replay-core.h"
 #include "exec/icount.h"
 #include "tcg/startup.h"
+#include "tcg/tcg-cache.h"
 #include "host/fpenv.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -1292,6 +1293,40 @@ static void tcg_set_smc(Object *obj, const char *value, Error **errp)
     }
 }
 
+static char *tcg_get_cache(Object *obj, Error **errp)
+{
+    switch (tcg_cache_mode) {
+    case TCG_CACHE_ON:
+        return g_strdup(tcg_cache_files ? "files" : "on");
+    case TCG_CACHE_CAPTURE:
+        return g_strdup("capture");
+    case TCG_CACHE_STRESS:
+        return g_strdup("stress");
+    default:
+        return g_strdup("off");
+    }
+}
+
+static void tcg_set_cache(Object *obj, const char *value, Error **errp)
+{
+    bool files = !strcmp(value, "files");
+
+    if (!strcmp(value, "off")) {
+        tcg_cache_mode = TCG_CACHE_OFF;
+        tcg_cache_files = false;
+    } else if (files || !strcmp(value, "on")) {
+        if (!tcg_can_cache()) {
+            error_setg(errp, "x-cache=%s: only in user mode on an aarch64 "
+                       "host", value);
+            return;
+        }
+        tcg_cache_mode = TCG_CACHE_ON;
+        tcg_cache_files = files;
+    } else {
+        error_setg(errp, "x-cache must be off, on or files");
+    }
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1653,6 +1688,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "and TBs of code that may change end after each insn that may "
         "store; user mode only) or check-call (the same, the CRC always "
         "by a helper call)");
+
+    object_class_property_add_str(oc, "x-cache", tcg_get_cache,
+                                  tcg_set_cache);
+    object_class_property_set_description(oc, "x-cache",
+        "The translation cache (user mode, aarch64 hosts): off, on (each "
+        "translation of image code kept in the process and installed again "
+        "before translating the same code) or files (kept in and read from "
+        "files too, which other processes share)");
 }
 
 static const TypeInfo tcg_accel_type = {

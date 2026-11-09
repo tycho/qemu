@@ -30,7 +30,14 @@ enum {
     TCG_CACHE_ON,           /* keep eligible artifacts, install from them */
 };
 
+/*
+ * x-cache sets both: off (TCG_CACHE_OFF), on (TCG_CACHE_ON) or files
+ * (TCG_CACHE_ON, and tcg_cache_files: the artifacts in files too, by the
+ * OS's directory back end).  The capture and stress modes are
+ * development modes outside the setting (tcg_cache_init).
+ */
 extern int tcg_cache_mode;
+extern bool tcg_cache_files;
 /* Development: move each install by up to this many 16-byte steps. */
 extern unsigned tcg_cache_skew;
 extern bool tcg_cache_stats_at_exit;

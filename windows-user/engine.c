@@ -698,15 +698,17 @@ static void set_settings(Object *accel, const char *settings)
                 /* A new directory for each process (development). */
                 xt_cache_fresh = true;
                 applied++;
-            } else if (!strcmp(kv[i], "cache")) {
-                /* Keep image code's artifacts; install before translating. */
-                tcg_cache_mode = TCG_CACHE_ON;
-                applied++;
-            } else if (!strcmp(kv[i], "cachefiles")) {
-                /* With cache: artifacts also in files (cache-files.c). */
-                tcg_cache_mode = TCG_CACHE_ON;
-                xt_cache_files = true;
-                applied++;
+            } else if (!strcmp(kv[i], "cache") ||
+                       !strcmp(kv[i], "cachefiles")) {
+                /* x-cache=on and x-cache=files. */
+                Error *err = NULL;
+
+                if (object_property_parse(accel, "x-cache",
+                                          kv[i][5] ? "files" : "on", &err)) {
+                    applied++;
+                } else {
+                    reject(kv[i], err);
+                }
             } else if (!strcmp(kv[i], "cachetrace")) {
                 tcg_cache_trace = true;
                 applied++;
@@ -875,6 +877,17 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     if (rejected) {
         refuse_settings(first_rejected);
     }
+#ifdef TARGET_X86_64
+    /*
+     * Not yet in the x64 module: it has no termination calls to stop the
+     * cache's writer before the process kills it, and a writer killed
+     * holding the sink's lock would leave a capture at exit waiting for it
+     * forever.  Its in-process cache isn't qualified either.
+     */
+    if (tcg_cache_mode == TCG_CACHE_ON) {
+        refuse_settings("x-cache: not in the x64 module");
+    }
+#endif
     /*
      * Guest registers in host registers across TBs, and globals synced
      * lazily: the engine's fault path stores them from the fault's native

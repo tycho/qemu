@@ -105,7 +105,6 @@ typedef struct XtFileDisposition {
                          FILE_APPEND_DATA | FILE_WRITE_EA |             \
                          FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD)
 
-bool xt_cache_files;
 /*
  * Development (the cachefresh setting): the files in a directory of this
  * process's own under the cache's, "fresh-" and the process id in hex, so
@@ -785,18 +784,9 @@ void xt_cache_files_init(CPUState *first)
     size_t n;
     HANDLE b = NULL, h;
 
-    if (!xt_cache_files || tcg_cache_mode != TCG_CACHE_ON) {
+    if (!tcg_cache_files || tcg_cache_mode != TCG_CACHE_ON) {
         return;
     }
-#ifdef TARGET_X86_64
-    /*
-     * Not yet: the x64 module has no termination calls to stop the writer
-     * before the process kills it, and a writer killed holding the sink's
-     * lock would leave a capture at exit waiting for it forever.
-     */
-    fprintf(stderr, "xtcg-cache: files: the WOW64 module only\n");
-    return;
-#endif
     if (NtQuerySystemInformation(SystemBasicInformation, &sbi, sizeof(sbi),
                                  NULL) < 0) {
         return;

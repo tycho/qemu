@@ -2494,6 +2494,15 @@ bool tcg_can_tblayout(void)
 #endif
 }
 
+bool tcg_can_cache(void)
+{
+#if defined(CONFIG_USER_ONLY) && defined(TCG_TARGET_HAS_CACHE)
+    return true;
+#else
+    return false;
+#endif
+}
+
 /*
  * Keep code_gen_ptr in the hot part of the current chunk with room for a
  * TB in both parts, else start the next chunk; s->lay_on says whether
