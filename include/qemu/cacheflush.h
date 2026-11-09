@@ -49,6 +49,11 @@ void flush_idcache_range(uintptr_t rx, uintptr_t rw, size_t len);
  */
 #if defined(HOST_AARCH64) && !defined(CONFIG_DARWIN)
 
+#ifdef CONFIG_WIN32
+/* Testing: take FlushInstructionCache even when IDC and DIC are set. */
+extern bool qemu_icache_test_fallback;
+#endif
+
 void flush_idcache_range2(uintptr_t rx0, uintptr_t rw0, size_t len0,
                           uintptr_t rx1, uintptr_t rw1, size_t len1);
 

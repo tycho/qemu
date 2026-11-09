@@ -590,6 +590,21 @@ extern int tcg_cache_test_unwind_damage;
 extern unsigned tcg_cache_test_capture_damage;
 extern unsigned tcg_cache_test_capture_damage_after;
 extern unsigned tcg_cache_test_firstuse_pause_ms;
+/* Testing: forced duplicate installs, page tracking's oracle and cap. */
+extern unsigned tcg_cache_test_dup;
+extern bool tcg_cache_test_pt_verify;
+extern unsigned tcg_cache_test_pt_cap;
+#ifdef CONFIG_USER_ONLY
+/* TBs waiting for page tracking (accel/tcg/tb-maint.c). */
+size_t tb_pending_count(void);
+/* Testing: the pending list and its page set on synthetic TBs. */
+void tb_pending_selftest(void);
+#endif
+/* The slot forms placement resets (statistics). */
+enum {
+    TCG_CACHE_SLOT_PLAIN, TCG_CACHE_SLOT_COLD, TCG_CACHE_SLOT_NOP,
+    TCG_CACHE_SLOT_CALL, TCG_CACHE_SLOT_COND,
+};
 /* Write @art's envelope at @out (room for ROUND_UP(64 + len, 8)). */
 size_t tcg_cache_envelope(void *out, uint64_t id, uint64_t rva,
                           uint32_t born, const void *art, size_t len);
@@ -853,6 +868,11 @@ typedef struct TCGCacheStats {
     /* First-use checks of unwind data (tcg_cache_unwind_first_use). */
     uint64_t unwind_checks[TCG_CACHE_UNWIND_MAX], unwind_repeats, unwind_ns;
     uint64_t test_unwind_damaged, test_capture_damaged, unwind_installed_wb;
+    /* Installation: slot forms reset (TCG_CACHE_SLOT_*), duplicates forced. */
+    uint64_t slot_forms[5], test_dups;
+    /* Deferred page tracking (accel/tcg/tb-maint.c). */
+    uint64_t pt_catch_query, pt_catch_cap, pt_caught, pt_pending_peak;
+    uint64_t pt_pages_peak, pt_verified, pt_pending_removed;
     /* TCG_CACHE_ON */
     uint64_t translations, inel_capture, stored, store_dup, store_full;
     uint64_t store_bytes, lookups, look_inel, look_none, hits;

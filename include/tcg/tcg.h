@@ -938,6 +938,8 @@ void tcg_tb_remove(TranslationBlock *tb);
  * NULL.
  */
 TranslationBlock *tcg_tb_lookup(uintptr_t tc_ptr);
+/* Testing: tcg_tb_insert and tcg_tb_remove check lookups around them. */
+extern bool tcg_tb_lookup_verify;
 
 /**
  * tcg_tb_foreach:
