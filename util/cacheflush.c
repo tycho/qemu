@@ -153,6 +153,29 @@ static void arch_cache_info(int *isize, int *dsize)
     }
 }
 
+#elif defined(HOST_AARCH64) && defined(CONFIG_WIN32)
+#include "host/cpuinfo.h"
+
+/*
+ * Windows doesn't let user mode read CTR_EL0, but lists it in the
+ * registry; without it, flush_idcache_range asks Windows.
+ */
+static uint64_t save_ctr_el0;
+static void arch_cache_info(int *isize, int *dsize)
+{
+    uint64_t ctr = cpuinfo_win32_ctr_el0();
+
+    save_ctr_el0 = ctr;
+    if (ctr) {
+        if (*isize == 0) {
+            *isize = 4 << (ctr & 0xf);
+        }
+        if (*dsize == 0) {
+            *dsize = 4 << ((ctr >> 16) & 0xf);
+        }
+    }
+}
+
 #elif defined(_ARCH_PPC64) && defined(__linux__)
 # include "elf.h"
 
@@ -231,11 +254,7 @@ static void __attribute__((constructor)) init_cache_info(void)
 
 /* Wasm doesn't have executable region of memory. */
 
-#elif defined(HOST_AARCH64) && !defined(CONFIG_WIN32)
-/*
- * For Windows, we use generic implementation of flush_idcache_range, that
- * performs a call to FlushInstructionCache, through __builtin___clear_cache.
- */
+#elif defined(HOST_AARCH64)
 
 #ifdef CONFIG_DARWIN
 /* Apple does not expose CTR_EL0, so we must use system interfaces. */
@@ -267,6 +286,22 @@ void flush_idcache_range(uintptr_t rx, uintptr_t rw, size_t len)
     const uintptr_t icache_lsize = qemu_icache_linesize;
     const uintptr_t dcache_lsize = qemu_dcache_linesize;
     uintptr_t p;
+
+#ifdef CONFIG_WIN32
+    /*
+     * Without CTR_EL0, or unless it says no maintenance by address is
+     * needed (IDC and DIC), FlushInstructionCache: that Windows lets user
+     * mode clean and invalidate by address, and at what stride across
+     * the processors, isn't established.
+     */
+    if ((ctr_el0 & (CTR_IDC | CTR_DIC)) != (CTR_IDC | CTR_DIC)) {
+        if (rw != rx) {
+            __builtin___clear_cache((char *)rw, (char *)rw + len);
+        }
+        __builtin___clear_cache((char *)rx, (char *)rx + len);
+        return;
+    }
+#endif
 
     /*
      * If CTR_EL0.IDC is enabled, Data cache clean to the Point of Unification
