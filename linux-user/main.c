@@ -1240,6 +1240,9 @@ int main(int argc, char **argv, char **envp)
     /* Before anything is translated or validated, in every cache mode. */
     tcg_cache_wb_init();
     tcg_cache_terminate = cache_terminate;
+    if (getenv("XTCG_CACHE_TEST_PT_SELFTEST")) {
+        tb_pending_selftest();
+    }
     if (getenv("XTCG_CACHE_SELFTEST")) {
         /* Testing the cache's guarded routines (tcg-cache.h). */
         size_t pg = qemu_real_host_page_size();

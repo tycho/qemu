@@ -639,6 +639,11 @@ static const TCGCacheHost *tb_cache_host(void)
 /* Why the last install failed (TCG_CACHE_W_*), and the last lookup. */
 static unsigned tb_cache_fail, tb_cache_why;
 
+static void tb_cache_test_dup(CPUState *cpu, TCGTBCPUState s,
+                              tb_page_addr_t phys_pc, const void *art,
+                              size_t len, const TCGCacheImage *img,
+                              TranslationBlock *first);
+
 static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
                                           tb_page_addr_t phys_pc,
                                           const void *art, size_t len,
@@ -831,7 +836,68 @@ static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
         tcg_tb_remove(tb);
         return existing_tb;
     }
+    /* The slot forms an installed TB was reset in (statistics). */
+    for (int n = 0; n < tb->nb_slots; n++) {
+        if (tb->jmp[n].reset_offset == TB_JMP_OFFSET_INVALID) {
+            continue;
+        }
+        if (tb->jmp_call & (1u << n)) {
+            tcg_cache_stats.slot_forms[TCG_CACHE_SLOT_CALL]++;
+        } else if (tb->jmp_cold & (1u << n)) {
+            tcg_cache_stats.slot_forms[tb->jmp[n].reset_offset ==
+                                       tb->jmp[n].insn_offset + 4
+                                       ? TCG_CACHE_SLOT_NOP
+                                       : TCG_CACHE_SLOT_COLD]++;
+        } else {
+            tcg_cache_stats.slot_forms[TCG_CACHE_SLOT_PLAIN]++;
+        }
+        if (tb->jmp[n].cond) {
+            tcg_cache_stats.slot_forms[TCG_CACHE_SLOT_COND]++;
+        }
+    }
+    if (unlikely(tcg_cache_test_dup)) {
+        tb_cache_test_dup(cpu, s, phys_pc, art, len, img, tb);
+    }
     return tb;
+}
+
+/*
+ * Testing (XTCG_CACHE_TEST_DUP=n): every nth install installs its
+ * artifact again right after, which must find @first and give back the
+ * second TB from the region array and page tracking.
+ */
+static void tb_cache_test_dup(CPUState *cpu, TCGTBCPUState s,
+                              tb_page_addr_t phys_pc, const void *art,
+                              size_t len, const TCGCacheImage *img,
+                              TranslationBlock *first)
+{
+    static unsigned n;
+    static bool in_dup;
+    size_t nb_tbs, pending;
+    uint64_t dups;
+    TranslationBlock *tb;
+
+    if (in_dup || ++n % tcg_cache_test_dup) {
+        return;
+    }
+    nb_tbs = tcg_nb_tbs();
+    pending = tb_pending_count();
+    dups = tcg_cache_stats.inst_dup;
+    in_dup = true;
+    tb = tb_cache_install(cpu, s, phys_pc, art, len, img);
+    in_dup = false;
+    if (!tb) {
+        /* Placement may fail here as at first (reach): no duplicate. */
+        return;
+    }
+    g_assert(tb == first);
+    g_assert(tcg_cache_stats.inst_dup == dups + 1);
+    g_assert(tcg_nb_tbs() == nb_tbs);
+    /* Admitting the duplicate may have caught up the pending list. */
+    g_assert(tb_pending_count() <= pending);
+    g_assert(first->pt_state == TB_PT_PENDING ||
+             first->pt_state == TB_PT_IN_TREE);
+    tcg_cache_stats.test_dups++;
 }
 
 /* A file's candidate, installed if it applies (tcg_cache_file_select). */

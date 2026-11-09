@@ -278,6 +278,10 @@ void flush_idcache_range(uintptr_t rx, uintptr_t rw, size_t len)
  * This is a copy of gcc's __aarch64_sync_cache_range, modified to take
  * the data and instruction views of @n ranges and synchronize once.
  */
+#ifdef CONFIG_WIN32
+bool qemu_icache_test_fallback;
+#endif
+
 static void sync_cache_ranges(const uintptr_t *rx, const uintptr_t *rw,
                               const size_t *len, int n)
 {
@@ -295,7 +299,8 @@ static void sync_cache_ranges(const uintptr_t *rx, const uintptr_t *rw,
      * mode clean and invalidate by address, and at what stride across
      * the processors, isn't established.
      */
-    if ((ctr_el0 & (CTR_IDC | CTR_DIC)) != (CTR_IDC | CTR_DIC)) {
+    if ((ctr_el0 & (CTR_IDC | CTR_DIC)) != (CTR_IDC | CTR_DIC) ||
+        qemu_icache_test_fallback) {
         for (int i = 0; i < n; i++) {
             if (!len[i]) {
                 continue;
