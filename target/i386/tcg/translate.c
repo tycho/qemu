@@ -4605,6 +4605,9 @@ void tcg_x86_init(void)
     tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_src));
     tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_src2));
     tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_dst2));
+#ifndef TARGET_X86_64
+    tcg_guest_addr32 = true;
+#endif
 
     for (i = 0; i < CPU_NB_EREGS; ++i) {
         cpu_regs[i] = tcg_global_mem_new(tcg_env,

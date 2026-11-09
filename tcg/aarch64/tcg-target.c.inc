@@ -2481,6 +2481,55 @@ static bool acqrel_onepath(MemOp memop)
 #define MIN_TLB_MASK_TABLE_OFS  -512
 
 /*
+ * x-zext32: with no guest base, a 32-bit guest address register is the
+ * host address, since the backend keeps it zero-extended (the 32-bit
+ * operations zero-extend; tcg.c extends the rest).
+ */
+#define TCG_TARGET_HAS_ZEXT32
+
+/* BRK's immediate for a failed x-zext32 check: the tag, plus the register. */
+#define ZEXT32_BRK_TAG  0x3200
+#define ZEXT32_BRK_MASK 0xffe0
+
+/* Set bits 48-63 of @r, for x-zext32's tests (tcg_zext32_poison). */
+static void tcg_out_zext32_poison(TCGContext *s, TCGReg r)
+{
+    tcg_out_insn(s, movw, MOVK, TCG_TYPE_I64, r, 0xdead, 48);
+}
+
+/*
+ * TCG_ZEXT32_CHECK: trap unless @r is zero-extended from 32 bits, in the
+ * access's own code, so the trap's pc unwinds to the guest insn.
+ */
+static void tcg_out_zext32_check(TCGContext *s, TCGReg r)
+{
+    /* cmp xr, wr, uxtw */
+    tcg_out32(s, 0xeb200000 | r << 16 | 2 << 13 | r << 5 | TCG_REG_XZR);
+    /* b.eq .+8 */
+    tcg_out32(s, 0x54000000 | 2 << 5 | COND_EQ);
+    /* brk #(tag | r) */
+    tcg_out32(s, 0xd4200000 | (ZEXT32_BRK_TAG | r) << 5);
+}
+
+/* The register a failed check at @pc names, or -1 if @pc isn't one. */
+static int tcg_target_zext32_trap_reg(uintptr_t pc)
+{
+    uint32_t insn = *(const uint32_t *)pc;
+
+    if ((insn & 0xffe0001f) == 0xd4200000 &&
+        ((insn >> 5) & ZEXT32_BRK_MASK) == ZEXT32_BRK_TAG) {
+        return (insn >> 5) & 31;
+    }
+    return -1;
+}
+
+/* Whether a 32-bit guest address register is the host address. */
+static bool zext32_addr(TCGType addr_type)
+{
+    return addr_type == TCG_TYPE_I32 && tcg_zext32_active;
+}
+
+/*
  * For system-mode, perform the TLB load and compare.
  * For user-mode, perform any required alignment tests.
  * In both cases, return a TCGLabelQemuLdst structure if the slow path
@@ -2623,7 +2672,8 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
             tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
         }
 
-        if (guest_base || addr_type == TCG_TYPE_I32) {
+        if (guest_base ||
+            (addr_type == TCG_TYPE_I32 && !zext32_addr(addr_type))) {
 #ifdef __arm64ec__
             g_assert_not_reached();
 #endif
@@ -2631,6 +2681,9 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
             h->index = addr_reg;
             h->index_ext = addr_type;
         } else {
+            if (tcg_zext32 == TCG_ZEXT32_CHECK && addr_type == TCG_TYPE_I32) {
+                tcg_out_zext32_check(s, addr_reg);
+            }
             h->base = addr_reg;
             h->index = TCG_REG_XZR;
             h->index_ext = TCG_TYPE_I64;
@@ -2904,6 +2957,7 @@ static void tcg_out_qemu_ld_direct(TCGContext *s, MemOp memop, TCGType ext,
                               h.index);
         break;
     case MO_SL:
+        tcg_debug_assert(ext == TCG_TYPE_I64);
         tcg_out_insn_ldst_reg(s, Ildst_imm_LDRSWX, data_r, h.base, h.index_ext,
                               h.index);
         break;
@@ -3329,6 +3383,7 @@ static AArch64Insn ld_insn(MemOp mop, TCGType ext)
     case MO_UL:
         return Ildst_imm_LDRW;
     case MO_SL:
+        tcg_debug_assert(ext);
         return Ildst_imm_LDRSWX;
     case MO_UQ:
         return Ildst_imm_LDRX;
@@ -4746,6 +4801,8 @@ static void tgen_bswap32(TCGContext *s, TCGType type,
 {
     tcg_out_rev(s, TCG_TYPE_I32, MO_32, a0, a1);
     if (flags & TCG_BSWAP_OS) {
+        /* A 32-bit value's register stays zero-extended (x-zext32). */
+        tcg_debug_assert(type == TCG_TYPE_I64);
         tcg_out_ext32s(s, a0, a0);
     }
 }
@@ -4774,6 +4831,7 @@ static void tgen_revbit32(TCGContext *s, TCGType type,
 {
     tcg_out_insn(s, rr_sf, RBIT, TCG_TYPE_I32, a0, a1);
     if (flags & TCG_BSWAP_OS) {
+        tcg_debug_assert(type == TCG_TYPE_I64);
         tcg_out_ext32s(s, a0, a0);
     }
 }
@@ -5019,6 +5077,7 @@ static const TCGOutOpLoad outop_ld32u = {
 static void tgen_ld32s(TCGContext *s, TCGType type, TCGReg dest,
                        TCGReg base, ptrdiff_t offset)
 {
+    tcg_debug_assert(type == TCG_TYPE_I64);
     tcg_out_ldst(s, Ildst_imm_LDRSWX, dest, base, offset, 2);
 }
 
