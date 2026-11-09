@@ -51,6 +51,9 @@
  * increasing address order between resets, and only the newest TB is
  * ever removed, when its space is given back.
  */
+/* Testing: check lookups around each insertion and removal. */
+bool tcg_tb_lookup_verify;
+
 struct tcg_region_tree {
     QemuMutex lock;
     TranslationBlock **tbs;
@@ -179,6 +182,8 @@ static struct tcg_region_tree *tc_ptr_to_region_tree(const void *p)
     return region_trees + region_idx * tree_size;
 }
 
+static void tcg_tb_lookup_check(struct tcg_region_tree *rt);
+
 void tcg_tb_insert(TranslationBlock *tb)
 {
     struct tcg_region_tree *rt = tc_ptr_to_region_tree(tb->tc.ptr);
@@ -197,6 +202,9 @@ void tcg_tb_insert(TranslationBlock *tb)
     }
     rt->tbs[rt->n++] = tb;
     qemu_mutex_unlock(&rt->lock);
+    if (unlikely(tcg_tb_lookup_verify)) {
+        tcg_tb_lookup_check(rt);
+    }
 }
 
 void tcg_tb_remove(TranslationBlock *tb)
@@ -209,6 +217,9 @@ void tcg_tb_remove(TranslationBlock *tb)
     rt->n--;
     qemu_spin_destroy(&tb->jmp_lock);
     qemu_mutex_unlock(&rt->lock);
+    if (unlikely(tcg_tb_lookup_verify)) {
+        tcg_tb_lookup_check(rt);
+    }
 }
 
 /*
@@ -247,6 +258,36 @@ TranslationBlock *tcg_tb_lookup(uintptr_t tc_ptr)
     }
     qemu_mutex_unlock(&rt->lock);
     return tb;
+}
+
+/*
+ * Testing (tcg_tb_lookup_verify): the newest two TBs of @rt are found at
+ * their first and last bytes and not past their ends, and a gap between
+ * them finds nothing.
+ */
+static void tcg_tb_lookup_check(struct tcg_region_tree *rt)
+{
+    TranslationBlock *t[2] = { NULL, NULL };
+
+    qemu_mutex_lock(&rt->lock);
+    for (int i = 0; i < 2 && i < rt->n; i++) {
+        t[i] = rt->tbs[rt->n - 1 - i];
+    }
+    qemu_mutex_unlock(&rt->lock);
+    for (int i = 0; i < 2 && t[i]; i++) {
+        uintptr_t p = (uintptr_t)t[i]->tc.ptr, e = p + t[i]->tc.size;
+
+        g_assert(tcg_tb_lookup(p) == t[i]);
+        g_assert(tcg_tb_lookup(e - 1) == t[i]);
+        g_assert(tcg_tb_lookup(e) != t[i]);
+    }
+    if (t[1]) {
+        uintptr_t e1 = (uintptr_t)t[1]->tc.ptr + t[1]->tc.size;
+
+        if (e1 < (uintptr_t)t[0]->tc.ptr) {
+            g_assert(tcg_tb_lookup(e1) == NULL);
+        }
+    }
 }
 
 static void tcg_region_tree_lock_all(void)
@@ -308,9 +349,17 @@ size_t tcg_nb_tbs(void)
 
 static void tcg_region_tree_reset_all(void)
 {
+    uintptr_t old = 0;
     size_t i;
 
     tcg_region_tree_lock_all();
+    if (unlikely(tcg_tb_lookup_verify)) {
+        struct tcg_region_tree *rt = region_trees;
+
+        if (rt->n) {
+            old = (uintptr_t)rt->tbs[rt->n - 1]->tc.ptr;
+        }
+    }
     for (i = 0; i < region.n; i++) {
         struct tcg_region_tree *rt = region_trees + i * tree_size;
 
@@ -320,6 +369,10 @@ static void tcg_region_tree_reset_all(void)
         rt->n = 0;
     }
     tcg_region_tree_unlock_all();
+    /* Testing: a TB from before the reset is gone. */
+    if (old) {
+        g_assert(tcg_tb_lookup(old) == NULL);
+    }
 }
 
 static void tcg_region_bounds(size_t curr_region, void **pstart, void **pend)

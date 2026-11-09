@@ -17,6 +17,9 @@ int tcg_cache_test_unwind_damage;
 unsigned tcg_cache_test_capture_damage;
 unsigned tcg_cache_test_capture_damage_after;
 unsigned tcg_cache_test_firstuse_pause_ms;
+unsigned tcg_cache_test_dup;
+bool tcg_cache_test_pt_verify;
+unsigned tcg_cache_test_pt_cap;
 bool tcg_cache_timing;
 bool tcg_cache_no_write;
 unsigned tcg_cache_test_reject;
@@ -122,6 +125,19 @@ static void tcg_cache_init(void)
     if (m && atoi(m) > 0) {
         tcg_cache_test_firstuse_pause_ms = atoi(m);
     }
+    m = getenv("XTCG_CACHE_TEST_DUP");
+    if (m && atoi(m) > 0) {
+        tcg_cache_test_dup = atoi(m);
+    }
+    tcg_cache_test_pt_verify = getenv("XTCG_CACHE_TEST_PT_VERIFY");
+    m = getenv("XTCG_CACHE_TEST_PT_CAP");
+    if (m && atoi(m) >= 2) {
+        tcg_cache_test_pt_cap = atoi(m);
+    }
+    tcg_tb_lookup_verify = getenv("XTCG_CACHE_TEST_TC_VERIFY");
+#ifdef CONFIG_WIN32
+    qemu_icache_test_fallback = getenv("XTCG_CACHE_TEST_ICFALLBACK");
+#endif
     tcg_cache_costs = getenv("XTCG_CACHE_COSTS");
     tcg_cache_pages = getenv("XTCG_CACHE_PAGES");
     if (getenv("XTCG_CACHE_TEST_IMG_SHIFT")) {
@@ -1493,6 +1509,27 @@ void tcg_cache_print_stats(void)
             t->search_bytes, t->ext_total, t->capture_ns / 1e6);
     fprintf(stderr, "xtcg-cache: capture validation %.3f ms\n",
             t->capture_val_ns / 1e6);
+    fprintf(stderr, "xtcg-cache: install: slots reset plain %" PRIu64
+            " cold %" PRIu64 " nop %" PRIu64 " call %" PRIu64 " cond %" PRIu64
+            "; duplicates forced %" PRIu64 "; region arrays %zu TBs\n",
+            t->slot_forms[TCG_CACHE_SLOT_PLAIN],
+            t->slot_forms[TCG_CACHE_SLOT_COLD],
+            t->slot_forms[TCG_CACHE_SLOT_NOP],
+            t->slot_forms[TCG_CACHE_SLOT_CALL],
+            t->slot_forms[TCG_CACHE_SLOT_COND], t->test_dups, tcg_nb_tbs());
+    fprintf(stderr, "xtcg-cache: page tracking: catch-ups by query %" PRIu64
+            " by cap %" PRIu64 ", TBs caught up %" PRIu64 ", pending peak %"
+            PRIu64 ", pages peak %" PRIu64 ", pending at exit %zu,"
+            " pending removed %" PRIu64 ";"
+            " verified queries %" PRIu64 "\n", t->pt_catch_query,
+            t->pt_catch_cap, t->pt_caught, t->pt_pending_peak,
+            t->pt_pages_peak,
+#ifdef CONFIG_USER_ONLY
+            tb_pending_count(),
+#else
+            (size_t)0,
+#endif
+            t->pt_pending_removed, t->pt_verified);
     fprintf(stderr, "xtcg-cache: unwind first use: restore %" PRIu64
             " lazysync %" PRIu64 " repeats %" PRIu64 " (%.3f ms)"
             " tb struct %zu; installed TBs' writebacks %" PRIu64 "\n",
