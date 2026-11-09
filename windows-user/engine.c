@@ -634,6 +634,8 @@ bool xt_diag;
 bool xt_rcu_stress;
 int xt_rcu_inj_step;
 static int applied, rejected;
+/* The first setting refused, and why. */
+static char *first_rejected;
 /* The translation cache (testing): cachedump, cacheselftest. */
 bool cache_dump, cache_selftest;
 /*
@@ -642,6 +644,17 @@ bool cache_dump, cache_selftest;
  */
 static bool cross_inline, cross_probe_fault;
 static char cross_desc[160];
+
+static void reject(const char *setting, Error *err)
+{
+    rejected++;
+    if (!first_rejected) {
+        first_rejected = err ? g_strdup_printf("%s: %s", setting,
+                                               error_get_pretty(err))
+                             : g_strdup(setting);
+    }
+    error_free(err);
+}
 
 static void set_settings(Object *accel, const char *settings)
 {
@@ -726,9 +739,31 @@ static void set_settings(Object *accel, const char *settings)
                 applied++;
             } else if (!strcmp(kv[i], "zext32report")) {
                 tcg_zext32_report = true;
+            } else {
+                reject(kv[i], NULL);
+            }
+            continue;
+        }
+        /* The translation cache's settings with a value (testing). */
+        if (!strncmp(kv[i], "cacheflush=", 11)) {
+            tcg_cache_flush_every = atoi(eq + 1);
+            applied++;
+            continue;
+        }
+        if (!strncmp(kv[i], "cachemax=", 9)) {
+            tcg_cache_max = (size_t)atoi(eq + 1) << 20;
+            applied++;
+            continue;
+        }
+        if (!strncmp(kv[i], "cacheinj=", 9)) {
+            xt_cache_inj = !strcmp(eq + 1, "noaccess") ? XT_CACHE_INJ_NOACCESS
+                         : !strcmp(eq + 1, "guard") ? XT_CACHE_INJ_GUARD
+                         : !strcmp(eq + 1, "byte") ? XT_CACHE_INJ_BYTE
+                         : XT_CACHE_INJ_NONE;
+            if (xt_cache_inj) {
                 applied++;
             } else {
-                rejected++;
+                reject(kv[i], NULL);
             }
             continue;
         }
@@ -747,11 +782,16 @@ static void set_settings(Object *accel, const char *settings)
             g_free(name);
             name = g_strdup_printf("x-%.*s", (int)(eq - kv[i]), kv[i]);
         }
-        if (object_property_find(accel, name) &&
-            object_property_parse(accel, name, eq + 1, NULL)) {
-            applied++;
+        if (!object_property_find(accel, name)) {
+            reject(kv[i], NULL);
         } else {
-            rejected++;
+            Error *err = NULL;
+
+            if (object_property_parse(accel, name, eq + 1, &err)) {
+                applied++;
+            } else {
+                reject(kv[i], err);
+            }
         }
     }
     g_strfreev(kv);
@@ -812,6 +852,23 @@ bool xt_fault_context_partial;
 bool xt_native_harness;
 
 /*
+ * A setting asked for that the module doesn't know or can't do: the
+ * process doesn't start, rather than run with other settings than were
+ * asked for.
+ */
+static void G_NORETURN refuse_settings(const char *why)
+{
+    g_autofree char *line = g_strdup_printf("settings refused: %s\n", why);
+
+    xt_log_text(line);
+    fputs(line, stderr);
+    NtTerminateProcess(GetCurrentProcess(), STATUS_INVALID_PARAMETER);
+    for (;;) {
+        __builtin_trap();
+    }
+}
+
+/*
  * The process-wide bring-up, as linux-user's main() without a loader:
  * QOM, the TCG accelerator with SETTINGS (comma-separated
  * accelerator properties, x- ones without the prefix), page size, the
@@ -845,6 +902,9 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     if (settings) {
         set_settings(OBJECT(accel), settings);
     }
+    if (rejected) {
+        refuse_settings(first_rejected);
+    }
     /*
      * Guest registers in host registers across TBs, and globals synced
      * lazily: the engine's fault path stores them from the fault's native
@@ -876,7 +936,9 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     tcg_tso_cross_faults = xt_cross_probe(cross_probe_fault, cross_desc,
                                           sizeof(cross_desc)) == 0 &&
                            !cross_inline;
-    ac->init_machine(accel, NULL);
+    if (ac->init_machine(accel, NULL) < 0) {
+        refuse_settings("the accelerator's initialization failed");
+    }
     log_settings(OBJECT(accel));
     if (tcg_cache_mode) {
         xt_cache_init();
