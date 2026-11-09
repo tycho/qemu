@@ -38,6 +38,7 @@
 #include "user/safe-syscall.h"
 #include "user/signal.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 
 /* target_siginfo_t must fit in gdbstub's siginfo save area. */
 QEMU_BUILD_BUG_ON(sizeof(target_siginfo_t) > MAX_SIGINFO_LENGTH);
@@ -1034,6 +1035,26 @@ static uintptr_t host_sigbus_handler(CPUState *cpu, siginfo_t *info,
     return pc;
 }
 
+#ifdef HOST_SIGNAL_XREG
+/* A failed x-zext32=check: report the access and abort. */
+static void zext32_trap(CPUState *cpu, host_sigcontext *uc)
+{
+    uintptr_t pc = host_signal_pc(uc);
+    uintptr_t ra = pc;
+    int reg = tcg_zext32_trap(pc);
+
+    if (reg < 0) {
+        return;
+    }
+    adjust_signal_pc(&ra, false);
+    cpu_restore_state(cpu, ra);
+    fprintf(stderr, "qemu: x-zext32 check failed: guest pc 0x%" VADDR_PRIx
+            ", host pc 0x%" PRIxPTR ", x%d = 0x%016" PRIx64 "\n",
+            cpu->cc->get_pc(cpu), pc, reg, host_signal_xreg(uc, reg));
+    abort();
+}
+#endif
+
 static void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
 {
     CPUState *cpu = thread_cpu;
@@ -1068,9 +1089,13 @@ static void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
             pc = host_sigbus_handler(cpu, info, uc);
             sync_sig = true;
             break;
+        case SIGTRAP:
+#ifdef HOST_SIGNAL_XREG
+            zext32_trap(cpu, uc);
+#endif
+            /* fall through */
         case SIGILL:
         case SIGFPE:
-        case SIGTRAP:
             die_from_signal(info);
         }
     }
