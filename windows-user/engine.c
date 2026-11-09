@@ -721,6 +721,16 @@ static void set_settings(Object *accel, const char *settings)
             } else if (!strcmp(kv[i], "cacheselftest")) {
                 cache_selftest = true;
                 applied++;
+            } else if (!strcmp(kv[i], "zext32poison")) {
+                /* x-zext32=check's tests (tcg_zext32_poison). */
+                tcg_zext32_poison = true;
+                applied++;
+            } else if (!strcmp(kv[i], "zext32nofix")) {
+                tcg_zext32_nofix = true;
+                applied++;
+            } else if (!strcmp(kv[i], "zext32report")) {
+                tcg_zext32_report = true;
+                applied++;
             } else {
                 reject(kv[i], NULL);
             }
