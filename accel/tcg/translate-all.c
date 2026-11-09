@@ -819,7 +819,7 @@ static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
 
     perf_report_code(s.pc, tb, tb->tc.ptr);
     tcg_tb_insert(tb);
-    existing_tb = tb_link_page(tb);
+    existing_tb = tb_link_page(tb, true);
     assert_no_pages_locked();
     tcg_cache_stats.installs++;
     tcg_cache_part(&tcg_cache_stats.inst_link_ns, &t2);
@@ -1479,7 +1479,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
      * No explicit memory barrier is required -- tb_link_page() makes the
      * TB visible in a consistent state.
      */
-    existing_tb = tb_link_page(tb);
+#ifdef CONFIG_USER_ONLY
+    tb->pt_state = TB_PT_ABSENT;
+#endif
+    existing_tb = tb_link_page(tb, false);
     assert_no_pages_locked();
 
     /* if the TB already exists, discard what we just translated */
