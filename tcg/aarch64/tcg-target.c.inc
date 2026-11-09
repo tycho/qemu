@@ -2911,6 +2911,8 @@ static void tcg_out_qemu_ld_acquire(TCGContext *s, MemOp memop, TCGType ext,
         tcg_out_ext16s(s, ext, data_r, data_r);
         return;
     case MO_SL:
+        /* A 32-bit value's register stays zero-extended (x-zext32). */
+        tcg_debug_assert(ext == TCG_TYPE_I64);
         if (have_lrcpc2) {
             insn = Ildapurs_WX;
             break;
@@ -3167,11 +3169,15 @@ static TCGLabelQemuLdst *prepare_atomic_addr(TCGContext *s, TCGReg *host,
             ldst->label_ptr[0] = s->code_ptr;
             tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
         }
-        if (guest_base || addr_type == TCG_TYPE_I32) {
+        if (guest_base ||
+            (addr_type == TCG_TYPE_I32 && !zext32_addr(addr_type))) {
             h.base = TCG_REG_GUEST_BASE;
             h.index = addr_reg;
             h.index_ext = addr_type;
         } else {
+            if (tcg_zext32 == TCG_ZEXT32_CHECK && addr_type == TCG_TYPE_I32) {
+                tcg_out_zext32_check(s, addr_reg);
+            }
             h.base = addr_reg;
             h.index = TCG_REG_XZR;
             h.index_ext = TCG_TYPE_I64;
@@ -3442,6 +3448,7 @@ static void tgen_qemu_ld_x(TCGContext *s, TCGType type, TCGReg data,
                 insn = type ? Ildapurs_HX : Ildapurs_HW;
                 break;
             case MO_SL:
+                tcg_debug_assert(type == TCG_TYPE_I64);
                 insn = Ildapurs_WX;
                 break;
             default:
