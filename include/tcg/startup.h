@@ -79,4 +79,30 @@ bool tcg_lean_narrow32(void);
  */
 extern bool tcg_alignfold;
 
+/*
+ * x-zext32: in user mode with no guest base, a guest whose addresses are
+ * all 32-bit (tcg_guest_addr32) accesses memory at its address register
+ * itself.  The backend then keeps every defined, live 32-bit value in a
+ * host register zero-extended at each op's boundary, extending where a
+ * value could otherwise carry other bits above it.
+ */
+typedef enum TCGZext32Mode {
+    TCG_ZEXT32_OFF,
+    TCG_ZEXT32_ON,
+} TCGZext32Mode;
+
+extern TCGZext32Mode tcg_zext32;
+
+/*
+ * Set by the front end, before the prologue is generated, if every guest
+ * address is a 32-bit (I32) temp.
+ */
+extern bool tcg_guest_addr32;
+
+/* Whether x-zext32 applies, decided when the prologue is generated. */
+extern bool tcg_zext32_active;
+
+/* Whether x-zext32 can be on: user mode on a host that supports it. */
+bool tcg_can_zext32(void);
+
 #endif
