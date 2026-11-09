@@ -369,6 +369,9 @@ extern bool tcg_tblayout;
 /* Whether the backend can do tcg_tblayout. */
 bool tcg_can_tblayout(void);
 
+/* Whether this build has the translation cache (x-cache): user mode. */
+bool tcg_can_cache(void);
+
 /*
  * tcg_slowthunk: with tcg_tblayout, each chunk starts its cold part with
  * a thunk that performs an MO_ACQ_REL access's out-of-line path from a

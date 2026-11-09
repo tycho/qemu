@@ -31,6 +31,7 @@
 #include "exec/replay-core.h"
 #include "exec/icount.h"
 #include "tcg/startup.h"
+#include "tcg/tcg-cache.h"
 #include "host/fpenv.h"
 #include "qapi/error.h"
 #include "qapi/qapi-builtin-type-infos.h"
@@ -1170,6 +1171,40 @@ static void tcg_set_zext32(Object *obj, const char *value, Error **errp)
 #endif
 }
 
+static char *tcg_get_cache(Object *obj, Error **errp)
+{
+    switch (tcg_cache_mode) {
+    case TCG_CACHE_ON:
+        return g_strdup(tcg_cache_files ? "files" : "on");
+    case TCG_CACHE_CAPTURE:
+        return g_strdup("capture");
+    case TCG_CACHE_STRESS:
+        return g_strdup("stress");
+    default:
+        return g_strdup("off");
+    }
+}
+
+static void tcg_set_cache(Object *obj, const char *value, Error **errp)
+{
+    bool files = !strcmp(value, "files");
+
+    if (!strcmp(value, "off")) {
+        tcg_cache_mode = TCG_CACHE_OFF;
+        tcg_cache_files = false;
+    } else if (files || !strcmp(value, "on")) {
+        if (!tcg_can_cache()) {
+            error_setg(errp, "x-cache=%s: only in user mode on an aarch64 "
+                       "host", value);
+            return;
+        }
+        tcg_cache_mode = TCG_CACHE_ON;
+        tcg_cache_files = files;
+    } else {
+        error_setg(errp, "x-cache must be off, on or files");
+    }
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1468,6 +1503,75 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Drop guest alignment checks implied by an earlier check on the "
         "same address registers");
 
+    object_class_property_add_bool(oc, "x-repstr", tcg_get_repstr,
+                                   tcg_set_repstr);
+    object_class_property_set_description(oc, "x-repstr",
+        "x86 REP STOS and REP MOVS a page at a time with the host's widest "
+        "stores, as with fast string operations (default off)");
+
+    object_class_property_add_str(oc, "x-hostpoll",
+                                  tcg_get_hostpoll, tcg_set_hostpoll);
+    object_class_property_set_description(oc, "x-hostpoll",
+        "how the main loop waits for its next timer on hosts without "
+        "ppoll: poll (milliseconds, rounded up), kqueue (a nanosecond "
+        "kqueue timer), spin (kqueue, waking early and polling until the "
+        "deadline)");
+
+    object_class_property_add(oc, "x-haltpoll", "uint32",
+                              tcg_get_haltpoll, tcg_set_haltpoll, NULL, NULL);
+    object_class_property_set_description(oc, "x-haltpoll",
+        "multi-threaded TCG: the longest a halted vCPU spins, watching for "
+        "an interrupt, before it sleeps (microseconds; 0, the default, "
+        "never spins); the spin adapts below it");
+
+    object_class_property_add(oc, "x-apicpost", "OnOffAuto",
+                              tcg_get_apicpost, tcg_set_apicpost, NULL, NULL);
+    object_class_property_set_description(oc, "x-apicpost",
+        "x86: fixed edge IPIs written to the ICR are posted to their "
+        "targets without the BQL (off, on, auto: on with multi-threaded "
+        "TCG, without icount or record/replay)");
+
+    object_class_property_add(oc, "x-apictimer", "OnOffAuto",
+                              tcg_get_apictimer, tcg_set_apictimer, NULL, NULL);
+    object_class_property_set_description(oc, "x-apictimer",
+        "x86: the local APIC timer fires on its vCPU, woken by a deadline "
+        "thread, instead of on the main loop (off, on, auto: as x-apicpost)");
+
+    object_class_property_add_bool(oc, "x-hyperv",
+                                   tcg_get_hyperv, tcg_set_hyperv);
+    object_class_property_set_description(oc, "x-hyperv",
+        "x86 system mode: implement the Hyper-V interface for hv-relaxed, "
+        "hv-vpindex, hv-time and hv-frequencies (otherwise ignored under "
+        "TCG), and turn them on by default; needs x-hosttime");
+
+    object_class_property_add_bool(oc, "x-hvtimers",
+                                   tcg_get_hvtimers, tcg_set_hvtimers);
+    object_class_property_set_description(oc, "x-hvtimers",
+        "x86 system mode, with x-hyperv: also implement hv-synic, hv-stimer "
+        "and hv-stimer-direct (the SynIC's message page and Hyper-V's "
+        "synthetic timers), and turn them on by default");
+
+    object_class_property_add_bool(oc, "x-tlbpin", tcg_get_tlbpin,
+                                   tcg_set_tlbpin);
+    object_class_property_set_description(oc, "x-tlbpin",
+        "Keep the TLB mask and table of a block's main mmu index in host "
+        "registers (system mode)");
+
+    object_class_property_add_str(oc, "x-smc", tcg_get_smc, tcg_set_smc);
+    object_class_property_set_description(oc, "x-smc",
+        "How self-modifying code is detected: protect (write-protect "
+        "translated pages), check (a CRC of each TB's code at its entry, "
+        "and TBs of code that may change end after each insn that may "
+        "store; user mode only) or check-call (the same, the CRC always "
+        "by a helper call)");
+
+    object_class_property_add_str(oc, "x-cache", tcg_get_cache,
+                                  tcg_set_cache);
+    object_class_property_set_description(oc, "x-cache",
+        "The translation cache (user mode, aarch64 hosts): off, on (each "
+        "translation of image code kept in the process and installed again "
+        "before translating the same code) or files (kept in and read from "
+        "files too, which other processes share)");
     object_class_property_add_str(oc, "x-zext32", tcg_get_zext32,
                                   tcg_set_zext32);
     object_class_property_set_description(oc, "x-zext32",
