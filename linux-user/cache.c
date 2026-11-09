@@ -1,7 +1,8 @@
 /*
  * linux-user: the translation cache's files (tcg-cache.h), for testing
  * the format, publication and refresh on a host where processes come and
- * go cheaply.  XTCG_CACHE=on XTCG_CACHE_DIR=dir turns it on.
+ * go cheaply.  x-cache=files (QEMU_XTCG=cache=files) with
+ * XTCG_CACHE_DIR=dir turns it on.
  *
  * The directory is dir/<fingerprint>: a hash of everything that changes
  * the code a translation gives (QEMU's build, its resolved settings, the
@@ -459,7 +460,12 @@ void tcg_cache_dir_init(const char *cpu_model)
     int64_t t0 = get_clock();
     int bfd;
 
-    if (!base || tcg_cache_mode != TCG_CACHE_ON) {
+    if (tcg_cache_mode != TCG_CACHE_ON || !tcg_cache_files) {
+        return;
+    }
+    if (!base) {
+        fprintf(stderr, "xtcg-cache: x-cache=files without XTCG_CACHE_DIR: "
+                "files off\n");
         return;
     }
     if (!cache_fingerprint(cpu_model, hex)) {

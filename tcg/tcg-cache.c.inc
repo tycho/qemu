@@ -7,6 +7,7 @@
  */
 
 int tcg_cache_mode;
+bool tcg_cache_files;
 static bool tcg_cache_verify_on;
 unsigned tcg_cache_skew;
 bool tcg_cache_stats_at_exit;
@@ -79,9 +80,9 @@ const char *const tcg_cache_x_names[TCG_CACHE_X_MAX] = {
 };
 
 /*
- * XTCG_CACHE=capture|stress|on (development): record and check every
- * translation, or also install each from its artifact, or keep eligible
- * artifacts and install from them before translating.  XTCG_CACHE_SKEW=n
+ * XTCG_CACHE=capture|stress (development, read only with x-cache=off):
+ * record and check every translation, or also install each from its
+ * artifact.  XTCG_CACHE_SKEW=n
  * moves each install by up to n 16-byte steps in each part;
  * XTCG_CACHE_FLUSH=n flushes the code buffer every n translations;
  * XTCG_CACHE_MAX=n bounds the store at n MiB; XTCG_CACHE_INJPROMOTE
@@ -92,12 +93,10 @@ static void tcg_cache_init(void)
     const char *m = getenv("XTCG_CACHE");
     const char *k = getenv("XTCG_CACHE_SKEW");
 
-    if (m && !strcmp(m, "capture")) {
+    if (tcg_cache_mode == TCG_CACHE_OFF && m && !strcmp(m, "capture")) {
         tcg_cache_mode = TCG_CACHE_CAPTURE;
-    } else if (m && !strcmp(m, "stress")) {
+    } else if (tcg_cache_mode == TCG_CACHE_OFF && m && !strcmp(m, "stress")) {
         tcg_cache_mode = TCG_CACHE_STRESS;
-    } else if (m && !strcmp(m, "on")) {
-        tcg_cache_mode = TCG_CACHE_ON;
     }
     tcg_cache_verify_on = tcg_cache_mode != TCG_CACHE_OFF
                           && !getenv("XTCG_CACHE_NOVERIFY");
