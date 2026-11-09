@@ -1675,6 +1675,42 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
  */
 #define TCG_TARGET_HAS_ZEXT32
 
+/* BRK's immediate for a failed x-zext32 check: the tag, plus the register. */
+#define ZEXT32_BRK_TAG  0x3200
+#define ZEXT32_BRK_MASK 0xffe0
+
+/* Set bits 48-63 of @r, for x-zext32's tests (tcg_zext32_poison). */
+static void tcg_out_zext32_poison(TCGContext *s, TCGReg r)
+{
+    tcg_out_insn(s, movw, MOVK, TCG_TYPE_I64, r, 0xdead, 48);
+}
+
+/*
+ * TCG_ZEXT32_CHECK: trap unless @r is zero-extended from 32 bits, in the
+ * access's own code, so the trap's pc unwinds to the guest insn.
+ */
+static void tcg_out_zext32_check(TCGContext *s, TCGReg r)
+{
+    /* cmp xr, wr, uxtw */
+    tcg_out32(s, 0xeb200000 | r << 16 | 2 << 13 | r << 5 | TCG_REG_XZR);
+    /* b.eq .+8 */
+    tcg_out32(s, 0x54000000 | 2 << 5 | COND_EQ);
+    /* brk #(tag | r) */
+    tcg_out32(s, 0xd4200000 | (ZEXT32_BRK_TAG | r) << 5);
+}
+
+/* The register a failed check at @pc names, or -1 if @pc isn't one. */
+static int tcg_target_zext32_trap_reg(uintptr_t pc)
+{
+    uint32_t insn = *(const uint32_t *)pc;
+
+    if ((insn & 0xffe0001f) == 0xd4200000 &&
+        ((insn >> 5) & ZEXT32_BRK_MASK) == ZEXT32_BRK_TAG) {
+        return (insn >> 5) & 31;
+    }
+    return -1;
+}
+
 /* Whether a 32-bit guest address register is the host address. */
 static bool zext32_addr(TCGType addr_type)
 {
@@ -1789,6 +1825,9 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
             h->index = addr_reg;
             h->index_ext = addr_type;
         } else {
+            if (tcg_zext32 == TCG_ZEXT32_CHECK && addr_type == TCG_TYPE_I32) {
+                tcg_out_zext32_check(s, addr_reg);
+            }
             h->base = addr_reg;
             h->index = TCG_REG_XZR;
             h->index_ext = TCG_TYPE_I64;

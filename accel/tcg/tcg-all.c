@@ -278,7 +278,19 @@ static void tcg_set_alignfold(Object *obj, bool value, Error **errp)
 
 static char *tcg_get_zext32(Object *obj, Error **errp)
 {
-    return g_strdup(tcg_zext32 == TCG_ZEXT32_ON ? "on" : "off");
+    switch (tcg_zext32) {
+    case TCG_ZEXT32_ON:
+        return g_strdup("on");
+    case TCG_ZEXT32_CHECK:
+        /*
+         * The development switches change the code: say so (a
+         * description, not a value the setter takes).
+         */
+        return g_strdup_printf("check%s%s", tcg_zext32_poison ? ",poison" : "",
+                               tcg_zext32_nofix ? ",nofix" : "");
+    default:
+        return g_strdup("off");
+    }
 }
 
 static void tcg_set_zext32(Object *obj, const char *value, Error **errp)
@@ -290,8 +302,10 @@ static void tcg_set_zext32(Object *obj, const char *value, Error **errp)
         return;
     } else if (!strcmp(value, "on")) {
         mode = TCG_ZEXT32_ON;
+    } else if (!strcmp(value, "check")) {
+        mode = TCG_ZEXT32_CHECK;
     } else {
-        error_setg(errp, "x-zext32 must be off or on");
+        error_setg(errp, "x-zext32 must be off, on or check");
         return;
     }
     if (!tcg_can_zext32()) {
@@ -300,6 +314,20 @@ static void tcg_set_zext32(Object *obj, const char *value, Error **errp)
         return;
     }
     tcg_zext32 = mode;
+#ifndef _WIN32
+    if (mode == TCG_ZEXT32_CHECK) {
+        /* XTCG_ZEXT32=poison, nofix, report: check's own tests. */
+        const char *dev = getenv("XTCG_ZEXT32");
+        g_auto(GStrv) words = g_strsplit(dev ? dev : "", ",", 0);
+
+        tcg_zext32_poison = g_strv_contains((const char *const *)words,
+                                            "poison");
+        tcg_zext32_nofix = g_strv_contains((const char *const *)words,
+                                           "nofix");
+        tcg_zext32_report = g_strv_contains((const char *const *)words,
+                                            "report");
+    }
+#endif
 }
 
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
@@ -350,7 +378,8 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-zext32",
         "User mode, aarch64 hosts, no guest base: a 32-bit guest address "
         "register is the host address, since 32-bit values are kept "
-        "zero-extended: off or on");
+        "zero-extended: off, on or check (on, and trap before an access "
+        "whose register isn't zero-extended)");
 }
 
 static const TypeInfo tcg_accel_type = {

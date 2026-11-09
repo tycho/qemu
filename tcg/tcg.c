@@ -240,6 +240,9 @@ TCGContext tcg_init_ctx;
 bool tcg_lean;
 bool tcg_alignfold;
 TCGZext32Mode tcg_zext32;
+bool tcg_zext32_poison;
+bool tcg_zext32_nofix;
+bool tcg_zext32_report;
 bool tcg_guest_addr32;
 bool tcg_zext32_active;
 __thread TCGContext *tcg_ctx;
@@ -1915,6 +1918,18 @@ void tcg_prologue_init(void)
     tcg_zext32_active = tcg_zext32 != TCG_ZEXT32_OFF && tcg_guest_addr32 &&
                         !guest_base;
 #endif
+    if (tcg_zext32 == TCG_ZEXT32_CHECK) {
+        if (tcg_zext32_report || tcg_zext32_poison || tcg_zext32_nofix) {
+            /* Development only: say whether the checks will be there. */
+            info_report("x-zext32=check: %s",
+                        tcg_zext32_active ? "active" :
+                        tcg_guest_addr32 ? "inactive (a guest base)" :
+                        "inactive (not a 32-bit guest)");
+        }
+    } else if (tcg_zext32_poison || tcg_zext32_nofix || tcg_zext32_report) {
+        warn_report("x-zext32: poison, nofix and report need check: ignored");
+        tcg_zext32_poison = tcg_zext32_nofix = tcg_zext32_report = false;
+    }
 
     qemu_thread_jit_write();
     /* Generate the prologue.  */
@@ -5240,7 +5255,14 @@ static void tcg_reg_alloc_do_movi(TCGContext *s, TCGTemp *ots,
  */
 static void tcg_zext32_normalize(TCGContext *s, TCGReg reg)
 {
-    tcg_out_ext32u(s, reg, reg);
+#ifdef TCG_TARGET_HAS_ZEXT32
+    if (tcg_zext32_poison) {
+        tcg_out_zext32_poison(s, reg);
+    }
+    if (!tcg_zext32_nofix) {
+        tcg_out_ext32u(s, reg, reg);
+    }
+#endif
 }
 
 /*
@@ -7120,6 +7142,17 @@ bool tcg_can_zext32(void)
 #else
     return false;
 #endif
+}
+
+int tcg_zext32_trap(uintptr_t pc)
+{
+#ifdef TCG_TARGET_HAS_ZEXT32
+    if (tcg_zext32 == TCG_ZEXT32_CHECK &&
+        in_code_gen_buffer((void *)(pc - tcg_splitwx_diff))) {
+        return tcg_target_zext32_trap_reg(pc);
+    }
+#endif
+    return -1;
 }
 
 bool tcg_lean_narrow32(void)
