@@ -28,7 +28,6 @@
 #include "qemu/mprotect.h"
 #include "qemu/memalign.h"
 #include "qemu/cacheinfo.h"
-#include "qemu/qtree.h"
 #include "qapi/error.h"
 #include "tcg/tcg.h"
 #include "tcg/startup.h"
@@ -47,9 +46,15 @@
 #define PROT_EXEC   4
 #endif
 
+/*
+ * A region's TBs, in increasing tc.ptr: a region allocates its code in
+ * increasing address order between resets, and only the newest TB is
+ * ever removed, when its space is given back.
+ */
 struct tcg_region_tree {
     QemuMutex lock;
-    QTree *tree;
+    TranslationBlock **tbs;
+    size_t n, cap;
     /* padding to avoid false sharing is computed at run-time */
 };
 
@@ -130,54 +135,6 @@ void *tcg_splitwx_to_rw(const void *rx)
 }
 #endif /* CONFIG_DEBUG_TCG */
 
-/* compare a pointer @ptr and a tb_tc @s */
-static int ptr_cmp_tb_tc(const void *ptr, const struct tb_tc *s)
-{
-    if (ptr >= s->ptr + s->size) {
-        return 1;
-    } else if (ptr < s->ptr) {
-        return -1;
-    }
-    return 0;
-}
-
-static gint tb_tc_cmp(gconstpointer ap, gconstpointer bp, gpointer userdata)
-{
-    const struct tb_tc *a = ap;
-    const struct tb_tc *b = bp;
-
-    /*
-     * When both sizes are set, we know this isn't a lookup.
-     * This is the most likely case: every TB must be inserted; lookups
-     * are a lot less frequent.
-     */
-    if (likely(a->size && b->size)) {
-        if (a->ptr > b->ptr) {
-            return 1;
-        } else if (a->ptr < b->ptr) {
-            return -1;
-        }
-        /* a->ptr == b->ptr should happen only on deletions */
-        g_assert(a->size == b->size);
-        return 0;
-    }
-    /*
-     * All lookups have either .size field set to 0.
-     * From the glib sources we see that @ap is always the lookup key. However
-     * the docs provide no guarantee, so we just mark this case as likely.
-     */
-    if (likely(a->size == 0)) {
-        return ptr_cmp_tb_tc(a->ptr, b);
-    }
-    return ptr_cmp_tb_tc(b->ptr, a);
-}
-
-static void tb_destroy(gpointer value)
-{
-    TranslationBlock *tb = value;
-    qemu_spin_destroy(&tb->jmp_lock);
-}
-
 static void tcg_region_trees_init(void)
 {
     size_t i;
@@ -188,7 +145,8 @@ static void tcg_region_trees_init(void)
         struct tcg_region_tree *rt = region_trees + i * tree_size;
 
         qemu_mutex_init(&rt->lock);
-        rt->tree = q_tree_new_full(tb_tc_cmp, NULL, NULL, tb_destroy);
+        rt->tbs = NULL;
+        rt->n = rt->cap = 0;
     }
 }
 
@@ -227,7 +185,17 @@ void tcg_tb_insert(TranslationBlock *tb)
 
     g_assert(rt != NULL);
     qemu_mutex_lock(&rt->lock);
-    q_tree_insert(rt->tree, &tb->tc, tb);
+    if (rt->n) {
+        const TranslationBlock *last = rt->tbs[rt->n - 1];
+
+        g_assert((uintptr_t)tb->tc.ptr >=
+                 (uintptr_t)last->tc.ptr + last->tc.size);
+    }
+    if (rt->n == rt->cap) {
+        rt->cap = rt->cap ? rt->cap * 2 : 1024;
+        rt->tbs = g_renew(TranslationBlock *, rt->tbs, rt->cap);
+    }
+    rt->tbs[rt->n++] = tb;
     qemu_mutex_unlock(&rt->lock);
 }
 
@@ -237,7 +205,9 @@ void tcg_tb_remove(TranslationBlock *tb)
 
     g_assert(rt != NULL);
     qemu_mutex_lock(&rt->lock);
-    q_tree_remove(rt->tree, &tb->tc);
+    g_assert(rt->n && rt->tbs[rt->n - 1] == tb);
+    rt->n--;
+    qemu_spin_destroy(&tb->jmp_lock);
     qemu_mutex_unlock(&rt->lock);
 }
 
@@ -249,15 +219,32 @@ void tcg_tb_remove(TranslationBlock *tb)
 TranslationBlock *tcg_tb_lookup(uintptr_t tc_ptr)
 {
     struct tcg_region_tree *rt = tc_ptr_to_region_tree((void *)tc_ptr);
-    TranslationBlock *tb;
-    struct tb_tc s = { .ptr = (void *)tc_ptr };
+    TranslationBlock *tb = NULL;
+    size_t lo = 0, hi;
 
     if (rt == NULL) {
         return NULL;
     }
 
     qemu_mutex_lock(&rt->lock);
-    tb = q_tree_lookup(rt->tree, &s);
+    /* The last TB starting at or before @tc_ptr, if it covers it. */
+    hi = rt->n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+
+        if ((uintptr_t)rt->tbs[mid]->tc.ptr <= tc_ptr) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo) {
+        TranslationBlock *t = rt->tbs[lo - 1];
+
+        if (tc_ptr < (uintptr_t)t->tc.ptr + t->tc.size) {
+            tb = t;
+        }
+    }
     qemu_mutex_unlock(&rt->lock);
     return tb;
 }
@@ -292,7 +279,14 @@ void tcg_tb_foreach(GTraverseFunc func, gpointer user_data)
     for (i = 0; i < region.n; i++) {
         struct tcg_region_tree *rt = region_trees + i * tree_size;
 
-        q_tree_foreach(rt->tree, func, user_data);
+        /* As a tree walk: in order, a region's walk ended by @func. */
+        for (size_t j = 0; j < rt->n; j++) {
+            TranslationBlock *tb = rt->tbs[j];
+
+            if (func(&tb->tc, tb, user_data)) {
+                break;
+            }
+        }
     }
     tcg_region_tree_unlock_all();
 }
@@ -306,7 +300,7 @@ size_t tcg_nb_tbs(void)
     for (i = 0; i < region.n; i++) {
         struct tcg_region_tree *rt = region_trees + i * tree_size;
 
-        nb_tbs += q_tree_nnodes(rt->tree);
+        nb_tbs += rt->n;
     }
     tcg_region_tree_unlock_all();
     return nb_tbs;
@@ -320,9 +314,10 @@ static void tcg_region_tree_reset_all(void)
     for (i = 0; i < region.n; i++) {
         struct tcg_region_tree *rt = region_trees + i * tree_size;
 
-        /* Increment the refcount first so that destroy acts as a reset */
-        q_tree_ref(rt->tree);
-        q_tree_destroy(rt->tree);
+        for (size_t j = 0; j < rt->n; j++) {
+            qemu_spin_destroy(&rt->tbs[j]->jmp_lock);
+        }
+        rt->n = 0;
     }
     tcg_region_tree_unlock_all();
 }
