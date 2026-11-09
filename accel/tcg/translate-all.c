@@ -813,14 +813,10 @@ static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
         tb_lock_page1(phys_pc, phys_p2);
     }
     tcg_cache_part(&tcg_cache_stats.inst_link_ns, &t2);
+    /* Placement left each slot reset; this synchronizes the whole TB. */
     tcg_cache_commit(tcg_ctx, &r);
     tcg_cache_part(&tcg_cache_stats.inst_flush_ns, &t2);
 
-    for (int n = 0; n < tb->nb_slots; n++) {
-        if (tb->jmp[n].reset_offset != TB_JMP_OFFSET_INVALID) {
-            tb_reset_jump(tb, n);
-        }
-    }
     perf_report_code(s.pc, tb, tb->tc.ptr);
     tcg_tb_insert(tb);
     existing_tb = tb_link_page(tb);
