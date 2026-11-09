@@ -3842,7 +3842,7 @@ static bool tcg_cond_link_reloc(int type)
  */
 static void tb_set_cond_link(const TranslationBlock *tb, int n, bool linked,
                              uintptr_t d_addr, uintptr_t jmp_rx,
-                             uintptr_t jmp_rw)
+                             uintptr_t jmp_rw, bool flush)
 {
     uintptr_t c_rx = (uintptr_t)tb->tc.ptr + tb->jmp[n].cond - 1;
     uintptr_t c_rw = c_rx + (jmp_rw - jmp_rx);
@@ -3853,11 +3853,17 @@ static void tb_set_cond_link(const TranslationBlock *tb, int n, bool linked,
         off = jmp_rx - c_rx;
     }
     qatomic_set((uint32_t *)c_rw, deposit32(insn, 5, 19, off >> 2));
-    flush_idcache_range(c_rx, c_rw, 4);
+    if (flush) {
+        flush_idcache_range(c_rx, c_rw, 4);
+    }
 }
 
-void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
-                              uintptr_t jmp_rx, uintptr_t jmp_rw)
+/*
+ * Write slot @n's insns for its target_addr; with @flush, synchronize the
+ * icache with each, as a published TB needs.
+ */
+static void tb_jmp_write(const TranslationBlock *tb, int n,
+                         uintptr_t jmp_rx, uintptr_t jmp_rw, bool flush)
 {
     uintptr_t d_addr = tb->jmp[n].target_addr;
     ptrdiff_t d_offset = d_addr - jmp_rx;
@@ -3880,7 +3886,9 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
             insn = deposit32(Ibranch_BL, 0, 26, d_offset >> 2);
         }
         qatomic_set((uint32_t *)jmp_rw, insn);
-        flush_idcache_range(jmp_rx, jmp_rw, 4);
+        if (flush) {
+            flush_idcache_range(jmp_rx, jmp_rw, 4);
+        }
         return;
     }
 
@@ -3900,9 +3908,12 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
             insn = NOP;
         }
         qatomic_set((uint32_t *)jmp_rw, insn);
-        flush_idcache_range(jmp_rx, jmp_rw, 4);
+        if (flush) {
+            flush_idcache_range(jmp_rx, jmp_rw, 4);
+        }
         if (tb->jmp[n].cond) {
-            tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw);
+            tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw,
+                             flush);
         }
         return;
     }
@@ -3918,14 +3929,22 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
         insn = deposit32(Ildlit_LDR | TCG_REG_TMP0, 5, 19, i_offset >> 2);
     }
     qatomic_set((uint32_t *)jmp_rw, insn);
-    flush_idcache_range(jmp_rx, jmp_rw, 4);
+    if (flush) {
+        flush_idcache_range(jmp_rx, jmp_rw, 4);
+    }
     if (tb->jmp[n].cond) {
         uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp[n].reset_offset;
 
-        tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw);
+        tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw,
+                         flush);
     }
 }
 
+void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
+                              uintptr_t jmp_rx, uintptr_t jmp_rw)
+{
+    tb_jmp_write(tb, n, jmp_rx, jmp_rw, true);
+}
 
 static void tgen_add(TCGContext *s, TCGType type,
                      TCGReg a0, TCGReg a1, TCGReg a2)
