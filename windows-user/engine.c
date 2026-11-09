@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "tcg/tcg-cache.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -197,6 +198,11 @@ static void refresh_region_flags(vaddr start, vaddr last, int flags)
     if (from <= last) {
         set_region_flags(from, last, flags);
     }
+}
+
+bool xt_is_own_image(const void *alloc_base)
+{
+    return alloc_base == (const void *)&__ImageBase;
 }
 
 /*
@@ -622,12 +628,27 @@ void xt_invalidate(vaddr start, vaddr len)
 
 CPUState *xt_spare_cpu;
 static int applied, rejected;
+/* The first setting refused, and why. */
+static char *first_rejected;
+/* The translation cache (testing): cachedump, cacheselftest. */
+bool cache_dump, cache_selftest;
 /*
  * crossinline: keep ordered accesses' inline crossing test (measuring);
  * crossprobefault: the probe meets a fault (testing xt_cross_probe).
  */
 static bool cross_inline, cross_probe_fault;
 static char cross_desc[160];
+
+static void reject(const char *setting, Error *err)
+{
+    rejected++;
+    if (!first_rejected) {
+        first_rejected = err ? g_strdup_printf("%s: %s", setting,
+                                               error_get_pretty(err))
+                             : g_strdup(setting);
+    }
+    error_free(err);
+}
 
 static void set_settings(Object *accel, const char *settings)
 {
@@ -652,8 +673,79 @@ static void set_settings(Object *accel, const char *settings)
                 /* Testing the crossing fault's path (xt_cross_inject). */
                 xt_cross_inject = true;
                 applied++;
+            } else if (!strcmp(kv[i], "cachecapture")) {
+                /* Translation artifacts (tcg-cache.h), development. */
+                tcg_cache_mode = TCG_CACHE_CAPTURE;
+                applied++;
+            } else if (!strcmp(kv[i], "cachestress")) {
+                tcg_cache_mode = TCG_CACHE_STRESS;
+                applied++;
+            } else if (!strcmp(kv[i], "cacheskew")) {
+                tcg_cache_skew = 37;
+                applied++;
+            } else if (!strcmp(kv[i], "cachedebug")) {
+                tcg_cache_debug = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cachestats")) {
+                tcg_cache_stats_at_exit = true;
+                tcg_cache_timing = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cachenowrite")) {
+                /* Files read, never written (development). */
+                tcg_cache_no_write = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cachefresh")) {
+                /* A new directory for each process (development). */
+                xt_cache_fresh = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cache") ||
+                       !strcmp(kv[i], "cachefiles")) {
+                /* x-cache=on and x-cache=files. */
+                Error *err = NULL;
+
+                if (object_property_parse(accel, "x-cache",
+                                          kv[i][5] ? "files" : "on", &err)) {
+                    applied++;
+                } else {
+                    reject(kv[i], err);
+                }
+            } else if (!strcmp(kv[i], "cachetrace")) {
+                tcg_cache_trace = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cachedump")) {
+                cache_dump = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cacheinjpromote")) {
+                tcg_cache_inj_promote = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cacheselftest")) {
+                cache_selftest = true;
+                applied++;
             } else {
-                rejected++;
+                reject(kv[i], NULL);
+            }
+            continue;
+        }
+        /* The translation cache's settings with a value (testing). */
+        if (!strncmp(kv[i], "cacheflush=", 11)) {
+            tcg_cache_flush_every = atoi(eq + 1);
+            applied++;
+            continue;
+        }
+        if (!strncmp(kv[i], "cachemax=", 9)) {
+            tcg_cache_max = (size_t)atoi(eq + 1) << 20;
+            applied++;
+            continue;
+        }
+        if (!strncmp(kv[i], "cacheinj=", 9)) {
+            xt_cache_inj = !strcmp(eq + 1, "noaccess") ? XT_CACHE_INJ_NOACCESS
+                         : !strcmp(eq + 1, "guard") ? XT_CACHE_INJ_GUARD
+                         : !strcmp(eq + 1, "byte") ? XT_CACHE_INJ_BYTE
+                         : XT_CACHE_INJ_NONE;
+            if (xt_cache_inj) {
+                applied++;
+            } else {
+                reject(kv[i], NULL);
             }
             continue;
         }
@@ -664,11 +756,16 @@ static void set_settings(Object *accel, const char *settings)
             g_free(name);
             name = g_strdup_printf("x-%.*s", (int)(eq - kv[i]), kv[i]);
         }
-        if (object_property_find(accel, name) &&
-            object_property_parse(accel, name, eq + 1, NULL)) {
-            applied++;
+        if (!object_property_find(accel, name)) {
+            reject(kv[i], NULL);
         } else {
-            rejected++;
+            Error *err = NULL;
+
+            if (object_property_parse(accel, name, eq + 1, &err)) {
+                applied++;
+            } else {
+                reject(kv[i], err);
+            }
         }
     }
     g_strfreev(kv);
@@ -709,8 +806,41 @@ static void log_settings(Object *accel)
     xt_log_text(head);
 }
 
+/*
+ * The translation cache's immediate end (tcg_cache_terminate), from the
+ * fault handler too: no logging, no exit handlers.
+ */
+#ifndef STATUS_DATA_ERROR
+#define STATUS_DATA_ERROR ((NTSTATUS)0xC000003EL)
+#endif
+
+static void G_NORETURN cache_terminate(void)
+{
+    NtTerminateProcess(GetCurrentProcess(), STATUS_DATA_ERROR);
+    for (;;) {
+        __builtin_trap();
+    }
+}
+
 bool xt_fault_context_partial;
 bool xt_native_harness;
+
+/*
+ * A setting asked for that the module doesn't know or can't do: the
+ * process doesn't start, rather than run with other settings than were
+ * asked for.
+ */
+static void G_NORETURN refuse_settings(const char *why)
+{
+    g_autofree char *line = g_strdup_printf("settings refused: %s\n", why);
+
+    xt_log_text(line);
+    fputs(line, stderr);
+    NtTerminateProcess(GetCurrentProcess(), STATUS_INVALID_PARAMETER);
+    for (;;) {
+        __builtin_trap();
+    }
+}
 
 /*
  * The process-wide bring-up, as linux-user's main() without a loader:
@@ -744,6 +874,20 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     if (settings) {
         set_settings(OBJECT(accel), settings);
     }
+    if (rejected) {
+        refuse_settings(first_rejected);
+    }
+#ifdef TARGET_X86_64
+    /*
+     * Not yet in the x64 module: it has no termination calls to stop the
+     * cache's writer before the process kills it, and a writer killed
+     * holding the sink's lock would leave a capture at exit waiting for it
+     * forever.  Its in-process cache isn't qualified either.
+     */
+    if (tcg_cache_mode == TCG_CACHE_ON) {
+        refuse_settings("x-cache: not in the x64 module");
+    }
+#endif
     /*
      * Guest registers in host registers across TBs, and globals synced
      * lazily: the engine's fault path stores them from the fault's native
@@ -775,8 +919,13 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     tcg_tso_cross_faults = xt_cross_probe(cross_probe_fault, cross_desc,
                                           sizeof(cross_desc)) == 0 &&
                            !cross_inline;
-    ac->init_machine(accel, NULL);
+    if (ac->init_machine(accel, NULL) < 0) {
+        refuse_settings("the accelerator's initialization failed");
+    }
     log_settings(OBJECT(accel));
+    if (tcg_cache_mode) {
+        xt_cache_init();
+    }
     if (n_applied) {
         *n_applied = applied;
         *n_rejected = rejected;
@@ -813,6 +962,10 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
         NtTerminateProcess(GetCurrentProcess(), STATUS_NOT_SUPPORTED);
     }
     tcg_prologue_init();
+    /* Before anything is translated or validated, in every cache mode. */
+    tcg_cache_wb_init();
+    tcg_cache_terminate = cache_terminate;
     xt_spare_cpu = first;
+    xt_cache_files_init(first);
     return 0;
 }

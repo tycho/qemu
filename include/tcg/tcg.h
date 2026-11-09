@@ -544,6 +544,32 @@ struct TCGContext {
     /* tcg_slowthunk: the current chunk's thunk, or NULL. */
     const void *lay_thunk;
     /*
+     * Translation artifacts (tcg-cache.h).  cap_on: this translation is
+     * captured.  The back end's records (cap_rec), the provenance for
+     * the next emission (cap_kind, cap_val), the ADRP form it declares
+     * (cap_adrp), the first reason it can't be captured (cap_fail), and
+     * where the cold code went (cap_cold, cap_cold_end).  The front
+     * end's: the first exclusion (cap_excl), the guest bytes read from
+     * the two pages at cap_page (cap_bytes, extents in cap_ext), and the
+     * acquire/release sites (cap_acq).
+     */
+    bool cap_on;
+    uint8_t cap_kind;
+    uint8_t cap_adrp;
+    uint8_t cap_fail;
+    uint8_t cap_excl;
+    uintptr_t cap_val;
+    struct TCGCapRec *cap_rec;
+    int cap_nrec, cap_maxrec;
+    void *cap_cold, *cap_cold_end;
+    uint64_t cap_page;
+    uint32_t cap_span;
+    uint8_t *cap_bytes;
+    struct TCGCacheArtExt *cap_ext;
+    int cap_next;
+    uint64_t *cap_acq;
+    int cap_nacq, cap_maxacq;
+    /*
      * tcg_goto_tb_cold: the last label emitted, and its offset in the
      * code, for a goto_tb slot right at it (TranslationBlock.jmp_cond).
      */
@@ -912,6 +938,8 @@ void tcg_tb_remove(TranslationBlock *tb);
  * NULL.
  */
 TranslationBlock *tcg_tb_lookup(uintptr_t tc_ptr);
+/* Testing: tcg_tb_insert and tcg_tb_remove check lookups around them. */
+extern bool tcg_tb_lookup_verify;
 
 /**
  * tcg_tb_foreach:

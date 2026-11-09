@@ -109,8 +109,17 @@ struct TranslationBlock {
     /* size of target code for this block (1 <= size <= TARGET_PAGE_SIZE) */
     uint16_t size;
     uint16_t icount;
+    /*
+     * Installed from a translation artifact (tcg-cache.h), its unwind
+     * data not yet checked: both readers of tc.search check it first
+     * (tb_unwind_check).  Set before the TB is published; cleared once.
+     */
+    uint8_t unwind_unchecked;
 
     struct tb_tc tc;
+    /* Installed from an artifact: the unwind data's bytes, and its bound. */
+    uint32_t search_len;
+    uint32_t code_len;
 
     /*
      * Track tb_page_addr_t intervals that intersect this TB.
@@ -133,9 +142,15 @@ struct TranslationBlock {
     bool smc_check;
     bool smc_reject;
     bool smc_inline;
+    /*
+     * Page tracking's state (TB_PT_*), and while pending, the TB's index
+     * in the pending list (accel/tcg/tb-maint.c).
+     */
+    uint8_t pt_state;
     uint16_t smc_len;
     uint16_t smc_check_end;
     uint32_t smc_crc;
+    uint32_t pt_index;
     const void *smc_stale;
 #else
     uintptr_t page_next[2];
@@ -243,6 +258,15 @@ static inline uint32_t tb_cflags(const TranslationBlock *tb)
 
 bool tcg_cflags_has(CPUState *cpu, uint32_t flags);
 void tcg_cflags_set(CPUState *cpu, uint32_t flags);
+
+#ifdef CONFIG_USER_ONLY
+/* TranslationBlock.pt_state */
+enum {
+    TB_PT_ABSENT,       /* not in page tracking */
+    TB_PT_PENDING,      /* recorded, not yet in the interval tree */
+    TB_PT_IN_TREE,
+};
+#endif
 
 static inline tb_page_addr_t tb_page_addr0(const TranslationBlock *tb)
 {

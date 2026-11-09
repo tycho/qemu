@@ -18,6 +18,14 @@
  */
 
 #include "qemu/osdep.h"
+#include "tcg/tcg-cache.h"
+#include "qemu/timer.h"
+#include "qemu/cacheflush.h"
+#ifdef CONFIG_USER_ONLY
+#include "user/guest-host.h"
+#include "user/page-protection.h"
+#include "exec/page-protection.h"
+#endif
 
 #include "trace.h"
 #include "disas/disas.h"
@@ -37,6 +45,7 @@
 #include "tb-context.h"
 #include "internal-common.h"
 #include "tcg/perf.h"
+#include "qemu/plugin.h"
 #include "tcg/insn-start-words.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/cpu_loop.h"
@@ -102,7 +111,7 @@ static int64_t decode_sleb128(const uint8_t **pp)
    with the host pc, and the middle columns with zeros.  */
 
 /* tcg_lazysync map: the register byte of a constant-valued global. */
-#define LAZY_WB_CONST 0xff
+#define LAZY_WB_CONST TCG_CACHE_LAZY_WB_CONST
 
 static int encode_search(TranslationBlock *tb, uint8_t *block,
                          uint8_t *highwater)
@@ -168,6 +177,20 @@ static int encode_search(TranslationBlock *tb, uint8_t *block,
     return p - block;
 }
 
+/*
+ * A TB installed from an artifact checks its unwind data before the first
+ * decode of it, by either reader (tcg_cache_unwind_first_use).  The TB
+ * stays allocated while it is checked: a reader runs on behalf of a vCPU
+ * counted as running, which a flush's exclusive section waits for, and
+ * invalidation doesn't free a TB.
+ */
+static inline void tb_unwind_check(TranslationBlock *tb, int consumer)
+{
+    if (unlikely(qatomic_load_acquire(&tb->unwind_unchecked))) {
+        tcg_cache_unwind_first_use(tb, consumer);
+    }
+}
+
 #ifdef CONFIG_USER_ONLY
 /*
  * A host signal at @host_pc in generated code: if it is a guest access
@@ -189,6 +212,7 @@ void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t (*regs)[2],
     if (!tb || host_pc < (uintptr_t)tb->tc.ptr) {
         return;
     }
+    tb_unwind_check(tb, TCG_CACHE_UNWIND_LAZYSYNC);
     off = host_pc - (uintptr_t)tb->tc.ptr;
     p = tb->tc.search;
     for (int i = 0; i < tb->icount * (INSN_START_WORDS + 1); ++i) {
@@ -210,6 +234,11 @@ void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t (*regs)[2],
 
             if (hit && base < nregs && (reg == LAZY_WB_CONST || reg < nregs)) {
                 uint64_t *dst = (void *)(uintptr_t)(regs[base][0] + ofs);
+
+                if (tb->search_len) {
+                    /* Installed from an artifact (testing's evidence). */
+                    qatomic_inc(&tcg_cache_stats.unwind_installed_wb);
+                }
 
                 if (reg == LAZY_WB_CONST) {
                     if (type == TCG_TYPE_I32) {
@@ -247,9 +276,11 @@ static int cpu_unwind_data_from_tb(TranslationBlock *tb, uintptr_t host_pc,
                                    uint64_t *data)
 {
     uintptr_t iter_pc = (uintptr_t)tb->tc.ptr;
-    const uint8_t *p = tb->tc.search;
+    const uint8_t *p;
     int i, j, num_insns = tb->icount;
 
+    tb_unwind_check(tb, TCG_CACHE_UNWIND_RESTORE);
+    p = tb->tc.search;
     host_pc -= GETPC_ADJ;
 
     if (host_pc < iter_pc) {
@@ -369,6 +400,693 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
     return tcg_gen_code(tcg_ctx, tb, pc);
 }
 
+#ifdef CONFIG_USER_ONLY
+/* The cflags a captured TB may have. */
+#define TB_CACHE_CFLAGS  (CF_PARALLEL | CF_CLUSTER_MASK | CF_COUNT_MASK)
+
+/*
+ * The guarded routines (tcg-cache.h).  The source loads are at the
+ * tcg_cache_gload* labels; nothing else in them may fault on the
+ * caller's behalf, and they keep LR, SP and the callee-saved registers,
+ * so that a handler can return to LR.  Results: 0 copied or equal, 1
+ * different.
+ */
+#if defined(__aarch64__) && (defined(__linux__) || defined(_WIN32))
+asm("   .text\n"
+    "   .balign 16\n"
+    "   .globl tcg_cache_gcopy\n"
+    "tcg_cache_gcopy:\n"
+    "   cmp     x2, #8\n"
+    "   b.lo    2f\n"
+    "1:\n"
+    "   .globl tcg_cache_gload0\n"
+    "tcg_cache_gload0:\n"
+    "   ldr     x3, [x1], #8\n"
+    "   str     x3, [x0], #8\n"
+    "   sub     x2, x2, #8\n"
+    "   cmp     x2, #8\n"
+    "   b.hs    1b\n"
+    "2:\n"
+    "   cbz     x2, 4f\n"
+    "3:\n"
+    "   .globl tcg_cache_gload1\n"
+    "tcg_cache_gload1:\n"
+    "   ldrb    w3, [x1], #1\n"
+    "   strb    w3, [x0], #1\n"
+    "   subs    x2, x2, #1\n"
+    "   b.ne    3b\n"
+    "4:\n"
+    "   mov     x0, #0\n"
+    "   ret\n"
+    "   .balign 16\n"
+    "   .globl tcg_cache_gcmp\n"
+    "tcg_cache_gcmp:\n"
+    "   cmp     x2, #8\n"
+    "   b.lo    2f\n"
+    "1:\n"
+    "   .globl tcg_cache_gload2\n"
+    "tcg_cache_gload2:\n"
+    "   ldr     x3, [x0], #8\n"
+    "   .globl tcg_cache_gload3\n"
+    "tcg_cache_gload3:\n"
+    "   ldr     x4, [x1], #8\n"
+    "   cmp     x3, x4\n"
+    "   b.ne    5f\n"
+    "   sub     x2, x2, #8\n"
+    "   cmp     x2, #8\n"
+    "   b.hs    1b\n"
+    "2:\n"
+    "   cbz     x2, 4f\n"
+    "3:\n"
+    "   .globl tcg_cache_gload4\n"
+    "tcg_cache_gload4:\n"
+    "   ldrb    w3, [x0], #1\n"
+    "   .globl tcg_cache_gload5\n"
+    "tcg_cache_gload5:\n"
+    "   ldrb    w4, [x1], #1\n"
+    "   cmp     w3, w4\n"
+    "   b.ne    5f\n"
+    "   subs    x2, x2, #1\n"
+    "   b.ne    3b\n"
+    "4:\n"
+    "   mov     x0, #0\n"
+    "   ret\n"
+    "5:\n"
+    "   mov     x0, #1\n"
+    "   ret\n"
+    "   .data\n"
+    "   .balign 8\n"
+    "   .globl tcg_cache_gloads\n"
+    "tcg_cache_gloads:\n"
+    "   .quad   tcg_cache_gload0, tcg_cache_gload1, tcg_cache_gload2\n"
+    "   .quad   tcg_cache_gload3, tcg_cache_gload4, tcg_cache_gload5\n"
+    "   .text\n");
+
+bool tcg_cache_guard_pc(uintptr_t pc)
+{
+    for (int i = 0; i < TCG_CACHE_GLOADS; i++) {
+        if (pc == tcg_cache_gloads[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+#else
+int64_t tcg_cache_gcopy(void *dst, const void *src, size_t len)
+{
+    memcpy(dst, src, len);
+    return 0;
+}
+
+int64_t tcg_cache_gcmp(const void *a, const void *b, size_t len)
+{
+    return memcmp(a, b, len) != 0;
+}
+
+bool tcg_cache_guard_pc(uintptr_t pc)
+{
+    return false;
+}
+#endif
+
+int tcg_cache_selftest(uint8_t *p, size_t page)
+{
+    static const size_t lens[] = { 0, 1, 7, 8, 9, 15, 16, 17, 63, 200 };
+    uint8_t *ref = g_malloc(page), *dst = g_malloc(page + 64);
+    int fails = 0, checks = 0;
+    int64_t r;
+
+#define SELFCHECK(cond, ...) do {                                      \
+        checks++;                                                       \
+        if (!(cond)) {                                                  \
+            fails++;                                                    \
+            fprintf(stderr, "xtcg-cache selftest: " __VA_ARGS__);       \
+        }                                                               \
+    } while (0)
+
+    for (size_t i = 0; i < page; i++) {
+        p[i] = ref[i] = i * 37 + 11;
+    }
+    /* Lengths and alignments, within the readable page. */
+    for (int a = 0; a < 8; a++) {
+        for (int l = 0; l < ARRAY_SIZE(lens); l++) {
+            size_t n = lens[l];
+
+            memset(dst, 0xee, page + 64);
+            r = tcg_cache_gcopy(dst + a, p + a + 3, n);
+            SELFCHECK(r == 0 && !memcmp(dst + a, ref + a + 3, n) &&
+                      dst[a + n] == 0xee,
+                      "copy align %d len %zu: %" PRIx64 "\n", a, n, r);
+            r = tcg_cache_gcmp(p + a, ref + a, n);
+            SELFCHECK(r == 0, "cmp equal align %d len %zu: %" PRIx64 "\n",
+                      a, n, r);
+            if (n) {
+                ref[a + n - 1] ^= 1;
+                r = tcg_cache_gcmp(p + a, ref + a, n);
+                SELFCHECK(r == 1, "cmp differ (last) align %d len %zu: %"
+                          PRIx64 "\n", a, n, r);
+                r = tcg_cache_gcmp(ref + a, p + a, n);
+                SELFCHECK(r == 1, "cmp differ (swapped) align %d len %zu: %"
+                          PRIx64 "\n", a, n, r);
+                ref[a + n - 1] ^= 1;
+            }
+        }
+    }
+    /*
+     * Across into the inaccessible page: a fault code whose address is in
+     * the access that crossed (an access that straddles the boundary may
+     * report its own start).
+     */
+    for (int t = 1; t <= 17; t += 8) {
+        uint8_t *src = p + page - t;
+        uintptr_t lo = (uintptr_t)(p + page - 8), hi = (uintptr_t)(p + page);
+
+#define FAULTED(r) ((uint64_t)(r) >> 62 == 2 &&                         \
+                    ((uint64_t)(r) & (TCG_CACHE_GFAULT_GUARD - 1)) >= lo && \
+                    ((uint64_t)(r) & (TCG_CACHE_GFAULT_GUARD - 1)) <= hi)
+        r = tcg_cache_gcopy(dst, src, t + 8);
+        SELFCHECK(FAULTED(r) && !memcmp(dst, ref + page - t, t & ~7),
+                  "copy fault tail %d: %" PRIx64 "\n", t, r);
+        r = tcg_cache_gcmp(ref + page - t, src, t + 8);
+        SELFCHECK(FAULTED(r), "cmp fault (second) tail %d: %" PRIx64 "\n",
+                  t, r);
+        r = tcg_cache_gcmp(src, ref + page - t, t + 8);
+        SELFCHECK(FAULTED(r), "cmp fault (first) tail %d: %" PRIx64 "\n",
+                  t, r);
+#undef FAULTED
+    }
+#if defined(__aarch64__) && (defined(__linux__) || defined(_WIN32))
+    /* Only the loads are recognised. */
+    SELFCHECK(!tcg_cache_guard_pc((uintptr_t)tcg_cache_gcopy) &&
+              !tcg_cache_guard_pc((uintptr_t)tcg_cache_gcmp) &&
+              !tcg_cache_guard_pc(tcg_cache_gloads[0] + 4),
+              "a non-load PC is recognised\n");
+#endif
+#undef SELFCHECK
+    fprintf(stderr, "xtcg-cache selftest: %d of %d checks failed\n", fails,
+            checks);
+    g_free(ref);
+    g_free(dst);
+    return fails;
+}
+
+/*
+ * TCG_CACHE_ON in qemu-user (testing).  A page is eligible when its
+ * translations are never SMC-checked (PAGE_FIXED_CODE: a private mapping)
+ * and nothing can write it (neither PAGE_WRITE nor PAGE_WRITE_ORG); the
+ * key is its absolute address.  The guarded routines contain a fault
+ * from a mapping whose backing went (a truncated file).  The OS layer
+ * may provide its own (tcg_cache_host).
+ */
+static bool tb_cache_page_image(vaddr page, TCGCacheImage *img)
+{
+    int want = PAGE_VALID | PAGE_EXEC | PAGE_FIXED_CODE;
+
+    if ((page_get_flags(page) & (want | PAGE_WRITE | PAGE_WRITE_ORG))
+        != want) {
+        return false;
+    }
+    img->id = tcg_cache_test_img_shift ? page >> tcg_cache_test_img_shift : 0;
+    img->base = 0;
+    return true;
+}
+
+static void tb_cache_fault(int64_t code)
+{
+}
+
+static const TCGCacheHost tb_cache_host_user = {
+    .page_image = tb_cache_page_image,
+    .copy = tcg_cache_gcopy,
+    .compare = tcg_cache_gcmp,
+    .fault = tb_cache_fault,
+};
+
+static const TCGCacheHost *tb_cache_host(void)
+{
+    return tcg_cache_host ? tcg_cache_host : &tb_cache_host_user;
+}
+
+/*
+ * Install the TB for @s from artifact @art, as a fresh translation is
+ * published: NULL if it doesn't apply here (the reason counted), else the
+ * TB, or one an other thread published for the same key first.  With
+ * @img (TCG_CACHE_ON), @art came from the store for @s.pc's page, which is
+ * eligible and in @img: the rest of its pages must be too, and no adaptive
+ * state may have changed what translation would give.  Called with
+ * mmap_lock held.
+ */
+/* Why the last install failed (TCG_CACHE_W_*), and the last lookup. */
+static unsigned tb_cache_fail, tb_cache_why;
+
+static void tb_cache_test_dup(CPUState *cpu, TCGTBCPUState s,
+                              tb_page_addr_t phys_pc, const void *art,
+                              size_t len, const TCGCacheImage *img,
+                              TranslationBlock *first);
+
+static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
+                                          tb_page_addr_t phys_pc,
+                                          const void *art, size_t len,
+                                          const TCGCacheImage *img)
+{
+    int64_t t0 = TCG_CACHE_CLOCK(), t1, t2;
+    const TCGCacheHost *host = tb_cache_host();
+    CPUArchState *env = cpu_env(cpu);
+    TCGCacheArtView v;
+    TCGCacheRes r;
+    const TCGCacheArt *h;
+    TranslationBlock *tb, *existing_tb;
+    tb_page_addr_t phys_p2 = -1;
+    vaddr page = s.pc & TARGET_PAGE_MASK;
+    bool spans, reads_p2 = false;
+    uint32_t off;
+
+    tb_cache_fail = TCG_CACHE_W_OTHER;
+    if (!tcg_cache_art_view(art, len, &v)) {
+        if (img) {
+            tcg_cache_stats.miss_struct++;
+        } else {
+            tcg_cache_stats.inst_fail_key++;
+        }
+        return NULL;
+    }
+    h = v.h;
+    if (h->pc != s.pc || h->cs_base != s.cs_base || h->tb_flags != s.flags
+        || h->cflags != s.cflags || !h->size) {
+        if (tcg_cache_debug) {
+            fprintf(stderr,
+                    "key: pc %llx/%llx cs %llx/%llx fl %x/%x cf %x/%x\n",
+                    (unsigned long long)h->pc, (unsigned long long)s.pc,
+                    (unsigned long long)h->cs_base,
+                    (unsigned long long)s.cs_base, h->tb_flags, s.flags,
+                    h->cflags, s.cflags);
+        }
+        tcg_cache_stats.inst_fail_key++;
+        if (h->pc != s.pc) {
+            tcg_cache_stats.inst_fail_kpc++;
+            tb_cache_fail = TCG_CACHE_W_KEYPC;
+        } else {
+            tb_cache_fail = TCG_CACHE_W_KEY;
+        }
+        return NULL;
+    }
+    spans = ((s.pc + h->size - 1) & TARGET_PAGE_MASK) != page;
+    if (spans != !!(h->flags & TCG_CACHE_ART_PAGE2)) {
+        tcg_cache_stats.inst_fail_key++;
+        tb_cache_fail = TCG_CACHE_W_KEY;
+        return NULL;
+    }
+    off = 0;
+    for (int i = 0; i < h->n_ext; i++) {
+        const TCGCacheArtExt *e = &v.ext[i];
+
+        if (e->off + e->len > 2 * TARGET_PAGE_SIZE ||
+            off + e->len > h->ext_bytes) {
+            tcg_cache_stats.inst_fail_bytes++;
+            return NULL;
+        }
+        reads_p2 |= e->off + e->len > TARGET_PAGE_SIZE;
+        off += e->len;
+    }
+
+    /* Every page the translation read is eligible, in the same image. */
+    if (img && (spans || reads_p2)) {
+        TCGCacheImage img2;
+
+        if (!host->page_image(page + TARGET_PAGE_SIZE, &img2) ||
+            img2.id != img->id || img2.base != img->base) {
+            tcg_cache_stats.miss_inel++;
+            return NULL;
+        }
+    }
+    if (spans) {
+        phys_p2 = get_page_addr_code(env, page + TARGET_PAGE_SIZE);
+        if (phys_p2 == -1) {
+            tcg_cache_stats.inst_fail_bytes++;
+            return NULL;
+        }
+    }
+
+    /* Promoted since: translation gives different code now. */
+    for (int i = 0; i < h->n_acq; i++) {
+        if (tcg_tso_cross_promoted(v.acq[i])) {
+            tcg_cache_stats.inst_fail_promoted++;
+            return NULL;
+        }
+    }
+    if (img && h->n_acq && tcg_cache_inj_promote) {
+        /* Testing: a promotion racing this install. */
+        while (!tcg_tso_cross_count(v.acq[0])) {
+            continue;
+        }
+        tcg_cache_stats.inj_promote++;
+    }
+    /* A region head translates as a region now. */
+    if (img && translator_region_is_head(phys_pc)) {
+        tcg_cache_stats.miss_region++;
+        return NULL;
+    }
+
+    /* The bytes the translation read are still there. */
+    t1 = TCG_CACHE_CLOCK();
+    tcg_cache_stats.inst_prep_ns += t1 - t0;
+    off = 0;
+    for (int i = 0; i < h->n_ext; i++) {
+        const TCGCacheArtExt *e = &v.ext[i];
+        void *g = g2h_untagged_vaddr(page + e->off);
+        int64_t c;
+
+        if (img && host->inject) {
+            host->inject(page + e->off, true);
+        }
+        c = host->compare(g, v.ext_bytes + off, e->len);
+        if (c < 0) {
+            host->fault(c);
+        }
+        if (img && host->inject) {
+            host->inject(page + e->off, false);
+        }
+        if (c) {
+            if (c < 0) {
+                if (tcg_cache_debug) {
+                    fprintf(stderr, "xtcg-cache: guarded compare fault %"
+                            PRIx64 " at pc %" PRIx64 "\n", c, (uint64_t)s.pc);
+                }
+                tcg_cache_stats.miss_fault++;
+            } else {
+                tcg_cache_stats.inst_fail_bytes++;
+            }
+            return NULL;
+        }
+        off += e->len;
+    }
+    tcg_cache_stats.checks++;
+    t2 = TCG_CACHE_CLOCK();
+    tcg_cache_stats.check_ns += t2 - t1;
+
+    if (!tcg_cache_reserve(tcg_ctx, &v, &r)) {
+        tcg_cache_stats.inst_fail_reserve++;
+        return NULL;
+    }
+    tcg_cache_part(&tcg_cache_stats.inst_res_ns, &t2);
+    tb = tcg_cache_place(tcg_ctx, &v, &r);
+    tcg_cache_part(&tcg_cache_stats.inst_place_ns, &t2);
+    if (!tb) {
+        tcg_cache_stats.inst_fail_reloc++;
+        tcg_cache_stats.inst_fail_rk[tcg_cache_fail_kind]++;
+        tcg_cache_stats.inst_fail_rf[tcg_cache_fail_form]++;
+        switch (tcg_cache_fail_kind) {
+        case TCG_CAP_HELPER:
+            tb_cache_fail = TCG_CACHE_W_HELPER;
+            break;
+        case TCG_CAP_STUB:
+            tb_cache_fail = TCG_CACHE_W_STUB;
+            break;
+        case TCG_CAP_THUNK:
+            tb_cache_fail = TCG_CACHE_W_THUNK;
+            break;
+        default:
+            tb_cache_fail = TCG_CACHE_W_RELOC;
+            break;
+        }
+        return NULL;
+    }
+    tb_set_page_addr0(tb, phys_pc);
+    tb_lock_page0(phys_pc);
+    if (phys_p2 != -1) {
+        tb_set_page_addr1(tb, phys_p2);
+        tb_lock_page1(phys_pc, phys_p2);
+    }
+    tcg_cache_part(&tcg_cache_stats.inst_link_ns, &t2);
+    /* Placement left each slot reset; this synchronizes the whole TB. */
+    tcg_cache_commit(tcg_ctx, &r);
+    tcg_cache_part(&tcg_cache_stats.inst_flush_ns, &t2);
+
+    perf_report_code(s.pc, tb, tb->tc.ptr);
+    tcg_tb_insert(tb);
+    existing_tb = tb_link_page(tb, true);
+    assert_no_pages_locked();
+    tcg_cache_stats.installs++;
+    tcg_cache_part(&tcg_cache_stats.inst_link_ns, &t2);
+    tcg_cache_stats.install_ns += TCG_CACHE_CLOCK() - t0;
+    if (unlikely(existing_tb != tb)) {
+        tcg_cache_stats.inst_dup++;
+        qatomic_set(&tcg_ctx->code_gen_ptr,
+                    r.split ? r.hot : (void *)tb);
+        tcg_tb_remove(tb);
+        return existing_tb;
+    }
+    /* The slot forms an installed TB was reset in (statistics). */
+    for (int n = 0; n < tb->nb_slots; n++) {
+        if (tb->jmp[n].reset_offset == TB_JMP_OFFSET_INVALID) {
+            continue;
+        }
+        if (tb->jmp_call & (1u << n)) {
+            tcg_cache_stats.slot_forms[TCG_CACHE_SLOT_CALL]++;
+        } else if (tb->jmp_cold & (1u << n)) {
+            tcg_cache_stats.slot_forms[tb->jmp[n].reset_offset ==
+                                       tb->jmp[n].insn_offset + 4
+                                       ? TCG_CACHE_SLOT_NOP
+                                       : TCG_CACHE_SLOT_COLD]++;
+        } else {
+            tcg_cache_stats.slot_forms[TCG_CACHE_SLOT_PLAIN]++;
+        }
+        if (tb->jmp[n].cond) {
+            tcg_cache_stats.slot_forms[TCG_CACHE_SLOT_COND]++;
+        }
+    }
+    if (unlikely(tcg_cache_test_dup)) {
+        tb_cache_test_dup(cpu, s, phys_pc, art, len, img, tb);
+    }
+    return tb;
+}
+
+/*
+ * Testing (XTCG_CACHE_TEST_DUP=n): every nth install installs its
+ * artifact again right after, which must find @first and give back the
+ * second TB from the region array and page tracking.
+ */
+static void tb_cache_test_dup(CPUState *cpu, TCGTBCPUState s,
+                              tb_page_addr_t phys_pc, const void *art,
+                              size_t len, const TCGCacheImage *img,
+                              TranslationBlock *first)
+{
+    static unsigned n;
+    static bool in_dup;
+    size_t nb_tbs, pending;
+    uint64_t dups;
+    TranslationBlock *tb;
+
+    if (in_dup || ++n % tcg_cache_test_dup) {
+        return;
+    }
+    nb_tbs = tcg_nb_tbs();
+    pending = tb_pending_count();
+    dups = tcg_cache_stats.inst_dup;
+    in_dup = true;
+    tb = tb_cache_install(cpu, s, phys_pc, art, len, img);
+    in_dup = false;
+    if (!tb) {
+        /* Placement may fail here as at first (reach): no duplicate. */
+        return;
+    }
+    g_assert(tb == first);
+    g_assert(tcg_cache_stats.inst_dup == dups + 1);
+    g_assert(tcg_nb_tbs() == nb_tbs);
+    /* Admitting the duplicate may have caught up the pending list. */
+    g_assert(tb_pending_count() <= pending);
+    g_assert(first->pt_state == TB_PT_PENDING ||
+             first->pt_state == TB_PT_IN_TREE);
+    tcg_cache_stats.test_dups++;
+}
+
+/* A file's candidate, installed if it applies (tcg_cache_file_select). */
+typedef struct TBCacheUse {
+    CPUState *cpu;
+    TCGTBCPUState s;
+    tb_page_addr_t phys_pc;
+    const TCGCacheImage *img;
+    TranslationBlock *tb;
+    int tried;
+} TBCacheUse;
+
+static bool tb_cache_use(const TCGCacheEnv *env, void *opaque)
+{
+    TBCacheUse *u = opaque;
+    int64_t t0 = TCG_CACHE_CLOCK();
+
+    if (u->tried++ < tcg_cache_test_reject) {
+        return false;
+    }
+
+    u->tb = tb_cache_install(u->cpu, u->s, u->phys_pc, env + 1,
+                             env->len - sizeof(*env), u->img);
+    if (!u->tb) {
+        tcg_cache_stats.file_fail++;
+        tcg_cache_stats.file_fail_ns += TCG_CACHE_CLOCK() - t0;
+        tb_cache_why = tb_cache_fail;
+    }
+    return u->tb != NULL;
+}
+
+/*
+ * TCG_CACHE_ON: the TB for @s from the store, if a candidate for @img
+ * applies, else NULL.  Each candidate is copied out (guarded) and its
+ * structure checked before anything in it is used.
+ */
+static TranslationBlock *tb_cache_lookup(CPUState *cpu, TCGTBCPUState s,
+                                         tb_page_addr_t phys_pc,
+                                         const TCGCacheImage *img)
+{
+    static void *buf;
+    static size_t buf_size;
+    const TCGCacheHost *host = tb_cache_host();
+    TCGCacheCand c[TCG_CACHE_CANDS];
+    int64_t t0 = TCG_CACHE_CLOCK(), t1;
+    int n;
+
+    tcg_cache_stats.lookups++;
+    tb_cache_why = TCG_CACHE_W_NONE;
+    /* The directory's files (the back end's snapshot). */
+    {
+        TCGCacheSnap *snap;
+
+        RCU_READ_LOCK_GUARD();
+        snap = qatomic_rcu_read(&tcg_cache_snap);
+        if (qatomic_read(&tcg_cache_sink_on) && (!snap || !snap->n)) {
+            /* Nothing mapped yet: others may have published since. */
+            qatomic_set(&tcg_cache_file_missed, true);
+        }
+        if (snap && snap->n) {
+            static void *sbuf;
+            TBCacheUse u = { cpu, s, phys_pc, img, NULL };
+
+            if (!sbuf) {
+                sbuf = g_malloc(sizeof(TCGCacheEnv) + TCG_CACHE_ART_MAX);
+            }
+            tcg_cache_stats.file_lookups++;
+            tcg_cache_snap_select(snap, img->id, s.pc - img->base, s.flags,
+                                  s.cs_base, s.cflags, sbuf,
+                                  sizeof(TCGCacheEnv) + TCG_CACHE_ART_MAX,
+                                  tb_cache_use, &u,
+                                  tcg_cache_stats.file_reject);
+            if (u.tb) {
+                tcg_cache_stats.file_hits++;
+                tcg_cache_stats.hits++;
+                tcg_cache_stats.hit_ns += TCG_CACHE_CLOCK() - t0;
+                tcg_cache_stats.look_ns += TCG_CACHE_CLOCK() - t0;
+                return u.tb;
+            }
+            qatomic_set(&tcg_cache_file_missed, true);
+        }
+    }
+    /* Testing (XTCG_CACHE_LOAD): a file's artifacts first. */
+    if (tcg_cache_have_loaded) {
+        static void *fbuf;
+        TBCacheUse u = { cpu, s, phys_pc, img, NULL };
+
+        if (!fbuf) {
+            fbuf = g_malloc(sizeof(TCGCacheEnv) + TCG_CACHE_ART_MAX);
+        }
+        tcg_cache_stats.file_lookups++;
+        tcg_cache_file_select(&tcg_cache_loaded, img->id, s.pc - img->base,
+                              s.flags, s.cs_base, s.cflags, fbuf,
+                              sizeof(TCGCacheEnv) + TCG_CACHE_ART_MAX,
+                              tb_cache_use, &u, tcg_cache_stats.file_reject);
+        if (u.tb) {
+            tcg_cache_stats.file_hits++;
+            tcg_cache_stats.hits++;
+            tcg_cache_stats.hit_ns += TCG_CACHE_CLOCK() - t0;
+            tcg_cache_stats.look_ns += TCG_CACHE_CLOCK() - t0;
+            return u.tb;
+        }
+    }
+    n = tcg_cache_store_find(img->id, s.pc - img->base, s.flags, s.cs_base,
+                             s.cflags, c);
+    if (!n) {
+        tcg_cache_stats.look_none++;
+        tcg_cache_stats.look_ns += TCG_CACHE_CLOCK() - t0;
+        return NULL;
+    }
+    for (int i = 0; i < n; i++) {
+        TranslationBlock *tb;
+        int64_t r;
+
+        if (c[i].base != img->base) {
+            tcg_cache_stats.miss_base++;
+            continue;
+        }
+        if (c[i].len > buf_size) {
+            buf_size = ROUND_UP(c[i].len, 4096);
+            g_free(buf);
+            buf = g_malloc(buf_size);
+        }
+        t1 = TCG_CACHE_CLOCK();
+        r = host->copy(buf, c[i].art, c[i].len);
+        tcg_cache_stats.copies++;
+        tcg_cache_stats.copy_ns += TCG_CACHE_CLOCK() - t1;
+        if (r) {
+            if (tcg_cache_debug) {
+                fprintf(stderr, "xtcg-cache: guarded copy fault %" PRIx64
+                        "\n", r);
+            }
+            host->fault(r);
+            tcg_cache_stats.miss_fault++;
+            continue;
+        }
+        tb = tb_cache_install(cpu, s, phys_pc, buf, c[i].len, img);
+        if (tb) {
+            tcg_cache_stats.hits++;
+            tcg_cache_stats.hit_ns += TCG_CACHE_CLOCK() - t0;
+            tcg_cache_stats.look_ns += TCG_CACHE_CLOCK() - t0;
+            return tb;
+        }
+    }
+    tcg_cache_stats.look_ns += TCG_CACHE_CLOCK() - t0;
+    return NULL;
+}
+
+/* TCG_CACHE_ON: a translation's line for XTCG_CACHE_TRACE. */
+static void tb_cache_trace(const TCGTBCPUState *s, const TCGCacheImage *img,
+                           const char *outcome, uint64_t ghash, int64_t ns)
+{
+    char line[200];
+
+    snprintf(line, sizeof(line), "xlat %016" PRIx64 " %" PRIx64 " %" PRIx64
+             " %x %" PRIx64 " %x %s %016" PRIx64 " %" PRId64 "\n",
+             img ? img->id : 0, (uint64_t)s->pc - (img ? img->base : 0),
+             img ? img->base : 0, s->flags, (uint64_t)s->cs_base, s->cflags,
+             outcome, ghash, ns);
+    tcg_cache_out(line);
+}
+
+/*
+ * TCG_CACHE_ON: testing, a flush every tcg_cache_flush_every translations
+ * (not installs, so that a working set larger than that doesn't keep the
+ * flushes going by itself).
+ */
+static void tb_cache_count(CPUState *cpu)
+{
+    static unsigned n;
+
+    if (tcg_cache_flush_every && ++n >= tcg_cache_flush_every) {
+        n = 0;
+        tcg_cache_stats.flushes++;
+        queue_tb_flush(cpu);
+    }
+}
+#else
+/*
+ * System mode installs nothing from files; their readers, built in every
+ * mode, copy with a plain one.
+ */
+int64_t tcg_cache_gcopy(void *dst, const void *src, size_t len)
+{
+    memcpy(dst, src, len);
+    return 0;
+}
+#endif
+
 /* Called with mmap_lock held for user mode emulation.  */
 TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 {
@@ -380,6 +1098,17 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     uint8_t *search, *search_hw;
     int64_t ti;
     void *host_pc;
+#ifdef CONFIG_USER_ONLY
+    void *art = NULL;
+    size_t art_len = 0;
+    TCGCacheImage cache_img = { };
+    bool cache_elig = false;
+    const char *cache_outcome = NULL;
+    uint64_t cache_ghash = 0;
+    int64_t cache_t0 = tcg_cache_trace ? get_clock() : 0;
+    int64_t gen_t0 = 0;
+    bool gen_counted = false;
+#endif
 
     assert_memory_lock();
     qemu_thread_jit_write();
@@ -398,6 +1127,38 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
         max_insns = TCG_MAX_INSNS;
     }
     QEMU_BUILD_BUG_ON(CF_COUNT_MASK + 1 != TCG_MAX_INSNS);
+
+#ifdef CONFIG_USER_ONLY
+    tcg_ctx->cap_on = tcg_cache_mode && phys_pc != -1
+                      && !(s.cflags & ~TB_CACHE_CFLAGS);
+#ifdef CONFIG_PLUGIN
+    /*
+     * A plugin instruments TBs as they are translated: nothing cached may
+     * stand in for a translation, and nothing translated is kept.
+     */
+    if (cpu->plugin_state
+        && test_bit(QEMU_PLUGIN_EV_VCPU_TB_TRANS,
+                    cpu->plugin_state->event_mask)) {
+        tcg_ctx->cap_on = false;
+    }
+#endif
+    if (tcg_ctx->cap_on && tcg_cache_mode == TCG_CACHE_ON) {
+        cache_elig = tb_cache_host()->page_image(s.pc & TARGET_PAGE_MASK,
+                                                 &cache_img);
+        if (cache_elig) {
+            tb = tb_cache_lookup(cpu, s, phys_pc, &cache_img);
+            if (tb) {
+                return tb;
+            }
+            gen_t0 = TCG_CACHE_CLOCK();
+            gen_counted = true;
+        } else {
+            tcg_cache_stats.look_inel++;
+            tcg_ctx->cap_on = false;
+            cache_outcome = "inel";
+        }
+    }
+#endif
 
  buffer_overflow:
     assert_no_pages_locked();
@@ -553,10 +1314,20 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     }
     tb->tc.size = gen_code_size;
     tb->tc.search = tcg_splitwx_to_rx(search);
+    tb->unwind_unchecked = 0;
+    tb->search_len = 0;
+    tb->code_len = 0;
 #ifdef CONFIG_USER_ONLY
     if (tb->smc_inline) {
         tb->smc_check_end = tcg_ctx->insn0_off;
         tb->smc_stale = tcg_ctx->smc_stale->u.value_ptr;
+    }
+    if (tcg_ctx->cap_on) {
+        art = tcg_cache_capture(tcg_ctx, tb, search, search_size, &art_len);
+        tcg_ctx->cap_on = false;
+        if (!art) {
+            cache_outcome = tcg_cache_x_names[tcg_cache_last_reason];
+        }
     }
 #endif
     if (tcg_ctx->lay_on) {
@@ -648,6 +1419,90 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
         ROUND_UP((uintptr_t)gen_code_buf + gen_code_size + search_size,
                  CODE_GEN_ALIGN));
 
+#ifdef CONFIG_USER_ONLY
+    if (tcg_cache_mode == TCG_CACHE_ON) {
+        tcg_cache_stats.translations++;
+        if (gen_counted) {
+            tcg_cache_stats.gen[tb_cache_why]++;
+            tcg_cache_stats.gen_ns[tb_cache_why] += TCG_CACHE_CLOCK() - gen_t0;
+        }
+        tb_cache_count(cpu);
+    }
+    if (tcg_cache_mode == TCG_CACHE_ON && tcg_cache_trace && !art) {
+        tb_cache_trace(&s, cache_elig ? &cache_img : NULL,
+                       cache_outcome ? cache_outcome : "nocap", 0,
+                       get_clock() - cache_t0);
+    }
+    /*
+     * XTCG_CACHE=stress: publish a copy installed from the artifact
+     * instead, and poison the translation, which is never published.
+     */
+    if (art) {
+        TranslationBlock *itb = NULL;
+
+        if (tcg_cache_mode == TCG_CACHE_STRESS) {
+            itb = tb_cache_install(cpu, s, phys_pc, art, art_len, NULL);
+        }
+        if (tcg_cache_mode == TCG_CACHE_ON) {
+            TCGCacheImage img2;
+            TCGCacheArtView v;
+            vaddr page = s.pc & TARGET_PAGE_MASK;
+            bool p2 = ((s.pc + tb->size - 1) & TARGET_PAGE_MASK) != page;
+
+            /*
+             * The second page, if the TB or the bytes it read reach it, is
+             * eligible and in the same image.
+             */
+            if (tcg_cache_art_view(art, art_len, &v)) {
+                for (int i = 0; i < v.h->n_ext; i++) {
+                    p2 |= v.ext[i].off + v.ext[i].len > TARGET_PAGE_SIZE;
+                }
+            }
+            if (cache_elig &&
+                (!p2 ||
+                 (tb_cache_host()->page_image(page + TARGET_PAGE_SIZE,
+                                              &img2) &&
+                  img2.id == cache_img.id && img2.base == cache_img.base))) {
+                cache_ghash = tcg_cache_art_ghash(art, art_len);
+                cache_outcome = tcg_cache_store_put(&cache_img, art, art_len);
+                /* A new artifact, still the store's: to the files too. */
+                if (qatomic_read(&tcg_cache_sink_on)
+                    && !strcmp(cache_outcome, "stored")) {
+                    tcg_cache_sink_put(cache_img.id, s.pc - cache_img.base,
+                                       tcg_cache_born, art, art_len,
+                                       get_clock());
+                }
+            } else {
+                tcg_cache_stats.inel_capture++;
+                cache_outcome = "inel2";
+                g_free(art);
+            }
+            art = NULL;
+            if (tcg_cache_trace) {
+                tb_cache_trace(&s, &cache_img, cache_outcome, cache_ghash,
+                               get_clock() - cache_t0);
+            }
+        }
+        g_free(art);
+        if (itb) {
+            memset(gen_code_buf, 0, gen_code_size);
+            flush_idcache_range((uintptr_t)tb->tc.ptr,
+                                (uintptr_t)gen_code_buf, gen_code_size);
+            if (tcg_ctx->cap_cold) {
+                size_t n = (uint8_t *)tcg_ctx->cap_cold_end
+                           - (uint8_t *)tcg_ctx->cap_cold;
+
+                memset(tcg_ctx->cap_cold, 0, n);
+                flush_idcache_range(
+                    (uintptr_t)tcg_splitwx_to_rx(tcg_ctx->cap_cold),
+                    (uintptr_t)tcg_ctx->cap_cold, n);
+            }
+            memset(tb, 0x5a, tb_struct_size(tb->nb_slots));
+            return itb;
+        }
+    }
+#endif
+
     /* init jump list */
     qemu_spin_init(&tb->jmp_lock);
     tb->jmp_list_head = (uintptr_t)NULL;
@@ -690,7 +1545,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
      * No explicit memory barrier is required -- tb_link_page() makes the
      * TB visible in a consistent state.
      */
-    existing_tb = tb_link_page(tb);
+#ifdef CONFIG_USER_ONLY
+    tb->pt_state = TB_PT_ABSENT;
+#endif
+    existing_tb = tb_link_page(tb, false);
     assert_no_pages_locked();
 
     /* if the TB already exists, discard what we just translated */

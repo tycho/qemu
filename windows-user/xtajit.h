@@ -384,6 +384,33 @@ void xt_inject(XtThread *t, int point);
 /* exec.c */
 void xt_run(XtThread *t, XtExit *x);
 
+/* cache.c: the translation cache's catalogue (tcg-cache.h) */
+enum {
+    XT_CACHE_INJ_NONE,
+    XT_CACHE_INJ_NOACCESS,
+    XT_CACHE_INJ_GUARD,
+    XT_CACHE_INJ_BYTE,
+};
+typedef struct XtCacheStats {
+    uint64_t queries, identities, identity_fail, images_dropped, query_ns;
+    uint64_t faults, guard_back, injected, inj_guard_seen;
+} XtCacheStats;
+extern XtCacheStats xt_cache_stats;
+extern int xt_cache_inj;
+extern bool cache_dump, cache_selftest;
+void xt_cache_init(void);
+/* engine.c: whether an allocation is this module's own image */
+bool xt_is_own_image(const void *alloc_base);
+void xt_cache_forget(int kind, vaddr start, vaddr last);
+void xt_cache_fault(int64_t code);
+void xt_cache_print_stats(void);
+void xt_cache_dump(void);
+void xt_cache_selftest(void);
+/* cache-files.c: the translation cache's files (x-cache=files) */
+extern IMAGE_DOS_HEADER __ImageBase;
+extern bool xt_cache_fresh;
+void xt_cache_files_init(CPUState *first);
+
 /* fault.c */
 bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx);
 uint32_t xt_fault_count(void);
@@ -402,6 +429,9 @@ NTSTATUS xt_continue_native(XtNativeContext *ctx);
 #endif
 #ifndef STATUS_ASSERTION_FAILURE
 #define STATUS_ASSERTION_FAILURE ((NTSTATUS)0xC0000420)
+#endif
+#ifndef STATUS_INVALID_PARAMETER
+#define STATUS_INVALID_PARAMETER ((NTSTATUS)0xC000000DL)
 #endif
 #ifndef STATUS_NOT_SUPPORTED
 #define STATUS_NOT_SUPPORTED ((NTSTATUS)0xC00000BB)

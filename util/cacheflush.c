@@ -275,10 +275,15 @@ void flush_idcache_range(uintptr_t rx, uintptr_t rw, size_t len)
 #else
 
 /*
- * This is a copy of gcc's __aarch64_sync_cache_range, modified
- * to fit this three-operand interface.
+ * This is a copy of gcc's __aarch64_sync_cache_range, modified to take
+ * the data and instruction views of @n ranges and synchronize once.
  */
-void flush_idcache_range(uintptr_t rx, uintptr_t rw, size_t len)
+#ifdef CONFIG_WIN32
+bool qemu_icache_test_fallback;
+#endif
+
+static void sync_cache_ranges(const uintptr_t *rx, const uintptr_t *rw,
+                              const size_t *len, int n)
 {
     const unsigned CTR_IDC = 1u << 28;
     const unsigned CTR_DIC = 1u << 29;
@@ -294,11 +299,17 @@ void flush_idcache_range(uintptr_t rx, uintptr_t rw, size_t len)
      * mode clean and invalidate by address, and at what stride across
      * the processors, isn't established.
      */
-    if ((ctr_el0 & (CTR_IDC | CTR_DIC)) != (CTR_IDC | CTR_DIC)) {
-        if (rw != rx) {
-            __builtin___clear_cache((char *)rw, (char *)rw + len);
+    if ((ctr_el0 & (CTR_IDC | CTR_DIC)) != (CTR_IDC | CTR_DIC) ||
+        qemu_icache_test_fallback) {
+        for (int i = 0; i < n; i++) {
+            if (!len[i]) {
+                continue;
+            }
+            if (rw[i] != rx[i]) {
+                __builtin___clear_cache((char *)rw[i], (char *)rw[i] + len[i]);
+            }
+            __builtin___clear_cache((char *)rx[i], (char *)rx[i] + len[i]);
         }
-        __builtin___clear_cache((char *)rx, (char *)rx + len);
         return;
     }
 #endif
@@ -309,12 +320,18 @@ void flush_idcache_range(uintptr_t rx, uintptr_t rw, size_t len)
      */
     if (!(ctr_el0 & CTR_IDC)) {
         /*
-         * Loop over the address range, clearing one cache line at once.
+         * Loop over the address ranges, clearing one cache line at once.
          * Data cache must be flushed to unification first to make sure
          * the instruction cache fetches the updated data.
          */
-        for (p = rw & -dcache_lsize; p < rw + len; p += dcache_lsize) {
-            asm volatile("dc\tcvau, %0" : : "r" (p) : "memory");
+        for (int i = 0; i < n; i++) {
+            if (!len[i]) {
+                continue;
+            }
+            for (p = rw[i] & -dcache_lsize; p < rw[i] + len[i];
+                 p += dcache_lsize) {
+                asm volatile("dc\tcvau, %0" : : "r" (p) : "memory");
+            }
         }
     }
 
@@ -326,13 +343,34 @@ void flush_idcache_range(uintptr_t rx, uintptr_t rw, size_t len)
      * of Unification is not required for instruction to data coherence.
      */
     if (!(ctr_el0 & CTR_DIC)) {
-        for (p = rx & -icache_lsize; p < rx + len; p += icache_lsize) {
-            asm volatile("ic\tivau, %0" : : "r"(p) : "memory");
+        for (int i = 0; i < n; i++) {
+            if (!len[i]) {
+                continue;
+            }
+            for (p = rx[i] & -icache_lsize; p < rx[i] + len[i];
+                 p += icache_lsize) {
+                asm volatile("ic\tivau, %0" : : "r"(p) : "memory");
+            }
         }
         asm volatile ("dsb\tish" : : : "memory");
     }
 
     asm volatile("isb" : : : "memory");
+}
+
+void flush_idcache_range(uintptr_t rx, uintptr_t rw, size_t len)
+{
+    sync_cache_ranges(&rx, &rw, &len, 1);
+}
+
+void flush_idcache_range2(uintptr_t rx0, uintptr_t rw0, size_t len0,
+                          uintptr_t rx1, uintptr_t rw1, size_t len1)
+{
+    const uintptr_t rx[2] = { rx0, rx1 };
+    const uintptr_t rw[2] = { rw0, rw1 };
+    const size_t len[2] = { len0, len1 };
+
+    sync_cache_ranges(rx, rw, len, 2);
 }
 #endif /* CONFIG_DARWIN */
 

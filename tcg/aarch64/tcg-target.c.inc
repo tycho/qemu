@@ -112,6 +112,7 @@ static bool reloc_pc26(tcg_insn_unit *src_rw, const tcg_insn_unit *target)
         /* read instruction, mask away previous PC_REL26 parameter contents,
            set the proper offset, then write back the instruction. */
         *src_rw = deposit32(*src_rw, 0, 26, offset);
+        tcg_cap_rec_k(tcg_ctx, src_rw, TCG_CAPF_B26, TCG_CAP_NONE, 0, 0);
         return true;
     }
     return false;
@@ -124,6 +125,10 @@ static bool reloc_pc19(tcg_insn_unit *src_rw, const tcg_insn_unit *target)
 
     if (offset == sextract64(offset, 0, 19)) {
         *src_rw = deposit32(*src_rw, 5, 19, offset);
+        tcg_cap_rec_k(tcg_ctx, src_rw,
+                      (*src_rw & 0x3b000000) == 0x18000000
+                      ? TCG_CAPF_LDRLIT19 : TCG_CAPF_BCOND19,
+                      TCG_CAP_NONE, 0, 0);
         return true;
     }
     return false;
@@ -136,6 +141,7 @@ static bool reloc_pc14(tcg_insn_unit *src_rw, const tcg_insn_unit *target)
 
     if (offset == sextract64(offset, 0, 14)) {
         *src_rw = deposit32(*src_rw, 5, 14, offset);
+        tcg_cap_rec_k(tcg_ctx, src_rw, TCG_CAPF_TBZ14, TCG_CAP_NONE, 0, 0);
         return true;
     }
     return false;
@@ -163,6 +169,8 @@ static bool patch_reloc(tcg_insn_unit *code_ptr, int type,
             }
             *code_ptr = deposit32(deposit32(*code_ptr, 29, 2, disp),
                                   5, 19, disp >> 2);
+            tcg_cap_rec_k(tcg_ctx, code_ptr, TCG_CAPF_ADR21, TCG_CAP_NONE,
+                          0, 0);
             return true;
         }
     default:
@@ -869,6 +877,7 @@ static void tcg_out_insn_simd_loadrep(TCGContext *s, AArch64Insn insn, bool q,
 static void tcg_out_insn_ldlit(TCGContext *s, AArch64Insn insn,
                               int imm19, TCGReg rt)
 {
+    tcg_cap_rec(s, s->code_ptr, TCG_CAPF_LDRLIT19);
     tcg_out32(s, insn | (imm19 & 0x7ffff) << 5 | rt);
 }
 
@@ -881,18 +890,21 @@ static void tcg_out_insn_stxp(TCGContext *s, AArch64Insn insn, TCGReg rs,
 static void tcg_out_insn_cbz(TCGContext *s, AArch64Insn insn, TCGType ext,
                               TCGReg rt, int imm19)
 {
+    tcg_cap_rec(s, s->code_ptr, TCG_CAPF_BCOND19);
     tcg_out32(s, insn | ext << 31 | (imm19 & 0x7ffff) << 5 | rt);
 }
 
 static void tcg_out_insn_bcond_imm(TCGContext *s, AArch64Insn insn,
                               TCGCond c, int imm19)
 {
+    tcg_cap_rec(s, s->code_ptr, TCG_CAPF_BCOND19);
     tcg_out32(s, insn | tcg_cond_to_aarch64[c] | (imm19 & 0x7ffff) << 5);
 }
 
 static void tcg_out_insn_tbz(TCGContext *s, AArch64Insn insn,
                               TCGReg rt, int imm6, int imm14)
 {
+    tcg_cap_rec(s, s->code_ptr, TCG_CAPF_TBZ14);
     insn |= (imm6 & 0x20) << (31 - 5);
     insn |= (imm6 & 0x1f) << 19;
     tcg_out32(s, insn | (imm14 & 0x3fff) << 5 | rt);
@@ -900,6 +912,7 @@ static void tcg_out_insn_tbz(TCGContext *s, AArch64Insn insn,
 
 static void tcg_out_insn_branch(TCGContext *s, AArch64Insn insn, int imm26)
 {
+    tcg_cap_rec(s, s->code_ptr, TCG_CAPF_B26);
     tcg_out32(s, insn | (imm26 & 0x03ffffff));
 }
 
@@ -974,6 +987,13 @@ static void tcg_out_insn_movw(TCGContext *s, AArch64Insn insn, TCGType ext,
 static void tcg_out_insn_pcrel(TCGContext *s, AArch64Insn insn,
                               TCGReg rd, int64_t disp)
 {
+    /* An ADRP's consumer must be declared (s->cap_adrp). */
+    if (unlikely(s->cap_on)) {
+        tcg_cap_rec(s, s->code_ptr,
+                    insn == Ipcrel_ADR ? TCG_CAPF_ADR21
+                    : s->cap_adrp ? s->cap_adrp : TCG_CAPF_RAW_ADRP);
+    }
+    s->cap_adrp = 0;
     tcg_out32(s, insn | (disp & 3) << 29 | (disp & 0x1ffffc) << (5 - 2) | rd);
 }
 
@@ -1363,6 +1383,24 @@ static bool tcg_out_dupm_vec(TCGContext *s, TCGType type, unsigned vece,
     return true;
 }
 
+/*
+ * A captured translation (tcg-cache.h): the value's provenance is the
+ * caller's (s->cap_kind), else the value itself.  A relocatable one is
+ * recorded in whatever form is chosen; the value itself only where the
+ * form is PC-relative.
+ */
+static void tcg_out_movi_cap(TCGContext *s, int kind, int form,
+                             uint16_t aux, tcg_target_long value)
+{
+    if (kind > TCG_CAP_ABS) {
+        if (form == TCG_CAPF_NONE) {
+            tcg_cap_fail(s, TCG_CACHE_X_ORR_PTR);
+        } else {
+            tcg_cap_rec_k(s, s->code_ptr, form, kind, aux, value);
+        }
+    }
+}
+
 static void tcg_out_movi(TCGContext *s, TCGType type, TCGReg rd,
                          tcg_target_long value)
 {
@@ -1371,6 +1409,9 @@ static void tcg_out_movi(TCGContext *s, TCGType type, TCGReg rd,
     tcg_target_long t0, t1, t2;
     int s0, s1;
     AArch64Insn opc;
+    const int kind = s->cap_kind;
+    const tcg_target_long cvalue = value;
+    uint16_t mx = type == TCG_TYPE_I64 ? TCG_CAP_MOVW_X : 0;
 
     switch (type) {
     case TCG_TYPE_I32:
@@ -1390,14 +1431,18 @@ static void tcg_out_movi(TCGContext *s, TCGType type, TCGReg rd,
         value = (uint32_t)value;
         ivalue = (uint32_t)ivalue;
         type = TCG_TYPE_I32;
+        mx = 0;
     }
 
     /* Speed things up by handling the common case of small positive
        and negative values specially.  */
     if ((value & ~0xffffull) == 0) {
+        tcg_out_movi_cap(s, kind, TCG_CAPF_MOVW, mx | 1, cvalue);
         tcg_out_insn(s, movw, MOVZ, type, rd, value, 0);
         return;
     } else if ((ivalue & ~0xffffull) == 0) {
+        tcg_out_movi_cap(s, kind, TCG_CAPF_MOVW,
+                         mx | TCG_CAP_MOVW_MOVN | 1, cvalue);
         tcg_out_insn(s, movw, MOVN, type, rd, ivalue, 0);
         return;
     }
@@ -1406,6 +1451,7 @@ static void tcg_out_movi(TCGContext *s, TCGType type, TCGReg rd,
        use the sign-extended value.  That lets us match rotated values such
        as 0xff0000ff with the same 64-bit logic matching 0xffffffffff0000ff. */
     if (is_limm(svalue)) {
+        tcg_out_movi_cap(s, kind, TCG_CAPF_NONE, 0, cvalue);
         tcg_out_logicali(s, Ilogic_imm_ORRI, type, rd, TCG_REG_XZR, svalue);
         return;
     }
@@ -1416,12 +1462,17 @@ static void tcg_out_movi(TCGContext *s, TCGType type, TCGReg rd,
         intptr_t src_rx = (intptr_t)tcg_splitwx_to_rx(s->code_ptr);
         tcg_target_long disp = value - src_rx;
         if (disp == sextract64(disp, 0, 21)) {
+            tcg_cap_prov(s, kind > TCG_CAP_ABS ? kind : TCG_CAP_ABS);
             tcg_out_insn(s, pcrel, ADR, rd, disp);
+            tcg_cap_prov(s, kind);
             return;
         }
         disp = (value >> 12) - (src_rx >> 12);
         if (disp == sextract64(disp, 0, 21)) {
+            tcg_cap_prov(s, kind > TCG_CAP_ABS ? kind : TCG_CAP_ABS);
+            s->cap_adrp = value & 0xfff ? TCG_CAPF_ADRP_ADD : TCG_CAPF_ADRP;
             tcg_out_insn(s, pcrel, ADRP, rd, disp);
+            tcg_cap_prov(s, kind);
             if (value & 0xfff) {
                 tcg_out_insn(s, addsub_imm, ADDI, type, rd, rd, value & 0xfff);
             }
@@ -1442,6 +1493,10 @@ static void tcg_out_movi(TCGContext *s, TCGType type, TCGReg rd,
     s1 = ctz64(t1) & (63 & -16);
     t2 = t1 & ~(0xffffull << s1);
     if (t2 == 0) {
+        tcg_out_movi_cap(s, kind, TCG_CAPF_MOVW,
+                         mx | (opc == Imovw_MOVN ? TCG_CAP_MOVW_MOVN : 0)
+                         | 1 << (s0 / 16) | (t1 ? 1 << (s1 / 16) : 0),
+                         cvalue);
         tcg_out_insn_movw(s, opc, type, rd, t0 >> s0, s0);
         if (t1 != 0) {
             tcg_out_insn(s, movw, MOVK, type, rd, value >> s1, s1);
@@ -1454,6 +1509,12 @@ static void tcg_out_movi(TCGContext *s, TCGType type, TCGReg rd,
      * of LDR's reach.
      */
     if (s->lay_cold_now) {
+        uint16_t m = 1;
+
+        for (int sh = 16; sh < 64; sh += 16) {
+            m |= (value >> sh) & 0xffff ? 1 << (sh / 16) : 0;
+        }
+        tcg_out_movi_cap(s, kind, TCG_CAPF_MOVW, mx | m, cvalue);
         tcg_out_insn(s, movw, MOVZ, type, rd, value & 0xffff, 0);
         for (int sh = 16; sh < 64; sh += 16) {
             if ((value >> sh) & 0xffff) {
@@ -1463,9 +1524,14 @@ static void tcg_out_movi(TCGContext *s, TCGType type, TCGReg rd,
         return;
     }
 
-    /* For more than 2 insns, dump it into the constant pool.  */
+    /*
+     * For more than 2 insns, dump it into the constant pool: the pool word
+     * keeps the value's provenance, the LDR refers to the TB's own pool.
+     */
     new_pool_label(s, value, R_AARCH64_CONDBR19, s->code_ptr, 0);
+    tcg_cap_prov(s, TCG_CAP_NONE);
     tcg_out_insn(s, ldlit, LDR, 0, rd);
+    tcg_cap_prov(s, kind);
 }
 
 static bool tcg_out_xchg(TCGContext *s, TCGType type, TCGReg r1, TCGReg r2)
@@ -1689,12 +1755,15 @@ static void tcg_out_tlb_pin_load(TCGContext *s)
 static void tcg_out_call_int(TCGContext *s, const tcg_insn_unit *target)
 {
     ptrdiff_t offset = tcg_pcrel_diff(s, target) >> 2;
+
+    tcg_cap_prov(s, tcg_cap_kind_of(s, target));
     if (offset == sextract64(offset, 0, 26)) {
         tcg_out_insn(s, branch, BL, offset);
     } else {
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP0, (intptr_t)target);
         tcg_out_insn(s, bcond_reg, BLR, TCG_REG_TMP0);
     }
+    tcg_cap_prov(s, TCG_CAP_NONE);
     tcg_out_tlb_pin_load(s);
 }
 
@@ -2229,9 +2298,14 @@ static bool tcg_out_acqrel_thunk(TCGContext *s, TCGLabelQemuLdst *lb)
     tcg_out_ldst_save(s, vregs, false, 0);
     offset = tcg_pcrel_diff(s, s->lay_thunk) >> 2;
     tcg_debug_assert(offset == sextract64(offset, 0, 26));
+    tcg_cap_prov(s, TCG_CAP_THUNK);
     tcg_out_insn(s, branch, BL, offset);
+    tcg_cap_prov(s, TCG_CAP_NONE);
 
     desc = tcg_splitwx_to_rx(s->code_ptr);
+    /* The descriptor: its first word an offset to the return address. */
+    tcg_cap_rec_k(s, s->code_ptr, TCG_CAPF_REL32, TCG_CAP_NONE, 0, 0);
+    tcg_cap_rec_k(s, s->code_ptr + 1, TCG_CAPF_DATA, TCG_CAP_NONE, 16, 0);
     flags = lb->addr_reg | lb->datalo_reg << 5
             | (uint32_t)(uint16_t)s->tlb_pin_ofs << 16;
     if (lb->is_ld) {
@@ -3541,10 +3615,15 @@ static void tcg_out_exit_tb(TCGContext *s, uintptr_t a0)
     if (a0 == 0) {
         target = tcg_code_gen_epilogue;
     } else {
+        /* The TB itself, plus the exit index. */
+        tcg_cap_prov(s, (a0 & ~(uintptr_t)TB_EXIT_MASK)
+                        == (uintptr_t)tcg_splitwx_to_rx(s->gen_tb)
+                        ? TCG_CAP_OWN_TB : TCG_CAP_UNSUPPORTED);
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_X0, a0);
         target = tb_ret_addr;
     }
 
+    tcg_cap_prov(s, TCG_CAP_STUB);
     offset = tcg_pcrel_diff(s, target) >> 2;
     if (offset == sextract64(offset, 0, 26)) {
         tcg_out_insn(s, branch, B, offset);
@@ -3557,6 +3636,7 @@ static void tcg_out_exit_tb(TCGContext *s, uintptr_t a0)
         tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP0, (intptr_t)target);
         tcg_out_insn(s, bcond_reg, BR, TCG_REG_TMP0);
     }
+    tcg_cap_prov(s, TCG_CAP_NONE);
 }
 
 /*
@@ -3602,6 +3682,7 @@ static void tcg_out_goto_tb_tramp(TCGContext *s, int which)
     intptr_t target = get_jmp_target_addr(s, which);
     intptr_t i_off = tcg_pcrel_diff(s, (void *)target);
 
+    tcg_cap_prov(s, TCG_CAP_OWN_TB);
     if (i_off == sextract64(i_off, 0, 21)) {
         tcg_out_insn(s, ldlit, LDR, i_off >> 2, TCG_REG_TMP0);
     } else {
@@ -3609,11 +3690,13 @@ static void tcg_out_goto_tb_tramp(TCGContext *s, int which)
 
         /* The TB struct out of literal range: ADRP and LDR reach it. */
         s->gen_tb->jmp_far |= 1u << which;
+        s->cap_adrp = TCG_CAPF_ADRP_LDR;
         tcg_out_insn(s, pcrel, ADRP, TCG_REG_TMP0,
                      (target >> 12) - (src_rx >> 12));
         tcg_out_insn_ldst_uimm(s, Ildst_imm_LDRX, TCG_REG_TMP0, TCG_REG_TMP0,
                                (target & 0xfff) >> 3);
     }
+    tcg_cap_prov(s, TCG_CAP_NONE);
     tcg_out_insn(s, bcond_reg, BR, TCG_REG_TMP0);
 }
 
@@ -3658,6 +3741,9 @@ static void tcg_out_goto_tb(TCGContext *s, int which)
     }
 
     set_jmp_insn_offset(s, which);
+    /* Linking may make the slot an LDR of the struct's target_addr. */
+    tcg_cap_rec_k(s, s->code_ptr, TCG_CAPF_CON, TCG_CAPC_SLOT_LDRLIT, which, 0);
+    tcg_cap_rec(s, s->code_ptr, TCG_CAPF_B26);
     tcg_out32(s, Ibranch_B);
     tcg_out_insn(s, bcond_reg, BR, TCG_REG_TMP0);
     set_jmp_reset_offset(s, which);
@@ -3842,7 +3928,7 @@ static bool tcg_cond_link_reloc(int type)
  */
 static void tb_set_cond_link(const TranslationBlock *tb, int n, bool linked,
                              uintptr_t d_addr, uintptr_t jmp_rx,
-                             uintptr_t jmp_rw)
+                             uintptr_t jmp_rw, bool flush)
 {
     uintptr_t c_rx = (uintptr_t)tb->tc.ptr + tb->jmp[n].cond - 1;
     uintptr_t c_rw = c_rx + (jmp_rw - jmp_rx);
@@ -3853,11 +3939,17 @@ static void tb_set_cond_link(const TranslationBlock *tb, int n, bool linked,
         off = jmp_rx - c_rx;
     }
     qatomic_set((uint32_t *)c_rw, deposit32(insn, 5, 19, off >> 2));
-    flush_idcache_range(c_rx, c_rw, 4);
+    if (flush) {
+        flush_idcache_range(c_rx, c_rw, 4);
+    }
 }
 
-void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
-                              uintptr_t jmp_rx, uintptr_t jmp_rw)
+/*
+ * Write slot @n's insns for its target_addr; with @flush, synchronize the
+ * icache with each, as a published TB needs.
+ */
+static void tb_jmp_write(const TranslationBlock *tb, int n,
+                         uintptr_t jmp_rx, uintptr_t jmp_rw, bool flush)
 {
     uintptr_t d_addr = tb->jmp[n].target_addr;
     ptrdiff_t d_offset = d_addr - jmp_rx;
@@ -3880,7 +3972,9 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
             insn = deposit32(Ibranch_BL, 0, 26, d_offset >> 2);
         }
         qatomic_set((uint32_t *)jmp_rw, insn);
-        flush_idcache_range(jmp_rx, jmp_rw, 4);
+        if (flush) {
+            flush_idcache_range(jmp_rx, jmp_rw, 4);
+        }
         return;
     }
 
@@ -3900,9 +3994,12 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
             insn = NOP;
         }
         qatomic_set((uint32_t *)jmp_rw, insn);
-        flush_idcache_range(jmp_rx, jmp_rw, 4);
+        if (flush) {
+            flush_idcache_range(jmp_rx, jmp_rw, 4);
+        }
         if (tb->jmp[n].cond) {
-            tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw);
+            tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw,
+                             flush);
         }
         return;
     }
@@ -3918,14 +4015,22 @@ void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
         insn = deposit32(Ildlit_LDR | TCG_REG_TMP0, 5, 19, i_offset >> 2);
     }
     qatomic_set((uint32_t *)jmp_rw, insn);
-    flush_idcache_range(jmp_rx, jmp_rw, 4);
+    if (flush) {
+        flush_idcache_range(jmp_rx, jmp_rw, 4);
+    }
     if (tb->jmp[n].cond) {
         uintptr_t reset = (uintptr_t)tb->tc.ptr + tb->jmp[n].reset_offset;
 
-        tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw);
+        tb_set_cond_link(tb, n, d_addr != reset, d_addr, jmp_rx, jmp_rw,
+                         flush);
     }
 }
 
+void tb_target_set_jmp_target(const TranslationBlock *tb, int n,
+                              uintptr_t jmp_rx, uintptr_t jmp_rw)
+{
+    tb_jmp_write(tb, n, jmp_rx, jmp_rw, true);
+}
 
 static void tgen_add(TCGContext *s, TCGType type,
                      TCGReg a0, TCGReg a1, TCGReg a2)
@@ -6779,4 +6884,323 @@ static const DebugFrame debug_frame = {
 void tcg_register_jit(const void *buf, size_t buf_size)
 {
     tcg_register_jit_int(buf, buf_size, &debug_frame, sizeof(debug_frame));
+}
+
+/*
+ * Translation artifacts (tcg-cache.h): a recorded site's target, zeroing
+ * what a relocation controls, and encoding a new value at a new place.
+ */
+#define TCG_TARGET_HAS_CACHE
+
+/* An ADRP's consumer: ADD (immediate), or LDR (unsigned offset), scaled. */
+static bool cache_adrp_consumer(uint32_t adrp, uint32_t next, int form,
+                                int *scale)
+{
+    if (extract32(next, 5, 5) != (adrp & 31)) {
+        return false;
+    }
+    if (form == TCG_CAPF_ADRP_ADD) {
+        *scale = 0;
+        return (next & 0x7fc00000) == 0x11000000;
+    }
+    *scale = extract32(next, 30, 2);
+    return (next & 0x3fc00000) == 0x39400000;
+}
+
+static uint32_t cache_movw_insns(uint16_t aux)
+{
+    return ctpop32(aux & TCG_CAP_MOVW_MASK);
+}
+
+/* The value a MOVZ or MOVN and its MOVKs build. */
+static bool cache_movw_value(const uint32_t *p, uint16_t aux, uint64_t *v)
+{
+    bool x = aux & TCG_CAP_MOVW_X;
+    uint32_t n = cache_movw_insns(aux), seen = 0;
+    uint64_t val = 0;
+
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t insn = p[i], want;
+        unsigned hw = extract32(insn, 21, 2);
+        uint64_t imm = extract32(insn, 5, 16);
+
+        if (i == 0) {
+            want = aux & TCG_CAP_MOVW_MOVN ? 0x12800000 : 0x52800000;
+        } else {
+            want = 0x72800000;
+        }
+        if ((insn & 0x7f800000) != want || extract32(insn, 31, 1) != x
+            || (insn & 31) != (p[0] & 31) || !(aux & (1 << hw))
+            || (seen & (1 << hw)) || (!x && hw > 1)) {
+            return false;
+        }
+        seen |= 1 << hw;
+        if (i == 0) {
+            val = aux & TCG_CAP_MOVW_MOVN ? ~(imm << (hw * 16))
+                                          : imm << (hw * 16);
+        } else {
+            val = (val & ~(0xffffull << (hw * 16))) | imm << (hw * 16);
+        }
+    }
+    *v = x ? val : (uint32_t)val;
+    return seen == (aux & TCG_CAP_MOVW_MASK);
+}
+
+/*
+ * The target or value at site @p (RW), at @pc (RX), as @form encodes it;
+ * false if the code there isn't that form.
+ */
+static bool tcg_cache_decode(const void *p, uintptr_t pc, int form,
+                             uint16_t aux, uintptr_t *out)
+{
+    const uint32_t *w = p;
+    uint32_t insn = w[0];
+    int scale;
+
+    switch (form) {
+    case TCG_CAPF_B26:
+        if ((insn & 0x7c000000) != 0x14000000) {
+            return false;
+        }
+        *out = pc + sextract64(insn, 0, 26) * 4;
+        return true;
+    case TCG_CAPF_BCOND19:
+        if ((insn & 0xff000010) != 0x54000000
+            && (insn & 0x7e000000) != 0x34000000) {
+            return false;
+        }
+        *out = pc + sextract64(insn, 5, 19) * 4;
+        return true;
+    case TCG_CAPF_LDRLIT19:
+        if ((insn & 0x3b000000) != 0x18000000) {
+            return false;
+        }
+        *out = pc + sextract64(insn, 5, 19) * 4;
+        return true;
+    case TCG_CAPF_TBZ14:
+        if ((insn & 0x7e000000) != 0x36000000) {
+            return false;
+        }
+        *out = pc + sextract64(insn, 5, 14) * 4;
+        return true;
+    case TCG_CAPF_ADR21:
+        if ((insn & 0x9f000000) != 0x10000000) {
+            return false;
+        }
+        *out = pc + sextract64(extract32(insn, 5, 19) << 2
+                               | extract32(insn, 29, 2), 0, 21);
+        return true;
+    case TCG_CAPF_ADRP:
+    case TCG_CAPF_ADRP_ADD:
+    case TCG_CAPF_ADRP_LDR:
+    case TCG_CAPF_RAW_ADRP:
+        if ((insn & 0x9f000000) != 0x90000000) {
+            return false;
+        }
+        *out = (pc & ~(uintptr_t)0xfff)
+               + (sextract64(extract32(insn, 5, 19) << 2
+                             | extract32(insn, 29, 2), 0, 21) << 12);
+        if (form == TCG_CAPF_ADRP_ADD || form == TCG_CAPF_ADRP_LDR) {
+            if (!cache_adrp_consumer(insn, w[1], form, &scale)) {
+                return false;
+            }
+            *out += extract32(w[1], 10, 12) << scale;
+        }
+        return true;
+    case TCG_CAPF_REL32:
+        *out = pc + (int32_t)insn;
+        return true;
+    case TCG_CAPF_MOVW:
+        {
+            uint64_t v;
+
+            if (!cache_movw_value(w, aux, &v)) {
+                return false;
+            }
+            *out = v;
+            return true;
+        }
+    case TCG_CAPF_POOL64:
+        *out = ldq_he_p(p);
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Clear the bits a relocation sets, keeping the rest of the encoding. */
+static void tcg_cache_zero(void *p, int form, uint16_t aux)
+{
+    uint32_t *w = p;
+
+    switch (form) {
+    case TCG_CAPF_B26:
+        w[0] &= ~0x03ffffffu;
+        break;
+    case TCG_CAPF_BCOND19:
+    case TCG_CAPF_LDRLIT19:
+        w[0] &= ~(0x7ffffu << 5);
+        break;
+    case TCG_CAPF_TBZ14:
+        w[0] &= ~(0x3fffu << 5);
+        break;
+    case TCG_CAPF_ADR21:
+    case TCG_CAPF_ADRP:
+        w[0] &= ~(0x60000000u | 0x7ffffu << 5);
+        break;
+    case TCG_CAPF_ADRP_ADD:
+    case TCG_CAPF_ADRP_LDR:
+        w[0] &= ~(0x60000000u | 0x7ffffu << 5);
+        w[1] &= ~(0xfffu << 10);
+        break;
+    case TCG_CAPF_MOVW:
+        for (uint32_t i = 0; i < cache_movw_insns(aux); i++) {
+            w[i] &= ~(0xffffu << 5);
+        }
+        break;
+    case TCG_CAPF_POOL64:
+        stq_he_p(p, 0);
+        break;
+    case TCG_CAPF_REL32:
+        w[0] = 0;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+/* Encode @value at site @p (RW) at @pc (RX); false if it can't hold it. */
+static bool tcg_cache_apply(void *p, uintptr_t pc, int form, uint16_t aux,
+                            uintptr_t value)
+{
+    uint32_t *w = p;
+    intptr_t off = value - pc;
+    int scale;
+
+    switch (form) {
+    case TCG_CAPF_B26:
+        if ((off & 3) || off != sextract64(off, 0, 28)) {
+            return false;
+        }
+        w[0] = deposit32(w[0], 0, 26, off >> 2);
+        return true;
+    case TCG_CAPF_BCOND19:
+    case TCG_CAPF_LDRLIT19:
+        if ((off & 3) || off != sextract64(off, 0, 21)) {
+            return false;
+        }
+        w[0] = deposit32(w[0], 5, 19, off >> 2);
+        return true;
+    case TCG_CAPF_TBZ14:
+        if ((off & 3) || off != sextract64(off, 0, 16)) {
+            return false;
+        }
+        w[0] = deposit32(w[0], 5, 14, off >> 2);
+        return true;
+    case TCG_CAPF_ADR21:
+        if (off != sextract64(off, 0, 21)) {
+            return false;
+        }
+        w[0] = deposit32(deposit32(w[0], 29, 2, off), 5, 19, off >> 2);
+        return true;
+    case TCG_CAPF_ADRP:
+    case TCG_CAPF_ADRP_ADD:
+    case TCG_CAPF_ADRP_LDR:
+        off = (intptr_t)(value >> 12) - (intptr_t)(pc >> 12);
+        if (off != sextract64(off, 0, 21)) {
+            return false;
+        }
+        if (form == TCG_CAPF_ADRP) {
+            if (value & 0xfff) {
+                return false;
+            }
+        } else {
+            if (!cache_adrp_consumer(w[0], w[1], form, &scale)
+                || (value & 0xfff & ((1 << scale) - 1))) {
+                return false;
+            }
+            w[1] = deposit32(w[1], 10, 12, (value & 0xfff) >> scale);
+        }
+        w[0] = deposit32(deposit32(w[0], 29, 2, off), 5, 19, off >> 2);
+        return true;
+    case TCG_CAPF_MOVW:
+        {
+            uint32_t n = cache_movw_insns(aux), tmp[4];
+            uint64_t got;
+
+            for (uint32_t i = 0; i < n; i++) {
+                unsigned sh = extract32(w[i], 21, 2) * 16;
+                uint64_t v = i == 0 && (aux & TCG_CAP_MOVW_MOVN)
+                             ? ~(uint64_t)value : value;
+
+                tmp[i] = deposit32(w[i], 5, 16, v >> sh);
+            }
+            if (!cache_movw_value(tmp, aux, &got) || got != value) {
+                return false;
+            }
+            memcpy(w, tmp, n * 4);
+            return true;
+        }
+    case TCG_CAPF_POOL64:
+        stq_he_p(p, value);
+        return true;
+    case TCG_CAPF_REL32:
+        if (off != (int32_t)off) {
+            return false;
+        }
+        w[0] = off;
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * The verifier: whether the insn at @pc is PC-relative, with its target;
+ * and the start of a MOVZ/MOVN group, with its length and value.
+ */
+static bool tcg_cache_insn_pcrel(const uint32_t *w, uintptr_t pc,
+                                 uintptr_t *target)
+{
+    static const int forms[] = {
+        TCG_CAPF_B26, TCG_CAPF_BCOND19, TCG_CAPF_LDRLIT19, TCG_CAPF_TBZ14,
+        TCG_CAPF_ADR21, TCG_CAPF_RAW_ADRP,
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(forms); i++) {
+        if (tcg_cache_decode(w, pc, forms[i], 0, target)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int tcg_cache_insn_movw(const uint32_t *w, int avail, uint64_t *v)
+{
+    uint32_t insn = w[0];
+    bool x = extract32(insn, 31, 1);
+    uint16_t aux;
+    int n;
+
+    if ((insn & 0x7f800000) == 0x52800000) {
+        aux = 0;
+    } else if ((insn & 0x7f800000) == 0x12800000) {
+        aux = TCG_CAP_MOVW_MOVN;
+    } else {
+        return 0;
+    }
+    aux |= (x ? TCG_CAP_MOVW_X : 0) | 1 << extract32(insn, 21, 2);
+    for (n = 1; n < avail && n < 4; n++) {
+        uint32_t k = w[n];
+
+        if ((k & 0x7f800000) != 0x72800000 || (k & 31) != (insn & 31)
+            || extract32(k, 31, 1) != x) {
+            break;
+        }
+        aux |= 1 << extract32(k, 21, 2);
+    }
+    if (!cache_movw_value(w, aux, v)) {
+        return 1;
+    }
+    return n;
 }
