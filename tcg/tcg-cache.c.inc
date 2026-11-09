@@ -1122,6 +1122,8 @@ TranslationBlock *tcg_cache_place(TCGContext *s, const TCGCacheArtView *v,
     }
 #ifdef CONFIG_USER_ONLY
     memset(&tb->itree, 0, sizeof(tb->itree));
+    tb->pt_state = TB_PT_ABSENT;
+    tb->pt_index = 0;
     tb->smc_check = false;
     tb->smc_reject = false;
     tb->smc_inline = false;
