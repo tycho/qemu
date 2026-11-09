@@ -1059,6 +1059,19 @@ static uint8_t *res_at(const TCGCacheRes *r, uint32_t place, uintptr_t *rx)
     return rw;
 }
 
+/* Whether the 4-byte insn at @rx lies within the placed hot or cold code. */
+static bool res_code_insn(const TCGCacheArt *h, uintptr_t hot_rx,
+                          uintptr_t cold_rx, uintptr_t rx)
+{
+    if (rx & 3) {
+        return false;
+    }
+    if (rx >= hot_rx && h->hot_len >= 4 && rx - hot_rx <= h->hot_len - 4) {
+        return true;
+    }
+    return h->cold_len >= 4 && rx >= cold_rx && rx - cold_rx <= h->cold_len - 4;
+}
+
 /* A place as an offset from the new hot part, for the slots. */
 static uint32_t res_off(const TCGCacheRes *r, uint32_t place)
 {
@@ -1223,6 +1236,32 @@ TranslationBlock *tcg_cache_place(TCGContext *s, const TCGCacheArtView *v,
             return NULL;
         }
     }
+
+    /*
+     * Each slot in its reset state, as tb_reset_jump sets it but without
+     * cache maintenance: tcg_cache_commit synchronizes the whole TB once,
+     * before it is published.
+     */
+    for (int n = 0; n < h->nb_slots; n++) {
+        uintptr_t cold_rx = (uintptr_t)tcg_splitwx_to_rx(r->cold);
+        uintptr_t jmp_rx;
+
+        if (tb->jmp[n].reset_offset == TB_JMP_OFFSET_INVALID) {
+            continue;
+        }
+        jmp_rx = hot_rx + tb->jmp[n].insn_offset;
+        if (!res_code_insn(h, hot_rx, cold_rx, jmp_rx)
+            || (tb->jmp[n].cond
+                && !res_code_insn(h, hot_rx, cold_rx,
+                                  hot_rx + tb->jmp[n].cond - 1))) {
+            tcg_cache_fail_kind = TCG_CAP_NONE;
+            tcg_cache_fail_form = TCG_CAPF_B26;
+            return NULL;
+        }
+        tb->jmp[n].target_addr = hot_rx + tb->jmp[n].reset_offset;
+        tb_jmp_write((const TranslationBlock *)tb_rx, n, jmp_rx,
+                     jmp_rx - tcg_splitwx_diff, false);
+    }
     return tb;
 #else
     return NULL;
@@ -1232,14 +1271,15 @@ TranslationBlock *tcg_cache_place(TCGContext *s, const TCGCacheArtView *v,
 void tcg_cache_commit(TCGContext *s, const TCGCacheRes *r)
 {
 #ifndef CONFIG_TCG_INTERPRETER
-    flush_idcache_range((uintptr_t)tcg_splitwx_to_rx(r->hot),
-                        (uintptr_t)r->hot,
-                        (uint8_t *)r->code_gen_ptr - (uint8_t *)r->hot);
-    if (r->split) {
-        flush_idcache_range((uintptr_t)tcg_splitwx_to_rx(r->cold),
-                            (uintptr_t)r->cold,
-                            (uint8_t *)r->lay_cold - (uint8_t *)r->cold);
-    }
+    /* The packed layout's cold code and unwind data follow its hot code. */
+    size_t cold_len = r->split ? (uint8_t *)r->lay_cold - (uint8_t *)r->cold
+                               : 0;
+
+    flush_idcache_range2((uintptr_t)tcg_splitwx_to_rx(r->hot),
+                         (uintptr_t)r->hot,
+                         (uint8_t *)r->code_gen_ptr - (uint8_t *)r->hot,
+                         (uintptr_t)tcg_splitwx_to_rx(r->cold),
+                         (uintptr_t)r->cold, cold_len);
 #endif
     if (r->split) {
         s->lay_cold = r->lay_cold;
