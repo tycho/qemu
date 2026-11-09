@@ -43,6 +43,12 @@ static inline void host_signal_set_pc(host_sigcontext *uc, uintptr_t pc)
     uc->uc_mcontext.pc = pc;
 }
 
+#define HOST_SIGNAL_XREG
+static inline uint64_t host_signal_xreg(host_sigcontext *uc, int n)
+{
+    return uc->uc_mcontext.regs[n];
+}
+
 static inline void *host_signal_mask(host_sigcontext *uc)
 {
     return &uc->uc_sigmask;
