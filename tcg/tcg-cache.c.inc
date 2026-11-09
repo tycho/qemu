@@ -12,6 +12,11 @@ unsigned tcg_cache_skew;
 bool tcg_cache_stats_at_exit;
 bool tcg_cache_debug;
 bool tcg_cache_costs;
+bool tcg_cache_validate_always;
+int tcg_cache_test_unwind_damage;
+unsigned tcg_cache_test_capture_damage;
+unsigned tcg_cache_test_capture_damage_after;
+unsigned tcg_cache_test_firstuse_pause_ms;
 bool tcg_cache_timing;
 bool tcg_cache_no_write;
 unsigned tcg_cache_test_reject;
@@ -67,6 +72,7 @@ const char *const tcg_cache_x_names[TCG_CACHE_X_MAX] = {
     [TCG_CACHE_X_PROV] = "prov",
     [TCG_CACHE_X_LAZY] = "lazy",
     [TCG_CACHE_X_VERIFY] = "verify",
+    [TCG_CACHE_X_INVALID] = "invalid",
 };
 
 /*
@@ -97,6 +103,24 @@ static void tcg_cache_init(void)
     }
     if (getenv("XTCG_CACHE_DEBUG")) {
         tcg_cache_debug = true;
+    }
+    m = getenv("XTCG_CACHE_VALIDATE");
+    tcg_cache_validate_always = m && !strcmp(m, "always");
+    m = getenv("XTCG_CACHE_TEST_UNWIND_DAMAGE");
+    if (m && atoi(m) > 0 && atoi(m) < TCG_CACHE_DAMAGE_MAX) {
+        tcg_cache_test_unwind_damage = atoi(m);
+    }
+    m = getenv("XTCG_CACHE_TEST_CAPTURE_DAMAGE");
+    if (m && atoi(m) > 0) {
+        tcg_cache_test_capture_damage = atoi(m);
+    }
+    m = getenv("XTCG_CACHE_TEST_CAPTURE_DAMAGE_AFTER");
+    if (m && atoi(m) > 0) {
+        tcg_cache_test_capture_damage_after = atoi(m);
+    }
+    m = getenv("XTCG_CACHE_TEST_FIRSTUSE_PAUSE_MS");
+    if (m && atoi(m) > 0) {
+        tcg_cache_test_firstuse_pause_ms = atoi(m);
     }
     tcg_cache_costs = getenv("XTCG_CACHE_COSTS");
     tcg_cache_pages = getenv("XTCG_CACHE_PAGES");
@@ -611,7 +635,8 @@ static void cap_reject(TCGContext *s, unsigned reason)
 void *tcg_cache_capture(TCGContext *s, TranslationBlock *tb,
                         const void *search, size_t search_len, size_t *lenp)
 {
-    int64_t t0 = TCG_CACHE_CLOCK();
+    int64_t t0 = TCG_CACHE_CLOCK(), t1;
+    size_t search_at;
     CapParts p;
     TCGCacheArt h = { };
     TCGCacheArtRel *rels;
@@ -816,6 +841,7 @@ void *tcg_cache_capture(TCGContext *s, TranslationBlock *tb,
         cap_buf_add(a, p.cold, p.cold_len);
     }
     cap_buf_size(a, ROUND_UP(a->len, 8));
+    search_at = a->len;
     cap_buf_add(a, search, search_len);
     cap_buf_size(a, ROUND_UP(a->len, 8));
     hot = a->data + hot_at;
@@ -836,6 +862,41 @@ void *tcg_cache_capture(TCGContext *s, TranslationBlock *tb,
         g_free(a->data);
         cap_reject(s, TCG_CACHE_X_TOO_MANY);
         return NULL;
+    }
+    /*
+     * Every check a reader makes depends only on the artifact's bytes and
+     * on what the fingerprint pins, so an artifact this build validates
+     * here validates wherever it is read.  One that doesn't is a producer
+     * bug: the TB runs as translated, and its artifact goes nowhere.
+     */
+    if (unlikely(tcg_cache_test_capture_damage)) {
+        static unsigned damage_n;
+
+        if (++damage_n % tcg_cache_test_capture_damage == 0
+            && tcg_cache_unwind_damage(a->data + search_at, search_len,
+                                       tb->icount,
+                                       TCG_CACHE_DAMAGE_TRUNCATED)) {
+            tcg_cache_stats.test_capture_damaged++;
+        }
+    }
+    t1 = TCG_CACHE_CLOCK();
+    if (tcg_cache_validate(a->data, a->len)) {
+        g_free(a->data);
+        cap_reject(s, TCG_CACHE_X_INVALID);
+        tcg_cache_stats.capture_val_ns += TCG_CACHE_CLOCK() - t1;
+        tcg_cache_stats.capture_ns += TCG_CACHE_CLOCK() - t0;
+        return NULL;
+    }
+    tcg_cache_stats.capture_val_ns += TCG_CACHE_CLOCK() - t1;
+    if (unlikely(tcg_cache_test_capture_damage_after)) {
+        static unsigned damage_after_n;
+
+        if (++damage_after_n % tcg_cache_test_capture_damage_after == 0
+            && tcg_cache_unwind_damage(a->data + search_at, search_len,
+                                       tb->icount,
+                                       TCG_CACHE_DAMAGE_TRUNCATED)) {
+            tcg_cache_stats.test_capture_damaged++;
+        }
     }
 
     tcg_cache_stats.captured++;
@@ -1037,6 +1098,15 @@ TranslationBlock *tcg_cache_place(TCGContext *s, const TCGCacheArtView *v,
     tb->tc.ptr = (void *)hot_rx;
     tb->tc.size = h->hot_len;
     tb->tc.search = tcg_splitwx_to_rx(r->search);
+    /* Ordered before publication by the installer's, as every field. */
+    tb->search_len = h->search_len;
+    tb->code_len = h->pool_off;
+    tb->unwind_unchecked = 1;
+    if (unlikely(tcg_cache_test_unwind_damage)
+        && tcg_cache_unwind_damage(r->search, h->search_len, h->icount,
+                                   tcg_cache_test_unwind_damage)) {
+        tcg_cache_stats.test_unwind_damaged++;
+    }
 #ifdef CONFIG_USER_ONLY
     memset(&tb->itree, 0, sizeof(tb->itree));
     tb->smc_check = false;
@@ -1379,6 +1449,21 @@ void tcg_cache_print_stats(void)
             " search %" PRIu64 " guest %" PRIu64 ") capture %.3f ms\n",
             t->tried, t->captured, t->bytes, t->hot_bytes, t->cold_bytes,
             t->search_bytes, t->ext_total, t->capture_ns / 1e6);
+    fprintf(stderr, "xtcg-cache: capture validation %.3f ms\n",
+            t->capture_val_ns / 1e6);
+    fprintf(stderr, "xtcg-cache: unwind first use: restore %" PRIu64
+            " lazysync %" PRIu64 " repeats %" PRIu64 " (%.3f ms)"
+            " tb struct %zu; installed TBs' writebacks %" PRIu64 "\n",
+            t->unwind_checks[TCG_CACHE_UNWIND_RESTORE],
+            t->unwind_checks[TCG_CACHE_UNWIND_LAZYSYNC], t->unwind_repeats,
+            t->unwind_ns / 1e6, sizeof(TranslationBlock),
+            t->unwind_installed_wb);
+    if (tcg_cache_test_unwind_damage || tcg_cache_test_capture_damage
+        || tcg_cache_test_capture_damage_after) {
+        fprintf(stderr, "xtcg-cache: test damage: installs %" PRIu64
+                " captures %" PRIu64 "\n", t->test_unwind_damaged,
+                t->test_capture_damaged);
+    }
     fprintf(stderr, "xtcg-cache: excluded");
     for (int i = 1; i < TCG_CACHE_X_MAX; i++) {
         if (t->excluded[i]) {

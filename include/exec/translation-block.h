@@ -109,8 +109,17 @@ struct TranslationBlock {
     /* size of target code for this block (1 <= size <= TARGET_PAGE_SIZE) */
     uint16_t size;
     uint16_t icount;
+    /*
+     * Installed from a translation artifact (tcg-cache.h), its unwind
+     * data not yet checked: both readers of tc.search check it first
+     * (tb_unwind_check).  Set before the TB is published; cleared once.
+     */
+    uint8_t unwind_unchecked;
 
     struct tb_tc tc;
+    /* Installed from an artifact: the unwind data's bytes, and its bound. */
+    uint32_t search_len;
+    uint32_t code_len;
 
     /*
      * Track tb_page_addr_t intervals that intersect this TB.

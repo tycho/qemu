@@ -240,30 +240,105 @@ static bool val_sleb(const uint8_t **pp, const uint8_t *end, int64_t *out)
 
 #define VAL_MAX_LAZY_MAPS 4096
 
-#ifdef CONFIG_USER_ONLY
-/* A lazy-writeback record must name a global, with its type. */
-static bool val_wb_global(TCGContext *s, unsigned base, int64_t ofs,
-                          unsigned type)
+/*
+ * The globals a lazy-writeback record may name: each TCG global whose
+ * memory base is a fixed register, as (base register, offset, type),
+ * sorted.  Built once the target's globals exist, before anything is
+ * translated, and immutable after, so that a check in fault context reads
+ * it without a lock.
+ */
+typedef struct ValWbGlobal {
+    int64_t ofs;
+    uint8_t base, type;
+} ValWbGlobal;
+
+static ValWbGlobal val_wb_table[TCG_MAX_TEMPS];
+static int val_wb_n, val_wb_nb_globals;
+static bool val_wb_built;
+
+static int val_wb_cmp(const ValWbGlobal *a, const ValWbGlobal *b)
 {
+    if (a->base != b->base) {
+        return a->base < b->base ? -1 : 1;
+    }
+    if (a->ofs != b->ofs) {
+        return a->ofs < b->ofs ? -1 : 1;
+    }
+    return a->type < b->type ? -1 : a->type > b->type;
+}
+
+static int val_wb_sort(const void *a, const void *b)
+{
+    return val_wb_cmp(a, b);
+}
+
+void tcg_cache_wb_init(void)
+{
+    TCGContext *s = &tcg_init_ctx;
+    int n = 0;
+
+    if (qatomic_load_acquire(&val_wb_built)) {
+        return;
+    }
     for (int i = 0; i < s->nb_globals; i++) {
         const TCGTemp *ts = &s->temps[i];
 
         if (ts->kind == TEMP_GLOBAL && ts->mem_base
-            && ts->mem_base->kind == TEMP_FIXED
-            && ts->mem_base->reg == base && ts->mem_offset == ofs
-            && ts->type == type) {
+            && ts->mem_base->kind == TEMP_FIXED) {
+            val_wb_table[n++] = (ValWbGlobal) {
+                .ofs = ts->mem_offset,
+                .base = ts->mem_base->reg,
+                .type = ts->type,
+            };
+        }
+    }
+    qsort(val_wb_table, n, sizeof(val_wb_table[0]), val_wb_sort);
+    val_wb_n = n;
+    val_wb_nb_globals = s->nb_globals;
+    qatomic_store_release(&val_wb_built, true);
+}
+
+#ifdef CONFIG_USER_ONLY
+/* A lazy-writeback record must name a global, with its type. */
+static bool val_wb_global(unsigned base, int64_t ofs, unsigned type)
+{
+    ValWbGlobal key = { .ofs = ofs, .base = base, .type = type };
+    int lo = 0, hi;
+
+    if (!qatomic_load_acquire(&val_wb_built)) {
+        return false;
+    }
+    hi = val_wb_n;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        int c = val_wb_cmp(&key, &val_wb_table[mid]);
+
+        if (c == 0) {
             return true;
+        }
+        if (c < 0) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
         }
     }
     return false;
 }
 #endif
 
-/* The unwind rows, then (tcg_lazysync_user) the lazy-sync map. */
-static int val_search(TCGContext *s, const TCGCacheArtView *v)
+/*
+ * The unwind rows, then (tcg_lazysync_user) the lazy-sync map: @search_len
+ * bytes at @search, for @icount insns of a TB at @pc with @cflags, whose
+ * host offsets lie below @code_len.  Reads nothing but its arguments,
+ * the target's row check and the writeback table, and allocates nothing,
+ * so that it may run in a host signal handler; @quiet in that case, which
+ * prints nothing.
+ */
+static int val_unwind(const uint8_t *search, uint32_t search_len,
+                      uint32_t icount, uint32_t cflags, uint64_t pc,
+                      uint32_t code_len, bool quiet)
 {
-    const TCGCacheArt *h = v->h;
-    const uint8_t *p = v->search, *end = p + h->search_len;
+    const uint8_t *p = search, *end = p + search_len;
     int64_t x, host = 0;
 
     uint64_t data[INSN_START_WORDS] = { };
@@ -271,10 +346,10 @@ static int val_search(TCGContext *s, const TCGCacheArtView *v)
     if (!tcg_cache_insn_ok) {
         return TCG_CACHE_V_UNWIND;
     }
-    if (!(h->cflags & CF_PCREL)) {
-        data[0] = h->pc;
+    if (!(cflags & CF_PCREL)) {
+        data[0] = pc;
     }
-    for (int i = 0; i < h->icount; i++) {
+    for (int i = 0; i < icount; i++) {
         /* Each row as cpu_unwind_data_from_tb rebuilds it, for the target. */
         for (int j = 0; j < INSN_START_WORDS; j++) {
             if (!val_sleb(&p, end, &x)) {
@@ -282,15 +357,15 @@ static int val_search(TCGContext *s, const TCGCacheArtView *v)
             }
             data[j] += x;
         }
-        if (!tcg_cache_insn_ok(data, h->cflags & CF_PCREL)) {
-            if (tcg_cache_debug) {
+        if (!tcg_cache_insn_ok(data, cflags & CF_PCREL)) {
+            if (!quiet && tcg_cache_debug) {
                 fprintf(stderr, "insn-state: pc %" PRIx64 " row %d: %" PRIx64
-                        " %" PRIx64 " %" PRIx64 "\n", h->pc, i, data[0],
+                        " %" PRIx64 " %" PRIx64 "\n", pc, i, data[0],
                         data[1], data[2]);
             }
             return TCG_CACHE_V_INSN;
         }
-        if (!val_sleb(&p, end, &x) || x < 0 || x > h->pool_off - host) {
+        if (!val_sleb(&p, end, &x) || x < 0 || x > code_len - host) {
             return TCG_CACHE_V_UNWIND;
         }
         host += x;
@@ -307,8 +382,8 @@ static int val_search(TCGContext *s, const TCGCacheArtView *v)
 
             if (!val_sleb(&p, end, &start) || !val_sleb(&p, end, &len)
                 || !val_sleb(&p, end, &nb_wb) || start < 0 || len < 0
-                || start > h->pool_off || len > h->pool_off - start
-                || nb_wb < 0 || nb_wb > s->nb_globals) {
+                || start > code_len || len > code_len - start
+                || nb_wb < 0 || nb_wb > val_wb_nb_globals) {
                 return TCG_CACHE_V_LAZY;
             }
             for (int64_t j = 0; j < nb_wb; j++) {
@@ -331,7 +406,7 @@ static int val_search(TCGContext *s, const TCGCacheArtView *v)
                         && type != TCG_TYPE_V64 && type != TCG_TYPE_V128)
                     || (is_const && type != TCG_TYPE_I32
                         && type != TCG_TYPE_I64)
-                    || !val_wb_global(s, base, ofs, type)) {
+                    || !val_wb_global(base, ofs, type)) {
                     return TCG_CACHE_V_LAZY;
                 }
                 if (is_const && !val_sleb(&p, end, &val)) {
@@ -344,10 +419,93 @@ static int val_search(TCGContext *s, const TCGCacheArtView *v)
     return p == end ? TCG_CACHE_V_OK : TCG_CACHE_V_UNWIND;
 }
 
-int tcg_cache_validate(const void *art, size_t len)
+/* @v in exactly @n bytes of SLEB128 at @p, if it fits. */
+static bool val_sleb_put(uint8_t *p, int n, int64_t v)
 {
-    /* Off translating threads (the writer's compaction), the first one's. */
-    TCGContext *s = tcg_ctx ? tcg_ctx : &tcg_init_ctx;
+    if (n < 1 || n > 9 || v < -((int64_t)1 << (7 * n - 1))
+        || v >= ((int64_t)1 << (7 * n - 1))) {
+        return false;
+    }
+    for (int i = 0; i < n - 1; i++) {
+        p[i] = ((uint64_t)v >> (7 * i) & 0x7f) | 0x80;
+    }
+    p[n - 1] = (uint64_t)v >> (7 * (n - 1)) & 0x7f;
+    return true;
+}
+
+bool tcg_cache_unwind_damage(uint8_t *search, uint32_t len, uint32_t icount,
+                             int kind)
+{
+    const uint8_t *p = search, *end = search + len;
+    int64_t x;
+
+    switch (kind) {
+    case TCG_CACHE_DAMAGE_TRUNCATED:
+        if (!len) {
+            return false;
+        }
+        search[len - 1] |= 0x80;
+        return true;
+    case TCG_CACHE_DAMAGE_OVERLONG:
+        if (len < 10) {
+            return false;
+        }
+        memset(search, 0x80, 10);
+        return true;
+    case TCG_CACHE_DAMAGE_ROW:
+        /* The first row's second word, as a value the target refuses. */
+        if (INSN_START_WORDS < 2 || !val_sleb(&p, end, &x)) {
+            return false;
+        }
+        {
+            uint8_t *w = search + (p - search);
+
+            if (!val_sleb(&p, end, &x)) {
+                return false;
+            }
+            for (int i = 0; i < tcg_cache_insn_nbad; i++) {
+                if (val_sleb_put(w, p - w, tcg_cache_insn_bad[i])) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    case TCG_CACHE_DAMAGE_WB:
+        /* The first writeback record's type, as one no global has. */
+        for (uint32_t i = 0; i < icount * (INSN_START_WORDS + 1); i++) {
+            if (!val_sleb(&p, end, &x)) {
+                return false;
+            }
+        }
+        {
+            int64_t n, start, l, nb_wb;
+
+            if (!tcg_lazysync_user || !val_sleb(&p, end, &n)) {
+                return false;
+            }
+            for (int64_t i = 0; i < n; i++) {
+                if (!val_sleb(&p, end, &start) || !val_sleb(&p, end, &l)
+                    || !val_sleb(&p, end, &nb_wb)) {
+                    return false;
+                }
+                if (nb_wb > 0 && end - p >= 3) {
+                    uint8_t *t = search + (p - search) + 2;
+
+                    *t = *t == TCG_TYPE_I32 ? TCG_TYPE_I64
+                         : *t == TCG_TYPE_I64 ? TCG_TYPE_I32
+                         : *t == TCG_TYPE_V64 ? TCG_TYPE_V128 : TCG_TYPE_V64;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
+/* Every check, or (!@unwind) all but the unwind data's. */
+static int val_artifact(const void *art, size_t len, bool unwind)
+{
     TCGCacheArtView v;
     const TCGCacheArt *h;
     ValParts vp;
@@ -626,12 +784,98 @@ int tcg_cache_validate(const void *art, size_t len)
     if (con_seen != con_need) {
         return TCG_CACHE_V_CON;
     }
-    return val_search(s, &v);
+    if (!unwind) {
+        return TCG_CACHE_V_OK;
+    }
+    return val_unwind(v.search, h->search_len, h->icount, h->cflags, h->pc,
+                      h->pool_off, false);
+}
+
+int tcg_cache_validate(const void *art, size_t len)
+{
+    return val_artifact(art, len, true);
+}
+
+int tcg_cache_validate_hit(const void *art, size_t len)
+{
+    return val_artifact(art, len, tcg_cache_validate_always);
+}
+
+/* A hit's checks, whatever XTCG_CACHE_VALIDATE says. */
+static int val_hit_only(const void *art, size_t len)
+{
+    return val_artifact(art, len, false);
+}
+
+TCGCacheFatal tcg_cache_fatal_record;
+void (*tcg_cache_terminate)(void);
+
+void tcg_cache_unwind_fatal(uint64_t pc, int consumer, int reason)
+{
+    TCGCacheFatal *f = &tcg_cache_fatal_record;
+
+    /* One writer; nobody waits for it, and nothing waits for the record. */
+    if (qatomic_cmpxchg(&f->claim, 0, 1) == 0) {
+        qatomic_set(&f->pc, pc);
+        qatomic_set(&f->consumer, consumer);
+        qatomic_set(&f->reason, reason);
+        qatomic_store_release(&f->complete, 1);
+    }
+    if (tcg_cache_terminate) {
+        tcg_cache_terminate();
+    }
+    abort();
+}
+
+void tcg_cache_unwind_first_use(TranslationBlock *tb, int consumer)
+{
+    int64_t t0 = tcg_cache_timing ? get_clock() : 0;
+    int r;
+
+    r = val_unwind(tb->tc.search, tb->search_len, tb->icount, tb_cflags(tb),
+                   tb->pc, tb->code_len, true);
+    if (r) {
+        tcg_cache_unwind_fatal(tb->pc, consumer, r);
+    }
+    if (unlikely(tcg_cache_test_firstuse_pause_ms)) {
+        g_usleep(tcg_cache_test_firstuse_pause_ms * 1000);
+    }
+    if (qatomic_xchg(&tb->unwind_unchecked, 0)) {
+        qatomic_inc(&tcg_cache_stats.unwind_checks[consumer]);
+    } else {
+        qatomic_inc(&tcg_cache_stats.unwind_repeats);
+    }
+    if (tcg_cache_timing) {
+        qatomic_add(&tcg_cache_stats.unwind_ns, get_clock() - t0);
+    }
 }
 #else
+void tcg_cache_wb_init(void)
+{
+}
+
 int tcg_cache_validate(const void *art, size_t len)
 {
     return TCG_CACHE_V_HEADER;
+}
+
+int tcg_cache_validate_hit(const void *art, size_t len)
+{
+    return TCG_CACHE_V_HEADER;
+}
+
+TCGCacheFatal tcg_cache_fatal_record;
+void (*tcg_cache_terminate)(void);
+
+void tcg_cache_unwind_first_use(TranslationBlock *tb, int consumer)
+{
+    abort();
+}
+
+bool tcg_cache_unwind_damage(uint8_t *search, uint32_t len, uint32_t icount,
+                             int kind)
+{
+    return false;
 }
 #endif
 
@@ -1265,7 +1509,7 @@ static bool file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
                 tcg_cache_stats.sel_dups++;
                 continue;
             }
-            r = tcg_cache_validate(env + 1, env->len - sizeof(*env));
+            r = tcg_cache_validate_hit(env + 1, env->len - sizeof(*env));
             tcg_cache_stats.sel_vals++;
             tcg_cache_part(&tcg_cache_stats.sel_val_ns, &tp);
         }
@@ -3718,6 +3962,22 @@ static int fuzz_full_table(const TCGCacheEnv *e)
     return fails;
 }
 
+/*
+ * A hit's check (all but the unwind data's) refuses what the full check
+ * refuses, for the same reason, except damage to the unwind data alone,
+ * which it accepts: @full is tcg_cache_validate's result for @art.
+ */
+static bool fuzz_split_agrees(const void *art, size_t len, int full)
+{
+    int hit = val_hit_only(art, len);
+
+    if (full == TCG_CACHE_V_UNWIND || full == TCG_CACHE_V_LAZY
+        || full == TCG_CACHE_V_INSN) {
+        return hit == TCG_CACHE_V_OK;
+    }
+    return hit == full;
+}
+
 int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
                         unsigned arts)
 {
@@ -3728,6 +3988,7 @@ int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
     uint64_t base_counts[TCG_CACHE_V_MAX] = { }, c[TCG_CACHE_V_MAX];
     uint64_t rng = seed | 1, undetected = 0, flips = 0, tried = 0;
     uint64_t sem[3][TCG_CACHE_V_MAX] = { }, sem_tried[3] = { };
+    uint64_t split_tried = 0, split_mismatch = 0;
     unsigned applied[ARRAY_SIZE(fuzz_cases)] = { };
     unsigned caught[ARRAY_SIZE(fuzz_cases)] = { };
     unsigned other[ARRAY_SIZE(fuzz_cases)] = { };
@@ -3877,6 +4138,8 @@ int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
             if (fuzz_view(&a) && fuzz_cases[t].fn(&a, rr)) {
                 applied[t]++;
                 r = tcg_cache_validate(a.b, a.len);
+                split_mismatch += !fuzz_split_agrees(a.b, a.len, r);
+                split_tried++;
                 if (r == fuzz_cases[t].want) {
                     caught[t]++;
                 } else if (r && r == fuzz_cases[t].alt) {
@@ -3913,7 +4176,10 @@ int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
                     uint8_t *m = g_memdup2(env + 1, alen);
 
                     m[lo[part] + fuzz_rng(&rng) % len3[part]] = fuzz_rng(&rng);
-                    sem[part][tcg_cache_validate(m, alen)]++;
+                    r = tcg_cache_validate(m, alen);
+                    sem[part][r]++;
+                    split_mismatch += !fuzz_split_agrees(m, alen, r);
+                    split_tried++;
                     sem_tried[part]++;
                     g_free(m);
                 }
@@ -3928,6 +4194,10 @@ int tcg_cache_fuzz_file(const void *map, size_t size, uint64_t seed,
                 applied[t] ? "" : " (not applicable to this file)");
         fails += accepted[t] + other[t];
     }
+    fprintf(stderr, "xtcg-cache fuzz: hit check against full: %" PRIu64
+            " damaged artifacts, %" PRIu64 " disagree\n", split_tried,
+            split_mismatch);
+    fails += split_mismatch;
     for (int part = 0; part < 3; part++) {
         static const char *const pn[] = { "metadata", "code", "unwind" };
 

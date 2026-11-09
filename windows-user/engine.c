@@ -786,6 +786,22 @@ static void log_settings(Object *accel)
     xt_log_text(head);
 }
 
+/*
+ * The translation cache's immediate end (tcg_cache_terminate), from the
+ * fault handler too: no logging, no exit handlers.
+ */
+#ifndef STATUS_DATA_ERROR
+#define STATUS_DATA_ERROR ((NTSTATUS)0xC000003EL)
+#endif
+
+static void G_NORETURN cache_terminate(void)
+{
+    NtTerminateProcess(GetCurrentProcess(), STATUS_DATA_ERROR);
+    for (;;) {
+        __builtin_trap();
+    }
+}
+
 bool xt_fault_context_partial;
 bool xt_native_harness;
 
@@ -893,6 +909,9 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
         NtTerminateProcess(GetCurrentProcess(), STATUS_NOT_SUPPORTED);
     }
     tcg_prologue_init();
+    /* Before anything is translated or validated, in every cache mode. */
+    tcg_cache_wb_init();
+    tcg_cache_terminate = cache_terminate;
     xt_spare_cpu = first;
     xt_cache_files_init(first);
     return 0;

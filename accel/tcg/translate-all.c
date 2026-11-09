@@ -177,6 +177,20 @@ static int encode_search(TranslationBlock *tb, uint8_t *block,
     return p - block;
 }
 
+/*
+ * A TB installed from an artifact checks its unwind data before the first
+ * decode of it, by either reader (tcg_cache_unwind_first_use).  The TB
+ * stays allocated while it is checked: a reader runs on behalf of a vCPU
+ * counted as running, which a flush's exclusive section waits for, and
+ * invalidation doesn't free a TB.
+ */
+static inline void tb_unwind_check(TranslationBlock *tb, int consumer)
+{
+    if (unlikely(qatomic_load_acquire(&tb->unwind_unchecked))) {
+        tcg_cache_unwind_first_use(tb, consumer);
+    }
+}
+
 #ifdef CONFIG_USER_ONLY
 /*
  * A host signal at @host_pc in generated code: if it is a guest access
@@ -198,6 +212,7 @@ void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t (*regs)[2],
     if (!tb || host_pc < (uintptr_t)tb->tc.ptr) {
         return;
     }
+    tb_unwind_check(tb, TCG_CACHE_UNWIND_LAZYSYNC);
     off = host_pc - (uintptr_t)tb->tc.ptr;
     p = tb->tc.search;
     for (int i = 0; i < tb->icount * (INSN_START_WORDS + 1); ++i) {
@@ -219,6 +234,11 @@ void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t (*regs)[2],
 
             if (hit && base < nregs && (reg == LAZY_WB_CONST || reg < nregs)) {
                 uint64_t *dst = (void *)(uintptr_t)(regs[base][0] + ofs);
+
+                if (tb->search_len) {
+                    /* Installed from an artifact (testing's evidence). */
+                    qatomic_inc(&tcg_cache_stats.unwind_installed_wb);
+                }
 
                 if (reg == LAZY_WB_CONST) {
                     if (type == TCG_TYPE_I32) {
@@ -256,9 +276,11 @@ static int cpu_unwind_data_from_tb(TranslationBlock *tb, uintptr_t host_pc,
                                    uint64_t *data)
 {
     uintptr_t iter_pc = (uintptr_t)tb->tc.ptr;
-    const uint8_t *p = tb->tc.search;
+    const uint8_t *p;
     int i, j, num_insns = tb->icount;
 
+    tb_unwind_check(tb, TCG_CACHE_UNWIND_RESTORE);
+    p = tb->tc.search;
     host_pc -= GETPC_ADJ;
 
     if (host_pc < iter_pc) {
@@ -1230,6 +1252,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     }
     tb->tc.size = gen_code_size;
     tb->tc.search = tcg_splitwx_to_rx(search);
+    tb->unwind_unchecked = 0;
+    tb->search_len = 0;
+    tb->code_len = 0;
 #ifdef CONFIG_USER_ONLY
     if (tb->smc_inline) {
         tb->smc_check_end = tcg_ctx->insn0_off;

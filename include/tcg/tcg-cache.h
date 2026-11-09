@@ -89,6 +89,7 @@ enum {
     TCG_CACHE_X_PROV,       /* a recorded meaning didn't match the code */
     TCG_CACHE_X_LAZY,       /* lazy-sync data outside the hot part */
     TCG_CACHE_X_VERIFY,     /* the verifier found an unrecorded site */
+    TCG_CACHE_X_INVALID,    /* the artifact fails the readers' validation */
     TCG_CACHE_X_MAX
 };
 
@@ -509,8 +510,86 @@ extern int tcg_cache_insn_nbad;
 
 const char *tcg_cache_v_name(int v);
 uint64_t tcg_cache_hash64(uint64_t seed, const void *data, size_t len);
+/*
+ * Build the table of globals that lazy-writeback records may name, once
+ * the target's globals exist and before anything is validated; until
+ * then every record naming one is refused.  Idempotent.
+ */
+void tcg_cache_wb_init(void);
 /* An artifact as it may be installed: TCG_CACHE_V_OK, or why not. */
 int tcg_cache_validate(const void *art, size_t len);
+/*
+ * A hit's check: tcg_cache_validate's but the unwind data's, which each
+ * TB installed from an artifact checks at its first use instead
+ * (tcg_cache_unwind_first_use).  The checksum binds the artifact's bytes
+ * to what this build validated when it captured them; every check left
+ * here guards what installing reads and writes.  With
+ * XTCG_CACHE_VALIDATE=always (testing), every check.
+ */
+int tcg_cache_validate_hit(const void *art, size_t len);
+extern bool tcg_cache_validate_always;
+
+/* The readers of a TB's unwind data. */
+enum {
+    TCG_CACHE_UNWIND_RESTORE,   /* cpu_unwind_data_from_tb */
+    TCG_CACHE_UNWIND_LAZYSYNC,  /* tb_lazysync_unwind */
+    TCG_CACHE_UNWIND_MAX
+};
+
+/*
+ * Check the unwind data of @tb, installed from an artifact, before
+ * @consumer's first decode of it: no lock, allocation or output, so that
+ * it may run in a host signal handler.  Threads may check one TB at once.
+ * Data that fails ends the process (tcg_cache_unwind_fatal): the TB may
+ * already have run, and nothing can rebuild a state from it.
+ */
+void tcg_cache_unwind_first_use(TranslationBlock *tb, int consumer);
+
+/*
+ * A failed first-use check, for a debugger or a core: the first thread to
+ * claim the record writes it, then sets @complete.  Termination never
+ * waits for it.
+ */
+typedef struct TCGCacheFatal {
+    uint32_t claim, complete;
+    uint32_t consumer, reason;
+    uint64_t pc;
+} TCGCacheFatal;
+
+extern TCGCacheFatal tcg_cache_fatal_record;
+/*
+ * How the OS layer ends the process at once, without exit handlers or
+ * output; async-signal-safe, never returns.  Unset, abort().
+ */
+extern void (*tcg_cache_terminate)(void);
+G_NORETURN void tcg_cache_unwind_fatal(uint64_t pc, int consumer,
+                                       int reason);
+
+/*
+ * Testing: damage the unwind data at @search in place, its length kept,
+ * as damage a checksum missed would; false if nothing in it applies.
+ * XTCG_CACHE_TEST_UNWIND_DAMAGE=kind damages every TB installed from an
+ * artifact; XTCG_CACHE_TEST_CAPTURE_DAMAGE=n every nth capture, before
+ * its validation (a truncated LEB), and _AFTER=n after it, so that the
+ * damage is published under a good checksum, as a writer the validation
+ * missed would.  XTCG_CACHE_TEST_FIRSTUSE_PAUSE_MS=ms pauses a first-use
+ * check before it completes.
+ */
+enum {
+    TCG_CACHE_DAMAGE_NONE,
+    TCG_CACHE_DAMAGE_TRUNCATED, /* the last LEB runs past the end */
+    TCG_CACHE_DAMAGE_OVERLONG,  /* the first LEB longer than 64 bits */
+    TCG_CACHE_DAMAGE_ROW,       /* a row the target's check refuses */
+    TCG_CACHE_DAMAGE_WB,        /* a writeback record naming no global */
+    TCG_CACHE_DAMAGE_MAX
+};
+
+bool tcg_cache_unwind_damage(uint8_t *search, uint32_t len, uint32_t icount,
+                             int kind);
+extern int tcg_cache_test_unwind_damage;
+extern unsigned tcg_cache_test_capture_damage;
+extern unsigned tcg_cache_test_capture_damage_after;
+extern unsigned tcg_cache_test_firstuse_pause_ms;
 /* Write @art's envelope at @out (room for ROUND_UP(64 + len, 8)). */
 size_t tcg_cache_envelope(void *out, uint64_t id, uint64_t rva,
                           uint32_t born, const void *art, size_t len);
@@ -770,7 +849,10 @@ typedef struct TCGCacheStats {
     uint64_t inst_fail_con, inst_fail_promoted, inst_fail_key, inst_dup;
     uint64_t rel_kind[TCG_CAP_UNSUPPORTED + 1], rel_form[TCG_CAPF_MAX];
     uint64_t hot_bytes, cold_bytes, search_bytes, ext_total;
-    uint64_t capture_ns, install_ns;
+    uint64_t capture_ns, install_ns, capture_val_ns;
+    /* First-use checks of unwind data (tcg_cache_unwind_first_use). */
+    uint64_t unwind_checks[TCG_CACHE_UNWIND_MAX], unwind_repeats, unwind_ns;
+    uint64_t test_unwind_damaged, test_capture_damaged, unwind_installed_wb;
     /* TCG_CACHE_ON */
     uint64_t translations, inel_capture, stored, store_dup, store_full;
     uint64_t store_bytes, lookups, look_inel, look_none, hits;
