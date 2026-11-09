@@ -610,4 +610,50 @@ extern bool tcg_hvtimers;
 extern bool tcg_tlbpin;
 bool tcg_tlbpin_supported(void);
 
+/*
+ * x-zext32: in user mode with no guest base, a guest whose addresses are
+ * all 32-bit (tcg_guest_addr32) accesses memory at its address register
+ * itself.  The backend then keeps every defined, live 32-bit value in a
+ * host register zero-extended at each op's boundary, extending where a
+ * value could otherwise carry other bits above it.  TCG_ZEXT32_CHECK
+ * also tests the register before each such access, and traps if its
+ * high half isn't zero.
+ */
+typedef enum TCGZext32Mode {
+    TCG_ZEXT32_OFF,
+    TCG_ZEXT32_ON,
+    TCG_ZEXT32_CHECK,
+} TCGZext32Mode;
+
+extern TCGZext32Mode tcg_zext32;
+
+/*
+ * Development switches for TCG_ZEXT32_CHECK's own tests: tcg_zext32_poison
+ * puts other bits above every 32-bit value the backend zero-extends for
+ * x-zext32 before it does so, and tcg_zext32_nofix leaves them there;
+ * tcg_zext32_report (implied by either) says on stderr, once the prologue
+ * is generated, whether the checks are active.
+ */
+extern bool tcg_zext32_poison;
+extern bool tcg_zext32_nofix;
+extern bool tcg_zext32_report;
+
+/*
+ * Set by the front end, before the prologue is generated, if every guest
+ * address is a 32-bit (I32) temp.
+ */
+extern bool tcg_guest_addr32;
+
+/* Whether x-zext32 applies, decided when the prologue is generated. */
+extern bool tcg_zext32_active;
+
+/* Whether x-zext32 can be on: user mode on a host that supports it. */
+bool tcg_can_zext32(void);
+
+/*
+ * The host register named by a failed TCG_ZEXT32_CHECK trap at host @pc
+ * (a synchronous trap in generated code), or -1 if @pc isn't one.
+ */
+int tcg_zext32_trap(uintptr_t pc);
+
 #endif

@@ -190,6 +190,30 @@ static void G_NORETURN xt_fault_entry(XtThread *t, uint64_t prev)
     xt_fault_continue(t, prev);
 }
 
+/* A failed x-zext32=check in generated code: report it and stop. */
+static void G_NORETURN zext32_trap(XtNativeContext *ctx, int reg)
+{
+    uintptr_t ra = ctx->Pc;
+    vaddr gpc = 0;
+    g_autofree char *line = NULL;
+
+    if (xt_self && xt_self->cpu) {
+        adjust_signal_pc(&ra, false);
+        cpu_restore_state(xt_self->cpu, ra);
+        gpc = xt_self->cpu->cc->get_pc(xt_self->cpu);
+    }
+    line = g_strdup_printf("x-zext32 check failed: guest pc 0x%" VADDR_PRIx
+                           ", host pc 0x%" PRIx64 ", x%d = 0x%016" PRIx64
+                           "\n", gpc, (uint64_t)ctx->Pc, reg,
+                           (uint64_t)ctx->X[reg]);
+    xt_log_text(line);
+    fputs(line, stderr);
+    NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
+    for (;;) {
+        __builtin_trap();
+    }
+}
+
 /*
  * Classify a host exception (from BTCpuResetToConsistentState, inside
  * Windows' exception dispatch, or the native harness's vectored handler),
@@ -242,6 +266,14 @@ bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx)
                    (TCG_CACHE_GFAULT_GUARD - 1));
         ctx->Pc = ctx->Lr;
         return true;
+    }
+    if (er->ExceptionCode == STATUS_BREAKPOINT ||
+        er->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION) {
+        int reg = tcg_zext32_trap(ctx->Pc);
+
+        if (reg >= 0) {
+            zext32_trap(ctx, reg);
+        }
     }
     t = xt_self;
     if (!t || t->fault.busy) {

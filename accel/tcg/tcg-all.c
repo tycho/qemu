@@ -130,6 +130,8 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-tblookup", "on" },
 #ifdef CONFIG_USER_ONLY
         { "x-ijguard", "on" },
+        /* Inactive but for i386 guests with no guest base. */
+        { "x-zext32", "on" },
 #endif
         { "x-sysret", "on" },
         { "x-xpage", "stub" },
@@ -1338,6 +1340,60 @@ static void tcg_set_cache(Object *obj, const char *value, Error **errp)
     }
 }
 
+static char *tcg_get_zext32(Object *obj, Error **errp)
+{
+    switch (tcg_zext32) {
+    case TCG_ZEXT32_ON:
+        return g_strdup("on");
+    case TCG_ZEXT32_CHECK:
+        /*
+         * The development switches change the code: say so (a
+         * description, not a value the setter takes).
+         */
+        return g_strdup_printf("check%s%s", tcg_zext32_poison ? ",poison" : "",
+                               tcg_zext32_nofix ? ",nofix" : "");
+    default:
+        return g_strdup("off");
+    }
+}
+
+static void tcg_set_zext32(Object *obj, const char *value, Error **errp)
+{
+    TCGZext32Mode mode;
+
+    if (!strcmp(value, "off")) {
+        tcg_zext32 = TCG_ZEXT32_OFF;
+        return;
+    } else if (!strcmp(value, "on")) {
+        mode = TCG_ZEXT32_ON;
+    } else if (!strcmp(value, "check")) {
+        mode = TCG_ZEXT32_CHECK;
+    } else {
+        error_setg(errp, "x-zext32 must be off, on or check");
+        return;
+    }
+    if (!tcg_can_zext32()) {
+        error_setg(errp, "x-zext32=%s: only in user mode on an aarch64 host",
+                   value);
+        return;
+    }
+    tcg_zext32 = mode;
+#ifndef _WIN32
+    if (mode == TCG_ZEXT32_CHECK) {
+        /* XTCG_ZEXT32=poison, nofix, report: check's own tests. */
+        const char *dev = getenv("XTCG_ZEXT32");
+        g_auto(GStrv) words = g_strsplit(dev ? dev : "", ",", 0);
+
+        tcg_zext32_poison = g_strv_contains((const char *const *)words,
+                                            "poison");
+        tcg_zext32_nofix = g_strv_contains((const char *const *)words,
+                                           "nofix");
+        tcg_zext32_report = g_strv_contains((const char *const *)words,
+                                            "report");
+    }
+#endif
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1713,6 +1769,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "translation of image code kept in the process and installed again "
         "before translating the same code) or files (kept in and read from "
         "files too, which other processes share)");
+
+    object_class_property_add_str(oc, "x-zext32", tcg_get_zext32,
+                                  tcg_set_zext32);
+    object_class_property_set_description(oc, "x-zext32",
+        "User mode, aarch64 hosts, no guest base: a 32-bit guest address "
+        "register is the host address, since 32-bit values are kept "
+        "zero-extended: off, on or check (on, and trap before an access "
+        "whose register isn't zero-extended)");
 }
 
 static const TypeInfo tcg_accel_type = {
