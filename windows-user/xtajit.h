@@ -321,6 +321,7 @@ static inline uint32_t xt_ec_eflags(CPUX86State *env)
 }
 
 void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n);
+void xt_ec_pack_call(XtThread *t, ARM64_NT_CONTEXT *n);
 void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n);
 bool xt_ec_ymm(XtThread *t);
 void xt_ec_import_ymm(XtThread *t, const CONTEXT *c);
