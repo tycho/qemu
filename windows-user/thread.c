@@ -245,6 +245,8 @@ XtThread *xt_thread_new(bool wow64)
     }
     t->env = cpu_env(t->cpu);
     t->cpu->opaque = t;
+    /* The thread runs this CPU until its record is freed (tcg_cpu_bound). */
+    current_cpu = t->cpu;
     t->heap = xt_heap_current();
     tcg_register_thread();
     xt_self = t;

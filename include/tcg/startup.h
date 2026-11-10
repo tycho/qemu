@@ -687,6 +687,13 @@ extern bool tcg_zext32_active;
  */
 extern bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
 
+/*
+ * tcg_cpu_bound: set by a user-mode front end that sets current_cpu
+ * itself, whenever a thread takes a CPU, and calls cpu_exec only with the
+ * calling thread's CPU.  cpu_exec then leaves current_cpu as it is.
+ */
+extern bool tcg_cpu_bound;
+
 /* Whether x-zext32 can be on: user mode on a host that supports it. */
 bool tcg_can_zext32(void);
 
