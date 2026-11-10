@@ -21,6 +21,21 @@
 #include "xtajit.h"
 #include "arm64ec.h"
 
+/* The layouts arm64ec.S's offsets (F_*, C_*, TEB_CPU_AREA, AREA_*) assume. */
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, entry) != 0x04);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, ctx) != 0x10);
+QEMU_BUILD_BUG_ON(XT_EC_ENTRY_CALL != 1 || XT_EC_ENTRY_RETURN != 2);
+QEMU_BUILD_BUG_ON(offsetof(ARM64_NT_CONTEXT, Cpsr) != 0x04);
+QEMU_BUILD_BUG_ON(offsetof(ARM64_NT_CONTEXT, X) != 0x08);
+QEMU_BUILD_BUG_ON(offsetof(ARM64_NT_CONTEXT, Sp) != 0x100);
+QEMU_BUILD_BUG_ON(offsetof(ARM64_NT_CONTEXT, Pc) != 0x108);
+QEMU_BUILD_BUG_ON(offsetof(ARM64_NT_CONTEXT, V) != 0x110);
+QEMU_BUILD_BUG_ON(sizeof(((ARM64_NT_CONTEXT *)0)->V[0]) != 16);
+QEMU_BUILD_BUG_ON(XT_TEB_CPU_AREA != 0x1788);
+QEMU_BUILD_BUG_ON(offsetof(XtCpuArea, EmulatorStackBase) != 0x08);
+QEMU_BUILD_BUG_ON(offsetof(XtCpuArea, SuspendDoorbell) != 0x20);
+QEMU_BUILD_BUG_ON(offsetof(XtCpuArea, EmulatorData[1]) != 0x38);
+
 NTSTATUS NTAPI NtContinue(PCONTEXT, BOOLEAN);
 NTSTATUS NTAPI NtTerminateThread(HANDLE, NTSTATUS);
 PVOID NTAPI RtlAddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
