@@ -25,6 +25,17 @@
 #ifndef TCG_STARTUP_H
 #define TCG_STARTUP_H
 
+#include "exec/vaddr.h"
+
+/*
+ * tcg_foreign_pc: set by a user-mode front end whose guest calls into
+ * code that isn't the guest's (an x64 process's native ARM64EC code on
+ * Windows): whether @pc is such code, which lookups then skip without
+ * probing its page.  With @exit, the call also prepares the CPU's exit to
+ * it (its exception_index), for cpu_exec to return.
+ */
+extern bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
+
 /**
  * tcg_init: Initialize the TCG runtime
  * @tb_size: translation buffer size

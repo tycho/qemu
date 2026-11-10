@@ -227,6 +227,8 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
  *
  * Returns: an existing translation block or NULL.
  */
+bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
+
 static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     TranslationBlock *tb;
@@ -246,6 +248,11 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
                tb->flags == s.flags &&
                tb_cflags(tb) == s.cflags)) {
         goto hit;
+    }
+
+    /* Code that isn't the guest's has no TB, nor a page to probe. */
+    if (unlikely(tcg_foreign_pc) && tcg_foreign_pc(cpu, s.pc, false)) {
+        return NULL;
     }
 
     tb = tb_htable_lookup(cpu, s);
@@ -982,6 +989,11 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             }
 
             tb = tb_lookup(cpu, s);
+            if (tb == NULL && unlikely(tcg_foreign_pc) &&
+                tcg_foreign_pc(cpu, s.pc, true)) {
+                /* Out through cpu_handle_exception, no fault. */
+                break;
+            }
             if (tb == NULL) {
                 unsigned flush_count = qatomic_read(&tb_ctx.tb_flush_count);
                 CPUJumpCache *jc;
