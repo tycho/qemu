@@ -418,8 +418,16 @@ void xt_run(XtThread *t, XtExit *x)
                 continue;
             }
         }
-        /* Clears exit_request and runs queued work, as linux-user's loop. */
-        qemu_process_cpu_events(cs);
+        /*
+         * Clears exit_request and runs queued work, as linux-user's loop.
+         * Work is listed before its kick sets the request
+         * (queue_work_on_cpu, cpu_exit's release): with no request seen
+         * there is no work to run yet, and a later kick's request stays
+         * set for the next cpu_exec.
+         */
+        if (qatomic_load_acquire(&cs->exit_request)) {
+            qemu_process_cpu_events(cs);
+        }
         if (xt_diag) {
             xt_event(t, XT_EV_EXIT, trapnr, env->eip);
             xt_check(t, XT_ENGINE, 10);
