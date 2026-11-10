@@ -156,16 +156,6 @@ static void *tls_alloc_of(void *teb)
 
 #endif
 
-/* WOW64's TLS slots, in the 64-bit TEB's TlsSlots (TEB + 0x1480). */
-#define TEB_TLS_SLOTS 0x1480
-#define WOW64_TLS_CPURESERVED_FLAGS 2   /* bit 0: running guest code */
-#define XT_TLS_THREAD 16                /* ours; unused by wow64.dll */
-
-static void **tls_slots(void *teb)
-{
-    return (void **)((char *)teb + TEB_TLS_SLOTS);
-}
-
 static uint64_t read_cntvct(void)
 {
     uint64_t v;
@@ -251,7 +241,7 @@ XtThread *xt_thread_new(bool wow64)
     tcg_register_thread();
     xt_self = t;
     if (wow64) {
-        tls_slots(t->teb)[XT_TLS_THREAD] = t;
+        xt_tls_slots(t->teb)[XT_TLS_THREAD] = t;
     }
     xt_event(t, XT_EV_THREAD_INIT, t->cpu->cpu_index, (uintptr_t)t->teb);
     xt_placement("thread record", t);
@@ -294,7 +284,7 @@ static void wait_record_users(void)
 static void unlink_record(XtThread *t)
 {
     if (t->wow64) {
-        qatomic_set(&tls_slots(t->teb)[XT_TLS_THREAD], NULL);
+        qatomic_set(&xt_tls_slots(t->teb)[XT_TLS_THREAD], NULL);
     }
 }
 
@@ -459,15 +449,12 @@ void xt_thread_free(XtThread *t)
  * once the thread has ended.  If the termination fails, the thread stays
  * suspended and the record stays.
  */
-/*
- * A thread another one is terminating stops here, where it holds nothing
- * of the engine's and slot 2 bit 0 is clear, until Windows ends it.
- */
-void xt_park_if_terminating(XtThread *t)
+/* xt_park_if_terminating's wait */
+void xt_park(XtThread *t)
 {
     LARGE_INTEGER tick = { .QuadPart = -100000 };
 
-    while (t && qatomic_read(&t->terminating)) {
+    while (qatomic_read(&t->terminating)) {
         NtDelayExecution(FALSE, &tick);
     }
 }
@@ -522,27 +509,13 @@ void xt_enter(void)
     }
 }
 
-void xt_set_slot2(XtThread *t, bool running)
-{
-    uint64_t *f = (uint64_t *)&tls_slots(t->teb)[WOW64_TLS_CPURESERVED_FLAGS];
-
-    if (!t->wow64) {
-        return;
-    }
-    if (running) {
-        qatomic_or(f, 1);
-    } else {
-        qatomic_and(f, ~(uint64_t)1);
-    }
-}
-
 static bool slot2_running(XtThread *t)
 {
     if (!t->wow64) {
         return t->state != XT_WINDOWS;
     }
     return qatomic_read((uint64_t *)
-                        &tls_slots(t->teb)[WOW64_TLS_CPURESERVED_FLAGS]) & 1;
+                        &xt_tls_slots(t->teb)[WOW64_TLS_CPURESERVED_FLAGS]) & 1;
 }
 
 /*
@@ -630,7 +603,7 @@ uint32_t xt_check(XtThread *t, XtState expect, int where)
  * threads' system calls.  Where Windows owns the thread the suspension is
  * plain and the wait just times out.
  */
-void xt_inject(XtThread *t, int point)
+void xt_inject_wait(XtThread *t, int point)
 {
     uint64_t freq, end;
     bool exit_point = point == XT_INJ_PUBLISH || point == XT_INJ_CALLBACK;
@@ -648,78 +621,11 @@ void xt_inject(XtThread *t, int point)
     xt_event(t, XT_EV_INJECT, point, qatomic_read(&t->suspend_req));
 }
 
-/*
- * WINDOWS -> ACQUIRING -> ENGINE.  Slot 2 bit 0 is set before the import,
- * so a suspension from here on takes the cooperative path and waits for
- * this thread's next notification.  The WOW64 module registers the RCU
- * reader here, for as long as the engine owns the thread; the x64 module
- * registers it once, for the thread's life (xt_rcu_ensure).
- * xt_acquire_begin and xt_acquire_end are the two
- * halves, for a caller that imports the state itself in between.
- */
-void xt_acquire_begin(XtThread *t)
-{
-    xt_park_if_terminating(t);
-    if (xt_diag) {
-        xt_check(t, XT_WINDOWS, 1);
-    }
-    t->state = XT_ACQUIRING;
-    xt_set_slot2(t, true);
-#ifdef TARGET_X86_64
-    if (!t->rcu_registered) {
-        xt_rcu_ensure();
-        t->rcu_registered = true;
-    }
-#else
-    rcu_register_thread();
-    t->rcu_registered = true;
-#endif
-    xt_inject(t, XT_INJ_ACQUIRE);
-}
-
-void xt_acquire_end(XtThread *t)
-{
-    t->state = XT_ENGINE;
-    if (xt_diag) {
-        xt_event(t, XT_EV_ACQUIRE, t->env->eip, t->env->regs[R_ESP]);
-        xt_check(t, XT_ENGINE, 2);
-    }
-}
-
 void xt_acquire(XtThread *t, const XtGuestContext *c)
 {
     xt_acquire_begin(t);
     xt_import(t, c);
     xt_acquire_end(t);
-}
-
-/*
- * ENGINE -> PUBLISHING -> WINDOWS: the exit's architectural effect is
- * complete; export (into C, unless it is NULL: a caller that takes the
- * state from the CPU itself), then end the RCU reader (the WOW64 module;
- * the x64 module's stays registered, outside any read section), then
- * clear bit 0.
- * The caller notifies (Wow64NotifyUnsimulateComplete) after.
- */
-void xt_publish(XtThread *t, XtGuestContext *c)
-{
-    if (xt_diag) {
-        xt_check(t, XT_ENGINE, 3);
-    }
-    t->state = XT_PUBLISHING;
-    if (c) {
-        xt_export(t, c);
-    }
-    xt_inject(t, XT_INJ_PUBLISH);
-#ifndef TARGET_X86_64
-    rcu_unregister_thread();
-    t->rcu_registered = false;
-#endif
-    t->state = XT_WINDOWS;
-    xt_set_slot2(t, false);
-    if (xt_diag) {
-        xt_check(t, XT_WINDOWS, 4);
-    }
 }
 
 /*
@@ -745,13 +651,8 @@ bool xt_guest_read(XtThread *t, vaddr addr, void *buf, size_t len)
 }
 
 /* Logging: XTAJIT_LOG names a directory; one file per process. */
-static HANDLE log_handle;
+HANDLE xt_log_file;
 NTSTATUS xt_log_status = -1;
-
-void *xt_log_handle(void)
-{
-    return log_handle;
-}
 
 void xt_log_open(void)
 {
@@ -784,13 +685,13 @@ void xt_log_open(void)
     us.Length = k * sizeof(WCHAR);
     us.MaximumLength = us.Length + sizeof(WCHAR);
     InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-    xt_log_status = NtCreateFile(&log_handle, FILE_APPEND_DATA | SYNCHRONIZE,
+    xt_log_status = NtCreateFile(&xt_log_file, FILE_APPEND_DATA | SYNCHRONIZE,
                                  &oa, &io, NULL, FILE_ATTRIBUTE_NORMAL,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE,
                                  FILE_OVERWRITE_IF,
                                  FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
     if (xt_log_status < 0) {
-        log_handle = NULL;
+        xt_log_file = NULL;
     } else {
         xt_diag = true;
     }
@@ -837,8 +738,8 @@ static void put(HANDLE h, const char *s, int n)
 /* With XTAJIT_LOG, a line of text as it is. */
 void xt_log_text(const char *s)
 {
-    if (log_handle) {
-        put(log_handle, s, strlen(s));
+    if (xt_log_file) {
+        put(xt_log_file, s, strlen(s));
     }
 }
 
@@ -889,11 +790,11 @@ void xt_log_flush(XtThread *t)
 {
     char who[32];
 
-    if (!log_handle || t->ring_pos == t->logged) {
+    if (!xt_log_file || t->ring_pos == t->logged) {
         return;
     }
     snprintf(who, sizeof(who), "t%lu", (unsigned long)t->tid);
-    dump_range(log_handle, t->ring, MAX(t->logged, t->ring_pos > XT_RING ?
+    dump_range(xt_log_file, t->ring, MAX(t->logged, t->ring_pos > XT_RING ?
                                          t->ring_pos - XT_RING : 0),
                t->ring_pos, who);
     t->logged = t->ring_pos;
@@ -911,7 +812,7 @@ void xt_log_native(EXCEPTION_RECORD *er, XtNativeContext *ctx)
     char line[200];
     int n;
 
-    if (!log_handle) {
+    if (!xt_log_file) {
         return;
     }
     if (NtQueryVirtualMemory(GetCurrentProcess(), (void *)ctx->Pc, 0, &pm,
@@ -933,12 +834,12 @@ void xt_log_native(EXCEPTION_RECORD *er, XtNativeContext *ctx)
                  ctx->Pc - (uintptr_t)pm.AllocationBase, ctx->Lr,
                  lm.AllocationBase, ctx->Lr - (uintptr_t)lm.AllocationBase,
                  ctx->Sp);
-    put(log_handle, line, n);
+    put(xt_log_file, line, n);
 }
 
 void xt_dump(XtThread *t, void *handle)
 {
-    HANDLE h = handle ? handle : log_handle;
+    HANDLE h = handle ? handle : xt_log_file;
     char who[32], line[400];
     int n;
 

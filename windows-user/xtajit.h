@@ -12,6 +12,7 @@
 
 #include <winternl.h>
 #include "runtime/runtime.h"
+#include "qemu/rcu.h"
 #include "exec/cpu-common.h"
 #include "exec/mmu-access-type.h"
 #include "user/guest-host.h"
@@ -316,15 +317,10 @@ void xt_thread_free(XtThread *t);
 void xt_event(XtThread *t, XtEv kind, uint64_t a, uint64_t b);
 void xt_gevent(XtEv kind, uint64_t a, uint64_t b);
 uint32_t xt_check(XtThread *t, XtState expect, int where);
-void xt_set_slot2(XtThread *t, bool running);
 void xt_acquire(XtThread *t, const XtGuestContext *c);
-void xt_acquire_begin(XtThread *t);
-void xt_acquire_end(XtThread *t);
-void xt_publish(XtThread *t, XtGuestContext *c);
 void xt_dump(XtThread *t, void *handle);
 void xt_log_flush(XtThread *t);
 void xt_log_open(void);
-void *xt_log_handle(void);
 void xt_log_text(const char *s);
 bool xt_guest_read(XtThread *t, vaddr addr, void *buf, size_t len);
 void xt_record_hold(void);
@@ -332,7 +328,7 @@ void xt_record_release(void);
 void xt_thread_retire(XtThread *t, void *thread_handle);
 bool xt_terminates(HANDLE thread);
 void xt_reap_later(void *thread_handle, void *alloc);
-void xt_park_if_terminating(XtThread *t);
+void xt_park(XtThread *t);
 int xt_reap(void);
 void xt_log_native(EXCEPTION_RECORD *er, XtNativeContext *ctx);
 extern NTSTATUS xt_log_status;      /* the event log's opening */
@@ -404,7 +400,131 @@ enum {
     XT_INJ_PUBLISH,
     XT_INJ_CALLBACK,
 };
-void xt_inject(XtThread *t, int point);
+void xt_inject_wait(XtThread *t, int point);
+
+/*
+ * The transitions between Windows and the engine, inline in both
+ * modules' entries and exits; their slow parts are out of line
+ * (thread.c).
+ */
+
+/* XTAJIT_INJECT: see xt_inject_wait. */
+static inline void xt_inject(XtThread *t, int point)
+{
+    if (unlikely(xt_inject_point == point)) {
+        xt_inject_wait(t, point);
+    }
+}
+
+/*
+ * A thread another one is terminating stops here, where it holds nothing
+ * of the engine's and slot 2 bit 0 is clear, until Windows ends it.
+ */
+static inline void xt_park_if_terminating(XtThread *t)
+{
+    if (t && unlikely(qatomic_read(&t->terminating))) {
+        xt_park(t);
+    }
+}
+
+/* WOW64's TLS slots, in the 64-bit TEB's TlsSlots (TEB + 0x1480). */
+#define TEB_TLS_SLOTS 0x1480
+#define WOW64_TLS_CPURESERVED_FLAGS 2   /* bit 0: running guest code */
+#define XT_TLS_THREAD 16                /* ours; unused by wow64.dll */
+
+static inline void **xt_tls_slots(void *teb)
+{
+    return (void **)((char *)teb + TEB_TLS_SLOTS);
+}
+
+static inline void xt_set_slot2(XtThread *t, bool running)
+{
+    uint64_t *f;
+
+    if (!t->wow64) {
+        return;
+    }
+    f = (uint64_t *)&xt_tls_slots(t->teb)[WOW64_TLS_CPURESERVED_FLAGS];
+    if (running) {
+        qatomic_or(f, 1);
+    } else {
+        qatomic_and(f, ~(uint64_t)1);
+    }
+}
+
+/*
+ * WINDOWS -> ACQUIRING -> ENGINE.  Slot 2 bit 0 is set before the import,
+ * so a suspension from here on takes the cooperative path and waits for
+ * this thread's next notification.  The WOW64 module registers the RCU
+ * reader here, for as long as the engine owns the thread; the x64 module
+ * registers it once, for the thread's life (xt_rcu_ensure).
+ * xt_acquire_begin and xt_acquire_end are the two
+ * halves, for a caller that imports the state itself in between.
+ */
+static inline void xt_acquire_begin(XtThread *t)
+{
+    xt_park_if_terminating(t);
+    if (unlikely(xt_diag)) {
+        xt_check(t, XT_WINDOWS, 1);
+    }
+    t->state = XT_ACQUIRING;
+    xt_set_slot2(t, true);
+#ifdef TARGET_X86_64
+    if (unlikely(!t->rcu_registered)) {
+        xt_rcu_ensure();
+        t->rcu_registered = true;
+    }
+#else
+    rcu_register_thread();
+    t->rcu_registered = true;
+#endif
+    xt_inject(t, XT_INJ_ACQUIRE);
+}
+
+static inline void xt_acquire_end(XtThread *t)
+{
+    t->state = XT_ENGINE;
+    if (unlikely(xt_diag)) {
+        xt_event(t, XT_EV_ACQUIRE, t->env->eip, t->env->regs[R_ESP]);
+        xt_check(t, XT_ENGINE, 2);
+    }
+}
+
+/*
+ * ENGINE -> PUBLISHING -> WINDOWS: the exit's architectural effect is
+ * complete; export (into C, unless it is NULL: a caller that takes the
+ * state from the CPU itself), then end the RCU reader (the WOW64 module;
+ * the x64 module's stays registered, outside any read section), then
+ * clear bit 0.
+ * The caller notifies (Wow64NotifyUnsimulateComplete) after.
+ */
+static inline void xt_publish(XtThread *t, XtGuestContext *c)
+{
+    if (unlikely(xt_diag)) {
+        xt_check(t, XT_ENGINE, 3);
+    }
+    t->state = XT_PUBLISHING;
+    if (c) {
+        xt_export(t, c);
+    }
+    xt_inject(t, XT_INJ_PUBLISH);
+#ifndef TARGET_X86_64
+    rcu_unregister_thread();
+    t->rcu_registered = false;
+#endif
+    t->state = XT_WINDOWS;
+    xt_set_slot2(t, false);
+    if (unlikely(xt_diag)) {
+        xt_check(t, XT_WINDOWS, 4);
+    }
+}
+
+extern HANDLE xt_log_file;
+
+static inline void *xt_log_handle(void)
+{
+    return xt_log_file;
+}
 
 /* exec.c: xt_run_core (run.h) with every exit in X */
 void xt_run(XtThread *t, XtExit *x);
