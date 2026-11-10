@@ -755,6 +755,14 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
 
     tb = tb_lookup(cpu, s);
     if (tb == NULL) {
+        /*
+         * Code that isn't the guest's: the exit to it is raised here,
+         * where the lookup has just classified it, and cpu_exec_loop
+         * leaves after the epilogue without looking it up again.
+         */
+        if (unlikely(tcg_foreign_pc)) {
+            tcg_foreign_pc(cpu, s.pc, true);
+        }
         return tcg_code_gen_epilogue;
     }
 
@@ -1529,6 +1537,16 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 region_sample(cpu, tb);
             }
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
+
+            /*
+             * An exit to code that isn't the guest's, raised by
+             * helper_lookup_tb_ptr: out through cpu_handle_exception, as
+             * from the lookup above.  Nothing else leaves a TB normally
+             * with an exception pending.
+             */
+            if (unlikely(tcg_foreign_pc) && cpu->exception_index >= 0) {
+                break;
+            }
 
             /* Try to align the host and virtual clocks
                if the guest is in advance */
