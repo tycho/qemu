@@ -408,6 +408,15 @@ void rcu_unregister_thread(void)
     qemu_mutex_unlock(&rcu_registry_lock);
 }
 
+void rcu_unregister_reader(struct rcu_reader_data *reader)
+{
+    assert(qatomic_read(&reader->ctr) == 0 && reader->depth == 0);
+    /* On the registry, on a grace period's qsreaders, or on neither. */
+    qemu_mutex_lock(&rcu_registry_lock);
+    QLIST_SAFE_REMOVE(reader, node);
+    qemu_mutex_unlock(&rcu_registry_lock);
+}
+
 void rcu_add_force_rcu_notifier(Notifier *n)
 {
     qemu_mutex_lock(&rcu_registry_lock);
