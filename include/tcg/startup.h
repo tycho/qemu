@@ -25,6 +25,8 @@
 #ifndef TCG_STARTUP_H
 #define TCG_STARTUP_H
 
+#include "exec/vaddr.h"
+
 /*
  * x86 guests: CR0.MP, EM and TS are not part of the TB flags; the first
  * instruction in a TB that depends on them checks them at run time.
@@ -646,6 +648,15 @@ extern bool tcg_guest_addr32;
 
 /* Whether x-zext32 applies, decided when the prologue is generated. */
 extern bool tcg_zext32_active;
+
+/*
+ * tcg_foreign_pc: set by a user-mode front end whose guest calls into
+ * code that isn't the guest's (an x64 process's native ARM64EC code on
+ * Windows): whether @pc is such code, which lookups then skip without
+ * probing its page.  With @exit, the call also prepares the CPU's exit to
+ * it (its exception_index), for cpu_exec to return.
+ */
+extern bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
 
 /* Whether x-zext32 can be on: user mode on a host that supports it. */
 bool tcg_can_zext32(void);

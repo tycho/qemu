@@ -298,10 +298,12 @@ static void unlink_record(XtThread *t)
 
 /*
  * The CPU leaves the CPU list and is freed (xt_cpu_free), as in
- * linux-user's exit, with an RCU reader of the calling thread's for the
- * duration (a thread Windows owns has none).  The thread T belonged to no
- * longer runs it; its allocator heap goes back, from whatever thread this
- * is (the loader may have freed T's TLS, or T may have been terminated).
+ * linux-user's exit, with an RCU reader of the calling thread's: in the
+ * WOW64 module registered for the duration (a thread Windows owns has
+ * none), in the x64 module for the thread's life (xt_rcu_ensure).  The
+ * thread T belonged to no longer runs it; its allocator heap goes back,
+ * from whatever thread this is (the loader may have freed T's TLS, or T
+ * may have been terminated).
  */
 static void free_record(XtThread *t)
 {
@@ -309,9 +311,14 @@ static void free_record(XtThread *t)
     void *heap = t->heap;
 
     xt_log_flush(t);
+#ifdef TARGET_X86_64
+    xt_rcu_ensure();
+    xt_cpu_free(cs);
+#else
     rcu_register_thread();
     xt_cpu_free(cs);
     rcu_unregister_thread();
+#endif
     g_free(t);
     xt_heap_release(heap);
 }
@@ -555,8 +562,10 @@ enum {
 uint32_t xt_check(XtThread *t, XtState expect, int where)
 {
     uint32_t bad = 0;
+#ifndef TARGET_X86_64
     bool engine = expect == XT_ACQUIRING || expect == XT_ENGINE ||
                   expect == XT_PUBLISHING;
+#endif
 
     if (t->state != expect) {
         bad |= XT_BAD_STATE;
@@ -573,9 +582,28 @@ uint32_t xt_check(XtThread *t, XtState expect, int where)
     if (t->active != XT_ACT_NONE) {
         bad |= XT_BAD_ACTIVE;
     }
+#ifdef TARGET_X86_64
+    /*
+     * Registered for the thread's life once it first entered: the engine
+     * owns it only after that; where Windows owns it, outside any read
+     * section.
+     */
+    {
+        struct rcu_reader_data *r = get_ptr_rcu_reader();
+
+        if (expect == XT_ENGINE &&
+            (xt_emutls_reader_get() != r || !r->node.le_prev)) {
+            bad |= XT_BAD_RCU;
+        }
+        if (expect == XT_WINDOWS && (r->depth || qatomic_read(&r->ctr))) {
+            bad |= XT_BAD_RCU;
+        }
+    }
+#else
     if (t->rcu_registered != engine) {
         bad |= XT_BAD_RCU;
     }
+#endif
     if (t->cpu->running) {
         bad |= XT_BAD_RUNNING;
     }
@@ -621,26 +649,39 @@ void xt_inject(XtThread *t, int point)
 /*
  * WINDOWS -> ACQUIRING -> ENGINE.  Slot 2 bit 0 is set before the import,
  * so a suspension from here on takes the cooperative path and waits for
- * this thread's next notification; the RCU reader exists only while the
- * engine owns the thread.  xt_acquire_begin and xt_acquire_end are the two
+ * this thread's next notification.  The WOW64 module registers the RCU
+ * reader here, for as long as the engine owns the thread; the x64 module
+ * registers it once, for the thread's life (xt_rcu_ensure).
+ * xt_acquire_begin and xt_acquire_end are the two
  * halves, for a caller that imports the state itself in between.
  */
 void xt_acquire_begin(XtThread *t)
 {
     xt_park_if_terminating(t);
-    xt_check(t, XT_WINDOWS, 1);
+    if (xt_diag) {
+        xt_check(t, XT_WINDOWS, 1);
+    }
     t->state = XT_ACQUIRING;
     xt_set_slot2(t, true);
+#ifdef TARGET_X86_64
+    if (!t->rcu_registered) {
+        xt_rcu_ensure();
+        t->rcu_registered = true;
+    }
+#else
     rcu_register_thread();
     t->rcu_registered = true;
+#endif
     xt_inject(t, XT_INJ_ACQUIRE);
 }
 
 void xt_acquire_end(XtThread *t)
 {
     t->state = XT_ENGINE;
-    xt_event(t, XT_EV_ACQUIRE, t->env->eip, t->env->regs[R_ESP]);
-    xt_check(t, XT_ENGINE, 2);
+    if (xt_diag) {
+        xt_event(t, XT_EV_ACQUIRE, t->env->eip, t->env->regs[R_ESP]);
+        xt_check(t, XT_ENGINE, 2);
+    }
 }
 
 void xt_acquire(XtThread *t, const XtGuestContext *c)
@@ -653,22 +694,30 @@ void xt_acquire(XtThread *t, const XtGuestContext *c)
 /*
  * ENGINE -> PUBLISHING -> WINDOWS: the exit's architectural effect is
  * complete; export (into C, unless it is NULL: a caller that takes the
- * state from the CPU itself), then end the RCU reader, then clear bit 0.
+ * state from the CPU itself), then end the RCU reader (the WOW64 module;
+ * the x64 module's stays registered, outside any read section), then
+ * clear bit 0.
  * The caller notifies (Wow64NotifyUnsimulateComplete) after.
  */
 void xt_publish(XtThread *t, XtGuestContext *c)
 {
-    xt_check(t, XT_ENGINE, 3);
+    if (xt_diag) {
+        xt_check(t, XT_ENGINE, 3);
+    }
     t->state = XT_PUBLISHING;
     if (c) {
         xt_export(t, c);
     }
     xt_inject(t, XT_INJ_PUBLISH);
+#ifndef TARGET_X86_64
     rcu_unregister_thread();
     t->rcu_registered = false;
+#endif
     t->state = XT_WINDOWS;
     xt_set_slot2(t, false);
-    xt_check(t, XT_WINDOWS, 4);
+    if (xt_diag) {
+        xt_check(t, XT_WINDOWS, 4);
+    }
 }
 
 /*
@@ -740,6 +789,8 @@ void xt_log_open(void)
                                  FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
     if (xt_log_status < 0) {
         log_handle = NULL;
+    } else {
+        xt_diag = true;
     }
 }
 
