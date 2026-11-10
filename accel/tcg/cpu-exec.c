@@ -228,6 +228,7 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
  * Returns: an existing translation block or NULL.
  */
 bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
+bool tcg_cpu_bound;
 
 static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
@@ -1077,7 +1078,9 @@ int cpu_exec(CPUState *cpu)
     SyncClocks sc = { 0 };
 
     /* replay_interrupt may need current_cpu */
-    current_cpu = cpu;
+    if (!tcg_cpu_bound) {
+        current_cpu = cpu;
+    }
 
 #ifndef CONFIG_USER_ONLY
     if (cpu->halted) {
