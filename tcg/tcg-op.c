@@ -2863,6 +2863,13 @@ void tcg_gen_call_tb(unsigned idx, TCGLabel *reset)
     add_as_label_use(reset, op);
 }
 
+void tcg_gen_ret_cancel(void)
+{
+    if (tcg_retalign && tcg_retstack_reg >= 0) {
+        tcg_emit_op(INDEX_op_ret_cancel, 0);
+    }
+}
+
 void tcg_gen_ret_tb(TCGv_i64 key, unsigned tag)
 {
     tcg_debug_assert(tag < TCG_RETSTACK_TAGS);

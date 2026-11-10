@@ -2766,6 +2766,10 @@ gen_eob(DisasContext *s, int mode)
     }
     if (req) {
         gen_set_label(req);
+        if (land) {
+            /* Pushed, but leaving before the call. */
+            tcg_gen_ret_cancel();
+        }
         tcg_gen_exit_tb(NULL, 0);
     }
     if (land) {
@@ -2856,6 +2860,8 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
         if (req) {
             gen_set_label(req);
         }
+        /* Pushed, but leaving before the call. */
+        tcg_gen_ret_cancel();
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
             tcg_gen_movi_tl(cpu_eip, new_eip);
         }

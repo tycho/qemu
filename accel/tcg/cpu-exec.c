@@ -879,6 +879,10 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
         log_cpu_exec(log_pc(cpu, itb), cpu, itb);
     }
 
+#ifdef CONFIG_DEBUG_TCG
+    /* x-retalign: no landing above 0 outside generated code. */
+    tcg_retstack_check(cpu);
+#endif
     qemu_thread_jit_execute();
     ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
     cpu->neg.can_do_io = true;
@@ -960,6 +964,7 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
 {
     /* Non-buggy compilers preserve this; assert the correct value. */
     g_assert(cpu == current_cpu);
+    tcg_retstack_settle(cpu);
 
 #ifdef CONFIG_USER_ONLY
     clear_helper_retaddr();

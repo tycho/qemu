@@ -449,6 +449,15 @@ extern bool tcg_retalign;
 bool tcg_retstack_pop_key(CPUState *cpu, uint64_t key);
 bool tcg_retstack_push_key(CPUState *cpu, uint64_t key);
 /*
+ * tcg_retalign: after generated code was left without its epilogue (a
+ * longjmp), mark old every landing above 0 from the top in env up, as
+ * the epilogue would its run of them, but return nothing: the host's
+ * return predictor is past repair.
+ */
+void tcg_retstack_settle(CPUState *cpu);
+/* tcg_retalign: assert that no landing from the top in env up is above 0. */
+void tcg_retstack_check(CPUState *cpu);
+/*
  * Whether the insn at @pc in the code buffer is a return stack push or
  * pop with its top in tcg_retstack_reg.
  */

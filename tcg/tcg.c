@@ -1605,6 +1605,13 @@ static void tcg_out_spin_hint(TCGContext *s)
 }
 #endif
 
+#ifndef TCG_TARGET_HAS_RETSTACK
+static void tcg_out_ret_cancel(TCGContext *s)
+{
+    g_assert_not_reached();
+}
+#endif
+
 #ifndef TCG_TARGET_HAS_QEMU_ATOMIC
 static const TCGOutOpQemuAtomic outop_qemu_atomic = {
     .base.static_constraint = C_NotImplemented,
@@ -3278,6 +3285,7 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return false;
 #endif
     case INDEX_op_call_tb:
+    case INDEX_op_ret_cancel:
 #ifdef TCG_TARGET_HAS_RETSTACK
         return true;
 #else
@@ -12089,6 +12097,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             break;
         case INDEX_op_spin_hint:
             tcg_out_spin_hint(s);
+            break;
+        case INDEX_op_ret_cancel:
+            tcg_out_ret_cancel(s);
             break;
         default:
         do_default:

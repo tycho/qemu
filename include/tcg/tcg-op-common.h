@@ -96,12 +96,17 @@ void tcg_gen_goto_tb(unsigned idx);
  *   @tag, return to its host code, else continue.  A tag is a front-end
  *   constant below TCG_RETSTACK_TAGS (an id of the TB's state, say),
  *   which only tcg_retstack_env backends keep: elsewhere it must be 0.
+ * tcg_gen_ret_cancel() - with tcg_retalign, mark the entry just pushed as
+ *   left without its host call: on the path that leaves the TB after
+ *   tcg_gen_push_ret() and before the call (an unlinked slot, an exit
+ *   request).
  */
 void tcg_gen_push_ret(TCGv_i64 key, TCGLabel *ret, TCGLabel *call,
                       unsigned tag);
 void tcg_gen_push_ret_done(void);
 void tcg_gen_call_tb(unsigned idx, TCGLabel *reset);
 void tcg_gen_ret_tb(TCGv_i64 key, unsigned tag);
+void tcg_gen_ret_cancel(void);
 
 /**
  * tcg_gen_boundary_in() - the boundary globals arrive in their registers

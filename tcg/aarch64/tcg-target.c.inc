@@ -3936,6 +3936,129 @@ static void tcg_out_call_ptr(TCGContext *s, TCGReg a0)
     tcg_out_insn(s, branch, BL, -1);
 }
 
+/*
+ * Whether generated code may reach a return stack landing by BR: the
+ * landings carry no BTI pad, so not where the code buffer is guarded
+ * (host_prot_read_exec).
+ */
+static bool retstack_br_landing(void)
+{
+#if defined(CONFIG_LINUX) && defined(PROT_BTI)
+    return !((cpuinfo & CPUINFO_BTI) && tcg_bti);
+#else
+    return true;
+#endif
+}
+
+/*
+ * tcg_retalign: a landing above 1 was pushed in this invocation of
+ * generated code and its host call is owed; 1 marks a push that left
+ * without its call (tcg_out_ret_cancel), 0 none, and a landing with bit
+ * 63 set is old, its call accounted for at an epilogue
+ * (tcg_out_retstack_walk).  Only the first kind returns by RET.  On the
+ * miss path, an old landing whose key matched is jumped to (a BR leaves
+ * the host's return predictor as it is); a real one that didn't match
+ * returns once to the next insn, taking its call off the predictor,
+ * before the lookup.  With TMP1 the popped key, LR the landing and the
+ * flags of their comparison with KEY.
+ */
+static void tcg_out_ret_tb_align(TCGContext *s, TCGReg key)
+{
+    /* CCMP LR, #1, #4, EQ: LE unless the key matched and LR > 1. */
+    tcg_out32(s, 0xfa400800 | tcg_cond_to_aarch64[TCG_COND_EQ] << 12
+              | 1 << 16 | TCG_REG_LR << 5 | 4);
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_LE, 2);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+    if (retstack_br_landing()) {
+        tcg_out_insn(s, tbz, TBZ, TCG_REG_LR, 63, 5);
+        tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_EQ, TCG_REG_TMP1, key, false);
+        tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 7);
+        tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I64, TCG_REG_LR,
+                         TCG_REG_LR, INT64_MAX);
+        tcg_out_insn(s, bcond_reg, BR, TCG_REG_LR);
+    } else {
+        tcg_out_insn(s, tbz, TBNZ, TCG_REG_LR, 63, 5);
+    }
+    tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_LEU, TCG_REG_LR, 1, true);
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_LEU, 3);
+    tcg_out_insn(s, pcrel, ADR, TCG_REG_LR, 8);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+}
+
+/* tcg_retalign: the push on top left without its host call. */
+static void tcg_out_ret_cancel(TCGContext *s)
+{
+    tcg_debug_assert(tcg_retstack_reg >= 0);
+    tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP0, 1);
+    tcg_out_st(s, TCG_TYPE_I64, TCG_REG_TMP0, tcg_retstack_reg, 8);
+}
+
+static void patch_bcond(tcg_insn_unit *at, TCGCond c, tcg_insn_unit *to)
+{
+    ptrdiff_t off = to - at;
+
+    *at = Ibcond_imm_B_C | tcg_cond_to_aarch64[c] | (off & 0x7ffff) << 5;
+}
+
+/*
+ * tcg_retalign, at the epilogue with only X0 live: the run of landings
+ * above 0 from the top are this invocation's live pushes (none is above
+ * 0 outside one).  Each real one becomes old and each cancelled one 0;
+ * then one return to the next insn for each real one takes their calls
+ * off the host's return predictor, which then predicts the epilogue's own
+ * return and its callers'.  Past four that would cost more than the
+ * mispredicted returns it saves: the landings are marked only.  The ring
+ * is aligned to twice its size, so its end follows from the top.
+ */
+static void tcg_out_retstack_walk(TCGContext *s)
+{
+    const TCGReg p = TCG_REG_TMP0, v = TCG_REG_TMP1;
+    const TCGReg end = TCG_REG_X2, n = TCG_REG_X1;
+    tcg_insn_unit *loop, *hs, *lt, *eq, *done, *cbz, *hi, *rep;
+
+    tcg_out_mov(s, TCG_TYPE_I64, p, tcg_retstack_reg);
+    tcg_out_logicali(s, Ilogic_imm_ANDI, TCG_TYPE_I64, end, p,
+                     ~(uint64_t)(2 * TCG_RETSTACK_SIZE - 1));
+    tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, end, end,
+                 TCG_RETSTACK_SIZE);
+    tcg_out_movi(s, TCG_TYPE_I64, n, 0);
+
+    loop = s->code_ptr;
+    tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_GEU, p, end, false);
+    hs = s->code_ptr;
+    tcg_out32(s, 0);
+    tcg_out_ld(s, TCG_TYPE_I64, v, p, 8);
+    tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_LT, v, 1, true);
+    lt = s->code_ptr;
+    tcg_out32(s, 0);
+    eq = s->code_ptr;
+    tcg_out32(s, 0);
+    tcg_out_logicali(s, Ilogic_imm_ORRI, TCG_TYPE_I64, v, v, INT64_MIN);
+    tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, n, n, 1);
+    tcg_out_insn(s, branch, B, 2);
+    patch_bcond(eq, TCG_COND_EQ, s->code_ptr);
+    tcg_out_movi(s, TCG_TYPE_I64, v, 0);
+    tcg_out_st(s, TCG_TYPE_I64, v, p, 8);
+    tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, p, p, 16);
+    tcg_out_insn(s, branch, B, loop - s->code_ptr);
+
+    done = s->code_ptr;
+    patch_bcond(hs, TCG_COND_GEU, done);
+    patch_bcond(lt, TCG_COND_LT, done);
+    cbz = s->code_ptr;
+    tcg_out32(s, 0);
+    tcg_out_cmp(s, TCG_TYPE_I64, TCG_COND_GTU, n, 4, true);
+    hi = s->code_ptr;
+    tcg_out32(s, 0);
+    rep = s->code_ptr;
+    tcg_out_insn(s, pcrel, ADR, TCG_REG_LR, 8);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+    tcg_out_insn(s, addsub_imm, SUBSI, TCG_TYPE_I64, n, n, 1);
+    tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, rep - s->code_ptr);
+    patch_bcond(hi, TCG_COND_GTU, s->code_ptr);
+    *cbz = Icbz_CBZ | 1u << 31 | ((s->code_ptr - cbz) & 0x7ffff) << 5 | n;
+}
+
 static void tcg_out_ret_tb(TCGContext *s, TCGReg key, unsigned tag)
 {
     if (tcg_retstack_reg < 0) {
@@ -3946,6 +4069,10 @@ static void tcg_out_ret_tb(TCGContext *s, TCGReg key, unsigned tag)
                  tcg_retstack_reg, 16, 0, 1);
     tcg_out_insn(s, addsub_shift, SUBS, TCG_TYPE_I64,
                  TCG_REG_XZR, TCG_REG_TMP1, key);
+    if (tcg_retalign) {
+        tcg_out_ret_tb_align(s, key);
+        return;
+    }
     tcg_out_ccmp_nz(s, TCG_REG_LR);
     tcg_out_insn(s, bcond_imm, B_C, TCG_COND_EQ, 2);
     tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
@@ -6869,6 +6996,9 @@ static void tcg_target_qemu_prologue(TCGContext *s)
                    tcg_retsp_off);
     }
     tcg_out_boundary_ldst(s, false);
+    if (tcg_retstack_reg >= 0 && tcg_retalign) {
+        tcg_out_retstack_walk(s);
+    }
 
     /* Remove TCG locals stack space.  */
     tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_SP,
