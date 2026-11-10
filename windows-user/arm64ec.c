@@ -263,17 +263,25 @@ static unsigned __stdcall doorbell_watcher(void *arg);
 /*
  * tcg_foreign_pc: native code is EC code (the PEB's bitmap); a lookup
  * skips it, and the exit to it is XT_EXCP_NATIVE, without the fetch fault
- * a translation of it would take (cpu_loop_exit_sigsegv).
+ * a translation of it would take (cpu_loop_exit_sigsegv).  The exit's
+ * call follows a tb_lookup of the same PC that found no TB, whose own
+ * call has just classified it: that answer is kept for it.
  */
 static bool ec_foreign_pc(CPUState *cs, vaddr pc, bool exit)
 {
-    if (!xt_is_ec_code(pc)) {
+    XtThread *t = cs->opaque;
+
+    if (!exit) {
+        t->ec_seen = xt_is_ec_code(pc);
+        t->ec_seen_pc = pc;
+        return t->ec_seen;
+    }
+    if (!(t->ec_seen && t->ec_seen_pc == pc) && !xt_is_ec_code(pc)) {
         return false;
     }
-    if (exit) {
-        ((XtThread *)cs->opaque)->native_target = pc;
-        cs->exception_index = XT_EXCP_NATIVE;
-    }
+    t->ec_seen = false;
+    t->native_target = pc;
+    cs->exception_index = XT_EXCP_NATIVE;
     return true;
 }
 

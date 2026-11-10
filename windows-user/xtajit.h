@@ -183,6 +183,8 @@ typedef struct XtThread {
     XtGuestFault gfault;
     XtFault fault;
     vaddr native_target;    /* set with XT_EXCP_NATIVE */
+    vaddr ec_seen_pc;       /* tb_lookup's last classification */
+    bool ec_seen;           /* (ec_foreign_pc): EC_SEEN_PC is EC code */
     ULONG *ec_doorbell;     /* the x64 module's SuspendDoorbell word */
     bool ec_suspended;      /* left through a suspension's continuation */
     /*
