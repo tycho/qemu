@@ -460,6 +460,9 @@ static int engine_state;    /* 0 none, 1 starting, 2 ready, -1 failed */
  * The engine, once per process, and the calling thread's record, once
  * per thread: at a thread's first entry, when the loader has set up the
  * module's TLS.  Another thread's first entry waits for the bring-up.
+ * The record is found through the CPU area, without the module's TLS:
+ * EmulatorData[0] is the thread's record from here until ThreadTerm
+ * takes it.
  */
 static XtThread *enter_engine(void)
 {
@@ -478,7 +481,7 @@ static XtThread *enter_engine(void)
             return NULL;
         }
     }
-    t = xt_self;
+    t = area->EmulatorData[0];
     if (!t) {
         t = xt_thread_new(false);
         t->cpu->opaque = t;
