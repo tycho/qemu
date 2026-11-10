@@ -2361,6 +2361,8 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
         tcg_gen_call_tb(tb_num, reset);
         gen_ret_landing(s, land, ret_landing_slot(s, tb_num));
         gen_set_label(reset);
+        /* Pushed, but leaving before the call. */
+        tcg_gen_ret_cancel();
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
             tcg_gen_movi_tl(cpu_eip, new_eip);
         }

@@ -1182,6 +1182,11 @@ bool tcg_sysret_supported(void)
 }
 
 #ifndef TCG_TARGET_HAS_RETSTACK
+static void tcg_out_ret_cancel(TCGContext *s)
+{
+    g_assert_not_reached();
+}
+
 static const TCGOutOp outop_retstack = {
     .static_constraint = C_NotImplemented,
 };
@@ -2543,6 +2548,7 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return false;
 #endif
     case INDEX_op_call_tb:
+    case INDEX_op_ret_cancel:
 #ifdef TCG_TARGET_HAS_RETSTACK
         return true;
 #else
@@ -7183,6 +7189,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             break;
         case INDEX_op_mb:
             tcg_out_mb(s, op->args[0]);
+            break;
+        case INDEX_op_ret_cancel:
+            tcg_out_ret_cancel(s);
             break;
         default:
         do_default:
