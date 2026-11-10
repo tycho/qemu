@@ -13,6 +13,7 @@
 #include "hw/core/cpu.h"
 #include "cpu.h"
 #include "tcg/tcg.h"
+#include "tcg/startup.h"
 #include "exec/mmap-lock.h"
 #include "accel/tcg/tb-context.h"
 #include "exec/page-protection.h"
@@ -258,6 +259,23 @@ static unsigned __stdcall doorbell_watcher(void *arg);
  * ThreadInit: so it runs at a thread's first entry (enter_engine), or in
  * the harness's own init.
  */
+/*
+ * tcg_foreign_pc: native code is EC code (the PEB's bitmap); a lookup
+ * skips it, and the exit to it is XT_EXCP_NATIVE, without the fetch fault
+ * a translation of it would take (cpu_loop_exit_sigsegv).
+ */
+static bool ec_foreign_pc(CPUState *cs, vaddr pc, bool exit)
+{
+    if (!xt_is_ec_code(pc)) {
+        return false;
+    }
+    if (exit) {
+        ((XtThread *)cs->opaque)->native_target = pc;
+        cs->exception_index = XT_EXCP_NATIVE;
+    }
+    return true;
+}
+
 static int process_init(void)
 {
     char *settings;
@@ -267,6 +285,7 @@ static int process_init(void)
     settings = settings_string();
     xt_log_open();
     xt_engine_init(settings, &init_applied, &init_rejected);
+    tcg_foreign_pc = ec_foreign_pc;
     /* Readers exist only while the engine owns a thread (xt_acquire). */
     rcu_unregister_thread();
     xt_gevent(XT_EV_THREAD_INIT, init_applied, init_rejected);
