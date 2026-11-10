@@ -1765,6 +1765,44 @@ void tcg_retstack_reset(CPUState *cpu)
     }
 }
 
+/* The top outside generated code, if the ring is in a register's keeping. */
+static uint64_t *retstack_top(CPUState *cpu, uint64_t **lo, uint64_t **hi)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+    if (tcg_retstack_reg < 0 || !jc || !jc->retring) {
+        return NULL;
+    }
+    *lo = jc->retring;
+    *hi = (uint64_t *)((char *)jc->retring + TCG_RETSTACK_SIZE);
+    return *(uint64_t **)((char *)cpu_env(cpu) + tcg_retsp_off);
+}
+
+bool tcg_retstack_pop_key(CPUState *cpu, uint64_t key)
+{
+    uint64_t *lo, *hi, *top = retstack_top(cpu, &lo, &hi);
+
+    if (!top || top < lo || top >= hi || top[0] != key) {
+        return false;
+    }
+    *(uint64_t **)((char *)cpu_env(cpu) + tcg_retsp_off) = top + 2;
+    return true;
+}
+
+bool tcg_retstack_push_key(CPUState *cpu, uint64_t key)
+{
+    uint64_t *lo, *hi, *top = retstack_top(cpu, &lo, &hi);
+
+    if (!top || top - 2 < lo || top > hi) {
+        return false;
+    }
+    top -= 2;
+    top[0] = key;
+    top[1] = 0;
+    *(uint64_t **)((char *)cpu_env(cpu) + tcg_retsp_off) = top;
+    return true;
+}
+
 /* tcg_retstack_env: entries pushed before now are no longer good. */
 void tcg_retstack_bump(CPUState *cpu)
 {

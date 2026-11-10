@@ -431,6 +431,18 @@ void tcg_retstack_bump(CPUState *cpu);
 #define TCG_RETSTACK_TAGS 128
 void tcg_retstack_reset(CPUState *cpu);
 /*
+ * tcg_retalign (x-retalign, user mode): keep the return stack in step
+ * with the host's calls where guest code is entered from outside it.
+ * With the top in tcg_retstack_reg (outside generated code, in env):
+ * tcg_retstack_pop_key() pops the top entry if its key is @key, and
+ * tcg_retstack_push_key() pushes @key with no landing, an entry that a
+ * return with that key reaches by the lookup.  Both stay within the ring
+ * and return whether they changed it.
+ */
+extern bool tcg_retalign;
+bool tcg_retstack_pop_key(CPUState *cpu, uint64_t key);
+bool tcg_retstack_push_key(CPUState *cpu, uint64_t key);
+/*
  * Whether the insn at @pc in the code buffer is a return stack push or
  * pop with its top in tcg_retstack_reg.
  */
