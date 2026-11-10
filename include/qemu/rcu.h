@@ -125,6 +125,13 @@ void synchronize_rcu(void);
  */
 void rcu_register_thread(void);
 void rcu_unregister_thread(void);
+/*
+ * Unregister @reader, another thread's, which has ended outside any read
+ * section, if it is registered; its storage must stay valid until this
+ * returns.  A thread that ended while registering is either registered or
+ * not: the registry's lock covers the insertion.
+ */
+void rcu_unregister_reader(struct rcu_reader_data *reader);
 
 /*
  * Support for fork().  fork() support is enabled at startup.
