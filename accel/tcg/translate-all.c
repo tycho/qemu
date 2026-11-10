@@ -1765,6 +1765,85 @@ void tcg_retstack_reset(CPUState *cpu)
     }
 }
 
+/* The top outside generated code, if the ring is in a register's keeping. */
+static uint64_t *retstack_top(CPUState *cpu, uint64_t **lo, uint64_t **hi)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+    if (tcg_retstack_reg < 0 || !jc || !jc->retring) {
+        return NULL;
+    }
+    *lo = jc->retring;
+    *hi = (uint64_t *)((char *)jc->retring + TCG_RETSTACK_SIZE);
+    return *(uint64_t **)((char *)cpu_env(cpu) + tcg_retsp_off);
+}
+
+bool tcg_retstack_pop_key(CPUState *cpu, uint64_t key)
+{
+    uint64_t *lo, *hi, *top = retstack_top(cpu, &lo, &hi);
+
+    if (!top || top < lo || top >= hi || top[0] != key) {
+        return false;
+    }
+    *(uint64_t **)((char *)cpu_env(cpu) + tcg_retsp_off) = top + 2;
+    return true;
+}
+
+void tcg_retstack_settle(CPUState *cpu)
+{
+    uint64_t *lo, *hi, *p;
+
+    if (!tcg_retalign) {
+        return;
+    }
+    p = retstack_top(cpu, &lo, &hi);
+    if (!p || p < lo) {
+        return;
+    }
+    /*
+     * Every landing above 0 from the top in env up is the abandoned
+     * invocation's: it may have returned past older entries and pushed
+     * again above them, so an old or empty landing doesn't end them.
+     * Below the top is free space, which a push writes before a return
+     * can read it.
+     */
+    for (; p < hi; p += 2) {
+        if ((int64_t)p[1] > 0) {
+            p[1] = p[1] == 1 ? 0 : p[1] | INT64_MIN;
+        }
+    }
+}
+
+void tcg_retstack_check(CPUState *cpu)
+{
+    uint64_t *lo, *hi, *p;
+
+    if (!tcg_retalign) {
+        return;
+    }
+    p = retstack_top(cpu, &lo, &hi);
+    if (!p || p < lo) {
+        return;
+    }
+    for (; p < hi; p += 2) {
+        tcg_debug_assert((int64_t)p[1] <= 0);
+    }
+}
+
+bool tcg_retstack_push_key(CPUState *cpu, uint64_t key)
+{
+    uint64_t *lo, *hi, *top = retstack_top(cpu, &lo, &hi);
+
+    if (!top || top - 2 < lo || top > hi) {
+        return false;
+    }
+    top -= 2;
+    top[0] = key;
+    top[1] = 0;
+    *(uint64_t **)((char *)cpu_env(cpu) + tcg_retsp_off) = top;
+    return true;
+}
+
 /* tcg_retstack_env: entries pushed before now are no longer good. */
 void tcg_retstack_bump(CPUState *cpu)
 {
@@ -1787,6 +1866,10 @@ uintptr_t tcg_retstack_fault(CPUState *cpu, uintptr_t pc, uintptr_t addr)
     if (addr + page < ring || addr >= ring + TCG_RETSTACK_SIZE + page ||
         (addr >= ring && addr < ring + TCG_RETSTACK_SIZE)) {
         return 0;
+    }
+    if (tcg_retalign) {
+        /* Which calls are owed is no longer known: none, from here. */
+        memset(jc->retring, 0, TCG_RETSTACK_SIZE);
     }
     return ring + TCG_RETSTACK_SIZE / 2;
 }

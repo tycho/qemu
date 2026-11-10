@@ -425,11 +425,38 @@ bool tcg_sysret_supported(void);
 void tcg_retstack_bump(CPUState *cpu);
 #define TCG_RETSTACK_SIZE (16 * 1024)
 /*
+ * User mode: the mapping for a ring aligned to twice its size, which
+ * generated code's walk relies on (tcg_retalign), with a guard page of
+ * size @page at each end.
+ */
+#define TCG_RETSTACK_MAP_SIZE(page) (3 * TCG_RETSTACK_SIZE + 2 * (page))
+/*
  * The tags of tcg_gen_push_ret() are below this; the epoch at
  * tcg_retep_off counts in steps of it.
  */
 #define TCG_RETSTACK_TAGS 128
 void tcg_retstack_reset(CPUState *cpu);
+/*
+ * tcg_retalign (x-retalign, user mode): keep the return stack in step
+ * with the host's calls where guest code is entered from outside it.
+ * With the top in tcg_retstack_reg (outside generated code, in env):
+ * tcg_retstack_pop_key() pops the top entry if its key is @key, and
+ * tcg_retstack_push_key() pushes @key with no landing, an entry that a
+ * return with that key reaches by the lookup.  Both stay within the ring
+ * and return whether they changed it.
+ */
+extern bool tcg_retalign;
+bool tcg_retstack_pop_key(CPUState *cpu, uint64_t key);
+bool tcg_retstack_push_key(CPUState *cpu, uint64_t key);
+/*
+ * tcg_retalign: after generated code was left without its epilogue (a
+ * longjmp), mark old every landing above 0 from the top in env up, as
+ * the epilogue would its run of them, but return nothing: the host's
+ * return predictor is past repair.
+ */
+void tcg_retstack_settle(CPUState *cpu);
+/* tcg_retalign: assert that no landing from the top in env up is above 0. */
+void tcg_retstack_check(CPUState *cpu);
 /*
  * Whether the insn at @pc in the code buffer is a return stack push or
  * pop with its top in tcg_retstack_reg.
@@ -654,9 +681,18 @@ extern bool tcg_zext32_active;
  * code that isn't the guest's (an x64 process's native ARM64EC code on
  * Windows): whether @pc is such code, which lookups then skip without
  * probing its page.  With @exit, the call also prepares the CPU's exit to
- * it (its exception_index), for cpu_exec to return.
+ * it (its exception_index), for cpu_exec to return: from the main loop's
+ * lookup, or from helper_lookup_tb_ptr's after a TB, which then leaves
+ * through the epilogue to the main loop, which returns.
  */
 extern bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
+
+/*
+ * tcg_cpu_bound: set by a user-mode front end that sets current_cpu
+ * itself, whenever a thread takes a CPU, and calls cpu_exec only with the
+ * calling thread's CPU.  cpu_exec then leaves current_cpu as it is.
+ */
+extern bool tcg_cpu_bound;
 
 /* Whether x-zext32 can be on: user mode on a host that supports it. */
 bool tcg_can_zext32(void);

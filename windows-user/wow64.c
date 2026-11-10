@@ -67,7 +67,7 @@ static void fix_query(uint32_t *args);
 static uint32_t nr_query_vm = ~0u;    /* NtQueryVirtualMemory's number */
 static uint32_t nr_protect_vm = ~0u;  /* NtProtectVirtualMemory's */
 static void guard_added(uint32_t *args);
-static void bring_out(DWORD tid, void *teb, bool retire);
+static void bring_out(DWORD tid, void *teb, HANDLE h, bool retire);
 
 static XtThread *thread_of_teb(void *teb)
 {
@@ -237,25 +237,36 @@ XTEXPORT NTSTATUS WINAPI BTCpuProcessInit(void)
 typedef struct XtThreadRef {
     DWORD tid;
     void *teb;
+    HANDLE h;               /* the record's own, copied */
 } XtThreadRef;
 
 static void bring_out_others(void)
 {
     DWORD me = GetCurrentThreadId();
     GArray *threads = g_array_sized_new(FALSE, FALSE, sizeof(XtThreadRef), 8);
+    LARGE_INTEGER zero = { .QuadPart = 0 };
     bool began = xt_adapter_begin();
     CPUState *cs;
 
-    /* The records stay while held, though their threads may exit. */
+    /*
+     * The records stay while held, though their threads may exit; a thread
+     * that has ended (another's termination, its record not yet reaped)
+     * is passed over, its TEB gone.
+     */
     xt_record_hold();
     cpu_list_lock();
     CPU_FOREACH(cs) {
         XtThread *t = cs->opaque;
 
-        if (t && t->wow64 && t->tid != me) {
+        if (t && t->wow64 && t->tid != me && t->handle &&
+            NtWaitForSingleObject(t->handle, FALSE, &zero) == STATUS_TIMEOUT) {
             XtThreadRef r = { t->tid, t->teb };
 
-            g_array_append_val(threads, r);
+            if (NtDuplicateObject(GetCurrentProcess(), t->handle,
+                                  GetCurrentProcess(), &r.h, 0, 0,
+                                  DUPLICATE_SAME_ACCESS) >= 0) {
+                g_array_append_val(threads, r);
+            }
         }
     }
     cpu_list_unlock();
@@ -263,7 +274,7 @@ static void bring_out_others(void)
     for (guint i = 0; i < threads->len; i++) {
         XtThreadRef *r = &g_array_index(threads, XtThreadRef, i);
 
-        bring_out(r->tid, r->teb, false);
+        bring_out(r->tid, r->teb, r->h, false);
     }
     xt_record_release();
     g_array_free(threads, TRUE);
@@ -339,22 +350,6 @@ XTEXPORT NTSTATUS WINAPI BTCpuThreadInit(void)
     return STATUS_SUCCESS;
 }
 
-static DWORD thread_id(HANDLE thread, void **teb)
-{
-    XtThreadBasicInfo tbi;
-
-    /* wow64.dll names the calling thread with a null handle. */
-    if (!thread || thread == GetCurrentThread()) {
-        *teb = NtCurrentTeb();
-        return GetCurrentThreadId();
-    }
-    if (NtQueryInformationThread(thread, 0, &tbi, sizeof(tbi), NULL) < 0) {
-        return 0;
-    }
-    *teb = tbi.TebBaseAddress;
-    return (DWORD)(uintptr_t)tbi.ClientId.UniqueThread;
-}
-
 /*
  * Another thread is about to be terminated (NtTerminateThread follows).
  * It must first stop where neither the engine nor wow64.dll has anything
@@ -380,40 +375,45 @@ static DWORD thread_id(HANDLE thread, void **teb)
  * it where it owns no engine state (outside simulation, not inside an
  * adapter's locks or wow64.dll's), else ask it to leave and try again.
  * Then retire its record (it is being terminated alone), or leave it
- * suspended there (the whole process is ending).
+ * suspended there (the whole process is ending).  A context that can't
+ * be read is a suspension that may not have taken effect: resumed and
+ * tried again, up to 64 times in a row.  A thread that can't be suspended
+ * through its record's own handle, or whose context can't be read, is
+ * ending already: left as it is, its record kept.
  */
-static void bring_out(DWORD tid, void *teb, bool retire)
+static void bring_out(DWORD tid, void *teb, HANDLE h, bool retire)
 {
-    OBJECT_ATTRIBUTES oa = { .Length = sizeof(oa) };
-    CLIENT_ID cid = { .UniqueThread = (HANDLE)(uintptr_t)tid };
     CONTEXT ctx = { .ContextFlags = CONTEXT_CONTROL };
     LARGE_INTEGER tick = { .QuadPart = -10000 };
     uint64_t *slot2 = (uint64_t *)((char *)teb + TEB_TLS_SLOTS + 2 * 8);
     uint64_t *slot6 = (uint64_t *)((char *)teb + TEB_TLS_SLOTS + 6 * 8);
-    HANDLE h;
     XtThread *t;
-    int tries;
+    int tries, unread = 0;
 
-    if (!thread_of_teb(teb)) {
-        /* Not ours, or a second notification for the same thread. */
-        xt_gevent(XT_EV_THREAD_TERM, tid, 0);
-        return;
-    }
-    if (NtOpenThread(&h, SYNCHRONIZE | THREAD_SUSPEND_RESUME |
-                     THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-                     &oa, &cid) < 0) {
-        xt_gevent(XT_EV_THREAD_TERM, tid, 1);
-        return;
-    }
+    /* Its TEB is read only once it is suspended: it may have ended. */
     for (tries = 0;; tries++) {
         if (NtSuspendThread(h, NULL) < 0) {
             break;
         }
-        /* The suspension takes effect by the time the context is read. */
-        NtGetContextThread(h, &ctx);
+        /*
+         * The suspension takes effect by the time the context is read:
+         * until it has been read, the thread may still be running.
+         */
+        if (NtGetContextThread(h, &ctx) < 0) {
+            NtResumeThread(h, NULL);
+            if (++unread == 64) {
+                break;
+            }
+            NtYieldExecution();
+            continue;
+        }
+        unread = 0;
         t = thread_of_teb(teb);
         if (!t) {
-            /* Its own exit has begun: let it finish. */
+            /*
+             * Not ours, a second notification for the same thread, or its
+             * own exit has begun: let it finish.
+             */
             NtResumeThread(h, NULL);
             break;
         }
@@ -451,20 +451,22 @@ static void bring_out(DWORD tid, void *teb, bool retire)
 /*
  * The suspension of another thread is outside an adapter scope: two
  * threads terminating each other would otherwise each wait for the
- * other's notification.  A thread Windows won't end (xt_terminates) is
- * left alone.
+ * other's notification.  A thread Windows won't end (xt_terminated_thread)
+ * is left alone.
  */
 XTEXPORT void WINAPI BTCpuThreadTerm(HANDLE thread, LONG code)
 {
     void *teb = NULL;
+    HANDLE own;
     DWORD tid;
     XtThread *t;
     bool began;
 
-    if (!xt_terminates(thread)) {
+    /* wow64.dll names the calling thread with a null handle. */
+    tid = xt_terminated_thread(thread, &teb, &own);
+    if (!tid) {
         return;
     }
-    tid = thread_id(thread, &teb);
     t = xt_tls_ready() ? xt_self : NULL;
     xt_enter();
     began = xt_adapter_begin();
@@ -481,8 +483,10 @@ XTEXPORT void WINAPI BTCpuThreadTerm(HANDLE thread, LONG code)
     if (t && tid == t->tid) {
         xt_crt_thread_fini();
     }
-    if (tid && tid != GetCurrentThreadId()) {
-        bring_out(tid, teb, true);
+    if (tid != GetCurrentThreadId()) {
+        bring_out(tid, teb, own, true);
+    } else if (own) {
+        NtClose(own);
     }
 }
 

@@ -297,6 +297,7 @@ static bool tb_jmp_cache_global(CPUState *cpu, TranslationBlock *tb, vaddr pc)
  * Returns: an existing translation block or NULL.
  */
 bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
+bool tcg_cpu_bound;
 
 static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
@@ -755,6 +756,14 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
 
     tb = tb_lookup(cpu, s);
     if (tb == NULL) {
+        /*
+         * Code that isn't the guest's: the exit to it is raised here,
+         * where the lookup has just classified it, and cpu_exec_loop
+         * leaves after the epilogue without looking it up again.
+         */
+        if (unlikely(tcg_foreign_pc)) {
+            tcg_foreign_pc(cpu, s.pc, true);
+        }
         return tcg_code_gen_epilogue;
     }
 
@@ -879,6 +888,10 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
         log_cpu_exec(log_pc(cpu, itb), cpu, itb);
     }
 
+#ifdef CONFIG_DEBUG_TCG
+    /* x-retalign: no landing above 0 outside generated code. */
+    tcg_retstack_check(cpu);
+#endif
     qemu_thread_jit_execute();
     ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
     cpu->neg.can_do_io = true;
@@ -960,6 +973,7 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
 {
     /* Non-buggy compilers preserve this; assert the correct value. */
     g_assert(cpu == current_cpu);
+    tcg_retstack_settle(cpu);
 
 #ifdef CONFIG_USER_ONLY
     clear_helper_retaddr();
@@ -1345,12 +1359,6 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
     return false;
 }
 
-/*
- * tcg_superblock with edge checks: a request seen at an exit that names no
- * TB (exit_tb(NULL, 0)) samples the next TB the main loop runs instead.
- */
-static __thread bool region_sample_next;
-
 static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
                                     vaddr pc, TranslationBlock **last_tb,
                                     int *tb_exit)
@@ -1364,7 +1372,7 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
             if (tb) {
                 region_sample(cpu, tb);
             } else if (tcg_edge_sys) {
-                region_sample_next = true;
+                cpu->tb_jmp_cache->region_sample_next = true;
             }
         }
         return;
@@ -1519,11 +1527,21 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 }
             }
 
-            if (unlikely(region_sample_next)) {
-                region_sample_next = false;
+            if (unlikely(cpu->tb_jmp_cache->region_sample_next)) {
+                cpu->tb_jmp_cache->region_sample_next = false;
                 region_sample(cpu, tb);
             }
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
+
+            /*
+             * An exit to code that isn't the guest's, raised by
+             * helper_lookup_tb_ptr: out through cpu_handle_exception, as
+             * from the lookup above.  Nothing else leaves a TB normally
+             * with an exception pending.
+             */
+            if (unlikely(tcg_foreign_pc) && cpu->exception_index >= 0) {
+                break;
+            }
 
             /* Try to align the host and virtual clocks
                if the guest is in advance */
@@ -1545,11 +1563,14 @@ static int cpu_exec_setjmp(CPUState *cpu, SyncClocks *sc)
 
 int cpu_exec(CPUState *cpu)
 {
+    struct rcu_reader_data *rcu;
     int excp;
     SyncClocks sc = { 0 };
 
     /* replay_interrupt may need current_cpu */
-    current_cpu = cpu;
+    if (!tcg_cpu_bound) {
+        current_cpu = cpu;
+    }
 
 #ifndef CONFIG_USER_ONLY
     if (cpu->halted) {
@@ -1560,7 +1581,8 @@ int cpu_exec(CPUState *cpu)
     }
 #endif
 
-    RCU_READ_LOCK_GUARD();
+    rcu = get_ptr_rcu_reader();
+    rcu_read_lock_reader(rcu);
     cpu_exec_enter(cpu);
 
     /*
@@ -1574,6 +1596,7 @@ int cpu_exec(CPUState *cpu)
     excp = cpu_exec_setjmp(cpu, &sc);
 
     cpu_exec_exit(cpu);
+    rcu_read_unlock_reader(rcu);
     return excp;
 }
 
@@ -1630,17 +1653,25 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
                                                    TCG_RETSTACK_SIZE);
         tcg_retstack_reset(cpu);
     } else if (tcg_retstack && tcg_retsp_off) {
+        /*
+         * A guard page at each end, the ring aligned to twice its size
+         * (TCG_RETSTACK_MAP_SIZE).
+         */
         size_t page = qemu_real_host_page_size();
-        char *p = mmap(NULL, TCG_RETSTACK_SIZE + 2 * page, PROT_NONE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        size_t len = TCG_RETSTACK_MAP_SIZE(page);
+        char *p = mmap(NULL, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS,
+                       -1, 0);
+        char *ring = p == MAP_FAILED ? NULL :
+            (char *)ROUND_UP((uintptr_t)p + page, 2 * TCG_RETSTACK_SIZE);
 
-        if (p != MAP_FAILED &&
-            !mprotect(p + page, TCG_RETSTACK_SIZE, PROT_READ | PROT_WRITE)) {
-            cpu->tb_jmp_cache->retring = p + page;
+        if (ring &&
+            !mprotect(ring, TCG_RETSTACK_SIZE, PROT_READ | PROT_WRITE)) {
+            cpu->tb_jmp_cache->retring = ring;
+            cpu->tb_jmp_cache->retmap = p;
             tcg_retstack_reset(cpu);
         } else {
             if (p != MAP_FAILED) {
-                munmap(p, TCG_RETSTACK_SIZE + 2 * page);
+                munmap(p, len);
             }
             /*
              * Generated code pushes and pops with the top in
@@ -1677,10 +1708,7 @@ static void tb_jmp_cache_free(CPUJumpCache *jc)
     if (tcg_retstack_env) {
         qemu_vfree(jc->retring);
     } else if (jc->retring) {
-        /* Mapped with a guard page at each end. */
-        size_t page = qemu_real_host_page_size();
-
-        munmap((char *)jc->retring - page, TCG_RETSTACK_SIZE + 2 * page);
+        munmap(jc->retmap, TCG_RETSTACK_MAP_SIZE(qemu_real_host_page_size()));
     }
     qemu_vfree(jc);
 }

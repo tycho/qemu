@@ -133,6 +133,8 @@ DEF(call_tb, 0, 0, 2, TCG_OPF_BB_EXIT | TCG_OPF_BB_END | TCG_OPF_NOT_PRESENT)
 DEF(goto_tb_cold, 0, 0, 2,
     TCG_OPF_BB_EXIT | TCG_OPF_BB_END | TCG_OPF_NOT_PRESENT)
 DEF(ret_tb, 0, 1, 1, TCG_OPF_BB_END | TCG_OPF_COND_BRANCH | TCG_OPF_INT)
+/* tcg_retalign: the push on top leaves without its host call. */
+DEF(ret_cancel, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 /* A TB's start, or a return into it: the boundary globals arrive. */
 DEF(boundary_in, 2, 0, 0, TCG_OPF_NOT_PRESENT)
 
