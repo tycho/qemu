@@ -47,7 +47,8 @@ NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
 extern IMAGE_DOS_HEADER __ImageBase;
 
 #ifndef XT_SCAFFOLD
-#define XT_SCAFFOLD "smc=check"
+/* The fork's defaults for the module; XTAJIT_SETTINGS overrides them. */
+#define XT_SCAFFOLD "smc=check,retalign=on"
 #endif
 
 /*
