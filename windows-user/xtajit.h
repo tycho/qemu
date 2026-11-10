@@ -168,6 +168,7 @@ typedef struct XtThread {
     void *heap;             /* its allocator heap, given back with it */
     DWORD tid;
     void *teb;
+    HANDLE handle;          /* the thread, with all access: who it is */
     bool wow64;             /* under wow64.dll: slot 2, the CPU area */
     bool stop_at_int3;      /* the native harness: int3 ends a run */
     uint64_t int3_rip;      /* a raised int3's RIP, past it, until dispatch */
@@ -326,7 +327,7 @@ bool xt_guest_read(XtThread *t, vaddr addr, void *buf, size_t len);
 void xt_record_hold(void);
 void xt_record_release(void);
 void xt_thread_retire(XtThread *t, void *thread_handle);
-bool xt_terminates(HANDLE thread);
+DWORD xt_terminated_thread(HANDLE thread, void **teb, HANDLE *own);
 void xt_reap_later(void *thread_handle, void *alloc);
 void xt_park(XtThread *t);
 int xt_reap(void);
