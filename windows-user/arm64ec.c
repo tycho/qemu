@@ -763,7 +763,9 @@ static void leave(XtThread *t, ARM64_NT_CONTEXT *n, bool context_exit)
     if (context_exit) {
         aux_push(t, n->Sp, xt_ec_eflags(t->env));
     }
-    xt_log_flush(t);
+    if (xt_log_handle()) {
+        xt_log_flush(t);
+    }
 }
 
 static G_NORETURN void leave_native(XtThread *t, XtEcFrame *f,
@@ -1119,6 +1121,7 @@ XTEXPORT int xt_ec_test_init(int *rejected)
     if (xt_cpu_avx()) {
         return -1;
     }
+    xt_diag = true;
     if (!init_syscalls() || process_init() < 0) {
         return -1;
     }

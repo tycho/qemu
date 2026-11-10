@@ -420,8 +420,10 @@ void xt_run(XtThread *t, XtExit *x)
         }
         /* Clears exit_request and runs queued work, as linux-user's loop. */
         qemu_process_cpu_events(cs);
-        xt_event(t, XT_EV_EXIT, trapnr, env->eip);
-        xt_check(t, XT_ENGINE, 10);
+        if (xt_diag) {
+            xt_event(t, XT_EV_EXIT, trapnr, env->eip);
+            xt_check(t, XT_ENGINE, 10);
+        }
 
         switch (trapnr) {
         case EXCP_INTERRUPT:

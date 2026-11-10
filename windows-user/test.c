@@ -55,6 +55,7 @@ static LONG CALLBACK xt_veh(EXCEPTION_POINTERS *p)
 
 XTEXPORT int xt_test_init(int *rejected)
 {
+    xt_diag = true;
     xt_process_init(false);
     RtlAddVectoredExceptionHandler(1, xt_veh);
     return xt_settings_applied(rejected);
