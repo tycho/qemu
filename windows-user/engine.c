@@ -721,6 +721,16 @@ static void set_settings(Object *accel, const char *settings)
             } else if (!strcmp(kv[i], "cacheselftest")) {
                 cache_selftest = true;
                 applied++;
+#ifdef TARGET_X86_64
+            } else if (!strcmp(kv[i], "rcustress")) {
+                /* Testing: grace periods back to back (arm64ec.c). */
+                xt_rcu_stress = true;
+                applied++;
+#endif
+            } else if (!strcmp(kv[i], "diag")) {
+                /* Transition diagnostics (xt_diag). */
+                xt_diag = true;
+                applied++;
             } else if (!strcmp(kv[i], "zext32poison")) {
                 /* x-zext32=check's tests (tcg_zext32_poison). */
                 tcg_zext32_poison = true;
@@ -737,6 +747,14 @@ static void set_settings(Object *accel, const char *settings)
             continue;
         }
         /* The translation cache's settings with a value (testing). */
+#ifdef TARGET_X86_64
+        if (!strncmp(kv[i], "rcuinj=", 7)) {
+            /* Testing: registration interrupted (arm64ec.c). */
+            xt_rcu_inj_step = atoi(eq + 1);
+            applied++;
+            continue;
+        }
+#endif
         if (!strncmp(kv[i], "cacheflush=", 11)) {
             tcg_cache_flush_every = atoi(eq + 1);
             applied++;
@@ -834,6 +852,9 @@ static void G_NORETURN cache_terminate(void)
 
 bool xt_fault_context_partial;
 bool xt_native_harness;
+bool xt_diag;
+bool xt_rcu_stress;
+int xt_rcu_inj_step;
 
 /*
  * A setting asked for that the module doesn't know or can't do: the

@@ -225,6 +225,18 @@ extern bool xt_fault_context_partial;
 /* The x64 module runs under its native test harness (xt_ec_test_init). */
 extern bool xt_native_harness;
 /*
+ * Diagnostics at every transition between Windows and the engine: the
+ * state machine's invariant checks (xt_check) and the routine events
+ * (acquire, exit) in the thread's event ring.  On with the setting
+ * keyword "diag", a log (XTAJIT_LOG), or a test harness; fault and
+ * suspension events are recorded regardless.
+ */
+extern bool xt_diag;
+/* Testing (keyword rcustress): grace periods back to back. */
+extern bool xt_rcu_stress;
+/* Testing (keyword rcuinj=N): registrations interrupted at step N. */
+extern int xt_rcu_inj_step;
+/*
  * Whether ordered accesses that cross 16 bytes fault on this host
  * (fault.c): the number of forms tried that faulted or gave wrong bytes,
  * 0 if every one was performed, -1 if the probe couldn't run; what it saw
@@ -285,6 +297,14 @@ enum {
 };
 long xt_emutls_test(int what, long arg);
 void xt_emutls_reap(void);
+#define XT_EMUTLS_READER_INTENT ((void *)1)
+void *xt_emutls_reader_intent(void);
+void xt_emutls_reader_set(void *reader);
+/* The x64 module: this thread's RCU reader, registered for its life. */
+void xt_rcu_ensure(void);
+void *xt_emutls_reader_get(void);
+void *xt_emutls_reader_ended(void *root);
+void xt_emutls_reader_retired(void *root);
 void xt_enter(void);
 void xt_placement(const char *what, const void *p);
 XtThread *xt_thread_new(bool wow64);
@@ -329,6 +349,7 @@ static inline uint32_t xt_ec_eflags(CPUX86State *env)
 }
 
 void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n);
+void xt_ec_pack_call(XtThread *t, ARM64_NT_CONTEXT *n);
 void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n);
 bool xt_ec_ymm(XtThread *t);
 void xt_ec_import_ymm(XtThread *t, const CONTEXT *c);
