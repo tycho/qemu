@@ -32,7 +32,9 @@
  * code that isn't the guest's (an x64 process's native ARM64EC code on
  * Windows): whether @pc is such code, which lookups then skip without
  * probing its page.  With @exit, the call also prepares the CPU's exit to
- * it (its exception_index), for cpu_exec to return.
+ * it (its exception_index), for cpu_exec to return: from the main loop's
+ * lookup, or from helper_lookup_tb_ptr's after a TB, which then leaves
+ * through the epilogue to the main loop, which returns.
  */
 extern bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
 
