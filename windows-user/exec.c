@@ -12,6 +12,7 @@
 #include "accel/tcg/cpu-loop.h"
 #include "exec/cpu-common.h"
 #include "xtajit.h"
+#include "run.h"
 
 uintptr_t xt_bop;
 
@@ -369,144 +370,112 @@ static void guest_exception(XtThread *t, int trapnr, XtExit *x)
     }
 }
 
-/*
- * Run guest code until an exit Windows has to see; the engine owns the
- * thread throughout.  Handled here, without leaving ownership: kicks
- * (exit requests, queued work such as flushes), the timer (int 0x81) and
- * the serial step of an atomic operation (EXCP_ATOMIC).  The system-call
- * stub's exit captures the number and argument pointer and completes the
- * stub's return (EIP from the stack, ESP + 4) before it is published.
- */
-void xt_run(XtThread *t, XtExit *x)
+/* The ends of a run that guest code runs on from: true when TRAPNR is one. */
+bool xt_run_handled(XtThread *t, int trapnr)
 {
     CPUState *cs = t->cpu;
     CPUX86State *env = t->env;
-    bool stepping;
-    int trapnr;
 
-    for (;;) {
-        /*
-         * A suspension request is checked here, between runs, as well as
-         * ending the run (cpu_exit): qemu_process_cpu_events clears an
-         * exit request that arrives after cpu_exec has returned.
-         */
-        if (qatomic_read(&t->suspend_req)) {
-            qatomic_set(&t->suspend_req, 0);
-            t->suspensions++;
-            t->after_suspend = true;
-            xt_event(t, XT_EV_SUSPEND_SEEN, 0, env->eip);
-            x->kind = XT_EXIT_SUSPEND;
-            x->trapnr = EXCP_INTERRUPT;
-            return;
-        }
-        t->after_suspend = false;
-        t->gfault.code = 0;
-        /* Past a breakpoint (xt_import): one instruction, stepped. */
-        stepping = t->bp_skip;
-        t->bp_skip = false;
-        if (stepping) {
-            cpu_single_step(cs, SSTEP_ENABLE | SSTEP_NOIRQ | SSTEP_NOTIMER);
-        }
-        t->active = XT_ACT_EXEC;
-        cpu_exec_start(cs);
-        trapnr = cpu_exec(cs);
-        cpu_exec_end(cs);
+    switch (trapnr) {
+    case EXCP_INTERRUPT:
+        return true;
+    case EXCP_ATOMIC:
+        xt_event(t, XT_EV_ATOMIC, 0, env->eip);
+        xt_inject(t, XT_INJ_ATOMIC);
+        t->active = XT_ACT_ATOMIC;
+        cpu_exec_step_atomic(cs);
         t->active = XT_ACT_NONE;
-        if (stepping) {
-            cpu_single_step(cs, 0);
-            if (trapnr == EXCP_DEBUG) {
-                continue;
-            }
-        }
-        /*
-         * Clears exit_request and runs queued work, as linux-user's loop.
-         * Work is listed before its kick sets the request
-         * (queue_work_on_cpu, cpu_exit's release): with no request seen
-         * there is no work to run yet, and a later kick's request stays
-         * set for the next cpu_exec.
-         */
-        if (qatomic_load_acquire(&cs->exit_request)) {
-            qemu_process_cpu_events(cs);
-        }
-        if (xt_diag) {
-            xt_event(t, XT_EV_EXIT, trapnr, env->eip);
-            xt_check(t, XT_ENGINE, 10);
-        }
+        return true;
+    case 0x81: {
+        uint64_t v = read_cntvct();
 
-        switch (trapnr) {
-        case EXCP_INTERRUPT:
-            continue;
-        case EXCP_ATOMIC:
-            xt_event(t, XT_EV_ATOMIC, 0, env->eip);
-            xt_inject(t, XT_INJ_ATOMIC);
-            t->active = XT_ACT_ATOMIC;
-            cpu_exec_step_atomic(cs);
-            t->active = XT_ACT_NONE;
-            continue;
+#ifdef TARGET_X86_64
+        /* The host counter, in RAX. */
+        env->regs[R_EAX] = v;
+#else
+        env->regs[R_EAX] = (uint32_t)v;
+        env->regs[R_EDX] = v >> 32;
+#endif
+        xt_event(t, XT_EV_INT81, v, env->eip);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+/*
+ * The exit Windows has to see for TRAPNR from xt_run_core, but a transfer
+ * to native code, into X.
+ */
+void xt_run_exit(XtThread *t, int trapnr, XtExit *x)
+{
+    CPUX86State *env = t->env;
+
+    switch (trapnr) {
+    case XT_EXCP_SUSPEND:
+        qatomic_set(&t->suspend_req, 0);
+        t->suspensions++;
+        t->after_suspend = true;
+        xt_event(t, XT_EV_SUSPEND_SEEN, 0, env->eip);
+        x->kind = XT_EXIT_SUSPEND;
+        x->trapnr = EXCP_INTERRUPT;
+        return;
 #ifndef TARGET_X86_64
-        case 0x81: {
-            uint64_t v = read_cntvct();
+    case 0x2e:
+        if (xt_bop && env->eip == xt_bop + 2) {
+            uint32_t esp = env->regs[R_ESP], ret;
 
-            env->regs[R_EAX] = (uint32_t)v;
-            env->regs[R_EDX] = v >> 32;
-            xt_event(t, XT_EV_INT81, v, env->eip);
-            continue;
-        }
-        case 0x2e:
-            if (xt_bop && env->eip == xt_bop + 2) {
-                uint32_t esp = env->regs[R_ESP], ret;
-
-                if (!xt_guest_read(t, esp, &ret, 4)) {
-                    env->eip = xt_bop;
-                    env->cr[2] = esp;
-                    env->error_code = PG_ERROR_U_MASK;
-                    t->gfault.code = STATUS_ACCESS_VIOLATION;
-                    guest_exception(t, EXCP0E_PAGE, x);
-                    return;
-                }
-                x->kind = XT_EXIT_SYSCALL;
-                x->trapnr = trapnr;
-                x->nr = env->regs[R_EAX];
-                x->args = esp + 8;
-                env->eip = ret;
-                env->regs[R_ESP] = esp + 4;
+            if (!xt_guest_read(t, esp, &ret, 4)) {
+                env->eip = xt_bop;
+                env->cr[2] = esp;
+                env->error_code = PG_ERROR_U_MASK;
+                t->gfault.code = STATUS_ACCESS_VIOLATION;
+                guest_exception(t, EXCP0E_PAGE, x);
                 return;
             }
-            break;
-#endif
-#ifdef TARGET_X86_64
-        case 0x81: {
-            /* The host counter, in RAX. */
-            uint64_t v = read_cntvct();
-
-            env->regs[R_EAX] = v;
-            xt_event(t, XT_EV_INT81, v, env->eip);
-            continue;
-        }
-        case XT_EXCP_NATIVE:
-            x->kind = XT_EXIT_NATIVE;
-            x->trapnr = trapnr;
-            x->target = t->native_target;
-            return;
-        case EXCP_SYSCALL:
-        case 0x2e:
-            /* syscall, or int 0x2e: RIP is past the instruction. */
             x->kind = XT_EXIT_SYSCALL;
             x->trapnr = trapnr;
             x->nr = env->regs[R_EAX];
+            x->args = esp + 8;
+            env->eip = ret;
+            env->regs[R_ESP] = esp + 4;
             return;
-#endif
-        case EXCP03_INT3:
-            if (t->stop_at_int3) {
-                x->kind = XT_EXIT_STOP;
-                x->trapnr = trapnr;
-                return;
-            }
-            break;
-        default:
-            break;
         }
-        guest_exception(t, trapnr, x);
+        break;
+#endif
+#ifdef TARGET_X86_64
+    case EXCP_SYSCALL:
+    case 0x2e:
+        /* syscall, or int 0x2e: RIP is past the instruction. */
+        x->kind = XT_EXIT_SYSCALL;
+        x->trapnr = trapnr;
+        x->nr = env->regs[R_EAX];
+        return;
+#endif
+    case EXCP03_INT3:
+        if (t->stop_at_int3) {
+            x->kind = XT_EXIT_STOP;
+            x->trapnr = trapnr;
+            return;
+        }
+        break;
+    default:
+        break;
+    }
+    guest_exception(t, trapnr, x);
+}
+
+/* xt_run_core, with every exit in X. */
+void xt_run(XtThread *t, XtExit *x)
+{
+    int trapnr = xt_run_core(t);
+
+    if (trapnr == XT_EXCP_NATIVE) {
+        x->kind = XT_EXIT_NATIVE;
+        x->trapnr = trapnr;
+        x->target = t->native_target;
         return;
     }
+    xt_run_exit(t, trapnr, x);
 }
