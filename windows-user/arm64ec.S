@@ -68,6 +68,8 @@ xt_check_call:
  * KiUserEmulationDispatcher's BeginSimulation).  While the capture probe
  * sets xt_cap_entry_mode, xt_cap_entry (test-ec.S) takes them instead.
  * x16 and x17 are free at each; x9 holds the target where there is one.
+ * x13 carries the entry's kind to the frame: ARM64EC code never uses it,
+ * so native code reached by the bypass below can't depend on it.
  */
 .macro cap_check which
     adrp    x17, xt_cap_entry_mode
@@ -78,7 +80,11 @@ xt_check_call:
 1:
 .endm
 
-/* XtEcFrame.ctx: an ARM64_NT_CONTEXT 16 bytes into the frame. */
+/*
+ * XtEcFrame.entry, the entry's kind (XT_EC_ENTRY_*), and XtEcFrame.ctx, an
+ * ARM64_NT_CONTEXT 16 bytes into the frame.
+ */
+#define F_ENTRY     0x04
 #define F_X(n)      (0x10 + 0x08 + 8 * (n))
 #define F_CPSR      (0x10 + 0x04)
 #define F_SP        (0x10 + 0x100)
@@ -100,12 +106,14 @@ xt_check_call:
 DispatchJump:
     cap_check 1
     str     lr, [sp, #-8]!      /* the x64 return address */
+    mov     w13, #1             /* XT_EC_ENTRY_CALL */
     b       2f
 
     .globl RetToEntryThunk
 RetToEntryThunk:
     cap_check 2
     mov     x9, lr
+    mov     w13, #2             /* XT_EC_ENTRY_RETURN */
 2:
     /* Native code (the EC bitmap) is reached without the engine. */
     ldr     x16, [x18, #TEB_PEB]
@@ -121,12 +129,14 @@ RetToEntryThunk:
 ExitToX64:
     cap_check 3
     str     lr, [sp, #-8]!      /* the x64 return address */
+    mov     w13, #1             /* XT_EC_ENTRY_CALL */
 3:
     /* InSimulation first: from here Windows waits for the doorbell. */
     ldr     x17, [x18, #TEB_CPU_AREA]
     mov     w16, #1
     strb    w16, [x17]
     ldr     x16, [x17, #AREA_FRAME]
+    str     w13, [x16, #F_ENTRY]
     stp     x0, x1, [x16, #F_X(0)]
     stp     x2, x3, [x16, #F_X(2)]
     stp     x4, x5, [x16, #F_X(4)]
