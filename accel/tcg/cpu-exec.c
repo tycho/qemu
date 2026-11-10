@@ -1568,6 +1568,7 @@ static int cpu_exec_setjmp(CPUState *cpu, SyncClocks *sc)
 
 int cpu_exec(CPUState *cpu)
 {
+    struct rcu_reader_data *rcu;
     int excp;
     SyncClocks sc = { 0 };
 
@@ -1583,7 +1584,8 @@ int cpu_exec(CPUState *cpu)
     }
 #endif
 
-    RCU_READ_LOCK_GUARD();
+    rcu = get_ptr_rcu_reader();
+    rcu_read_lock_reader(rcu);
     cpu_exec_enter(cpu);
 
     /*
@@ -1597,6 +1599,7 @@ int cpu_exec(CPUState *cpu)
     excp = cpu_exec_setjmp(cpu, &sc);
 
     cpu_exec_exit(cpu);
+    rcu_read_unlock_reader(rcu);
     return excp;
 }
 
