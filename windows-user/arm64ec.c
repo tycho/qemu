@@ -584,6 +584,7 @@ XTEXPORT NTSTATUS ThreadInit(void)
 }
 
 NTSTATUS NTAPI NtSuspendThread(HANDLE, PULONG);
+NTSTATUS NTAPI NtResumeThread(HANDLE, PULONG);
 NTSTATUS NTAPI NtGetContextThread(HANDLE, PCONTEXT);
 NTSTATUS NTAPI NtDuplicateObject(HANDLE, HANDLE, HANDLE, PHANDLE,
                                  ACCESS_MASK, ULONG, ULONG);
@@ -591,63 +592,117 @@ NTSTATUS NTAPI NtDuplicateObject(HANDLE, HANDLE, HANDLE, PHANDLE,
 static void ec_unregister(XtThread *t);
 
 /*
+ * Another thread out of the engine for Windows to end, through H: it is
+ * suspended and its context read, which waits for it to answer the
+ * doorbell or to leave an adapter scope (InSyscallCallback), as FEX's
+ * module does.  0 with it suspended there; else the status of the step
+ * that failed, the suspension undone.
+ */
+static NTSTATUS ec_stop_for_term(HANDLE h)
+{
+    CONTEXT c = { .ContextFlags = CONTEXT_CONTROL };
+    NTSTATUS st;
+
+    st = NtSuspendThread(h, NULL);
+    if (st < 0) {
+        return st;
+    }
+    st = NtGetContextThread(h, &c);
+    if (st < 0) {
+        NtResumeThread(h, NULL);
+    }
+    return st < 0 ? st : 0;
+}
+
+/*
  * A thread's end, by itself or by another thread (THREAD), before Windows
- * terminates it.  Another thread is suspended and its context read first,
- * as FEX's module does: that waits for it to answer the doorbell, so it
- * is outside the engine, holding none of its locks; it stays suspended
- * for Windows to end.  Then the record leaves the watcher's list and goes:
- * the thread's own at once, another's once its handle is signalled
- * (xt_reap), as the emulator stack and its page.  A thread Windows won't
- * end (xt_terminates) is left alone.
+ * terminates it.  Another thread is found, whatever THREAD allows
+ * (TerminateThread needs THREAD_TERMINATE alone), through its record's
+ * own handle (xt_terminated_thread), and stopped through that where it
+ * holds nothing of the engine's: suspended and its context read
+ * (ec_stop_for_term).  It stays suspended for Windows to end.  Then the
+ * record leaves the watcher's list and goes: the thread's own at once,
+ * another's once its handle is signalled (xt_reap), as the emulator stack
+ * and its page; the handles the reaper waits on are made first, and
+ * without them the record stays.  A thread that can't be stopped so is
+ * left as it is, with its record (the failure is an event): with all
+ * access to it, that takes a thread already ending.  A thread Windows
+ * won't end, or that the engine has no record of, is left alone.
  */
 XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
 {
-    XtThreadBasicInfo tbi;
     XtCpuArea *area;
     XtThread *t;
-    HANDLE h, dup;
+    HANDLE h, own = NULL, stack_ref = NULL, rec_ref = NULL;
+    void *teb = NULL;
+    DWORD tid;
     bool self;
 
-    if (qatomic_load_acquire(&engine_state) != 2 || !xt_terminates(thread)) {
+    if (qatomic_load_acquire(&engine_state) != 2) {
         return STATUS_SUCCESS;
     }
     xt_enter();
+    tid = xt_terminated_thread(thread, &teb, &own);
+    if (!tid) {
+        return STATUS_SUCCESS;
+    }
     xt_reap();
-    if (!thread || thread == GetCurrentThread()) {
-        tbi.TebBaseAddress = NtCurrentTeb();
-        self = true;
-    } else if (NtQueryInformationThread(thread, 0, &tbi, sizeof(tbi),
-                                        NULL) < 0) {
-        return STATUS_SUCCESS;
+    self = teb == NtCurrentTeb();
+    if (self) {
+        h = GetCurrentThread();
     } else {
-        self = tbi.TebBaseAddress == NtCurrentTeb();
-    }
-    area = xt_cpu_area(tbi.TebBaseAddress);
-    if (!area || !qatomic_read(&area->EmulatorData[0])) {
-        return STATUS_SUCCESS;
-    }
-    h = self ? GetCurrentThread() : thread;
-    if (!self) {
-        CONTEXT c = { .ContextFlags = CONTEXT_CONTROL };
+        NTSTATUS st = ec_stop_for_term(own);
 
-        NtSuspendThread(h, NULL);
-        NtGetContextThread(h, &c);
+        if (st < 0) {
+            xt_gevent(XT_EV_THREAD_TERM, tid, 4 | (uint64_t)(uint32_t)st << 32);
+            goto out;
+        }
+        h = own;
+    }
+    /* Its TEB is read only once it is stopped: it may have ended. */
+    area = xt_cpu_area(teb);
+    if (!area || !qatomic_read(&area->EmulatorData[0])) {
+        if (!self) {
+            NtResumeThread(h, NULL);
+        }
+        goto out;
+    }
+    if (NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
+                          &stack_ref, 0, 0, DUPLICATE_SAME_ACCESS) < 0 ||
+        (!self &&
+         NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
+                           &rec_ref, 0, 0, DUPLICATE_SAME_ACCESS) < 0)) {
+        /* Stopped, and the record stays with it. */
+        goto out;
     }
     t = qatomic_xchg(&area->EmulatorData[0], NULL);
     if (!t) {
-        return STATUS_SUCCESS;
+        /* Its own end, or another termination, took it first. */
+        if (!self) {
+            NtResumeThread(h, NULL);
+        }
+        goto out;
     }
     ec_unregister(t);
-    if (NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(), &dup,
-                          0, 0, DUPLICATE_SAME_ACCESS) >= 0) {
-        xt_reap_later(dup, area->EmulatorData[1]);
-    }
+    xt_reap_later(stack_ref, area->EmulatorData[1]);
+    stack_ref = NULL;
     if (self) {
         xt_thread_free(t);
         xt_crt_thread_fini();
-    } else if (NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
-                                 &dup, 0, 0, DUPLICATE_SAME_ACCESS) >= 0) {
-        xt_thread_retire(t, dup);
+    } else {
+        xt_thread_retire(t, rec_ref);
+        rec_ref = NULL;
+    }
+out:
+    if (stack_ref) {
+        NtClose(stack_ref);
+    }
+    if (rec_ref) {
+        NtClose(rec_ref);
+    }
+    if (own) {
+        /* A suspension outlives the handle: Windows ends the thread. */
+        NtClose(own);
     }
     return STATUS_SUCCESS;
 }

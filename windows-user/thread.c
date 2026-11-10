@@ -28,8 +28,7 @@ NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
                                            SIZE_T, PSIZE_T);
 NTSTATUS NTAPI NtDelayExecution(BOOLEAN, PLARGE_INTEGER);
 NTSTATUS NTAPI NtYieldExecution(void);
-NTSTATUS NTAPI NtOpenThread(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
-                            PCLIENT_ID);
+NTSTATUS NTAPI NtCompareObjects(HANDLE, HANDLE);
 NTSTATUS NTAPI NtFreeVirtualMemory(HANDLE, PVOID *, PSIZE_T, ULONG);
 NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, PVOID, int, PVOID, SIZE_T,
                                     PSIZE_T);
@@ -39,7 +38,6 @@ uint32_t xt_inject_point;
 
 /* The TEB's ThreadLocalStoragePointer (TEB + 0x58); its process id. */
 #define TEB_TLS_POINTER 0x58
-#define TEB_CLIENT_ID 0x40
 
 #ifndef TARGET_X86_64
 extern char _tls_start, _tls_end;
@@ -225,6 +223,10 @@ XtThread *xt_thread_new(bool wow64)
 
     t->tid = GetCurrentThreadId();
     t->teb = NtCurrentTeb();
+    /* Its own: whatever other threads' handles to it allow. */
+    NtDuplicateObject(GetCurrentProcess(), GetCurrentThread(),
+                      GetCurrentProcess(), &t->handle, 0, 0,
+                      DUPLICATE_SAME_ACCESS);
     t->wow64 = wow64;
     t->state = XT_WINDOWS;
     if (xt_spare_cpu) {
@@ -311,6 +313,9 @@ static void free_record(XtThread *t)
     xt_cpu_free(cs);
     rcu_unregister_thread();
 #endif
+    if (t->handle) {
+        NtClose(t->handle);
+    }
     g_free(t);
     xt_heap_release(heap);
 }
@@ -400,22 +405,6 @@ int xt_reap(void)
     return n;
 }
 
-#ifndef TARGET_X86_64
-static HANDLE open_thread(DWORD tid)
-{
-    OBJECT_ATTRIBUTES oa = { .Length = sizeof(oa) };
-    CLIENT_ID cid = { .UniqueThread = (HANDLE)(uintptr_t)tid };
-    HANDLE h = NULL;
-
-    if (NtOpenThread(&h, SYNCHRONIZE | THREAD_SUSPEND_RESUME |
-                     THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-                     &oa, &cid) < 0) {
-        return NULL;
-    }
-    return h;
-}
-#endif
-
 /*
  * A thread's own exit: the record and CPU go now, the TLS block once the
  * thread has ended.  A suspension that found the record first finishes
@@ -424,7 +413,10 @@ static HANDLE open_thread(DWORD tid)
 void xt_thread_free(XtThread *t)
 {
 #ifndef TARGET_X86_64
-    HANDLE self = open_thread(t->tid);
+    HANDLE self = NULL;
+
+    NtDuplicateObject(GetCurrentProcess(), t->handle, GetCurrentProcess(),
+                      &self, 0, 0, DUPLICATE_SAME_ACCESS);
 #endif
 
     xt_event(t, XT_EV_THREAD_TERM, 0, 0);
@@ -441,14 +433,6 @@ void xt_thread_free(XtThread *t)
 #endif
 }
 
-/*
- * Another thread's termination, before Windows terminates it: the thread
- * is suspended already, in Windows' hands and holding nothing of the
- * engine's (bring_out).  Its record is
- * unlinked, so later suspensions find none, and freed with its TLS block
- * once the thread has ended.  If the termination fails, the thread stays
- * suspended and the record stays.
- */
 /* xt_park_if_terminating's wait */
 void xt_park(XtThread *t)
 {
@@ -460,27 +444,83 @@ void xt_park(XtThread *t)
 }
 
 /*
- * Whether Windows will end THREAD for its caller: this thread, or one of
- * this process through a handle with THREAD_TERMINATE.  ThreadTerm and
+ * The engine's thread THREAD names, if it has a record of it and it hasn't
+ * ended: its ID and TEB, and in OWN a handle to suspend it, read its
+ * context and wait for it, whatever THREAD allows: a copy of the record's
+ * own (XtThread.handle, with all access), or of THREAD if the record has
+ * none.  0 if there is none (a thread the engine has no record of holds
+ * nothing of its).  A handle that can't be queried for the thread it
+ * names (THREAD_TERMINATE alone does for TerminateThread) is compared, as
+ * an object, with each record's own, which needs no access.  The look is
+ * a short adapter scope, so that this thread, if it is terminated
+ * meanwhile, is stopped outside the records and the CPU list.
+ */
+static DWORD thread_by_handle(HANDLE thread, void **teb, HANDLE *own)
+{
+    LARGE_INTEGER zero = { .QuadPart = 0 };
+    XtThreadBasicInfo tbi;
+    bool queried, began;
+    DWORD tid = 0;
+    CPUState *cs;
+
+    *own = NULL;
+    queried = NtQueryInformationThread(thread, 0, &tbi, sizeof(tbi),
+                                       NULL) >= 0;
+    began = xt_adapter_begin();
+    xt_record_hold();
+    cpu_list_lock();
+    CPU_FOREACH(cs) {
+        XtThread *t = cs->opaque;
+        HANDLE h;
+
+        if (!t || (queried ? (HANDLE)(uintptr_t)t->tid !=
+                             tbi.ClientId.UniqueThread
+                           : !t->handle ||
+                             NtCompareObjects(thread, t->handle) != 0)) {
+            continue;
+        }
+        h = t->handle ? t->handle : thread;
+        if (NtWaitForSingleObject(h, FALSE, &zero) != STATUS_TIMEOUT &&
+            t->handle) {
+            /* Ended, its TEB gone, or not to be waited for. */
+            break;
+        }
+        if (NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
+                              own, 0, 0, DUPLICATE_SAME_ACCESS) >= 0) {
+            tid = t->tid;
+            *teb = t->teb;
+        }
+        break;
+    }
+    cpu_list_unlock();
+    xt_record_release();
+    xt_adapter_end(began);
+    return tid;
+}
+
+/*
+ * The thread Windows will end for its caller through THREAD, as
+ * thread_by_handle has it; 0 also if Windows won't end it (THREAD lacks
+ * THREAD_TERMINATE, which TerminateThread needs alone).  The caller's own
+ * thread is found without a handle (OWN NULL).  ThreadTerm and
  * BTCpuThreadTerm run before Windows checks the handle, and a thread whose
  * termination fails must be left as it was.
  */
-bool xt_terminates(HANDLE thread)
+DWORD xt_terminated_thread(HANDLE thread, void **teb, HANDLE *own)
 {
     PUBLIC_OBJECT_BASIC_INFORMATION obi;
-    XtThreadBasicInfo tbi;
-    HANDLE pid = *(HANDLE *)((char *)NtCurrentTeb() + TEB_CLIENT_ID);
 
+    *own = NULL;
     if (!thread || thread == GetCurrentThread()) {
-        return true;
+        *teb = NtCurrentTeb();
+        return GetCurrentThreadId();
     }
     if (NtQueryObject(thread, ObjectBasicInformation, &obi, sizeof(obi),
                       NULL) < 0 ||
         !(obi.GrantedAccess & THREAD_TERMINATE)) {
-        return false;
+        return 0;
     }
-    return NtQueryInformationThread(thread, 0, &tbi, sizeof(tbi), NULL) >= 0 &&
-           tbi.ClientId.UniqueProcess == pid;
+    return thread_by_handle(thread, teb, own);
 }
 
 /* An allocation of a thread's (MEM_RELEASE), freed once the thread ended. */
@@ -489,6 +529,14 @@ void xt_reap_later(void *thread_handle, void *alloc)
     reap_add(thread_handle, alloc, NULL);
 }
 
+/*
+ * Another thread's termination, before Windows terminates it: the thread
+ * is suspended already, in Windows' hands and holding nothing of the
+ * engine's.  Its record is unlinked, so later suspensions find none, and
+ * freed with its TLS block once the thread has ended (THREAD_HANDLE, which
+ * must allow SYNCHRONIZE).  If the termination fails, the thread stays
+ * suspended and the record stays.
+ */
 void xt_thread_retire(XtThread *t, void *thread_handle)
 {
     xt_event(t, XT_EV_THREAD_TERM, 1, 0);
