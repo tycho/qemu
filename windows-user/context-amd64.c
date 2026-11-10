@@ -193,12 +193,6 @@ static uint32_t ec_eflags(uint32_t cpsr)
            (cpsr & (1u << 21) ? TF_MASK : 0);
 }
 
-/* Whether the guest has YMM state: its XCR0 enables the AVX component. */
-bool xt_ec_ymm(XtThread *t)
-{
-    return t->env->xcr0 & XSTATE_YMM_MASK;
-}
-
 /*
  * The guest's state as native code keeps it (the packed form): x64
  * registers in their ARM64EC places, the MMX registers where Windows
