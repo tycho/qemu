@@ -993,8 +993,12 @@ static void leave(XtThread *t, ARM64_NT_CONTEXT *n, bool context_exit)
     }
 }
 
-static G_NORETURN void leave_native(XtThread *t, XtEcFrame *f,
-                                       vaddr target)
+/*
+ * Inline in the entries (ec_run), as their run loop is: each call between
+ * them is one per native call.
+ */
+static inline QEMU_ALWAYS_INLINE G_NORETURN
+void leave_native(XtThread *t, XtEcFrame *f, vaddr target)
 {
     /* leave()'s, with only what the exit to native code loads. */
     xt_publish(t, NULL);
@@ -1111,7 +1115,8 @@ void ec_leave(XtThread *t, XtEcFrame *f, int trapnr)
     }
 }
 
-static G_NORETURN void ec_run(XtThread *t, XtEcFrame *f)
+static inline QEMU_ALWAYS_INLINE G_NORETURN
+void ec_run(XtThread *t, XtEcFrame *f)
 {
     int trapnr = xt_run_core(t);
 
@@ -1121,7 +1126,7 @@ static G_NORETURN void ec_run(XtThread *t, XtEcFrame *f)
     ec_leave(t, f, trapnr);
 }
 
-static XtThread *ec_thread(void)
+static __attribute__((noinline)) XtThread *ec_thread_first(void)
 {
     XtThread *t = enter_engine();
 
@@ -1129,6 +1134,23 @@ static XtThread *ec_thread(void)
         NtTerminateProcess(GetCurrentProcess(),
                            !xt_log_handle() && xt_log_status < 0 ?
                            xt_log_status : STATUS_NOT_SUPPORTED);
+    }
+    return t;
+}
+
+/*
+ * The calling thread's record, from the CPU area once the engine is up
+ * and the thread has one (enter_engine), else from the bring-up.
+ */
+static inline QEMU_ALWAYS_INLINE XtThread *ec_thread(void)
+{
+    XtThread *t = NULL;
+
+    if (likely(qatomic_read(&engine_state) == 2)) {
+        t = xt_cpu_area(NtCurrentTeb())->EmulatorData[0];
+    }
+    if (unlikely(!t)) {
+        t = ec_thread_first();
     }
     t->activation++;
     return t;
