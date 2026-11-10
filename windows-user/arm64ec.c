@@ -1111,6 +1111,22 @@ static XtThread *ec_thread(void)
 }
 
 /*
+ * x-retalign: an entry from native code keeps the return stack in step.
+ * A return resumes past the call that left for native code, whose entry
+ * goes if it is on top.  A call pushes an entry with no landing for its
+ * return address, so that the x64 callee's return to native code takes
+ * that one and not an older entry.
+ */
+static void ec_retstack_entry(XtThread *t, const XtEcFrame *f)
+{
+    if (f->entry == XT_EC_ENTRY_RETURN) {
+        tcg_retstack_pop_key(t->cpu, f->ctx.Pc);
+    } else if (f->entry == XT_EC_ENTRY_CALL) {
+        tcg_retstack_push_key(t->cpu, f->ctx.Lr);
+    }
+}
+
+/*
  * A call, jump or return into x64 code (ExitToX64, DispatchJump,
  * RetToEntryThunk in arm64ec.S): the x64 registers are in their ARM64EC
  * places in F, the return address on the stack already.
@@ -1126,6 +1142,9 @@ void xt_ec_enter(XtEcFrame *f)
     xt_acquire_begin(t);
     xt_ec_import_call(t, &f->ctx);
     xt_acquire_end(t);
+    if (tcg_retalign) {
+        ec_retstack_entry(t, f);
+    }
     ec_run(t, f);
 }
 

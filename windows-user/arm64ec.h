@@ -103,14 +103,19 @@ void xt_check_call(void);
 
 /*
  * The page below a thread's emulator stack (ThreadInit): its doorbell, and
- * the native registers of an entry (arm64ec.S stores them) or of an exit
- * to native code (xt_ec_exit_native loads them).
+ * the native registers of an entry (arm64ec.S stores them, and the entry's
+ * kind) or of an exit to native code (xt_ec_exit_native loads them).
  */
 typedef struct XtEcFrame {
     ULONG doorbell;
-    uint32_t pad[3];
+    uint32_t entry;             /* XT_EC_ENTRY_*, at offset 4 */
+    uint32_t pad[2];
     ARM64_NT_CONTEXT ctx;
 } XtEcFrame;
+
+/* XtEcFrame.entry: a call or jump into x64 code, or a return to it */
+#define XT_EC_ENTRY_CALL    1
+#define XT_EC_ENTRY_RETURN  2
 
 /* arm64ec.c: the entries' C halves, on the emulator stack */
 void xt_ec_enter(XtEcFrame *f);
