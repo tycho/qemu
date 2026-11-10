@@ -1630,17 +1630,25 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
                                                    TCG_RETSTACK_SIZE);
         tcg_retstack_reset(cpu);
     } else if (tcg_retstack && tcg_retsp_off) {
+        /*
+         * A guard page at each end, the ring aligned to twice its size
+         * (TCG_RETSTACK_MAP_SIZE).
+         */
         size_t page = qemu_real_host_page_size();
-        char *p = mmap(NULL, TCG_RETSTACK_SIZE + 2 * page, PROT_NONE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        size_t len = TCG_RETSTACK_MAP_SIZE(page);
+        char *p = mmap(NULL, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS,
+                       -1, 0);
+        char *ring = p == MAP_FAILED ? NULL :
+            (char *)ROUND_UP((uintptr_t)p + page, 2 * TCG_RETSTACK_SIZE);
 
-        if (p != MAP_FAILED &&
-            !mprotect(p + page, TCG_RETSTACK_SIZE, PROT_READ | PROT_WRITE)) {
-            cpu->tb_jmp_cache->retring = p + page;
+        if (ring &&
+            !mprotect(ring, TCG_RETSTACK_SIZE, PROT_READ | PROT_WRITE)) {
+            cpu->tb_jmp_cache->retring = ring;
+            cpu->tb_jmp_cache->retmap = p;
             tcg_retstack_reset(cpu);
         } else {
             if (p != MAP_FAILED) {
-                munmap(p, TCG_RETSTACK_SIZE + 2 * page);
+                munmap(p, len);
             }
             /*
              * Generated code pushes and pops with the top in
@@ -1677,10 +1685,7 @@ static void tb_jmp_cache_free(CPUJumpCache *jc)
     if (tcg_retstack_env) {
         qemu_vfree(jc->retring);
     } else if (jc->retring) {
-        /* Mapped with a guard page at each end. */
-        size_t page = qemu_real_host_page_size();
-
-        munmap((char *)jc->retring - page, TCG_RETSTACK_SIZE + 2 * page);
+        munmap(jc->retmap, TCG_RETSTACK_MAP_SIZE(qemu_real_host_page_size()));
     }
     qemu_vfree(jc);
 }

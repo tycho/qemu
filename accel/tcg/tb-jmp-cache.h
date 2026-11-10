@@ -73,6 +73,8 @@ typedef struct CPUJumpCache {
      * host code is for the TB state of the cache.
      */
     void *retring;
+    /* User mode: the mapping that holds it, with its guard pages. */
+    void *retmap;
     /*
      * tcg_jcgen: 1 << the salt's lowest bit, for the guest mode at the
      * last flush; a flush in a mode with another clears the entries.

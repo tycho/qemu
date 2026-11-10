@@ -425,6 +425,12 @@ bool tcg_sysret_supported(void);
 void tcg_retstack_bump(CPUState *cpu);
 #define TCG_RETSTACK_SIZE (16 * 1024)
 /*
+ * User mode: the mapping for a ring aligned to twice its size, which
+ * generated code's walk relies on (tcg_retalign), with a guard page of
+ * size @page at each end.
+ */
+#define TCG_RETSTACK_MAP_SIZE(page) (3 * TCG_RETSTACK_SIZE + 2 * (page))
+/*
  * The tags of tcg_gen_push_ret() are below this; the epoch at
  * tcg_retep_off counts in steps of it.
  */
