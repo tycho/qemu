@@ -53,6 +53,11 @@ typedef struct TlsRoot {
     HANDLE thread;          /* signalled once the thread has ended */
     TlsChunk *chunks;       /* further storage, when the root's is used up */
     char *free, *end;       /* the rest of the current storage */
+    /*
+     * The thread's RCU reader while it is registered (xt_emutls_reader):
+     * a copy in this root, which stays until the reader is retired.
+     */
+    void *reader;
     void *slot[ROOT_SLOTS]; /* each variable's copy, by index - 1 */
 } TlsRoot;
 
@@ -433,6 +438,54 @@ static void free_root(TlsRoot *r)
  * since; the sweeper alone takes roots off, so the head it saw is still
  * listed then.
  */
+/*
+ * The calling thread's RCU reader, registered for the thread's life: its
+ * root keeps the reader's storage until xt_emutls_reader_retired, after
+ * the thread has ended.  xt_emutls_reader_intent marks the root first
+ * (XT_EMUTLS_READER_INTENT), so the sweep keeps it from then on, and
+ * returns it, the retirer's identity for it; xt_emutls_reader_set then
+ * names the reader.
+ */
+void *xt_emutls_reader_intent(void)
+{
+    TlsRoot *r = *root_cell();
+
+    qatomic_set(&r->reader, XT_EMUTLS_READER_INTENT);
+    return r;
+}
+
+void xt_emutls_reader_set(void *reader)
+{
+    qatomic_set(&(*root_cell())->reader, reader);
+}
+
+void *xt_emutls_reader_get(void)
+{
+    TlsRoot *r = qatomic_load_acquire(&slot_cell) ? *root_cell() : NULL;
+
+    return r ? qatomic_read(&r->reader) : NULL;
+}
+
+/* ROOT's reader, if its thread has ended, else NULL. */
+void *xt_emutls_reader_ended(void *root)
+{
+    TlsRoot *r = root;
+
+    return thread_ended(r->thread) ? qatomic_read(&r->reader) : NULL;
+}
+
+/* ROOT's reader is unregistered: the sweep may free the root. */
+void xt_emutls_reader_retired(void *root)
+{
+    qatomic_store_release(&((TlsRoot *)root)->reader, NULL);
+}
+
+/* A root the sweep can free: its thread has ended, its reader retired. */
+static bool root_done(TlsRoot *r)
+{
+    return thread_ended(r->thread) && !qatomic_load_acquire(&r->reader);
+}
+
 void xt_emutls_reap(void)
 {
     ULONG id = *(ULONG *)((char *)NtCurrentTeb() + TEB_CLIENT_ID + 8);
@@ -447,7 +500,7 @@ void xt_emutls_reap(void)
     test_step(XT_EMUTLS_STEP_SWEEP);
     for (;;) {
         prev = qatomic_load_acquire(&roots);
-        if (!prev || !thread_ended(prev->thread)) {
+        if (!prev || !root_done(prev)) {
             break;
         }
         if (qatomic_cmpxchg(&roots, prev, qatomic_read(&prev->next)) == prev) {
@@ -456,7 +509,7 @@ void xt_emutls_reap(void)
         }
     }
     while (prev && (r = qatomic_read(&prev->next))) {
-        if (thread_ended(r->thread)) {
+        if (root_done(r)) {
             qatomic_set(&prev->next, qatomic_read(&r->next));
             test_step(XT_EMUTLS_STEP_UNLINK);
             free_root(r);

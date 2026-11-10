@@ -22,6 +22,7 @@
 #include "arm64ec.h"
 
 NTSTATUS NTAPI NtContinue(PCONTEXT, BOOLEAN);
+NTSTATUS NTAPI NtTerminateThread(HANDLE, NTSTATUS);
 PVOID NTAPI RtlAddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
 PVOID NTAPI RtlImageDirectoryEntryToData(PVOID, BOOLEAN, USHORT, PULONG);
 NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
@@ -276,6 +277,150 @@ static bool ec_foreign_pc(CPUState *cs, vaddr pc, bool exit)
     return true;
 }
 
+/*
+ * RCU readers for a thread's life (the x64 module, whose thread-local
+ * storage is its own, runtime/emutls.c): a thread registers once, at its
+ * first need (xt_rcu_ensure), and stays registered while Windows owns it,
+ * where it is never inside a read section, so it holds up no grace period.
+ * A thread never unregisters itself: it may be terminated anywhere, and
+ * one terminated holding the registry's lock would stop every grace
+ * period.  The retirer, a thread of the module's, unregisters each reader
+ * once its thread has ended, while its TLS root keeps the reader's
+ * storage; the root goes after (xt_emutls_reap).
+ *
+ * Registration is ordered so that a thread terminated at any point leaves
+ * a state the retirer completes: the root is marked first (the sweep keeps
+ * it), then the retirer's node is listed, then the reader is named, then
+ * registered.  A mark with no reader named has nothing to unregister, and
+ * rcu_unregister_reader takes a reader that never reached the registry.
+ * Only a termination inside rcu_register_thread, holding the registry's
+ * lock, isn't recovered; a root marked but not listed is kept for good.
+ */
+typedef struct XtReaderNode {
+    void *root;
+    struct XtReaderNode *next;
+} XtReaderNode;
+
+static XtReaderNode *readers;
+
+static void readers_push(XtReaderNode *n)
+{
+    XtReaderNode *head;
+
+    do {
+        head = qatomic_read(&readers);
+        n->next = head;
+    } while (qatomic_cmpxchg(&readers, head, n) != head);
+}
+
+/*
+ * Testing (the setting keyword rcuinj=N): every 7th registration made
+ * outside an activation, where Windows may end the thread at any point (a
+ * reaper's free_record), ends its thread right after step N (1 marked, 2
+ * listed, 3 named, 4 registered).  An activation's own registration is
+ * protected: a termination waits for it (xt_park_if_terminating).
+ */
+static void rcu_inj(int step)
+{
+    static int count;
+    XtThread *t = xt_self;
+
+    if (xt_rcu_inj_step == step && (!t || t->state == XT_WINDOWS) &&
+        qatomic_fetch_inc(&count) % 7 == 6) {
+        /* The current thread's pseudo-handle, -2. */
+        NtTerminateThread((HANDLE)~(uintptr_t)1, 0);
+    }
+}
+
+void xt_rcu_ensure(void)
+{
+    XtReaderNode *n;
+
+    if (xt_emutls_reader_get()) {
+        return;
+    }
+    n = g_new0(XtReaderNode, 1);
+    n->root = xt_emutls_reader_intent();
+    rcu_inj(1);
+    readers_push(n);
+    rcu_inj(2);
+    xt_emutls_reader_set(get_ptr_rcu_reader());
+    rcu_inj(3);
+    rcu_register_thread();
+    rcu_inj(4);
+}
+
+static unsigned __stdcall reader_retirer(void *arg)
+{
+    LARGE_INTEGER tick = { .QuadPart = -20 * 10000 };   /* 20 ms */
+
+    for (;;) {
+        XtReaderNode *n = qatomic_xchg(&readers, NULL), *keep = NULL;
+
+        while (n) {
+            XtReaderNode *next = n->next;
+            void *reader = xt_emutls_reader_ended(n->root);
+
+            if (reader) {
+                if (reader != XT_EMUTLS_READER_INTENT) {
+                    rcu_unregister_reader(reader);
+                }
+                xt_emutls_reader_retired(n->root);
+                g_free(n);
+            } else {
+                n->next = keep;
+                keep = n;
+            }
+            n = next;
+        }
+        while (keep) {
+            XtReaderNode *next = keep->next;
+
+            readers_push(keep);
+            keep = next;
+        }
+        NtDelayExecution(FALSE, &tick);
+    }
+    return 0;
+}
+
+/*
+ * Testing (the setting keyword rcustress): grace periods back to back on a
+ * thread of the module's, while threads register and their readers are
+ * retired.  A watchdog ends the process if none completes for 5 s, and
+ * the process's end reports how many did (ProcessTerm).
+ */
+static uint64_t rcu_stress_done;
+
+static unsigned __stdcall rcu_stress(void *arg)
+{
+    LARGE_INTEGER ms = { .QuadPart = -10000 };
+
+    for (;;) {
+        synchronize_rcu();
+        qatomic_inc(&rcu_stress_done);
+        NtDelayExecution(FALSE, &ms);
+    }
+    return 0;
+}
+
+static unsigned __stdcall rcu_stress_watchdog(void *arg)
+{
+    LARGE_INTEGER s = { .QuadPart = -5 * 1000 * 10000 };    /* 5 s */
+    uint64_t seen = 0;
+
+    for (;;) {
+        NtDelayExecution(FALSE, &s);
+        if (qatomic_read(&rcu_stress_done) == seen) {
+            fputs("rcustress: no grace period completed in 5 s\n", stderr);
+            xt_log_text("rcustress: no grace period completed in 5 s\n");
+            NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
+        }
+        seen = qatomic_read(&rcu_stress_done);
+    }
+    return 0;
+}
+
 static int process_init(void)
 {
     char *settings;
@@ -286,12 +431,16 @@ static int process_init(void)
     xt_log_open();
     xt_engine_init(settings, &init_applied, &init_rejected);
     tcg_foreign_pc = ec_foreign_pc;
-    /* Readers exist only while the engine owns a thread (xt_acquire). */
+    /* A thread's reader is registered at its first need (xt_rcu_ensure). */
     rcu_unregister_thread();
     xt_gevent(XT_EV_THREAD_INIT, init_applied, init_rejected);
     xt_placement("module", &__ImageBase);
     xt_placement("code buffer", tcg_ctx->code_gen_buffer);
-    if (!_beginthreadex(NULL, 0, doorbell_watcher, NULL, 0, NULL)) {
+    if (!_beginthreadex(NULL, 0, doorbell_watcher, NULL, 0, NULL) ||
+        !_beginthreadex(NULL, 0, reader_retirer, NULL, 0, NULL) ||
+        (xt_rcu_stress &&
+         (!_beginthreadex(NULL, 0, rcu_stress, NULL, 0, NULL) ||
+          !_beginthreadex(NULL, 0, rcu_stress_watchdog, NULL, 0, NULL)))) {
         return -1;
     }
     return 0;
@@ -368,6 +517,14 @@ XTEXPORT NTSTATUS ProcessInit(void)
 
 XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
 {
+    if (xt_rcu_stress) {
+        char line[64];
+
+        snprintf(line, sizeof(line), "rcustress: %llu grace periods\n",
+                 (unsigned long long)qatomic_read(&rcu_stress_done));
+        fputs(line, stderr);
+        xt_log_text(line);
+    }
 }
 
 #define XT_EMULATOR_STACK (256 * 1024)
