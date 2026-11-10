@@ -209,6 +209,14 @@ extern uint32_t xt_inject_point;    /* XTAJIT_INJECT: see xt_inject */
 /* engine.c */
 extern CPUState *xt_spare_cpu;      /* made at init, for the first thread */
 int xt_engine_init(const char *settings, int *applied, int *rejected);
+/*
+ * Diagnostics at every transition between Windows and the engine: the
+ * state machine's invariant checks (xt_check) and the routine events
+ * (acquire, exit) in the thread's event ring.  On with the setting
+ * keyword "diag", a log (XTAJIT_LOG), or a test harness; fault and
+ * suspension events are recorded regardless.
+ */
+extern bool xt_diag;
 CPUState *xt_cpu_new(void);
 void xt_cpu_free(CPUState *cs);
 extern const char *xt_cpu_model;   /* -cpu syntax; set before init */

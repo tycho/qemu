@@ -613,6 +613,7 @@ void xt_invalidate(vaddr start, vaddr len)
 }
 
 CPUState *xt_spare_cpu;
+bool xt_diag;
 static int applied, rejected;
 
 static void set_settings(Object *accel, const char *settings)
@@ -627,6 +628,10 @@ static void set_settings(Object *accel, const char *settings)
             /* nochain: no direct jumps between TBs, as -d nochain. */
             if (!strcmp(kv[i], "nochain")) {
                 qemu_loglevel |= CPU_LOG_TB_NOCHAIN;
+                applied++;
+            } else if (!strcmp(kv[i], "diag")) {
+                /* Transition diagnostics (xt_diag). */
+                xt_diag = true;
                 applied++;
             } else {
                 rejected++;

@@ -628,7 +628,9 @@ void xt_inject(XtThread *t, int point)
 void xt_acquire_begin(XtThread *t)
 {
     xt_park_if_terminating(t);
-    xt_check(t, XT_WINDOWS, 1);
+    if (xt_diag) {
+        xt_check(t, XT_WINDOWS, 1);
+    }
     t->state = XT_ACQUIRING;
     xt_set_slot2(t, true);
     rcu_register_thread();
@@ -639,8 +641,10 @@ void xt_acquire_begin(XtThread *t)
 void xt_acquire_end(XtThread *t)
 {
     t->state = XT_ENGINE;
-    xt_event(t, XT_EV_ACQUIRE, t->env->eip, t->env->regs[R_ESP]);
-    xt_check(t, XT_ENGINE, 2);
+    if (xt_diag) {
+        xt_event(t, XT_EV_ACQUIRE, t->env->eip, t->env->regs[R_ESP]);
+        xt_check(t, XT_ENGINE, 2);
+    }
 }
 
 void xt_acquire(XtThread *t, const XtGuestContext *c)
@@ -658,7 +662,9 @@ void xt_acquire(XtThread *t, const XtGuestContext *c)
  */
 void xt_publish(XtThread *t, XtGuestContext *c)
 {
-    xt_check(t, XT_ENGINE, 3);
+    if (xt_diag) {
+        xt_check(t, XT_ENGINE, 3);
+    }
     t->state = XT_PUBLISHING;
     if (c) {
         xt_export(t, c);
@@ -668,7 +674,9 @@ void xt_publish(XtThread *t, XtGuestContext *c)
     t->rcu_registered = false;
     t->state = XT_WINDOWS;
     xt_set_slot2(t, false);
-    xt_check(t, XT_WINDOWS, 4);
+    if (xt_diag) {
+        xt_check(t, XT_WINDOWS, 4);
+    }
 }
 
 /*
@@ -740,6 +748,8 @@ void xt_log_open(void)
                                  FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
     if (xt_log_status < 0) {
         log_handle = NULL;
+    } else {
+        xt_diag = true;
     }
 }
 
