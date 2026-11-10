@@ -1358,12 +1358,6 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
     return false;
 }
 
-/*
- * tcg_superblock with edge checks: a request seen at an exit that names no
- * TB (exit_tb(NULL, 0)) samples the next TB the main loop runs instead.
- */
-static __thread bool region_sample_next;
-
 static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
                                     vaddr pc, TranslationBlock **last_tb,
                                     int *tb_exit)
@@ -1377,7 +1371,7 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
             if (tb) {
                 region_sample(cpu, tb);
             } else if (tcg_edge_sys) {
-                region_sample_next = true;
+                cpu->tb_jmp_cache->region_sample_next = true;
             }
         }
         return;
@@ -1532,8 +1526,8 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 }
             }
 
-            if (unlikely(region_sample_next)) {
-                region_sample_next = false;
+            if (unlikely(cpu->tb_jmp_cache->region_sample_next)) {
+                cpu->tb_jmp_cache->region_sample_next = false;
                 region_sample(cpu, tb);
             }
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
