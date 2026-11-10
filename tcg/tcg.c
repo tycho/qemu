@@ -250,6 +250,7 @@ bool tcg_retstack_addr64;
 bool tcg_sysret;
 bool tcg_retstack_env;
 intptr_t tcg_retep_off;
+bool tcg_retalign;
 bool tcg_tb_flags_canon;
 TCGJumpCacheLayout tcg_jc_layout;
 const void *tcg_xpage_stub;
@@ -2029,6 +2030,17 @@ void tcg_prologue_init(void)
     qemu_thread_jit_write();
     /* Generate the prologue.  */
     tcg_target_qemu_prologue(s);
+
+    /*
+     * x-retalign keeps its account in the register that holds the return
+     * stack's top, which the prologue has now chosen or not.
+     */
+    if (tcg_retalign && tcg_retstack_reg < 0) {
+        error_report("x-retalign: needs x-retstack with its top in a host "
+                     "register (a 64-bit guest, no guest base, an AArch64 "
+                     "host)");
+        exit(EXIT_FAILURE);
+    }
 
     /* Allow the prologue to put e.g. guest_base into a pool entry.  */
     {
