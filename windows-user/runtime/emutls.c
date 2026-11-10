@@ -83,6 +83,13 @@ static LONG roots_made, roots_freed;
 
 static LONG slot_state;     /* 0 none, 1 being allocated, 2 slot_index */
 static ULONG slot_index;
+/*
+ * The slot's cell as an offset into the TEB, 0 until the slot is taken:
+ * one word, final once nonzero, published after every thread's cell has
+ * been cleared (xt_emutls_init), and read with acquire, so a thread that
+ * sees it also sees its own cell cleared.
+ */
+static uintptr_t slot_cell;
 static EmutlsObject *registered[ROOT_SLOTS]; /* by index - 1 */
 static TlsRoot *roots;
 static uint64_t sweeper;    /* the sweeping thread's token, 0 none */
@@ -152,6 +159,7 @@ void xt_emutls_init(void)
         emutls_fail("libarm64ecxtcg: TEB TLS slot not cleared\n");
     }
     slot_index = i;
+    qatomic_store_release(&slot_cell, TEB_TLS_SLOTS + i * sizeof(void *));
     qatomic_store_release(&slot_state, 2);
 }
 
@@ -262,9 +270,7 @@ static uintptr_t register_object(EmutlsObject *o)
     emutls_fail("libarm64ecxtcg: too many thread-local variables\n");
 }
 
-/* The compiler's call, at every access to a thread-local variable. */
-void *__emutls_get_address(EmutlsObject *o);
-void *__emutls_get_address(EmutlsObject *o)
+static void *emutls_get_slow(EmutlsObject *o)
 {
     uintptr_t i = qatomic_load_acquire(&o->index);
     TlsRoot *r;
@@ -285,6 +291,32 @@ void *__emutls_get_address(EmutlsObject *o)
         p = r->slot[i - 1] = new_copy(r, o);
     }
     return p;
+}
+
+/*
+ * The compiler's call, at every access to a thread-local variable.  On
+ * the fast path a variable's index needs no ordering (final once nonzero,
+ * and only an identity: the copy it finds is this thread's), and the
+ * slot's cell one acquire (slot_cell).
+ */
+void *__emutls_get_address(EmutlsObject *o);
+void *__emutls_get_address(EmutlsObject *o)
+{
+    uintptr_t i = qatomic_read(&o->index);
+    uintptr_t cell = qatomic_load_acquire(&slot_cell);
+
+    if (likely(i && cell)) {
+        TlsRoot *r = *(TlsRoot **)((char *)NtCurrentTeb() + cell);
+
+        if (likely(r)) {
+            void *p = r->slot[i - 1];
+
+            if (likely(p)) {
+                return p;
+            }
+        }
+    }
+    return emutls_get_slow(o);
 }
 
 static void free_region(void *p)
