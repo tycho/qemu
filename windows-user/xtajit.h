@@ -217,6 +217,10 @@ int xt_engine_init(const char *settings, int *applied, int *rejected);
  * suspension events are recorded regardless.
  */
 extern bool xt_diag;
+/* Testing (keyword rcustress): grace periods back to back. */
+extern bool xt_rcu_stress;
+/* Testing (keyword rcuinj=N): registrations interrupted at step N. */
+extern int xt_rcu_inj_step;
 CPUState *xt_cpu_new(void);
 void xt_cpu_free(CPUState *cs);
 extern const char *xt_cpu_model;   /* -cpu syntax; set before init */
@@ -265,6 +269,14 @@ enum {
 };
 long xt_emutls_test(int what, long arg);
 void xt_emutls_reap(void);
+#define XT_EMUTLS_READER_INTENT ((void *)1)
+void *xt_emutls_reader_intent(void);
+void xt_emutls_reader_set(void *reader);
+/* The x64 module: this thread's RCU reader, registered for its life. */
+void xt_rcu_ensure(void);
+void *xt_emutls_reader_get(void);
+void *xt_emutls_reader_ended(void *root);
+void xt_emutls_reader_retired(void *root);
 void xt_enter(void);
 void xt_placement(const char *what, const void *p);
 XtThread *xt_thread_new(bool wow64);

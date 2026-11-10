@@ -614,6 +614,8 @@ void xt_invalidate(vaddr start, vaddr len)
 
 CPUState *xt_spare_cpu;
 bool xt_diag;
+bool xt_rcu_stress;
+int xt_rcu_inj_step;
 static int applied, rejected;
 
 static void set_settings(Object *accel, const char *settings)
@@ -629,6 +631,12 @@ static void set_settings(Object *accel, const char *settings)
             if (!strcmp(kv[i], "nochain")) {
                 qemu_loglevel |= CPU_LOG_TB_NOCHAIN;
                 applied++;
+#ifdef TARGET_X86_64
+            } else if (!strcmp(kv[i], "rcustress")) {
+                /* Testing: grace periods back to back (arm64ec.c). */
+                xt_rcu_stress = true;
+                applied++;
+#endif
             } else if (!strcmp(kv[i], "diag")) {
                 /* Transition diagnostics (xt_diag). */
                 xt_diag = true;
@@ -639,6 +647,14 @@ static void set_settings(Object *accel, const char *settings)
             continue;
         }
         /* QEMU's own accelerator properties go as they are, the rest as x-. */
+#ifdef TARGET_X86_64
+        if (!strncmp(kv[i], "rcuinj=", 7)) {
+            /* Testing: registration interrupted (arm64ec.c). */
+            xt_rcu_inj_step = atoi(eq + 1);
+            applied++;
+            continue;
+        }
+#endif
         name = g_strndup(kv[i], eq - kv[i]);
         if (strcmp(name, "one-insn-per-tb") && strcmp(name, "tb-size") &&
             strcmp(name, "split-wx")) {
