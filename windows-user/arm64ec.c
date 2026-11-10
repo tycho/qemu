@@ -20,6 +20,7 @@
 #include "user/page-protection.h"
 #include "xtajit.h"
 #include "arm64ec.h"
+#include "run.h"
 
 /* The layouts arm64ec.S's offsets (F_*, C_*, TEB_CPU_AREA, AREA_*) assume. */
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, entry) != 0x04);
@@ -1092,24 +1093,32 @@ static G_NORETURN void leave_suspend(XtThread *t, XtEcFrame *f)
     __builtin_unreachable();
 }
 
-static G_NORETURN void ec_run(XtThread *t, XtEcFrame *f)
+/* Every exit but a transfer to native code, with its XtExit. */
+static G_NORETURN __attribute__((noinline))
+void ec_leave(XtThread *t, XtEcFrame *f, int trapnr)
 {
     XtExit x;
 
-    for (;;) {
-        xt_run(t, &x);
-        switch (x.kind) {
-        case XT_EXIT_NATIVE:
-            leave_native(t, f, x.target);
-        case XT_EXIT_SYSCALL:
-            xt_event(t, XT_EV_SYSCALL, x.nr, 0);
-            leave_syscall(t);
-        case XT_EXIT_SUSPEND:
-            leave_suspend(t, f);
-        default:
-            leave_exception(t, &x);
-        }
+    xt_run_exit(t, trapnr, &x);
+    switch (x.kind) {
+    case XT_EXIT_SYSCALL:
+        xt_event(t, XT_EV_SYSCALL, x.nr, 0);
+        leave_syscall(t);
+    case XT_EXIT_SUSPEND:
+        leave_suspend(t, f);
+    default:
+        leave_exception(t, &x);
     }
+}
+
+static G_NORETURN void ec_run(XtThread *t, XtEcFrame *f)
+{
+    int trapnr = xt_run_core(t);
+
+    if (likely(trapnr == XT_EXCP_NATIVE)) {
+        leave_native(t, f, t->native_target);
+    }
+    ec_leave(t, f, trapnr);
 }
 
 static XtThread *ec_thread(void)

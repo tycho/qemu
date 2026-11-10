@@ -148,6 +148,8 @@ typedef enum XtExitKind {
  * x86 interrupt vector.
  */
 #define XT_EXCP_NATIVE 0x10100
+/* xt_run_core's for a suspension request, seen before a run */
+#define XT_EXCP_SUSPEND 0x10101
 
 typedef struct XtExit {
     XtExitKind kind;
@@ -404,7 +406,7 @@ enum {
 };
 void xt_inject(XtThread *t, int point);
 
-/* exec.c */
+/* exec.c: xt_run_core (run.h) with every exit in X */
 void xt_run(XtThread *t, XtExit *x);
 
 /* cache.c: the translation cache's catalogue (tcg-cache.h) */
