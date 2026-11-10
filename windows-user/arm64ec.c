@@ -947,7 +947,12 @@ static void leave(XtThread *t, ARM64_NT_CONTEXT *n, bool context_exit)
 static G_NORETURN void leave_native(XtThread *t, XtEcFrame *f,
                                        vaddr target)
 {
-    leave(t, &f->ctx, false);
+    /* leave()'s, with only what the exit to native code loads. */
+    xt_publish(t, NULL);
+    xt_ec_pack_call(t, &f->ctx);
+    if (xt_log_handle()) {
+        xt_log_flush(t);
+    }
     f->ctx.Pc = target;
     if (xt_ec_ymm(t)) {
         xt_ec_exit_native_ymm(&f->ctx);
