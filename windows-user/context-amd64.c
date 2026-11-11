@@ -194,6 +194,21 @@ static uint32_t ec_eflags(uint32_t cpsr)
 }
 
 /*
+ * XMMn's 128 bits, or YMMn's upper 128, between the CPU state and a
+ * vector register's place in the packed form: 16 bytes at once, the
+ * halves in the same order (Low the lower quadword).
+ */
+static inline void ec_v_store(ARM64_NT_NEON128 *v, const ZMMReg *z, int half)
+{
+    memcpy(v, &z->ZMM_Q(2 * half), sizeof(*v));
+}
+
+static inline void ec_v_load(ZMMReg *z, const ARM64_NT_NEON128 *v)
+{
+    memcpy(&z->ZMM_Q(0), v, sizeof(*v));
+}
+
+/*
  * The guest's state as native code keeps it (the packed form): x64
  * registers in their ARM64EC places, the MMX registers where Windows
  * looks for them (FEX's ARM64EC module packs them the same way), NZCV and
@@ -226,13 +241,11 @@ void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
     n->Pc = env->eip;
     n->Cpsr = ec_cpsr(xt_ec_eflags(env));
     for (int i = 0; i < 16; i++) {
-        n->V[i].Low = env->xmm_regs[i].ZMM_Q(0);
-        n->V[i].High = env->xmm_regs[i].ZMM_Q(1);
+        ec_v_store(&n->V[i], &env->xmm_regs[i], 0);
     }
     if (xt_ec_ymm(t)) {
         for (int i = 0; i < 16; i++) {
-            n->V[16 + i].Low = env->xmm_regs[i].ZMM_Q(2);
-            n->V[16 + i].High = env->xmm_regs[i].ZMM_Q(3);
+            ec_v_store(&n->V[16 + i], &env->xmm_regs[i], 1);
         }
     }
     /*
@@ -273,6 +286,7 @@ void xt_ec_pack_call(XtThread *t, ARM64_NT_CONTEXT *n)
 {
     static const int8_t mm_lo[8] = { 30, 6, 7, 9, 10, 11, 12, 15 };
     CPUX86State *env = t->env;
+    unsigned top = env->fpstt;
 
     if (env->dr[6] & (DR6_BS | 0xf)) {
         env->dr[6] = 0;
@@ -282,17 +296,15 @@ void xt_ec_pack_call(XtThread *t, ARM64_NT_CONTEXT *n)
     }
     n->Pc = env->eip;
     for (int i = 0; i < 16; i++) {
-        n->V[i].Low = env->xmm_regs[i].ZMM_Q(0);
-        n->V[i].High = env->xmm_regs[i].ZMM_Q(1);
+        ec_v_store(&n->V[i], &env->xmm_regs[i], 0);
     }
     if (xt_ec_ymm(t)) {
         for (int i = 0; i < 16; i++) {
-            n->V[16 + i].Low = env->xmm_regs[i].ZMM_Q(2);
-            n->V[16 + i].High = env->xmm_regs[i].ZMM_Q(3);
+            ec_v_store(&n->V[16 + i], &env->xmm_regs[i], 1);
         }
     }
     for (int i = 0; i < 8; i++) {
-        n->X[mm_lo[i]] = env->fpregs[(env->fpstt + i) & 7].d.low;
+        n->X[mm_lo[i]] = env->fpregs[(top + i) & 7].d.low;
     }
 }
 
@@ -374,8 +386,7 @@ void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n)
     t->bp_skip = (eflags & RF_MASK) || (t->bp_hit && n->Pc == t->bp_hit);
     t->bp_hit = 0;
     for (int i = 0; i < 16; i++) {
-        env->xmm_regs[i].ZMM_Q(0) = n->V[i].Low;
-        env->xmm_regs[i].ZMM_Q(1) = n->V[i].High;
+        ec_v_load(&env->xmm_regs[i], &n->V[i]);
     }
     ec_seg(t, R_CS, 0x33);
     ec_seg(t, R_SS, 0x2b);
