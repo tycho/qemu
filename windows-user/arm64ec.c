@@ -36,6 +36,17 @@ QEMU_BUILD_BUG_ON(XT_TEB_CPU_AREA != 0x1788);
 QEMU_BUILD_BUG_ON(offsetof(XtCpuArea, EmulatorStackBase) != 0x08);
 QEMU_BUILD_BUG_ON(offsetof(XtCpuArea, SuspendDoorbell) != 0x20);
 QEMU_BUILD_BUG_ON(offsetof(XtCpuArea, EmulatorData[1]) != 0x38);
+/* And the CPU state's (E_*, xt_ec_exit_native_env's loads). */
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, regs) != 0);
+QEMU_BUILD_BUG_ON(sizeof(((CPUX86State *)0)->regs[0]) != 8);
+QEMU_BUILD_BUG_ON(R_EAX != 0 || R_ECX != 1 || R_EDX != 2 || R_EBX != 3 ||
+                  R_ESP != 4 || R_EBP != 5 || R_ESI != 6 || R_EDI != 7);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpstt) != 0x2e0);
+QEMU_BUILD_BUG_ON(sizeof(((CPUX86State *)0)->fpstt) != 4);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpregs) != 0x2f0);
+QEMU_BUILD_BUG_ON(sizeof(FPReg) != 16 || offsetof(floatx80, low) != 0);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, xmm_regs) != 0x3d0);
+QEMU_BUILD_BUG_ON(sizeof(ZMMReg) != 64);
 
 NTSTATUS NTAPI NtContinue(PCONTEXT, BOOLEAN);
 NTSTATUS NTAPI NtTerminateThread(HANDLE, NTSTATUS);
@@ -1059,22 +1070,24 @@ static void leave(XtThread *t, ARM64_NT_CONTEXT *n, bool context_exit)
 
 /*
  * Inline in the entries (ec_run), as their run loop is: each call between
- * them is one per native call.
+ * them is one per native call.  leave()'s, with the registers loaded
+ * straight from the CPU state (xt_ec_exit_native_env).  DR6's
+ * single-step and breakpoint bits have no place there, and end here as
+ * xt_ec_pack ends them.
  */
 static inline QEMU_ALWAYS_INLINE G_NORETURN
-void leave_native(XtThread *t, XtEcFrame *f, vaddr target)
+void leave_native(XtThread *t, vaddr target)
 {
-    /* leave()'s, with only what the exit to native code loads. */
+    CPUX86State *env = t->env;
+
     xt_publish(t, NULL);
-    xt_ec_pack_call(t, &f->ctx);
+    if (env->dr[6] & (DR6_BS | 0xf)) {
+        env->dr[6] = 0;
+    }
     if (xt_log_handle()) {
         xt_log_flush(t);
     }
-    f->ctx.Pc = target;
-    if (xt_ec_ymm(t)) {
-        xt_ec_exit_native_ymm(&f->ctx);
-    }
-    xt_ec_exit_native(&f->ctx);
+    xt_ec_exit_native_env(env, target, xt_ec_ymm(t));
 }
 
 static G_NORETURN void leave_syscall(XtThread *t)
@@ -1185,7 +1198,7 @@ void ec_run(XtThread *t, XtEcFrame *f)
     int trapnr = xt_run_core(t);
 
     if (likely(trapnr == XT_EXCP_NATIVE)) {
-        leave_native(t, f, t->native_target);
+        leave_native(t, t->native_target);
     }
     ec_leave(t, f, trapnr);
 }

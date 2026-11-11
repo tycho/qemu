@@ -217,7 +217,9 @@ static inline void ec_v_load(ZMMReg *z, const ARM64_NT_NEON128 *v)
  * x18, x23, x24 or x28.  The rest of EFLAGS and the x87 control state have no
  * place here.  Straight from the CPU state, for an exit through a context
  * (a system call, an exception, a suspension); an exit to native code
- * takes xt_ec_pack_call.
+ * loads the same places from the CPU state (xt_ec_exit_native_env),
+ * without NZCV, FPCR, FPSR, x16 or x17 (native code's EFLAGS and MXCSR
+ * are the ABI's, and the x87 state's high parts stay in the engine).
  */
 void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
 {
@@ -270,42 +272,6 @@ void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
     n->Fpsr = (mx & 1 ? 1 : 0) | (mx & 4 ? 2 : 0) | (mx & 8 ? 4 : 0) |
               (mx & 0x10 ? 8 : 0) | (mx & 0x20 ? 0x10 : 0) |
               (mx & 2 ? 0x80 : 0);
-}
-
-/*
- * xt_ec_pack for an exit to native code (xt_ec_exit_native): only what the
- * exit loads into registers, the values xt_ec_pack gives them.  The exit
- * doesn't load NZCV, FPCR, FPSR, x16 or x17 (native code's EFLAGS and
- * MXCSR are the ABI's, and the x87 state's high parts stay in the
- * engine).  Each later reader of N finds what it reads written first: the
- * next entry (ExitToX64, RetToEntryThunk) stores what xt_ec_import_call
- * reads, BeginSimulation what xt_ec_begin reads; a suspension packs a
- * context of its own (leave_suspend).
- */
-void xt_ec_pack_call(XtThread *t, ARM64_NT_CONTEXT *n)
-{
-    static const int8_t mm_lo[8] = { 30, 6, 7, 9, 10, 11, 12, 15 };
-    CPUX86State *env = t->env;
-    unsigned top = env->fpstt;
-
-    if (env->dr[6] & (DR6_BS | 0xf)) {
-        env->dr[6] = 0;
-    }
-    for (int i = 0; i < 16; i++) {
-        *ec_gpr(n, i) = env->regs[i];
-    }
-    n->Pc = env->eip;
-    for (int i = 0; i < 16; i++) {
-        ec_v_store(&n->V[i], &env->xmm_regs[i], 0);
-    }
-    if (xt_ec_ymm(t)) {
-        for (int i = 0; i < 16; i++) {
-            ec_v_store(&n->V[16 + i], &env->xmm_regs[i], 1);
-        }
-    }
-    for (int i = 0; i < 8; i++) {
-        n->X[mm_lo[i]] = env->fpregs[(top + i) & 7].d.low;
-    }
 }
 
 /*

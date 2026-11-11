@@ -104,7 +104,7 @@ void xt_check_call(void);
 /*
  * The page below a thread's emulator stack (ThreadInit): its doorbell, and
  * the native registers of an entry (arm64ec.S stores them, and the entry's
- * kind) or of an exit to native code (xt_ec_exit_native loads them).
+ * kind).
  */
 typedef struct XtEcFrame {
     ULONG doorbell;
@@ -122,9 +122,8 @@ void xt_ec_enter(XtEcFrame *f);
 void xt_ec_begin(void);
 
 /* arm64ec.S: transfers out of the engine; neither returns */
-G_NORETURN void xt_ec_exit_native(ARM64_NT_CONTEXT *n);
-/* The same, and v16-v31 from N (the YMM upper halves) */
-G_NORETURN void xt_ec_exit_native_ymm(ARM64_NT_CONTEXT *n);
+G_NORETURN void xt_ec_exit_native_env(CPUArchState *env, uintptr_t target,
+                                      bool ymm);
 G_NORETURN void xt_ec_jump_set_stack(uintptr_t pc, uintptr_t sp);
 /* NtContinue, keeping registers for BeginSimulation; returns on failure */
 void xt_ec_continue_kept(ARM64_NT_CONTEXT *n, int64_t nr_continue);
