@@ -68,8 +68,13 @@ xt_check_call:
  * KiUserEmulationDispatcher's BeginSimulation).  While the capture probe
  * sets xt_cap_entry_mode, xt_cap_entry (test-ec.S) takes them instead.
  * x16 and x17 are free at each; x9 holds the target where there is one.
- * x13 carries the entry's kind to the frame: ARM64EC code never uses it,
- * so native code reached by the bypass below can't depend on it.
+ * x13 carries the entry's kind to the frame, and x14, x23 and x24 are
+ * scratch: ARM64EC code never uses them, so native code reached by the
+ * bypass below can't depend on them.  The x64 registers go into the CPU
+ * state when the frame names it (XtEcFrame.env), else into the frame;
+ * NZCV is read before any instruction that sets flags, and the guest's
+ * sp after the return address's push.  The MMX places and v16-v31 are
+ * not taken: the engine keeps the x87 state and the YMM upper halves.
  */
 /* MMn's mantissa (ST(n) from the stack top in w0, the x87 registers at x1). */
 .macro mm_load i, r
@@ -89,19 +94,32 @@ xt_check_call:
 .endm
 
 /*
- * XtEcFrame.entry, the entry's kind (XT_EC_ENTRY_*), and XtEcFrame.ctx, an
- * ARM64_NT_CONTEXT 16 bytes into the frame.
+ * XtEcFrame: the entry's record (its kind, XT_EC_ENTRY_*; NZCV; whether the
+ * registers went into the CPU state; the target and lr), env, the CPU
+ * state, and ctx, an ARM64_NT_CONTEXT 0x30 bytes into the frame.
  */
 #define F_ENTRY     0x04
-#define F_X(n)      (0x10 + 0x08 + 8 * (n))
-#define F_CPSR      (0x10 + 0x04)
-#define F_SP        (0x10 + 0x100)
-#define F_PC        (0x10 + 0x108)
-#define F_V         (0x10 + 0x110)
+#define F_NZCV      0x08
+#define F_SAVED     0x0c
+#define F_PCLR      0x10
+#define F_ENV       0x20
+#define F_X(n)      (0x30 + 0x08 + 8 * (n))
+#define F_SP        (0x30 + 0x100)
+#define F_V         (0x30 + 0x110)
 #define C_X(n)      (0x08 + 8 * (n))
 #define C_SP        0x100
 #define C_PC        0x108
 #define C_V         0x110
+
+/*
+ * The CPU state's layout (CPUX86State), as arm64ec.c checks it: regs[]
+ * from 0 (RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8-R15), the x87 stack
+ * top and registers (16 bytes each, the mantissa first), XMM registers
+ * 64 bytes apart (YMMn's upper half 16 bytes into XMMn's).
+ */
+#define E_FPSTT     0x2e0
+#define E_FPREGS    0x2f0
+#define E_XMM       0x3d0
 
 #define TEB_PEB         0x60
 #define TEB_CPU_AREA    0x1788
@@ -143,8 +161,32 @@ ExitToX64:
     ldr     x17, [x18, #TEB_CPU_AREA]
     mov     w16, #1
     strb    w16, [x17]
+    mrs     x24, nzcv
     ldr     x16, [x17, #AREA_FRAME]
+    ldr     x14, [x16, #F_ENV]
     str     w13, [x16, #F_ENTRY]
+    str     w24, [x16, #F_NZCV]
+    stp     x9, x30, [x16, #F_PCLR]
+    cbz     x14, 7f
+    /* The x64 registers into the CPU state (xt_ec_exit_native_env's places). */
+    mov     w24, #1
+    str     w24, [x16, #F_SAVED]
+    mov     x23, sp
+    stp     x8, x0, [x14, #0x00]        /* RAX, RCX */
+    stp     x1, x27, [x14, #0x10]       /* RDX, RBX */
+    stp     x23, x29, [x14, #0x20]      /* RSP, RBP */
+    stp     x25, x26, [x14, #0x30]      /* RSI, RDI */
+    stp     x2, x3, [x14, #0x40]        /* R8-R11 */
+    stp     x4, x5, [x14, #0x50]
+    stp     x19, x20, [x14, #0x60]      /* R12-R15 */
+    stp     x21, x22, [x14, #0x70]
+    .irp    r, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    str     q\r, [x14, #(E_XMM + \r * 64)]
+    .endr
+    b       8f
+7:
+    /* No CPU state yet (the thread's first entry): into the frame. */
+    str     wzr, [x16, #F_SAVED]
     stp     x0, x1, [x16, #F_X(0)]
     stp     x2, x3, [x16, #F_X(2)]
     stp     x4, x5, [x16, #F_X(4)]
@@ -160,9 +202,6 @@ ExitToX64:
     stp     x29, x30, [x16, #F_X(29)]
     mov     x0, sp
     str     x0, [x16, #F_SP]
-    str     x9, [x16, #F_PC]
-    mrs     x0, nzcv
-    str     w0, [x16, #F_CPSR]
     add     x0, x16, #F_V
     stp     q0, q1, [x0, #0]
     stp     q2, q3, [x0, #32]
@@ -172,6 +211,7 @@ ExitToX64:
     stp     q10, q11, [x0, #160]
     stp     q12, q13, [x0, #192]
     stp     q14, q15, [x0, #224]
+8:
     ldr     x0, [x17, #AREA_STACK_BASE]
     mov     sp, x0
     mov     x0, x16
@@ -192,16 +232,6 @@ BeginSimulation:
     mov     sp, x16
     bl      "#xt_ec_begin"
     brk     #0xf000
-
-/*
- * The CPU state's layout (CPUX86State), as arm64ec.c checks it: regs[]
- * from 0 (RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8-R15), the x87 stack
- * top and registers (16 bytes each, the mantissa first), XMM registers
- * 64 bytes apart (YMMn's upper half 16 bytes into XMMn's).
- */
-#define E_FPSTT     0x2e0
-#define E_FPREGS    0x2f0
-#define E_XMM       0x3d0
 
 /*
  * void xt_ec_exit_native_env(env, target, ymm): leave the engine for

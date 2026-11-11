@@ -324,41 +324,50 @@ static void ec_seg(XtThread *t, X86Seg r, int sel)
 
 /*
  * A call or jump into x64 code from native code, into the CPU state while
- * the thread is being acquired (xt_acquire_begin): the x64 registers from
- * their ARM64EC places, RIP the target, x64 Windows' selectors.  EFLAGS'
- * SF, ZF, CF, OF and TF come from NZCV and SS, the rest (DF, PF, AF) is
- * the engine's, as it was at the last exit; the x87 state, MXCSR and the
- * YMM upper halves stay the engine's (native code's system calls zero
- * v16-v31, and x64 calls don't preserve the upper halves).  As xt_import
- * would take the same registers from a CONTEXT, without the round trip:
- * this runs on every entry.
+ * the thread is being acquired (xt_acquire_begin), all but the registers
+ * the entry stores (xt_ec_import_call's, or arm64ec.S's directly): RIP
+ * PC, x64 Windows' selectors.  EFLAGS' SF, ZF, CF, OF and TF come from
+ * NZCV and SS, the rest (DF, PF, AF) is the engine's, as it was at the
+ * last exit; the x87 state, MXCSR and the YMM upper halves stay the
+ * engine's (native code's system calls zero v16-v31, and x64 calls don't
+ * preserve the upper halves).  As xt_import would take the same state
+ * from a CONTEXT, without the round trip: this runs on every entry.
  */
-void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n)
+void xt_ec_import_entry(XtThread *t, uint64_t pc, uint32_t nzcv)
 {
     CPUX86State *env = t->env;
     uint32_t eflags = (xt_ec_eflags(env) &
                        ~(CC_S | CC_Z | CC_C | CC_O | TF_MASK)) |
-                      ec_eflags(n->Cpsr);
+                      ec_eflags(nzcv);
 
-    for (int i = 0; i < 16; i++) {
-        env->regs[i] = *ec_gpr(n, i);
-    }
-    env->eip = n->Pc;
+    env->eip = pc;
     env->eflags = (env->eflags & ~EFLAGS_FROM_CONTEXT) |
                   (eflags & EFLAGS_FROM_CONTEXT) | 0x2;
     CC_SRC = eflags & (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
     CC_OP = CC_OP_EFLAGS;
     env->df = 1 - (2 * ((eflags >> 10) & 1));
-    t->bp_skip = (eflags & RF_MASK) || (t->bp_hit && n->Pc == t->bp_hit);
+    t->bp_skip = (eflags & RF_MASK) || (t->bp_hit && pc == t->bp_hit);
     t->bp_hit = 0;
-    for (int i = 0; i < 16; i++) {
-        ec_v_load(&env->xmm_regs[i], &n->V[i]);
-    }
     ec_seg(t, R_CS, 0x33);
     ec_seg(t, R_SS, 0x2b);
     ec_seg(t, R_DS, 0x2b);
     ec_seg(t, R_ES, 0x2b);
     ec_seg(t, R_FS, 0x53);
     ec_seg(t, R_GS, 0x2b);
+}
+
+/* An entry's x64 registers from their ARM64EC places in N, then the rest. */
+void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n, uint64_t pc,
+                       uint32_t nzcv)
+{
+    CPUX86State *env = t->env;
+
+    for (int i = 0; i < 16; i++) {
+        env->regs[i] = *ec_gpr(n, i);
+    }
+    for (int i = 0; i < 16; i++) {
+        ec_v_load(&env->xmm_regs[i], &n->V[i]);
+    }
+    xt_ec_import_entry(t, pc, nzcv);
 }
 #endif
