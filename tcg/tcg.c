@@ -364,6 +364,7 @@ bool tcg_retstack_addr64;
 bool tcg_sysret;
 bool tcg_retstack_env;
 intptr_t tcg_retep_off;
+bool tcg_retalign;
 bool tcg_tb_flags_canon;
 bool tcg_addr32;
 bool tcg_tsc_counter;
@@ -1604,6 +1605,13 @@ static void tcg_out_spin_hint(TCGContext *s)
 }
 #endif
 
+#ifndef TCG_TARGET_HAS_RETSTACK
+static void tcg_out_ret_cancel(TCGContext *s)
+{
+    g_assert_not_reached();
+}
+#endif
+
 #ifndef TCG_TARGET_HAS_QEMU_ATOMIC
 static const TCGOutOpQemuAtomic outop_qemu_atomic = {
     .base.static_constraint = C_NotImplemented,
@@ -2680,6 +2688,17 @@ void tcg_prologue_init(void)
     /* Generate the prologue.  */
     tcg_target_qemu_prologue(s);
 
+    /*
+     * x-retalign keeps its account in the register that holds the return
+     * stack's top, which the prologue has now chosen or not.
+     */
+    if (tcg_retalign && tcg_retstack_reg < 0) {
+        error_report("x-retalign: needs x-retstack with its top in a host "
+                     "register (a 64-bit guest, no guest base, an AArch64 "
+                     "host)");
+        exit(EXIT_FAILURE);
+    }
+
     /* Allow the prologue to put e.g. guest_base into a pool entry.  */
     {
         int result = tcg_out_pool_finalize(s);
@@ -3266,6 +3285,7 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return false;
 #endif
     case INDEX_op_call_tb:
+    case INDEX_op_ret_cancel:
 #ifdef TCG_TARGET_HAS_RETSTACK
         return true;
 #else
@@ -12077,6 +12097,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             break;
         case INDEX_op_spin_hint:
             tcg_out_spin_hint(s);
+            break;
+        case INDEX_op_ret_cancel:
+            tcg_out_ret_cancel(s);
             break;
         default:
         do_default:

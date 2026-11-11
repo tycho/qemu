@@ -75,9 +75,14 @@ struct rcu_reader_data {
 
 QEMU_DECLARE_CO_TLS(struct rcu_reader_data, rcu_reader)
 
-static inline void rcu_read_lock(void)
+/*
+ * rcu_read_lock_reader and rcu_read_unlock_reader are rcu_read_lock and
+ * rcu_read_unlock for a caller that looks up the calling thread's reader
+ * (get_ptr_rcu_reader) once for both.  Not for coroutines, which can move
+ * to another thread, and so another reader, inside the section.
+ */
+static inline void rcu_read_lock_reader(struct rcu_reader_data *p_rcu_reader)
 {
-    struct rcu_reader_data *p_rcu_reader = get_ptr_rcu_reader();
     unsigned ctr;
 
     if (p_rcu_reader->depth++ > 0) {
@@ -94,10 +99,8 @@ static inline void rcu_read_lock(void)
     smp_mb_placeholder();
 }
 
-static inline void rcu_read_unlock(void)
+static inline void rcu_read_unlock_reader(struct rcu_reader_data *p_rcu_reader)
 {
-    struct rcu_reader_data *p_rcu_reader = get_ptr_rcu_reader();
-
     assert(p_rcu_reader->depth != 0);
     if (--p_rcu_reader->depth > 0) {
         return;
@@ -116,6 +119,16 @@ static inline void rcu_read_unlock(void)
         qatomic_set(&p_rcu_reader->waiting, false);
         qemu_event_set(&rcu_gp_event);
     }
+}
+
+static inline void rcu_read_lock(void)
+{
+    rcu_read_lock_reader(get_ptr_rcu_reader());
+}
+
+static inline void rcu_read_unlock(void)
+{
+    rcu_read_unlock_reader(get_ptr_rcu_reader());
 }
 
 void synchronize_rcu(void);

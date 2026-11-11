@@ -20,6 +20,22 @@
 #include "user/page-protection.h"
 #include "xtajit.h"
 #include "arm64ec.h"
+#include "run.h"
+
+/* The layouts arm64ec.S's offsets (F_*, C_*, TEB_CPU_AREA, AREA_*) assume. */
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, entry) != 0x04);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, ctx) != 0x10);
+QEMU_BUILD_BUG_ON(XT_EC_ENTRY_CALL != 1 || XT_EC_ENTRY_RETURN != 2);
+QEMU_BUILD_BUG_ON(offsetof(ARM64_NT_CONTEXT, Cpsr) != 0x04);
+QEMU_BUILD_BUG_ON(offsetof(ARM64_NT_CONTEXT, X) != 0x08);
+QEMU_BUILD_BUG_ON(offsetof(ARM64_NT_CONTEXT, Sp) != 0x100);
+QEMU_BUILD_BUG_ON(offsetof(ARM64_NT_CONTEXT, Pc) != 0x108);
+QEMU_BUILD_BUG_ON(offsetof(ARM64_NT_CONTEXT, V) != 0x110);
+QEMU_BUILD_BUG_ON(sizeof(((ARM64_NT_CONTEXT *)0)->V[0]) != 16);
+QEMU_BUILD_BUG_ON(XT_TEB_CPU_AREA != 0x1788);
+QEMU_BUILD_BUG_ON(offsetof(XtCpuArea, EmulatorStackBase) != 0x08);
+QEMU_BUILD_BUG_ON(offsetof(XtCpuArea, SuspendDoorbell) != 0x20);
+QEMU_BUILD_BUG_ON(offsetof(XtCpuArea, EmulatorData[1]) != 0x38);
 
 NTSTATUS NTAPI NtContinue(PCONTEXT, BOOLEAN);
 NTSTATUS NTAPI NtTerminateThread(HANDLE, NTSTATUS);
@@ -31,7 +47,8 @@ NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
 extern IMAGE_DOS_HEADER __ImageBase;
 
 #ifndef XT_SCAFFOLD
-#define XT_SCAFFOLD "smc=check"
+/* The fork's defaults for the module; XTAJIT_SETTINGS overrides them. */
+#define XT_SCAFFOLD "smc=check,retalign=on"
 #endif
 
 /*
@@ -263,17 +280,25 @@ static unsigned __stdcall doorbell_watcher(void *arg);
 /*
  * tcg_foreign_pc: native code is EC code (the PEB's bitmap); a lookup
  * skips it, and the exit to it is XT_EXCP_NATIVE, without the fetch fault
- * a translation of it would take (cpu_loop_exit_sigsegv).
+ * a translation of it would take (cpu_loop_exit_sigsegv).  The exit's
+ * call follows a tb_lookup of the same PC that found no TB, whose own
+ * call has just classified it: that answer is kept for it.
  */
 static bool ec_foreign_pc(CPUState *cs, vaddr pc, bool exit)
 {
-    if (!xt_is_ec_code(pc)) {
+    XtThread *t = cs->opaque;
+
+    if (!exit) {
+        t->ec_seen = xt_is_ec_code(pc);
+        t->ec_seen_pc = pc;
+        return t->ec_seen;
+    }
+    if (!(t->ec_seen && t->ec_seen_pc == pc) && !xt_is_ec_code(pc)) {
         return false;
     }
-    if (exit) {
-        ((XtThread *)cs->opaque)->native_target = pc;
-        cs->exception_index = XT_EXCP_NATIVE;
-    }
+    t->ec_seen = false;
+    t->native_target = pc;
+    cs->exception_index = XT_EXCP_NATIVE;
     return true;
 }
 
@@ -452,6 +477,9 @@ static int engine_state;    /* 0 none, 1 starting, 2 ready, -1 failed */
  * The engine, once per process, and the calling thread's record, once
  * per thread: at a thread's first entry, when the loader has set up the
  * module's TLS.  Another thread's first entry waits for the bring-up.
+ * The record is found through the CPU area, without the module's TLS:
+ * EmulatorData[0] is the thread's record from here until ThreadTerm
+ * takes it.
  */
 static XtThread *enter_engine(void)
 {
@@ -470,7 +498,7 @@ static XtThread *enter_engine(void)
             return NULL;
         }
     }
-    t = xt_self;
+    t = area->EmulatorData[0];
     if (!t) {
         t = xt_thread_new(false);
         t->cpu->opaque = t;
@@ -557,6 +585,7 @@ XTEXPORT NTSTATUS ThreadInit(void)
 }
 
 NTSTATUS NTAPI NtSuspendThread(HANDLE, PULONG);
+NTSTATUS NTAPI NtResumeThread(HANDLE, PULONG);
 NTSTATUS NTAPI NtGetContextThread(HANDLE, PCONTEXT);
 NTSTATUS NTAPI NtDuplicateObject(HANDLE, HANDLE, HANDLE, PHANDLE,
                                  ACCESS_MASK, ULONG, ULONG);
@@ -564,63 +593,117 @@ NTSTATUS NTAPI NtDuplicateObject(HANDLE, HANDLE, HANDLE, PHANDLE,
 static void ec_unregister(XtThread *t);
 
 /*
+ * Another thread out of the engine for Windows to end, through H: it is
+ * suspended and its context read, which waits for it to answer the
+ * doorbell or to leave an adapter scope (InSyscallCallback), as FEX's
+ * module does.  0 with it suspended there; else the status of the step
+ * that failed, the suspension undone.
+ */
+static NTSTATUS ec_stop_for_term(HANDLE h)
+{
+    CONTEXT c = { .ContextFlags = CONTEXT_CONTROL };
+    NTSTATUS st;
+
+    st = NtSuspendThread(h, NULL);
+    if (st < 0) {
+        return st;
+    }
+    st = NtGetContextThread(h, &c);
+    if (st < 0) {
+        NtResumeThread(h, NULL);
+    }
+    return st < 0 ? st : 0;
+}
+
+/*
  * A thread's end, by itself or by another thread (THREAD), before Windows
- * terminates it.  Another thread is suspended and its context read first,
- * as FEX's module does: that waits for it to answer the doorbell, so it
- * is outside the engine, holding none of its locks; it stays suspended
- * for Windows to end.  Then the record leaves the watcher's list and goes:
- * the thread's own at once, another's once its handle is signalled
- * (xt_reap), as the emulator stack and its page.  A thread Windows won't
- * end (xt_terminates) is left alone.
+ * terminates it.  Another thread is found, whatever THREAD allows
+ * (TerminateThread needs THREAD_TERMINATE alone), through its record's
+ * own handle (xt_terminated_thread), and stopped through that where it
+ * holds nothing of the engine's: suspended and its context read
+ * (ec_stop_for_term).  It stays suspended for Windows to end.  Then the
+ * record leaves the watcher's list and goes: the thread's own at once,
+ * another's once its handle is signalled (xt_reap), as the emulator stack
+ * and its page; the handles the reaper waits on are made first, and
+ * without them the record stays.  A thread that can't be stopped so is
+ * left as it is, with its record (the failure is an event): with all
+ * access to it, that takes a thread already ending.  A thread Windows
+ * won't end, or that the engine has no record of, is left alone.
  */
 XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
 {
-    XtThreadBasicInfo tbi;
     XtCpuArea *area;
     XtThread *t;
-    HANDLE h, dup;
+    HANDLE h, own = NULL, stack_ref = NULL, rec_ref = NULL;
+    void *teb = NULL;
+    DWORD tid;
     bool self;
 
-    if (qatomic_load_acquire(&engine_state) != 2 || !xt_terminates(thread)) {
+    if (qatomic_load_acquire(&engine_state) != 2) {
         return STATUS_SUCCESS;
     }
     xt_enter();
+    tid = xt_terminated_thread(thread, &teb, &own);
+    if (!tid) {
+        return STATUS_SUCCESS;
+    }
     xt_reap();
-    if (!thread || thread == GetCurrentThread()) {
-        tbi.TebBaseAddress = NtCurrentTeb();
-        self = true;
-    } else if (NtQueryInformationThread(thread, 0, &tbi, sizeof(tbi),
-                                        NULL) < 0) {
-        return STATUS_SUCCESS;
+    self = teb == NtCurrentTeb();
+    if (self) {
+        h = GetCurrentThread();
     } else {
-        self = tbi.TebBaseAddress == NtCurrentTeb();
-    }
-    area = xt_cpu_area(tbi.TebBaseAddress);
-    if (!area || !qatomic_read(&area->EmulatorData[0])) {
-        return STATUS_SUCCESS;
-    }
-    h = self ? GetCurrentThread() : thread;
-    if (!self) {
-        CONTEXT c = { .ContextFlags = CONTEXT_CONTROL };
+        NTSTATUS st = ec_stop_for_term(own);
 
-        NtSuspendThread(h, NULL);
-        NtGetContextThread(h, &c);
+        if (st < 0) {
+            xt_gevent(XT_EV_THREAD_TERM, tid, 4 | (uint64_t)(uint32_t)st << 32);
+            goto out;
+        }
+        h = own;
+    }
+    /* Its TEB is read only once it is stopped: it may have ended. */
+    area = xt_cpu_area(teb);
+    if (!area || !qatomic_read(&area->EmulatorData[0])) {
+        if (!self) {
+            NtResumeThread(h, NULL);
+        }
+        goto out;
+    }
+    if (NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
+                          &stack_ref, 0, 0, DUPLICATE_SAME_ACCESS) < 0 ||
+        (!self &&
+         NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
+                           &rec_ref, 0, 0, DUPLICATE_SAME_ACCESS) < 0)) {
+        /* Stopped, and the record stays with it. */
+        goto out;
     }
     t = qatomic_xchg(&area->EmulatorData[0], NULL);
     if (!t) {
-        return STATUS_SUCCESS;
+        /* Its own end, or another termination, took it first. */
+        if (!self) {
+            NtResumeThread(h, NULL);
+        }
+        goto out;
     }
     ec_unregister(t);
-    if (NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(), &dup,
-                          0, 0, DUPLICATE_SAME_ACCESS) >= 0) {
-        xt_reap_later(dup, area->EmulatorData[1]);
-    }
+    xt_reap_later(stack_ref, area->EmulatorData[1]);
+    stack_ref = NULL;
     if (self) {
         xt_thread_free(t);
         xt_crt_thread_fini();
-    } else if (NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
-                                 &dup, 0, 0, DUPLICATE_SAME_ACCESS) >= 0) {
-        xt_thread_retire(t, dup);
+    } else {
+        xt_thread_retire(t, rec_ref);
+        rec_ref = NULL;
+    }
+out:
+    if (stack_ref) {
+        NtClose(stack_ref);
+    }
+    if (rec_ref) {
+        NtClose(rec_ref);
+    }
+    if (own) {
+        /* A suspension outlives the handle: Windows ends the thread. */
+        NtClose(own);
     }
     return STATUS_SUCCESS;
 }
@@ -966,8 +1049,12 @@ static void leave(XtThread *t, ARM64_NT_CONTEXT *n, bool context_exit)
     }
 }
 
-static G_NORETURN void leave_native(XtThread *t, XtEcFrame *f,
-                                       vaddr target)
+/*
+ * Inline in the entries (ec_run), as their run loop is: each call between
+ * them is one per native call.
+ */
+static inline QEMU_ALWAYS_INLINE G_NORETURN
+void leave_native(XtThread *t, XtEcFrame *f, vaddr target)
 {
     /* leave()'s, with only what the exit to native code loads. */
     xt_publish(t, NULL);
@@ -1066,27 +1153,36 @@ static G_NORETURN void leave_suspend(XtThread *t, XtEcFrame *f)
     __builtin_unreachable();
 }
 
-static G_NORETURN void ec_run(XtThread *t, XtEcFrame *f)
+/* Every exit but a transfer to native code, with its XtExit. */
+static G_NORETURN __attribute__((noinline))
+void ec_leave(XtThread *t, XtEcFrame *f, int trapnr)
 {
     XtExit x;
 
-    for (;;) {
-        xt_run(t, &x);
-        switch (x.kind) {
-        case XT_EXIT_NATIVE:
-            leave_native(t, f, x.target);
-        case XT_EXIT_SYSCALL:
-            xt_event(t, XT_EV_SYSCALL, x.nr, 0);
-            leave_syscall(t);
-        case XT_EXIT_SUSPEND:
-            leave_suspend(t, f);
-        default:
-            leave_exception(t, &x);
-        }
+    xt_run_exit(t, trapnr, &x);
+    switch (x.kind) {
+    case XT_EXIT_SYSCALL:
+        xt_event(t, XT_EV_SYSCALL, x.nr, 0);
+        leave_syscall(t);
+    case XT_EXIT_SUSPEND:
+        leave_suspend(t, f);
+    default:
+        leave_exception(t, &x);
     }
 }
 
-static XtThread *ec_thread(void)
+static inline QEMU_ALWAYS_INLINE G_NORETURN
+void ec_run(XtThread *t, XtEcFrame *f)
+{
+    int trapnr = xt_run_core(t);
+
+    if (likely(trapnr == XT_EXCP_NATIVE)) {
+        leave_native(t, f, t->native_target);
+    }
+    ec_leave(t, f, trapnr);
+}
+
+static __attribute__((noinline)) XtThread *ec_thread_first(void)
 {
     XtThread *t = enter_engine();
 
@@ -1095,8 +1191,41 @@ static XtThread *ec_thread(void)
                            !xt_log_handle() && xt_log_status < 0 ?
                            xt_log_status : STATUS_NOT_SUPPORTED);
     }
+    return t;
+}
+
+/*
+ * The calling thread's record, from the CPU area once the engine is up
+ * and the thread has one (enter_engine), else from the bring-up.
+ */
+static inline QEMU_ALWAYS_INLINE XtThread *ec_thread(void)
+{
+    XtThread *t = NULL;
+
+    if (likely(qatomic_read(&engine_state) == 2)) {
+        t = xt_cpu_area(NtCurrentTeb())->EmulatorData[0];
+    }
+    if (unlikely(!t)) {
+        t = ec_thread_first();
+    }
     t->activation++;
     return t;
+}
+
+/*
+ * x-retalign: an entry from native code keeps the return stack in step.
+ * A return resumes past the call that left for native code, whose entry
+ * goes if it is on top.  A call pushes an entry with no landing for its
+ * return address, so that the x64 callee's return to native code takes
+ * that one and not an older entry.
+ */
+static void ec_retstack_entry(XtThread *t, const XtEcFrame *f)
+{
+    if (f->entry == XT_EC_ENTRY_RETURN) {
+        tcg_retstack_pop_key(t->cpu, f->ctx.Pc);
+    } else if (f->entry == XT_EC_ENTRY_CALL) {
+        tcg_retstack_push_key(t->cpu, f->ctx.Lr);
+    }
 }
 
 /*
@@ -1115,6 +1244,9 @@ void xt_ec_enter(XtEcFrame *f)
     xt_acquire_begin(t);
     xt_ec_import_call(t, &f->ctx);
     xt_acquire_end(t);
+    if (tcg_retalign) {
+        ec_retstack_entry(t, f);
+    }
     ec_run(t, f);
 }
 

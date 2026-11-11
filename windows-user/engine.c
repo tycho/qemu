@@ -897,6 +897,8 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
 
     module_call_init(MODULE_INIT_TRACE);
     qemu_init_cpu_list();
+    /* A thread's record binds current_cpu (xt_thread_new). */
+    tcg_cpu_bound = true;
     module_call_init(MODULE_INIT_QOM);
 
     accel = current_accel();
