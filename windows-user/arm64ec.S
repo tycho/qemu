@@ -71,6 +71,14 @@ xt_check_call:
  * x13 carries the entry's kind to the frame: ARM64EC code never uses it,
  * so native code reached by the bypass below can't depend on it.
  */
+/* MMn's mantissa (ST(n) from the stack top in w0, the x87 registers at x1). */
+.macro mm_load i, r
+    add     w2, w0, #\i
+    and     x2, x2, #7
+    add     x2, x1, x2, lsl #4
+    ldr     x\r, [x2]
+.endm
+
 .macro cap_check which
     adrp    x17, xt_cap_entry_mode
     ldr     w17, [x17, :lo12:xt_cap_entry_mode]
@@ -186,57 +194,56 @@ BeginSimulation:
     brk     #0xf000
 
 /*
- * void xt_ec_exit_native(ARM64_NT_CONTEXT *n): leave the engine for
- * native code at n->Pc, with the packed guest state of N (xt_ec_pack):
- * the x64 registers in their places, sp the guest's.  The _ymm entry
- * loads v16-v31 too, so the thread's context shows the YMM upper halves
- * until native code changes them.  The engine has
- * given the thread back; no frame of the emulator stack is live.
+ * The CPU state's layout (CPUX86State), as arm64ec.c checks it: regs[]
+ * from 0 (RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8-R15), the x87 stack
+ * top and registers (16 bytes each, the mantissa first), XMM registers
+ * 64 bytes apart (YMMn's upper half 16 bytes into XMMn's).
  */
-    .globl "#xt_ec_exit_native_ymm"
-    .def "#xt_ec_exit_native_ymm"; .scl 2; .type 32; .endef
-"#xt_ec_exit_native_ymm":
-    mov     x16, x0
-    add     x17, x16, #C_V
-    ldp     q16, q17, [x17, #256]
-    ldp     q18, q19, [x17, #288]
-    ldp     q20, q21, [x17, #320]
-    ldp     q22, q23, [x17, #352]
-    ldp     q24, q25, [x17, #384]
-    ldp     q26, q27, [x17, #416]
-    ldp     q28, q29, [x17, #448]
-    ldp     q30, q31, [x17, #480]
-    b       1f
+#define E_FPSTT     0x2e0
+#define E_FPREGS    0x2f0
+#define E_XMM       0x3d0
 
-    .globl "#xt_ec_exit_native"
-    .def "#xt_ec_exit_native"; .scl 2; .type 32; .endef
-"#xt_ec_exit_native":
+/*
+ * void xt_ec_exit_native_env(env, target, ymm): leave the engine for
+ * native code at TARGET with the guest state of ENV in its ARM64EC places
+ * (xt_ec_pack's, without the frame): the x64 registers, sp the guest's;
+ * MM0-7's mantissas from the x87 stack top on, in x30, x6, x7, (x9),
+ * x10-x12 and x15, where x9 takes the target and the dispatch may replace
+ * lr; with YMM, v16-v31 the upper halves, so the thread's context shows
+ * them until native code changes them.  The arguments are taken before
+ * the registers they arrive in are loaded.  The engine has given the
+ * thread back; no frame of the emulator stack is live.
+ */
+    .globl "#xt_ec_exit_native_env"
+    .def "#xt_ec_exit_native_env"; .scl 2; .type 32; .endef
+"#xt_ec_exit_native_env":
     mov     x16, x0
-    add     x17, x16, #C_V
+    mov     x9, x1
+    cbz     w2, 1f
+    .irp    r, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+    ldr     q\r, [x16, #(E_XMM + 16 + (\r - 16) * 64)]
+    .endr
 1:
-    ldp     q0, q1, [x17, #0]
-    ldp     q2, q3, [x17, #32]
-    ldp     q4, q5, [x17, #64]
-    ldp     q6, q7, [x17, #96]
-    ldp     q8, q9, [x17, #128]
-    ldp     q10, q11, [x17, #160]
-    ldp     q12, q13, [x17, #192]
-    ldp     q14, q15, [x17, #224]
-    ldp     x0, x1, [x16, #C_X(0)]
-    ldp     x2, x3, [x16, #C_X(2)]
-    ldp     x4, x5, [x16, #C_X(4)]
-    ldp     x6, x7, [x16, #C_X(6)]
-    ldr     x8, [x16, #C_X(8)]
-    ldp     x10, x11, [x16, #C_X(10)]
-    ldr     x12, [x16, #C_X(12)]
-    ldr     x15, [x16, #C_X(15)]
-    ldp     x19, x20, [x16, #C_X(19)]
-    ldp     x21, x22, [x16, #C_X(21)]
-    ldp     x25, x26, [x16, #C_X(25)]
-    ldr     x27, [x16, #C_X(27)]
-    ldp     x29, x30, [x16, #C_X(29)]
-    ldr     x9, [x16, #C_PC]
-    ldr     x17, [x16, #C_SP]
+    .irp    r, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    ldr     q\r, [x16, #(E_XMM + \r * 64)]
+    .endr
+    ldr     w0, [x16, #E_FPSTT]
+    add     x1, x16, #E_FPREGS
+    mm_load 0, 30
+    mm_load 1, 6
+    mm_load 2, 7
+    mm_load 4, 10
+    mm_load 5, 11
+    mm_load 6, 12
+    mm_load 7, 15
+    ldp     x8, x0, [x16, #0x00]        /* RAX, RCX */
+    ldp     x1, x27, [x16, #0x10]       /* RDX, RBX */
+    ldp     x17, x29, [x16, #0x20]      /* RSP, RBP */
+    ldp     x25, x26, [x16, #0x30]      /* RSI, RDI */
+    ldp     x2, x3, [x16, #0x40]        /* R8-R11 */
+    ldp     x4, x5, [x16, #0x50]
+    ldp     x19, x20, [x16, #0x60]      /* R12-R15 */
+    ldp     x21, x22, [x16, #0x70]
     mov     sp, x17
 
 /*
