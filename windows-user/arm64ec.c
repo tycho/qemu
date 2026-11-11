@@ -71,8 +71,11 @@ static uintptr_t ki_exception_dispatcher;
 
 /*
  * Work other processes queued for this one's emulator (a flush of code
- * they wrote): ntdll delivers it through the notification exports, when
- * asked at each entry and system call.
+ * they wrote, a protection change): ntdll delivers it through the
+ * notification exports when asked, which takes a lock of its own.  Asked
+ * where what it reports matters to the engine: before a translation
+ * (ec_foreign_pc), at a system call and at a continuation (xt_ec_begin);
+ * not at every call to or return from native code.
  */
 static void (*cross_process_work)(void);
 
@@ -282,7 +285,9 @@ static unsigned __stdcall doorbell_watcher(void *arg);
  * skips it, and the exit to it is XT_EXCP_NATIVE, without the fetch fault
  * a translation of it would take (cpu_loop_exit_sigsegv).  The exit's
  * call follows a tb_lookup of the same PC that found no TB, whose own
- * call has just classified it: that answer is kept for it.
+ * call has just classified it: that answer is kept for it.  Guest code
+ * that found no TB is translated next, so work other processes queued
+ * (cross_process_work) is asked for first.
  */
 static bool ec_foreign_pc(CPUState *cs, vaddr pc, bool exit)
 {
@@ -294,6 +299,9 @@ static bool ec_foreign_pc(CPUState *cs, vaddr pc, bool exit)
         return t->ec_seen;
     }
     if (!(t->ec_seen && t->ec_seen_pc == pc) && !xt_is_ec_code(pc)) {
+        if (cross_process_work) {
+            cross_process_work();
+        }
         return false;
     }
     t->ec_seen = false;
@@ -1238,9 +1246,6 @@ void xt_ec_enter(XtEcFrame *f)
     XtThread *t = ec_thread();
 
     t->ec_suspended = false;
-    if (cross_process_work) {
-        cross_process_work();
-    }
     xt_acquire_begin(t);
     xt_ec_import_call(t, &f->ctx);
     xt_acquire_end(t);
