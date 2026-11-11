@@ -102,14 +102,21 @@ static inline bool xt_is_ec_code(uint64_t addr)
 void xt_check_call(void);
 
 /*
- * The page below a thread's emulator stack (ThreadInit): its doorbell, and
- * the native registers of an entry (arm64ec.S stores them, and the entry's
- * kind).
+ * The page below a thread's emulator stack (ThreadInit): its doorbell, an
+ * entry's record (arm64ec.S writes it: the kind, NZCV, the target and lr,
+ * and where the registers went), the native registers of an entry that
+ * had no CPU state to store them into, and that CPU state, ENV: NULL
+ * until the thread's record exists (enter_engine), and again from when
+ * the record is taken (ThreadTerm), so that when it is set it is
+ * EmulatorData[0]'s.
  */
 typedef struct XtEcFrame {
     ULONG doorbell;
     uint32_t entry;             /* XT_EC_ENTRY_*, at offset 4 */
-    uint32_t pad[2];
+    uint32_t nzcv;              /* at entry, as the Cpsr's */
+    uint32_t saved_to_env;      /* the registers in ENV, not in CTX */
+    uint64_t pc, lr;            /* the target (x9), lr at entry */
+    CPUArchState *env;
     ARM64_NT_CONTEXT ctx;
 } XtEcFrame;
 
