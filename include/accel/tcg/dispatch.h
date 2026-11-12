@@ -29,4 +29,12 @@ TCGTBCPUState cpu_exec_tb_state(CPUState *cpu);
  */
 TranslationBlock *cpu_exec_tb_cached(CPUState *cpu, TCGTBCPUState s);
 
+/*
+ * The loop's check before each TB: unless the next TB is a one-shot
+ * CF_NOIRQ one, clear the kick (icount_decr.u16.high) and handle the
+ * requests behind it.  True, with cpu->exception_index set, when the
+ * loop must stop.  It may clear *@last_tb.
+ */
+bool cpu_exec_interrupted(CPUState *cpu, TranslationBlock **last_tb);
+
 #endif

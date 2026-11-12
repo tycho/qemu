@@ -298,6 +298,16 @@ static bool tb_jmp_cache_global(CPUState *cpu, TranslationBlock *tb, vaddr pc)
 #endif
 }
 
+/*
+ * The loop's steps that accel/tcg/dispatch.h exports have a second caller
+ * in user mode: always inline in the loop there, as with one caller.
+ */
+#ifdef CONFIG_USER_ONLY
+#define DISPATCH_INLINE QEMU_ALWAYS_INLINE
+#else
+#define DISPATCH_INLINE
+#endif
+
 /**
  * tb_lookup:
  * @cpu: CPU that will execute the returned translation block
@@ -1286,8 +1296,8 @@ static inline bool icount_exit_request(CPUState *cpu)
     return cpu->neg.icount_decr.u16.low + cpu->icount_extra == 0;
 }
 
-static inline bool cpu_handle_interrupt(CPUState *cpu,
-                                        TranslationBlock **last_tb)
+static inline DISPATCH_INLINE
+bool cpu_handle_interrupt(CPUState *cpu, TranslationBlock **last_tb)
 {
     /*
      * If we have requested custom cflags with CF_NOIRQ we should
@@ -1394,6 +1404,13 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
 
     return false;
 }
+
+#ifdef CONFIG_USER_ONLY
+bool cpu_exec_interrupted(CPUState *cpu, TranslationBlock **last_tb)
+{
+    return cpu_handle_interrupt(cpu, last_tb);
+}
+#endif
 
 static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
                                     vaddr pc, TranslationBlock **last_tb,
