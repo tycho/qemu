@@ -37,4 +37,15 @@ TranslationBlock *cpu_exec_tb_cached(CPUState *cpu, TCGTBCPUState s);
  */
 bool cpu_exec_interrupted(CPUState *cpu, TranslationBlock **last_tb);
 
+/*
+ * The loop's work after a TB's code, entered through the prologue
+ * (tcg_qemu_tb_exec()), has returned @ret: the TB it left from (its
+ * read-write view), returned, and how it left, in *@tb_exit; the guest PC
+ * restored if it left before starting; the single-step's debug exception
+ * (by cpu_loop_exit(), so a longjmp destination must be ready); *@last_tb
+ * for the next TB's link; the region sample on a requested exit.
+ */
+TranslationBlock *cpu_exec_tb_done(CPUState *cpu, uintptr_t ret,
+                                   TranslationBlock **last_tb, int *tb_exit);
+
 #endif

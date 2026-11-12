@@ -913,6 +913,10 @@ static vaddr log_pc(CPUState *cpu, const TranslationBlock *tb)
     }
 }
 
+static inline TranslationBlock *cpu_tb_exec_after(CPUState *cpu,
+                                                  uintptr_t ret,
+                                                  int *tb_exit);
+
 /* Execute a TB, and fix up the CPU state afterwards if necessary */
 /*
  * Disable CFI checks.
@@ -927,7 +931,6 @@ static inline TranslationBlock * QEMU_DISABLE_CFI
 cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
 {
     uintptr_t ret;
-    TranslationBlock *last_tb;
     const void *tb_ptr = itb->tc.ptr;
 
     if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
@@ -940,6 +943,20 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
 #endif
     qemu_thread_jit_execute();
     ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
+    return cpu_tb_exec_after(cpu, ret, tb_exit);
+}
+
+/*
+ * After a TB's code has returned @ret: the TB it left from and how
+ * (*@tb_exit), the guest PC restored if it left before starting, and the
+ * single-step's debug exception raised.
+ */
+static inline QEMU_ALWAYS_INLINE
+TranslationBlock *cpu_tb_exec_after(CPUState *cpu, uintptr_t ret,
+                                    int *tb_exit)
+{
+    TranslationBlock *last_tb;
+
     cpu->neg.can_do_io = true;
     qemu_plugin_disable_mem_helpers(cpu);
     /*
@@ -1412,12 +1429,14 @@ bool cpu_exec_interrupted(CPUState *cpu, TranslationBlock **last_tb)
 }
 #endif
 
-static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
-                                    vaddr pc, TranslationBlock **last_tb,
-                                    int *tb_exit)
+/*
+ * The loop's work after a TB: *@last_tb for the next TB's link, the
+ * region sample on a requested exit, the icount budget refilled.
+ */
+static inline QEMU_ALWAYS_INLINE
+void cpu_loop_tb_after(CPUState *cpu, TranslationBlock *tb,
+                       TranslationBlock **last_tb, int *tb_exit)
 {
-    trace_exec_tb(tb, pc);
-    tb = cpu_tb_exec(cpu, tb, tb_exit);
     if (*tb_exit != TB_EXIT_REQUESTED) {
         *last_tb = tb;
         /* A TB that checks the request on its exits left on it. */
@@ -1468,6 +1487,26 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
     }
 #endif
 }
+
+static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
+                                    vaddr pc, TranslationBlock **last_tb,
+                                    int *tb_exit)
+{
+    trace_exec_tb(tb, pc);
+    tb = cpu_tb_exec(cpu, tb, tb_exit);
+    cpu_loop_tb_after(cpu, tb, last_tb, tb_exit);
+}
+
+#ifdef CONFIG_USER_ONLY
+TranslationBlock *cpu_exec_tb_done(CPUState *cpu, uintptr_t ret,
+                                   TranslationBlock **last_tb, int *tb_exit)
+{
+    TranslationBlock *tb = cpu_tb_exec_after(cpu, ret, tb_exit);
+
+    cpu_loop_tb_after(cpu, tb, last_tb, tb_exit);
+    return tb;
+}
+#endif
 
 /* main execution loop */
 
