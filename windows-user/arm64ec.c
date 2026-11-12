@@ -10,10 +10,13 @@
 #include "qemu/units.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
+#include "qemu/log.h"
 #include "hw/core/cpu.h"
 #include "cpu.h"
 #include "tcg/tcg.h"
 #include "tcg/startup.h"
+#include "tcg/host-fpenv.h"
+#include "accel/tcg/dispatch.h"
 #include "exec/mmap-lock.h"
 #include "accel/tcg/tb-context.h"
 #include "exec/page-protection.h"
@@ -1216,15 +1219,20 @@ void ec_leave(XtThread *t, XtEcFrame *f, int trapnr)
     }
 }
 
+/* The exit for xt_run_core's TRAPNR. */
 static inline QEMU_ALWAYS_INLINE G_NORETURN
-void ec_run(XtThread *t, XtEcFrame *f)
+void ec_exit(XtThread *t, XtEcFrame *f, int trapnr)
 {
-    int trapnr = xt_run_core(t);
-
     if (likely(trapnr == XT_EXCP_NATIVE)) {
         leave_native(t, t->native_target);
     }
     ec_leave(t, f, trapnr);
+}
+
+static inline QEMU_ALWAYS_INLINE G_NORETURN
+void ec_run(XtThread *t, XtEcFrame *f)
+{
+    ec_exit(t, f, xt_run_core(t));
 }
 
 static __attribute__((noinline)) XtThread *ec_thread_first(void)
@@ -1274,6 +1282,223 @@ static void ec_retstack_entry(XtThread *t, const XtEcFrame *f)
 }
 
 /*
+ * The dispatch: an entry from native code whose first TB the jump cache
+ * holds, and which leaves that TB for native code, runs without
+ * cpu_exec's activation.  It takes the run loop's own steps
+ * (accel/tcg/dispatch.h) and xt_run_core's, in their order, with the
+ * activation's resources taken directly: the record's RCU reader, the
+ * host FP state, cpu->jmp_env.  Anything else ends the activation where
+ * cpu_exec would have ended, with the same work done, and goes on as
+ * xt_run_core would from there (ec_dispatch_fallback).
+ *
+ * An entry is dispatched (ec_dispatch_ready) when it has nothing for
+ * the run's preamble or cpu_exec's first steps to do: its registers in
+ * the CPU state, the thread's reader registered, no termination or
+ * suspension request, no breakpoint to step past (xt_ec_import_entry's
+ * RF and bp_hit), no single step or breakpoints, no one-shot cflags or
+ * pending exception, the selectors loaded, no diagnostics or execution
+ * log.  It fails before anything is written, and the entry is
+ * xt_ec_enter's as before.
+ */
+static inline QEMU_ALWAYS_INLINE bool ec_dispatch_ready(XtThread *t,
+                                                        const XtEcFrame *f)
+{
+    CPUState *cs = t->cpu;
+    CPUX86State *env = t->env;
+
+    return likely(f->saved_to_env && t->rcu_reader &&
+                  !qatomic_read(&t->terminating) &&
+                  !qatomic_read(&t->suspend_req) &&
+                  !(xt_ec_eflags(env) & RF_MASK) &&
+                  (!t->bp_hit || t->bp_hit != f->pc) &&
+                  !cpu_single_stepping(cs) &&
+                  QTAILQ_EMPTY(&cs->breakpoints) &&
+                  cs->cflags_next_tb == -1 && cs->exception_index < 0 &&
+                  !xt_diag &&
+                  !qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC) &&
+                  xt_ec_segs_loaded(t));
+}
+
+/* Out of the lazy flags, as cpu_exec's exit leaves them (x86_cpu_exec_exit). */
+static inline QEMU_ALWAYS_INLINE void ec_dispatch_flags_out(CPUX86State *env)
+{
+    env->eflags = cpu_compute_eflags(env);
+    env_archcpu(env)->eflags_in_tcg = false;
+}
+
+/* The end of the activation: cpu_exec's, then xt_run_exec's. */
+static inline QEMU_ALWAYS_INLINE void ec_dispatch_end(XtThread *t,
+                                                      CPUState *cs,
+                                                      CPUX86State *env)
+{
+    ec_dispatch_flags_out(env);
+    x86_host_fp_exit(env);
+    rcu_read_unlock_reader(t->rcu_reader);
+    cpu_exec_end(cs);
+    t->active = XT_ACT_NONE;
+}
+
+typedef enum EcFallback {
+    EC_FB_MISS,     /* no TB to run here: the request check, then a run */
+    EC_FB_TRAP,     /* cpu_exec's TRAPNR: the completion */
+    EC_FB_RETRY,    /* a longjmp with no exception: cpu_exec again */
+} EcFallback;
+
+/*
+ * After ec_dispatch_end: xt_run_core's remaining steps, from where the
+ * activation ended, without the import or the preamble again (both are
+ * done), then the exit for the trap number it returns.  A miss, before
+ * or after a TB, is where cpu_exec would have looked further or
+ * translated: the completion's request check, then xt_run_core.  A trap
+ * number (a pending exception consumed, or a request found between TBs)
+ * goes to the completion, with the fault's details intact.  A longjmp
+ * without an exception (an SMC or crossing retry, with cflags_next_tb
+ * kept) is cpu_exec's re-entry into its loop: the run, then the
+ * completion.
+ */
+static G_NORETURN __attribute__((noinline))
+void ec_dispatch_fallback(XtThread *t, XtEcFrame *f, EcFallback how,
+                          int trapnr)
+{
+    CPUState *cs = t->cpu;
+
+    switch (how) {
+    case EC_FB_TRAP:
+        if (xt_run_complete(t, cs, trapnr, false)) {
+            ec_exit(t, f, trapnr);
+        }
+        break;
+    case EC_FB_RETRY:
+        trapnr = xt_run_exec(t, cs);
+        if (xt_run_complete(t, cs, trapnr, false)) {
+            ec_exit(t, f, trapnr);
+        }
+        break;
+    default:
+        if (qatomic_load_acquire(&cs->exit_request)) {
+            qemu_process_cpu_events(cs);
+        }
+        break;
+    }
+    ec_run(t, f);
+}
+
+/*
+ * The dispatch's round trip: xt_ec_enter's ownership and import, with
+ * cpu_exec's entry into the lazy flags (xt_ec_import_engine); the
+ * preamble's (a suspension request seen there leaves as the preamble
+ * would); xt_run_exec's and cpu_exec's entry; the loop's request check
+ * and the jump cache's TB; the TB, through the prologue; the loop's work
+ * after it.  A TB that left for native code, by helper_lookup_tb_ptr's
+ * exit (XT_EXCP_NATIVE) or by an exit slot to EC code (tb_lookup's
+ * classification, ec_foreign_pc's, without the cache's miss), ends the
+ * activation as cpu_exec and the completion do, then leaves.
+ */
+static G_NORETURN __attribute__((noinline))
+void ec_dispatch(XtThread *t, XtEcFrame *f)
+{
+    CPUState *cs = t->cpu;
+    CPUX86State *env = t->env;
+    TranslationBlock *tb, *last_tb = NULL;
+    uintptr_t ret;
+    int tb_exit, trapnr;
+    vaddr pc;
+
+    t->ec_suspended = false;
+    t->state = XT_ACQUIRING;
+    xt_inject(t, XT_INJ_ACQUIRE);
+    xt_ec_import_engine(t, f->pc, f->nzcv);
+    t->state = XT_ENGINE;
+    if (tcg_retalign) {
+        ec_retstack_entry(t, f);
+    }
+
+    if (unlikely(qatomic_read(&t->suspend_req))) {
+        ec_dispatch_flags_out(env);
+        ec_leave(t, f, XT_EXCP_SUSPEND);
+    }
+    t->after_suspend = false;
+    t->gfault.code = 0;
+
+    t->active = XT_ACT_EXEC;
+    cpu_exec_start(cs);
+    if (!tcg_cpu_bound) {
+        current_cpu = cs;
+    }
+    rcu_read_lock_reader(t->rcu_reader);
+    x86_host_fp_enter(env);
+    if (unlikely(sigsetjmp(cs->jmp_env, 0) != 0)) {
+        cpu_exec_longjmp_cleanup(cs);
+        if (cs->exception_index >= 0) {
+            goto trap;
+        }
+        ec_dispatch_end(t, cs, env);
+        ec_dispatch_fallback(t, f, EC_FB_RETRY, 0);
+    }
+
+    if (unlikely(cpu_exec_interrupted(cs, &last_tb))) {
+        goto trap;
+    }
+    tb = cpu_exec_tb_cached(cs, cpu_exec_tb_state(cs));
+    if (unlikely(!tb)) {
+        goto miss;
+    }
+#ifdef CONFIG_DEBUG_TCG
+    tcg_retstack_check(cs);
+#endif
+    qemu_thread_jit_execute();
+    ret = tcg_qemu_tb_exec(env, tb->tc.ptr);
+    cpu_exec_tb_done(cs, ret, &last_tb, &tb_exit);
+
+    if (cs->exception_index >= 0 ||
+        unlikely(cpu_exec_interrupted(cs, &last_tb))) {
+        goto trap;
+    }
+    pc = env->hflags & HF_CS64_MASK ? env->eip
+                                    : (uint32_t)(env->segs[R_CS].base +
+                                                 env->eip);
+    if (unlikely(cs->cflags_next_tb != -1)) {
+        goto miss;
+    }
+    if (!xt_is_ec_code(pc)) {
+        /*
+         * Guest code, which cpu_exec runs: first the loop's link from
+         * this exit to the TB the jump cache holds for it, which the loop
+         * makes before running that TB and cpu_exec, entered afresh,
+         * can't.  The next round trip goes on through the link.
+         */
+        if (last_tb) {
+            tb = cpu_exec_tb_cached(cs, cpu_exec_tb_state(cs));
+            if (tb) {
+                cpu_exec_tb_link(last_tb, tb_exit, tb);
+            }
+        }
+        goto miss;
+    }
+    t->ec_seen = false;
+    t->native_target = pc;
+
+native:
+    ec_dispatch_end(t, cs, env);
+    if (qatomic_load_acquire(&cs->exit_request)) {
+        qemu_process_cpu_events(cs);
+    }
+    leave_native(t, t->native_target);
+
+trap:
+    cpu_exec_exception(cs, &trapnr);
+    if (likely(trapnr == XT_EXCP_NATIVE)) {
+        goto native;
+    }
+    ec_dispatch_end(t, cs, env);
+    ec_dispatch_fallback(t, f, EC_FB_TRAP, trapnr);
+
+miss:
+    ec_dispatch_end(t, cs, env);
+    ec_dispatch_fallback(t, f, EC_FB_MISS, 0);
+}
+
+/*
  * A call, jump or return into x64 code (ExitToX64, DispatchJump,
  * RetToEntryThunk in arm64ec.S), with F's record of it: the x64 registers
  * are in the CPU state already, or, where the frame had none to name (a
@@ -1285,6 +1510,9 @@ void xt_ec_enter(XtEcFrame *f)
 {
     XtThread *t = ec_thread();
 
+    if (ec_dispatch_ready(t, f)) {
+        ec_dispatch(t, f);
+    }
     t->ec_suspended = false;
     xt_acquire_begin(t);
     if (likely(f->saved_to_env)) {
