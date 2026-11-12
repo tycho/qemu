@@ -64,4 +64,12 @@ void cpu_exec_tb_link(TranslationBlock *last_tb, int tb_exit,
  */
 bool cpu_exec_exception(CPUState *cpu, int *excp);
 
+/*
+ * What cpu_exec() undoes when a longjmp to cpu->jmp_env arrives: the
+ * return stack settled, the helper's return address cleared, the locks
+ * the abandoned code held released, the host FP state's brackets
+ * unwound.  For a dispatch with its own sigsetjmp on cpu->jmp_env.
+ */
+void cpu_exec_longjmp_cleanup(CPUState *cpu);
+
 #endif

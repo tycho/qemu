@@ -1032,7 +1032,7 @@ static void cpu_exec_exit(CPUState *cpu)
     }
 }
 
-static void cpu_exec_longjmp_cleanup(CPUState *cpu)
+void cpu_exec_longjmp_cleanup(CPUState *cpu)
 {
     /* Non-buggy compilers preserve this; assert the correct value. */
     g_assert(cpu == current_cpu);
