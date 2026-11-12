@@ -165,6 +165,8 @@ typedef struct XtExit {
 typedef struct XtThread {
     CPUState *cpu;
     CPUX86State *env;
+    /* The x64 module's: the thread's reader, once registered (its TLS's) */
+    struct rcu_reader_data *rcu_reader;
     void *heap;             /* its allocator heap, given back with it */
     DWORD tid;
     void *teb;
@@ -478,6 +480,7 @@ static inline void xt_acquire_begin(XtThread *t)
 #ifdef TARGET_X86_64
     if (unlikely(!t->rcu_registered)) {
         xt_rcu_ensure();
+        t->rcu_reader = get_ptr_rcu_reader();
         t->rcu_registered = true;
     }
 #else
