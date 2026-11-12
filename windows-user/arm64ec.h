@@ -117,6 +117,7 @@ typedef struct XtEcFrame {
     uint32_t saved_to_env;      /* the registers in ENV, not in CTX */
     uint64_t pc, lr;            /* the target (x9), lr at entry */
     CPUArchState *env;
+    uint32_t inj_armed;         /* XTAJIT_INJECT=sN: suspended before */
     ARM64_NT_CONTEXT ctx;
 } XtEcFrame;
 
@@ -143,5 +144,29 @@ extern const char xt_cap_loop[], xt_cap_loop_top[], xt_cap_trap[],
 extern uint32_t xt_cap_entry_mode;
 extern uint64_t xt_cap_entry_rec[6];
 void xt_cap_entry_end(uint64_t which);
+
+/*
+ * XTAJIT_INJECT=sN or SN (test-ec.c): the stubs' test points.  With
+ * XT_EC_ENTRY_INJECT in xt_cap_entry_mode, the entries take copies of
+ * themselves (arm64ec.S) that wait TICKS at point N: 1 before
+ * InSimulation is set, 2 after it, 3 after the registers' stores; and
+ * the exit, through xt_ec_exit_native_env_inj: 4 before the registers'
+ * loads, 5 after them, 6 after InSimulation is cleared.  With sN, only in
+ * a thread suspended before (XtEcFrame.inj_armed); with SN, always.
+ * HITS counts the waits, RUNG those that ended with the doorbell set.
+ */
+#define XT_EC_ENTRY_INJECT  0x80000000u
+
+typedef struct XtStubInject {
+    uint32_t point, always;
+    uint64_t ticks;
+    uint64_t hits[8], rung[8];
+} QEMU_ALIGNED(128) XtStubInject;
+
+extern XtStubInject xt_stub_inject;
+G_NORETURN void xt_ec_exit_native_env_inj(CPUArchState *env,
+                                          uintptr_t target, bool ymm);
+void xt_ec_stub_inject_init(void);
+void xt_ec_stub_inject_report(void);
 
 #endif

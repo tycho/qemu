@@ -29,7 +29,11 @@ QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, saved_to_env) != 0x0c);
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, pc) != 0x10);
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, lr) != 0x18);
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, env) != 0x20);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, inj_armed) != 0x28);
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, ctx) != 0x30);
+QEMU_BUILD_BUG_ON(offsetof(XtStubInject, ticks) != 0x08);
+QEMU_BUILD_BUG_ON(offsetof(XtStubInject, hits) != 0x10);
+QEMU_BUILD_BUG_ON(offsetof(XtStubInject, rung) != 0x50);
 QEMU_BUILD_BUG_ON(sizeof(XtEcFrame) > 0x1000);
 QEMU_BUILD_BUG_ON(XT_EC_ENTRY_CALL != 1 || XT_EC_ENTRY_RETURN != 2);
 QEMU_BUILD_BUG_ON(offsetof(ARM64_NT_CONTEXT, Cpsr) != 0x04);
@@ -567,11 +571,13 @@ XTEXPORT NTSTATUS ProcessInit(void)
     }
     reached |= 0x80;
     xt_ec_probe_process_init();
+    xt_ec_stub_inject_init();
     return STATUS_SUCCESS;
 }
 
 XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
 {
+    xt_ec_stub_inject_report();
     if (xt_rcu_stress) {
         char line[64];
 
@@ -790,6 +796,7 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
         t->int3_rip = 0;
     }
     if (native->Pc == (uintptr_t)xt_ec_exit_suspend_point) {
+        ((XtEcFrame *)area->EmulatorData[1])->inj_armed = 1;
         qatomic_set(area->SuspendDoorbell, 0);
         native->Pc = (uintptr_t)xt_ec_exit_resume_point;
         xt_continue_native(native);
@@ -1100,6 +1107,9 @@ void leave_native(XtThread *t, vaddr target)
     if (xt_log_handle()) {
         xt_log_flush(t);
     }
+    if (unlikely(xt_stub_inject.point)) {
+        xt_ec_exit_native_env_inj(env, target, xt_ec_ymm(t));
+    }
     xt_ec_exit_native_env(env, target, xt_ec_ymm(t));
 }
 
@@ -1180,6 +1190,7 @@ static G_NORETURN void leave_suspend(XtThread *t, XtEcFrame *f)
 
     leave(t, &n, true);
     qatomic_set(&f->doorbell, 0);
+    f->inj_armed = 1;
     t->ec_suspended = true;
     xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
     xt_ec_continue_kept(&n, nr_continue);
