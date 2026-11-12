@@ -228,8 +228,74 @@ void xt_ec_probe_process_init(void)
 /* Entries go to xt_cap_entry while MODE is set; REC gets its record. */
 XTEXPORT void xt_ec_cap_entry(int mode, uint64_t rec[6])
 {
-    qatomic_set(&xt_cap_entry_mode, mode);
+    qatomic_set(&xt_cap_entry_mode,
+                mode | (qatomic_read(&xt_cap_entry_mode) & XT_EC_ENTRY_INJECT));
     if (rec) {
         memcpy(rec, xt_cap_entry_rec, sizeof(xt_cap_entry_rec));
     }
+}
+
+XtStubInject xt_stub_inject;
+
+/*
+ * At process init: XTAJIT_INJECT=sN or SN, with N from 1 to 6, and
+ * optionally ",MS" for the wait in milliseconds (1 by default).  A digit
+ * alone is xt_inject_point's, as in the 32-bit module.
+ */
+void xt_ec_stub_inject_init(void)
+{
+    WCHAR w[16];
+    SIZE_T n = 0;
+    uint64_t freq, ms = 1;
+
+    if (RtlQueryEnvironmentVariable(NULL, L"XTAJIT_INJECT", 13, w,
+                                    ARRAY_SIZE(w) - 1, &n) < 0 || !n) {
+        return;
+    }
+    w[n] = 0;
+    if (w[0] >= '1' && w[0] <= '9') {
+        xt_inject_point = w[0] - '0';
+        return;
+    }
+    if ((w[0] != 's' && w[0] != 'S') || n < 2 || w[1] < '1' || w[1] > '6') {
+        return;
+    }
+    if (n > 3 && w[2] == ',') {
+        ms = 0;
+        for (SIZE_T i = 3; i < n && w[i] >= '0' && w[i] <= '9'; i++) {
+            ms = ms * 10 + w[i] - '0';
+        }
+    }
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    xt_stub_inject.ticks = freq * ms / 1000;
+    xt_stub_inject.always = w[0] == 'S';
+    xt_stub_inject.point = w[1] - '0';
+    qatomic_or(&xt_cap_entry_mode, XT_EC_ENTRY_INJECT);
+}
+
+/* At the process's end: the stubs' test points' waits, if any. */
+void xt_ec_stub_inject_report(void)
+{
+    static bool reported;
+    char line[160];
+    int k;
+
+    if (!xt_stub_inject.point || reported) {
+        return;
+    }
+    reported = true;
+    k = snprintf(line, sizeof(line), "stubinject: point %u%s; waits",
+                 xt_stub_inject.point, xt_stub_inject.always ? " always" : "");
+    for (int i = 1; i <= 6 && k < sizeof(line); i++) {
+        uint64_t h = qatomic_read(&xt_stub_inject.hits[i]);
+        uint64_t r = qatomic_read(&xt_stub_inject.rung[i]);
+
+        k += snprintf(line + k, sizeof(line) - k, " %llu/%llu",
+                      (unsigned long long)h, (unsigned long long)r);
+    }
+    if (k < sizeof(line) - 1) {
+        strcpy(line + k, "\n");
+    }
+    fputs(line, stderr);
+    xt_log_text(line);
 }

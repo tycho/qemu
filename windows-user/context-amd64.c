@@ -194,6 +194,21 @@ static uint32_t ec_eflags(uint32_t cpsr)
 }
 
 /*
+ * XMMn's 128 bits, or YMMn's upper 128, between the CPU state and a
+ * vector register's place in the packed form: 16 bytes at once, the
+ * halves in the same order (Low the lower quadword).
+ */
+static inline void ec_v_store(ARM64_NT_NEON128 *v, const ZMMReg *z, int half)
+{
+    memcpy(v, &z->ZMM_Q(2 * half), sizeof(*v));
+}
+
+static inline void ec_v_load(ZMMReg *z, const ARM64_NT_NEON128 *v)
+{
+    memcpy(&z->ZMM_Q(0), v, sizeof(*v));
+}
+
+/*
  * The guest's state as native code keeps it (the packed form): x64
  * registers in their ARM64EC places, the MMX registers where Windows
  * looks for them (FEX's ARM64EC module packs them the same way), NZCV and
@@ -202,7 +217,9 @@ static uint32_t ec_eflags(uint32_t cpsr)
  * x18, x23, x24 or x28.  The rest of EFLAGS and the x87 control state have no
  * place here.  Straight from the CPU state, for an exit through a context
  * (a system call, an exception, a suspension); an exit to native code
- * takes xt_ec_pack_call.
+ * loads the same places from the CPU state (xt_ec_exit_native_env),
+ * without NZCV, FPCR, FPSR, x16 or x17 (native code's EFLAGS and MXCSR
+ * are the ABI's, and the x87 state's high parts stay in the engine).
  */
 void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
 {
@@ -226,13 +243,11 @@ void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
     n->Pc = env->eip;
     n->Cpsr = ec_cpsr(xt_ec_eflags(env));
     for (int i = 0; i < 16; i++) {
-        n->V[i].Low = env->xmm_regs[i].ZMM_Q(0);
-        n->V[i].High = env->xmm_regs[i].ZMM_Q(1);
+        ec_v_store(&n->V[i], &env->xmm_regs[i], 0);
     }
     if (xt_ec_ymm(t)) {
         for (int i = 0; i < 16; i++) {
-            n->V[16 + i].Low = env->xmm_regs[i].ZMM_Q(2);
-            n->V[16 + i].High = env->xmm_regs[i].ZMM_Q(3);
+            ec_v_store(&n->V[16 + i], &env->xmm_regs[i], 1);
         }
     }
     /*
@@ -257,43 +272,6 @@ void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n)
     n->Fpsr = (mx & 1 ? 1 : 0) | (mx & 4 ? 2 : 0) | (mx & 8 ? 4 : 0) |
               (mx & 0x10 ? 8 : 0) | (mx & 0x20 ? 0x10 : 0) |
               (mx & 2 ? 0x80 : 0);
-}
-
-/*
- * xt_ec_pack for an exit to native code (xt_ec_exit_native): only what the
- * exit loads into registers, the values xt_ec_pack gives them.  The exit
- * doesn't load NZCV, FPCR, FPSR, x16 or x17 (native code's EFLAGS and
- * MXCSR are the ABI's, and the x87 state's high parts stay in the
- * engine).  Each later reader of N finds what it reads written first: the
- * next entry (ExitToX64, RetToEntryThunk) stores what xt_ec_import_call
- * reads, BeginSimulation what xt_ec_begin reads; a suspension packs a
- * context of its own (leave_suspend).
- */
-void xt_ec_pack_call(XtThread *t, ARM64_NT_CONTEXT *n)
-{
-    static const int8_t mm_lo[8] = { 30, 6, 7, 9, 10, 11, 12, 15 };
-    CPUX86State *env = t->env;
-
-    if (env->dr[6] & (DR6_BS | 0xf)) {
-        env->dr[6] = 0;
-    }
-    for (int i = 0; i < 16; i++) {
-        *ec_gpr(n, i) = env->regs[i];
-    }
-    n->Pc = env->eip;
-    for (int i = 0; i < 16; i++) {
-        n->V[i].Low = env->xmm_regs[i].ZMM_Q(0);
-        n->V[i].High = env->xmm_regs[i].ZMM_Q(1);
-    }
-    if (xt_ec_ymm(t)) {
-        for (int i = 0; i < 16; i++) {
-            n->V[16 + i].Low = env->xmm_regs[i].ZMM_Q(2);
-            n->V[16 + i].High = env->xmm_regs[i].ZMM_Q(3);
-        }
-    }
-    for (int i = 0; i < 8; i++) {
-        n->X[mm_lo[i]] = env->fpregs[(env->fpstt + i) & 7].d.low;
-    }
 }
 
 /*
@@ -346,42 +324,50 @@ static void ec_seg(XtThread *t, X86Seg r, int sel)
 
 /*
  * A call or jump into x64 code from native code, into the CPU state while
- * the thread is being acquired (xt_acquire_begin): the x64 registers from
- * their ARM64EC places, RIP the target, x64 Windows' selectors.  EFLAGS'
- * SF, ZF, CF, OF and TF come from NZCV and SS, the rest (DF, PF, AF) is
- * the engine's, as it was at the last exit; the x87 state, MXCSR and the
- * YMM upper halves stay the engine's (native code's system calls zero
- * v16-v31, and x64 calls don't preserve the upper halves).  As xt_import
- * would take the same registers from a CONTEXT, without the round trip:
- * this runs on every entry.
+ * the thread is being acquired (xt_acquire_begin), all but the registers
+ * the entry stores (xt_ec_import_call's, or arm64ec.S's directly): RIP
+ * PC, x64 Windows' selectors.  EFLAGS' SF, ZF, CF, OF and TF come from
+ * NZCV and SS, the rest (DF, PF, AF) is the engine's, as it was at the
+ * last exit; the x87 state, MXCSR and the YMM upper halves stay the
+ * engine's (native code's system calls zero v16-v31, and x64 calls don't
+ * preserve the upper halves).  As xt_import would take the same state
+ * from a CONTEXT, without the round trip: this runs on every entry.
  */
-void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n)
+void xt_ec_import_entry(XtThread *t, uint64_t pc, uint32_t nzcv)
 {
     CPUX86State *env = t->env;
     uint32_t eflags = (xt_ec_eflags(env) &
                        ~(CC_S | CC_Z | CC_C | CC_O | TF_MASK)) |
-                      ec_eflags(n->Cpsr);
+                      ec_eflags(nzcv);
 
-    for (int i = 0; i < 16; i++) {
-        env->regs[i] = *ec_gpr(n, i);
-    }
-    env->eip = n->Pc;
+    env->eip = pc;
     env->eflags = (env->eflags & ~EFLAGS_FROM_CONTEXT) |
                   (eflags & EFLAGS_FROM_CONTEXT) | 0x2;
     CC_SRC = eflags & (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
     CC_OP = CC_OP_EFLAGS;
     env->df = 1 - (2 * ((eflags >> 10) & 1));
-    t->bp_skip = (eflags & RF_MASK) || (t->bp_hit && n->Pc == t->bp_hit);
+    t->bp_skip = (eflags & RF_MASK) || (t->bp_hit && pc == t->bp_hit);
     t->bp_hit = 0;
-    for (int i = 0; i < 16; i++) {
-        env->xmm_regs[i].ZMM_Q(0) = n->V[i].Low;
-        env->xmm_regs[i].ZMM_Q(1) = n->V[i].High;
-    }
     ec_seg(t, R_CS, 0x33);
     ec_seg(t, R_SS, 0x2b);
     ec_seg(t, R_DS, 0x2b);
     ec_seg(t, R_ES, 0x2b);
     ec_seg(t, R_FS, 0x53);
     ec_seg(t, R_GS, 0x2b);
+}
+
+/* An entry's x64 registers from their ARM64EC places in N, then the rest. */
+void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n, uint64_t pc,
+                       uint32_t nzcv)
+{
+    CPUX86State *env = t->env;
+
+    for (int i = 0; i < 16; i++) {
+        env->regs[i] = *ec_gpr(n, i);
+    }
+    for (int i = 0; i < 16; i++) {
+        ec_v_load(&env->xmm_regs[i], &n->V[i]);
+    }
+    xt_ec_import_entry(t, pc, nzcv);
 }
 #endif

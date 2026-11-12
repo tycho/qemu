@@ -24,7 +24,17 @@
 
 /* The layouts arm64ec.S's offsets (F_*, C_*, TEB_CPU_AREA, AREA_*) assume. */
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, entry) != 0x04);
-QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, ctx) != 0x10);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, nzcv) != 0x08);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, saved_to_env) != 0x0c);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, pc) != 0x10);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, lr) != 0x18);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, env) != 0x20);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, inj_armed) != 0x28);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, ctx) != 0x30);
+QEMU_BUILD_BUG_ON(offsetof(XtStubInject, ticks) != 0x08);
+QEMU_BUILD_BUG_ON(offsetof(XtStubInject, hits) != 0x10);
+QEMU_BUILD_BUG_ON(offsetof(XtStubInject, rung) != 0x50);
+QEMU_BUILD_BUG_ON(sizeof(XtEcFrame) > 0x1000);
 QEMU_BUILD_BUG_ON(XT_EC_ENTRY_CALL != 1 || XT_EC_ENTRY_RETURN != 2);
 QEMU_BUILD_BUG_ON(offsetof(ARM64_NT_CONTEXT, Cpsr) != 0x04);
 QEMU_BUILD_BUG_ON(offsetof(ARM64_NT_CONTEXT, X) != 0x08);
@@ -36,6 +46,17 @@ QEMU_BUILD_BUG_ON(XT_TEB_CPU_AREA != 0x1788);
 QEMU_BUILD_BUG_ON(offsetof(XtCpuArea, EmulatorStackBase) != 0x08);
 QEMU_BUILD_BUG_ON(offsetof(XtCpuArea, SuspendDoorbell) != 0x20);
 QEMU_BUILD_BUG_ON(offsetof(XtCpuArea, EmulatorData[1]) != 0x38);
+/* And the CPU state's (E_*: the entries' stores, the native exit's loads). */
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, regs) != 0);
+QEMU_BUILD_BUG_ON(sizeof(((CPUX86State *)0)->regs[0]) != 8);
+QEMU_BUILD_BUG_ON(R_EAX != 0 || R_ECX != 1 || R_EDX != 2 || R_EBX != 3 ||
+                  R_ESP != 4 || R_EBP != 5 || R_ESI != 6 || R_EDI != 7);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpstt) != 0x2e0);
+QEMU_BUILD_BUG_ON(sizeof(((CPUX86State *)0)->fpstt) != 4);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, fpregs) != 0x2f0);
+QEMU_BUILD_BUG_ON(sizeof(FPReg) != 16 || offsetof(floatx80, low) != 0);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, xmm_regs) != 0x3d0);
+QEMU_BUILD_BUG_ON(sizeof(ZMMReg) != 64);
 
 NTSTATUS NTAPI NtContinue(PCONTEXT, BOOLEAN);
 NTSTATUS NTAPI NtTerminateThread(HANDLE, NTSTATUS);
@@ -71,8 +92,11 @@ static uintptr_t ki_exception_dispatcher;
 
 /*
  * Work other processes queued for this one's emulator (a flush of code
- * they wrote): ntdll delivers it through the notification exports, when
- * asked at each entry and system call.
+ * they wrote, a protection change): ntdll delivers it through the
+ * notification exports when asked, which takes a lock of its own.  Asked
+ * where what it reports matters to the engine: before a translation
+ * (ec_foreign_pc), at a system call and at a continuation (xt_ec_begin);
+ * not at every call to or return from native code.
  */
 static void (*cross_process_work)(void);
 
@@ -282,7 +306,9 @@ static unsigned __stdcall doorbell_watcher(void *arg);
  * skips it, and the exit to it is XT_EXCP_NATIVE, without the fetch fault
  * a translation of it would take (cpu_loop_exit_sigsegv).  The exit's
  * call follows a tb_lookup of the same PC that found no TB, whose own
- * call has just classified it: that answer is kept for it.
+ * call has just classified it: that answer is kept for it.  Guest code
+ * that found no TB is translated next, so work other processes queued
+ * (cross_process_work) is asked for first.
  */
 static bool ec_foreign_pc(CPUState *cs, vaddr pc, bool exit)
 {
@@ -294,6 +320,9 @@ static bool ec_foreign_pc(CPUState *cs, vaddr pc, bool exit)
         return t->ec_seen;
     }
     if (!(t->ec_seen && t->ec_seen_pc == pc) && !xt_is_ec_code(pc)) {
+        if (cross_process_work) {
+            cross_process_work();
+        }
         return false;
     }
     t->ec_seen = false;
@@ -505,6 +534,8 @@ static XtThread *enter_engine(void)
         t->ec_doorbell = area->SuspendDoorbell;
         area->EmulatorData[0] = t;
         ec_register(t);
+        /* From here the entries store the registers into the CPU state. */
+        qatomic_set(&((XtEcFrame *)area->EmulatorData[1])->env, t->env);
     }
     return t;
 }
@@ -540,11 +571,13 @@ XTEXPORT NTSTATUS ProcessInit(void)
     }
     reached |= 0x80;
     xt_ec_probe_process_init();
+    xt_ec_stub_inject_init();
     return STATUS_SUCCESS;
 }
 
 XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
 {
+    xt_ec_stub_inject_report();
     if (xt_rcu_stress) {
         char line[64];
 
@@ -684,6 +717,11 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
         }
         goto out;
     }
+    /*
+     * Before the CPU state goes: the thread is this one, or stopped, so no
+     * entry is storing into it.
+     */
+    qatomic_set(&((XtEcFrame *)area->EmulatorData[1])->env, NULL);
     ec_unregister(t);
     xt_reap_later(stack_ref, area->EmulatorData[1]);
     stack_ref = NULL;
@@ -758,6 +796,7 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
         t->int3_rip = 0;
     }
     if (native->Pc == (uintptr_t)xt_ec_exit_suspend_point) {
+        ((XtEcFrame *)area->EmulatorData[1])->inj_armed = 1;
         qatomic_set(area->SuspendDoorbell, 0);
         native->Pc = (uintptr_t)xt_ec_exit_resume_point;
         xt_continue_native(native);
@@ -1051,22 +1090,27 @@ static void leave(XtThread *t, ARM64_NT_CONTEXT *n, bool context_exit)
 
 /*
  * Inline in the entries (ec_run), as their run loop is: each call between
- * them is one per native call.
+ * them is one per native call.  leave()'s, with the registers loaded
+ * straight from the CPU state (xt_ec_exit_native_env).  DR6's
+ * single-step and breakpoint bits have no place there, and end here as
+ * xt_ec_pack ends them.
  */
 static inline QEMU_ALWAYS_INLINE G_NORETURN
-void leave_native(XtThread *t, XtEcFrame *f, vaddr target)
+void leave_native(XtThread *t, vaddr target)
 {
-    /* leave()'s, with only what the exit to native code loads. */
+    CPUX86State *env = t->env;
+
     xt_publish(t, NULL);
-    xt_ec_pack_call(t, &f->ctx);
+    if (env->dr[6] & (DR6_BS | 0xf)) {
+        env->dr[6] = 0;
+    }
     if (xt_log_handle()) {
         xt_log_flush(t);
     }
-    f->ctx.Pc = target;
-    if (xt_ec_ymm(t)) {
-        xt_ec_exit_native_ymm(&f->ctx);
+    if (unlikely(xt_stub_inject.point)) {
+        xt_ec_exit_native_env_inj(env, target, xt_ec_ymm(t));
     }
-    xt_ec_exit_native(&f->ctx);
+    xt_ec_exit_native_env(env, target, xt_ec_ymm(t));
 }
 
 static G_NORETURN void leave_syscall(XtThread *t)
@@ -1146,6 +1190,7 @@ static G_NORETURN void leave_suspend(XtThread *t, XtEcFrame *f)
 
     leave(t, &n, true);
     qatomic_set(&f->doorbell, 0);
+    f->inj_armed = 1;
     t->ec_suspended = true;
     xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
     xt_ec_continue_kept(&n, nr_continue);
@@ -1177,7 +1222,7 @@ void ec_run(XtThread *t, XtEcFrame *f)
     int trapnr = xt_run_core(t);
 
     if (likely(trapnr == XT_EXCP_NATIVE)) {
-        leave_native(t, f, t->native_target);
+        leave_native(t, t->native_target);
     }
     ec_leave(t, f, trapnr);
 }
@@ -1222,27 +1267,31 @@ static inline QEMU_ALWAYS_INLINE XtThread *ec_thread(void)
 static void ec_retstack_entry(XtThread *t, const XtEcFrame *f)
 {
     if (f->entry == XT_EC_ENTRY_RETURN) {
-        tcg_retstack_pop_key(t->cpu, f->ctx.Pc);
+        tcg_retstack_pop_key(t->cpu, f->pc);
     } else if (f->entry == XT_EC_ENTRY_CALL) {
-        tcg_retstack_push_key(t->cpu, f->ctx.Lr);
+        tcg_retstack_push_key(t->cpu, f->lr);
     }
 }
 
 /*
  * A call, jump or return into x64 code (ExitToX64, DispatchJump,
- * RetToEntryThunk in arm64ec.S): the x64 registers are in their ARM64EC
- * places in F, the return address on the stack already.
+ * RetToEntryThunk in arm64ec.S), with F's record of it: the x64 registers
+ * are in the CPU state already, or, where the frame had none to name (a
+ * thread's first entry, whose record ec_thread creates), in their ARM64EC
+ * places in F; the return address on the stack already.  The record says
+ * which, whatever exists by now.
  */
 void xt_ec_enter(XtEcFrame *f)
 {
     XtThread *t = ec_thread();
 
     t->ec_suspended = false;
-    if (cross_process_work) {
-        cross_process_work();
-    }
     xt_acquire_begin(t);
-    xt_ec_import_call(t, &f->ctx);
+    if (likely(f->saved_to_env)) {
+        xt_ec_import_entry(t, f->pc, f->nzcv);
+    } else {
+        xt_ec_import_call(t, &f->ctx, f->pc, f->nzcv);
+    }
     xt_acquire_end(t);
     if (tcg_retalign) {
         ec_retstack_entry(t, f);
