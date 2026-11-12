@@ -745,6 +745,22 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     qemu_spin_unlock(&tb_next->jmp_lock);
 }
 
+/* Link @last_tb's exit *@tb_exit to @tb. */
+static inline QEMU_ALWAYS_INLINE
+void tb_link(TranslationBlock *last_tb, const int *tb_exit,
+             TranslationBlock *tb)
+{
+    tb_add_jump(last_tb, *tb_exit, tb);
+}
+
+#ifdef CONFIG_USER_ONLY
+void cpu_exec_tb_link(TranslationBlock *last_tb, int tb_exit,
+                      TranslationBlock *tb)
+{
+    tb_link(last_tb, &tb_exit, tb);
+}
+#endif
+
 #ifndef CONFIG_USER_ONLY
 static bool cpu_poll_while_halted(CPUState *cpu)
 {
@@ -1127,7 +1143,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 #endif
             /* See if we can patch the calling TB. */
             if (last_tb) {
-                tb_add_jump(last_tb, tb_exit, tb);
+                tb_link(last_tb, &tb_exit, tb);
             }
 
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
