@@ -84,11 +84,24 @@ xt_check_call:
     ldr     x\r, [x2]
 .endm
 
+/*
+ * The capture probe's entries (xt_cap_entry), or with XT_EC_ENTRY_INJECT
+ * (bit 31) the copies with the test points.
+ */
 .macro cap_check which
     adrp    x17, xt_cap_entry_mode
     ldr     w17, [x17, :lo12:xt_cap_entry_mode]
     cbz     w17, 1f
     mov     x16, #\which
+.if \which == 1
+    tbnz    w17, #31, xt_ec_inj_jump
+.elseif \which == 2
+    tbnz    w17, #31, xt_ec_inj_ret
+.elseif \which == 3
+    tbnz    w17, #31, xt_ec_inj_call
+.else
+    tbnz    w17, #31, 1f
+.endif
     b       xt_cap_entry
 1:
 .endm
@@ -103,6 +116,7 @@ xt_check_call:
 #define F_SAVED     0x0c
 #define F_PCLR      0x10
 #define F_ENV       0x20
+#define F_ARMED     0x28
 #define F_X(n)      (0x30 + 0x08 + 8 * (n))
 #define F_SP        (0x30 + 0x100)
 #define F_V         (0x30 + 0x110)
@@ -128,40 +142,62 @@ xt_check_call:
 #define AREA_DOORBELL   0x20
 #define AREA_FRAME      0x38    /* EmulatorData[1] */
 
-    .globl DispatchJump
-DispatchJump:
-    cap_check 1
-    str     lr, [sp, #-8]!      /* the x64 return address */
-    mov     w13, #1             /* XT_EC_ENTRY_CALL */
-    b       2f
+/*
+ * XTAJIT_INJECT's test point N (XtStubInject): when it is the chosen one,
+ * and the thread has been suspended before or the point is always taken,
+ * wait its ticks, then count the wait, and the doorbell if it is set.
+ * Only x\a and x\b change; NZCV is kept.
+ */
+.macro inj_point n, a, b
+    adrp    x\a, xt_stub_inject
+    add     x\a, x\a, :lo12:xt_stub_inject
+    ldr     w\b, [x\a, #0]
+    sub     w\b, w\b, #\n
+    cbnz    w\b, .Linj_out\@
+    ldr     w\b, [x\a, #4]
+    cbnz    w\b, .Linj_go\@
+    ldr     x\b, [x18, #TEB_CPU_AREA]
+    ldr     x\b, [x\b, #AREA_FRAME]
+    ldr     w\b, [x\b, #F_ARMED]
+    cbz     w\b, .Linj_out\@
+.Linj_go\@:
+    ldr     x\b, [x\a, #8]
+    mrs     x\a, cntvct_el0
+    add     x\a, x\a, x\b
+.Linj_spin\@:
+    yield
+    mrs     x\b, cntvct_el0
+    sub     x\b, x\a, x\b
+    tbz     x\b, #63, .Linj_spin\@
+    adrp    x\a, xt_stub_inject
+    add     x\a, x\a, :lo12:xt_stub_inject
+    ldr     x\b, [x\a, #(0x10 + 8 * \n)]
+    add     x\b, x\b, #1
+    str     x\b, [x\a, #(0x10 + 8 * \n)]
+    ldr     x\b, [x18, #TEB_CPU_AREA]
+    ldr     x\b, [x\b, #AREA_DOORBELL]
+    cbz     x\b, .Linj_out\@
+    ldr     w\b, [x\b]
+    cbz     w\b, .Linj_out\@
+    ldr     x\b, [x\a, #(0x50 + 8 * \n)]
+    add     x\b, x\b, #1
+    str     x\b, [x\a, #(0x50 + 8 * \n)]
+.Linj_out\@:
+.endm
 
-    .globl RetToEntryThunk
-RetToEntryThunk:
-    cap_check 2
-    mov     x9, lr
-    mov     w13, #2             /* XT_EC_ENTRY_RETURN */
-2:
-    /* Native code (the EC bitmap) is reached without the engine. */
-    ldr     x16, [x18, #TEB_PEB]
-    ldr     x16, [x16, #PEB_EC_BITMAP]
-    lsr     x17, x9, #18
-    ldr     x16, [x16, x17, lsl #3]
-    lsr     x17, x9, #12
-    lsr     x16, x16, x17
-    tbnz    x16, #0, xt_ec_exit_dispatch
-    b       3f
-
-    .globl ExitToX64
-ExitToX64:
-    cap_check 3
-    str     lr, [sp, #-8]!      /* the x64 return address */
-    mov     w13, #1             /* XT_EC_ENTRY_CALL */
-3:
+/* The entries' common part; with INJ, XTAJIT_INJECT's points 1-3. */
+.macro entry_tail inj
+.if \inj
+    inj_point 1, 16, 17
+.endif
     /* InSimulation first: from here Windows waits for the doorbell. */
     ldr     x17, [x18, #TEB_CPU_AREA]
     mov     w16, #1
     strb    w16, [x17]
     mrs     x24, nzcv
+.if \inj
+    inj_point 2, 14, 16
+.endif
     ldr     x16, [x17, #AREA_FRAME]
     ldr     x14, [x16, #F_ENV]
     str     w13, [x16, #F_ENTRY]
@@ -212,11 +248,75 @@ ExitToX64:
     stp     q12, q13, [x0, #192]
     stp     q14, q15, [x0, #224]
 8:
+.if \inj
+    inj_point 3, 0, 1
+.endif
     ldr     x0, [x17, #AREA_STACK_BASE]
     mov     sp, x0
     mov     x0, x16
     bl      "#xt_ec_enter"
     brk     #0xf000
+
+.endm
+
+    .globl DispatchJump
+DispatchJump:
+    cap_check 1
+    str     lr, [sp, #-8]!      /* the x64 return address */
+    mov     w13, #1             /* XT_EC_ENTRY_CALL */
+    b       2f
+
+    .globl RetToEntryThunk
+RetToEntryThunk:
+    cap_check 2
+    mov     x9, lr
+    mov     w13, #2             /* XT_EC_ENTRY_RETURN */
+2:
+    /* Native code (the EC bitmap) is reached without the engine. */
+    ldr     x16, [x18, #TEB_PEB]
+    ldr     x16, [x16, #PEB_EC_BITMAP]
+    lsr     x17, x9, #18
+    ldr     x16, [x16, x17, lsl #3]
+    lsr     x17, x9, #12
+    lsr     x16, x16, x17
+    tbnz    x16, #0, xt_ec_exit_dispatch
+    b       3f
+
+    .globl ExitToX64
+ExitToX64:
+    cap_check 3
+    str     lr, [sp, #-8]!      /* the x64 return address */
+    mov     w13, #1             /* XT_EC_ENTRY_CALL */
+3:
+    entry_tail 0
+
+/*
+ * The entries' copies with XTAJIT_INJECT's test points, reached from
+ * cap_check.
+ */
+xt_ec_inj_jump:
+    str     lr, [sp, #-8]!
+    mov     w13, #1
+    b       2f
+
+xt_ec_inj_ret:
+    mov     x9, lr
+    mov     w13, #2
+2:
+    ldr     x16, [x18, #TEB_PEB]
+    ldr     x16, [x16, #PEB_EC_BITMAP]
+    lsr     x17, x9, #18
+    ldr     x16, [x16, x17, lsl #3]
+    lsr     x17, x9, #12
+    lsr     x16, x16, x17
+    tbnz    x16, #0, xt_ec_exit_dispatch
+    b       3f
+
+xt_ec_inj_call:
+    str     lr, [sp, #-8]!
+    mov     w13, #1
+3:
+    entry_tail 1
 
     .globl BeginSimulation
 BeginSimulation:
@@ -244,9 +344,7 @@ BeginSimulation:
  * the registers they arrive in are loaded.  The engine has given the
  * thread back; no frame of the emulator stack is live.
  */
-    .globl "#xt_ec_exit_native_env"
-    .def "#xt_ec_exit_native_env"; .scl 2; .type 32; .endef
-"#xt_ec_exit_native_env":
+.macro exit_loads
     mov     x16, x0
     mov     x9, x1
     cbz     w2, 1f
@@ -275,6 +373,12 @@ BeginSimulation:
     ldp     x19, x20, [x16, #0x60]      /* R12-R15 */
     ldp     x21, x22, [x16, #0x70]
     mov     sp, x17
+.endm
+
+    .globl "#xt_ec_exit_native_env"
+    .def "#xt_ec_exit_native_env"; .scl 2; .type 32; .endef
+"#xt_ec_exit_native_env":
+    exit_loads
 
 /*
  * Native code reached from x64 code, the x64 state in its ARM64EC places
@@ -321,6 +425,26 @@ xt_ec_exit_resume_point:
     .globl xt_ec_exit_suspend_point
 xt_ec_exit_suspend_point:
     brk     #0xcafe
+
+/*
+ * xt_ec_exit_native_env and the dispatch's start with XTAJIT_INJECT's
+ * test points; a suspension at the doorbell resumes in the original.
+ */
+    .globl "#xt_ec_exit_native_env_inj"
+    .def "#xt_ec_exit_native_env_inj"; .scl 2; .type 32; .endef
+"#xt_ec_exit_native_env_inj":
+    inj_point 4, 3, 4
+    exit_loads
+    inj_point 5, 16, 17
+    ldr     x17, [x18, #TEB_CPU_AREA]
+    strb    wzr, [x17]
+    ldr     x17, [x17, #AREA_DOORBELL]
+    cbz     x17, 4f
+    ldr     w17, [x17]
+    cbnz    w17, xt_ec_exit_suspend_point
+4:
+    inj_point 6, 16, 17
+    b       xt_ec_exit_resume_point
 
 /*
  * void xt_ec_continue_kept(ARM64_NT_CONTEXT *n, nr): NtContinue at N with
