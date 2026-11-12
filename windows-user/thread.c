@@ -217,6 +217,10 @@ void xt_placement(const char *what, const void *p)
     xt_gevent(XT_EV_PLACE, (uintptr_t)what, (uintptr_t)p);
 }
 
+/* XtThread's round trip fields, within the CPU state's QOM header */
+QEMU_BUILD_BUG_ON(offsetof(XtThread, ec_doorbell) + sizeof(ULONG *) >
+                  sizeof(DeviceState));
+
 XtThread *xt_thread_new(bool wow64)
 {
     XtThread *t = g_new0(XtThread, 1);

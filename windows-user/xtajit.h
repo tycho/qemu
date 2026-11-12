@@ -163,36 +163,46 @@ typedef struct XtExit {
 } XtExit;
 
 typedef struct XtThread {
+    /*
+     * A round trip's fields (an entry from native code into x64 code, and
+     * its exit) first, together.  The allocator places the record and the
+     * CPU state at the same offset in a page (blocks this large start
+     * after its page header), so these share page offsets only with the
+     * CPU state's QOM header (checked in thread.c), which a round trip
+     * doesn't touch: a core may take a load as dependent on an earlier
+     * store whose address matches its own in the low 12 bits.
+     */
     CPUState *cpu;
     CPUX86State *env;
     /* The x64 module's: the thread's reader, once registered (its TLS's) */
     struct rcu_reader_data *rcu_reader;
-    void *heap;             /* its allocator heap, given back with it */
-    DWORD tid;
     void *teb;
-    HANDLE handle;          /* the thread, with all access: who it is */
-    bool wow64;             /* under wow64.dll: slot 2, the CPU area */
-    bool stop_at_int3;      /* the native harness: int3 ends a run */
-    uint64_t int3_rip;      /* a raised int3's RIP, past it, until dispatch */
     XtState state;
     XtActive active;
-    bool rcu_registered;
     uint32_t activation;
     int suspend_req;        /* set by another thread (cpu_exit after) */
     int terminating;        /* another thread is terminating this one */
-    vaddr bp[4];            /* DR0-DR3 as execute breakpoints, where bp_on */
-    bool bp_on[4];
-    vaddr bp_hit;           /* the last breakpoint reported, else 0 */
-    bool bp_skip;           /* run one instruction past breakpoints */
-    uint32_t suspensions;   /* suspension exits taken */
-    bool after_suspend;     /* the last exit was a suspension */
     XtGuestFault gfault;
-    XtFault fault;
+    bool wow64;             /* under wow64.dll: slot 2, the CPU area */
+    bool rcu_registered;
+    bool after_suspend;     /* the last exit was a suspension */
+    bool bp_skip;           /* run one instruction past breakpoints */
+    bool ec_seen;           /* (ec_foreign_pc): EC_SEEN_PC is EC code */
+    bool ec_suspended;      /* left through a suspension's continuation */
+    vaddr bp_hit;           /* the last breakpoint reported, else 0 */
     vaddr native_target;    /* set with XT_EXCP_NATIVE */
     vaddr ec_seen_pc;       /* tb_lookup's last classification */
-    bool ec_seen;           /* (ec_foreign_pc): EC_SEEN_PC is EC code */
     ULONG *ec_doorbell;     /* the x64 module's SuspendDoorbell word */
-    bool ec_suspended;      /* left through a suspension's continuation */
+
+    void *heap;             /* its allocator heap, given back with it */
+    DWORD tid;
+    HANDLE handle;          /* the thread, with all access: who it is */
+    bool stop_at_int3;      /* the native harness: int3 ends a run */
+    uint64_t int3_rip;      /* a raised int3's RIP, past it, until dispatch */
+    vaddr bp[4];            /* DR0-DR3 as execute breakpoints, where bp_on */
+    bool bp_on[4];
+    uint32_t suspensions;   /* suspension exits taken */
+    XtFault fault;
     /*
      * EFLAGS the packed context can't carry, kept at each exit that
      * re-enters through a context (a system call, an exception, a
