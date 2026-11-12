@@ -1191,6 +1191,26 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     qemu_spin_unlock(&tb_next->jmp_lock);
 }
 
+/* Link @last_tb's exit *@tb_exit to @tb, and its dead slot's too. */
+static inline QEMU_ALWAYS_INLINE
+void tb_link(TranslationBlock *last_tb, const int *tb_exit,
+             TranslationBlock *tb)
+{
+    tb_add_jump(last_tb, *tb_exit, tb);
+    /* Its goto_tb_dead too, if tb writes them first. */
+    if (last_tb->jmp[*tb_exit].dead && tb->chain_dead_in) {
+        tb_add_jump(last_tb, last_tb->jmp[*tb_exit].dead - 1, tb);
+    }
+}
+
+#ifdef CONFIG_USER_ONLY
+void cpu_exec_tb_link(TranslationBlock *last_tb, int tb_exit,
+                      TranslationBlock *tb)
+{
+    tb_link(last_tb, &tb_exit, tb);
+}
+#endif
+
 #ifndef CONFIG_USER_ONLY
 static inline bool cpu_handle_halt(CPUState *cpu)
 {
@@ -1612,11 +1632,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 #endif
             /* See if we can patch the calling TB. */
             if (last_tb) {
-                tb_add_jump(last_tb, tb_exit, tb);
-                /* Its goto_tb_dead too, if tb writes them first. */
-                if (last_tb->jmp[tb_exit].dead && tb->chain_dead_in) {
-                    tb_add_jump(last_tb, last_tb->jmp[tb_exit].dead - 1, tb);
-                }
+                tb_link(last_tb, &tb_exit, tb);
             }
 
             if (unlikely(cpu->tb_jmp_cache->region_sample_next)) {

@@ -48,4 +48,12 @@ bool cpu_exec_interrupted(CPUState *cpu, TranslationBlock **last_tb);
 TranslationBlock *cpu_exec_tb_done(CPUState *cpu, uintptr_t ret,
                                    TranslationBlock **last_tb, int *tb_exit);
 
+/*
+ * Link exit @tb_exit of @last_tb (cpu_exec_tb_done()'s) to @tb, as the
+ * loop does before running @tb: with its dead slot's link where @tb
+ * writes those exits first.
+ */
+void cpu_exec_tb_link(TranslationBlock *last_tb, int tb_exit,
+                      TranslationBlock *tb);
+
 #endif
