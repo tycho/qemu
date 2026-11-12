@@ -23,6 +23,7 @@
 #include "qapi/type-helpers.h"
 #include "hw/core/cpu.h"
 #include "accel/tcg/cpu-loop.h"
+#include "accel/tcg/dispatch.h"
 #include "accel/tcg/cpu-ops.h"
 #include "accel/tcg/helper-retaddr.h"
 #include "trace.h"
@@ -230,6 +231,21 @@ static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
 bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
 bool tcg_cpu_bound;
 
+/*
+ * Whether @tb, read from a jump-cache entry whose key is at @key, is the
+ * TB for state @s.
+ */
+static inline bool tb_jmp_cache_hit(CPUJumpCache *jc, const vaddr *key,
+                                    TranslationBlock *tb,
+                                    const TCGTBCPUState *s)
+{
+    return tb &&
+           *key == s->pc &&
+           tb->cs_base == s->cs_base &&
+           tb->flags == s->flags &&
+           tb_cflags(tb) == s->cflags;
+}
+
 static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     TranslationBlock *tb;
@@ -243,11 +259,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     jc = cpu->tb_jmp_cache;
 
     tb = qatomic_read(&jc->array[hash].tb);
-    if (likely(tb &&
-               jc->array[hash].pc == s.pc &&
-               tb->cs_base == s.cs_base &&
-               tb->flags == s.flags &&
-               tb_cflags(tb) == s.cflags)) {
+    if (likely(tb_jmp_cache_hit(jc, &jc->array[hash].pc, tb, &s))) {
         goto hit;
     }
 
@@ -272,6 +284,27 @@ hit:
     assert((tb_cflags(tb) & CF_PCREL) || tb->pc == s.pc);
     return tb;
 }
+
+#ifdef CONFIG_USER_ONLY
+TranslationBlock *cpu_exec_tb_cached(CPUState *cpu, TCGTBCPUState s)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    uint32_t hash = tb_jmp_cache_hash_func(s.pc);
+    TranslationBlock *tb = qatomic_read(&jc->array[hash].tb);
+
+    return tb_jmp_cache_hit(jc, &jc->array[hash].pc, tb, &s) ? tb : NULL;
+}
+#endif
+
+#ifdef CONFIG_USER_ONLY
+TCGTBCPUState cpu_exec_tb_state(CPUState *cpu)
+{
+    TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
+
+    s.cflags = curr_cflags(cpu);
+    return s;
+}
+#endif
 
 static void log_cpu_exec(vaddr pc, CPUState *cpu,
                          const TranslationBlock *tb)
