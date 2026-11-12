@@ -350,8 +350,9 @@ static inline uint32_t xt_ec_eflags(CPUX86State *env)
 }
 
 void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n);
-void xt_ec_pack_call(XtThread *t, ARM64_NT_CONTEXT *n);
-void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n);
+void xt_ec_import_entry(XtThread *t, uint64_t pc, uint32_t nzcv);
+void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n, uint64_t pc,
+                       uint32_t nzcv);
 /* Whether the guest has YMM state: its XCR0 enables the AVX component. */
 static inline bool xt_ec_ymm(XtThread *t)
 {

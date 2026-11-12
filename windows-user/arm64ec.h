@@ -102,14 +102,22 @@ static inline bool xt_is_ec_code(uint64_t addr)
 void xt_check_call(void);
 
 /*
- * The page below a thread's emulator stack (ThreadInit): its doorbell, and
- * the native registers of an entry (arm64ec.S stores them, and the entry's
- * kind) or of an exit to native code (xt_ec_exit_native loads them).
+ * The page below a thread's emulator stack (ThreadInit): its doorbell, an
+ * entry's record (arm64ec.S writes it: the kind, NZCV, the target and lr,
+ * and where the registers went), the native registers of an entry that
+ * had no CPU state to store them into, and that CPU state, ENV: NULL
+ * until the thread's record exists (enter_engine), and again from when
+ * the record is taken (ThreadTerm), so that when it is set it is
+ * EmulatorData[0]'s.
  */
 typedef struct XtEcFrame {
     ULONG doorbell;
     uint32_t entry;             /* XT_EC_ENTRY_*, at offset 4 */
-    uint32_t pad[2];
+    uint32_t nzcv;              /* at entry, as the Cpsr's */
+    uint32_t saved_to_env;      /* the registers in ENV, not in CTX */
+    uint64_t pc, lr;            /* the target (x9), lr at entry */
+    CPUArchState *env;
+    uint32_t inj_armed;         /* XTAJIT_INJECT=sN: suspended before */
     ARM64_NT_CONTEXT ctx;
 } XtEcFrame;
 
@@ -122,9 +130,8 @@ void xt_ec_enter(XtEcFrame *f);
 void xt_ec_begin(void);
 
 /* arm64ec.S: transfers out of the engine; neither returns */
-G_NORETURN void xt_ec_exit_native(ARM64_NT_CONTEXT *n);
-/* The same, and v16-v31 from N (the YMM upper halves) */
-G_NORETURN void xt_ec_exit_native_ymm(ARM64_NT_CONTEXT *n);
+G_NORETURN void xt_ec_exit_native_env(CPUArchState *env, uintptr_t target,
+                                      bool ymm);
 G_NORETURN void xt_ec_jump_set_stack(uintptr_t pc, uintptr_t sp);
 /* NtContinue, keeping registers for BeginSimulation; returns on failure */
 void xt_ec_continue_kept(ARM64_NT_CONTEXT *n, int64_t nr_continue);
@@ -137,5 +144,29 @@ extern const char xt_cap_loop[], xt_cap_loop_top[], xt_cap_trap[],
 extern uint32_t xt_cap_entry_mode;
 extern uint64_t xt_cap_entry_rec[6];
 void xt_cap_entry_end(uint64_t which);
+
+/*
+ * XTAJIT_INJECT=sN or SN (test-ec.c): the stubs' test points.  With
+ * XT_EC_ENTRY_INJECT in xt_cap_entry_mode, the entries take copies of
+ * themselves (arm64ec.S) that wait TICKS at point N: 1 before
+ * InSimulation is set, 2 after it, 3 after the registers' stores; and
+ * the exit, through xt_ec_exit_native_env_inj: 4 before the registers'
+ * loads, 5 after them, 6 after InSimulation is cleared.  With sN, only in
+ * a thread suspended before (XtEcFrame.inj_armed); with SN, always.
+ * HITS counts the waits, RUNG those that ended with the doorbell set.
+ */
+#define XT_EC_ENTRY_INJECT  0x80000000u
+
+typedef struct XtStubInject {
+    uint32_t point, always;
+    uint64_t ticks;
+    uint64_t hits[8], rung[8];
+} QEMU_ALIGNED(128) XtStubInject;
+
+extern XtStubInject xt_stub_inject;
+G_NORETURN void xt_ec_exit_native_env_inj(CPUArchState *env,
+                                          uintptr_t target, bool ymm);
+void xt_ec_stub_inject_init(void);
+void xt_ec_stub_inject_report(void);
 
 #endif
