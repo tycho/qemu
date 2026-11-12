@@ -56,4 +56,12 @@ TranslationBlock *cpu_exec_tb_done(CPUState *cpu, uintptr_t ret,
 void cpu_exec_tb_link(TranslationBlock *last_tb, int tb_exit,
                       TranslationBlock *tb);
 
+/*
+ * The loop's handling of a pending exception (cpu->exception_index),
+ * before anything else runs: true, with the trap number cpu_exec() would
+ * return in *@excp and the exception consumed, if there is one to leave
+ * with (EXCP_DEBUG's handling and user mode's fake_user_interrupt done).
+ */
+bool cpu_exec_exception(CPUState *cpu, int *excp);
+
 #endif

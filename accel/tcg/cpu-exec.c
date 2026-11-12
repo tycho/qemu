@@ -1243,7 +1243,8 @@ static inline void cpu_handle_debug_exception(CPUState *cpu)
     }
 }
 
-static inline bool cpu_handle_exception(CPUState *cpu, int *excp)
+static inline DISPATCH_INLINE
+bool cpu_handle_exception(CPUState *cpu, int *excp)
 {
     if (cpu->exception_index < 0) {
 #ifndef CONFIG_USER_ONLY
@@ -1307,6 +1308,13 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *excp)
 
     return false;
 }
+
+#ifdef CONFIG_USER_ONLY
+bool cpu_exec_exception(CPUState *cpu, int *excp)
+{
+    return cpu_handle_exception(cpu, excp);
+}
+#endif
 
 void tcg_kick_vcpu_thread(CPUState *cpu)
 {
