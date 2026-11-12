@@ -363,6 +363,24 @@ static inline uint32_t xt_ec_eflags(CPUX86State *env)
 
 void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n);
 void xt_ec_import_entry(XtThread *t, uint64_t pc, uint32_t nzcv);
+void xt_ec_import_engine(XtThread *t, uint64_t pc, uint32_t nzcv);
+
+/* Segment R holds SEL, with the base load_seg gives it (GS's the TEB). */
+static inline bool xt_ec_seg_loaded(XtThread *t, X86Seg r, int sel)
+{
+    const SegmentCache *s = &t->env->segs[r];
+
+    return s->selector == sel &&
+           s->base == (r == R_GS ? (uintptr_t)t->teb : 0);
+}
+
+/* The selectors an entry from native code loads (xt_ec_import_entry). */
+static inline bool xt_ec_segs_loaded(XtThread *t)
+{
+    return xt_ec_seg_loaded(t, R_CS, 0x33) && xt_ec_seg_loaded(t, R_SS, 0x2b) &&
+           xt_ec_seg_loaded(t, R_DS, 0x2b) && xt_ec_seg_loaded(t, R_ES, 0x2b) &&
+           xt_ec_seg_loaded(t, R_FS, 0x53) && xt_ec_seg_loaded(t, R_GS, 0x2b);
+}
 void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n, uint64_t pc,
                        uint32_t nzcv);
 /* Whether the guest has YMM state: its XCR0 enables the AVX component. */

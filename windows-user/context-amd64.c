@@ -311,13 +311,10 @@ void xt_ec_import_ymm(XtThread *t, const CONTEXT *c)
     }
 }
 
-/* Load SEL into R unless it is loaded already, with the base load_seg gives. */
+/* Load SEL into R unless it is loaded already. */
 static void ec_seg(XtThread *t, X86Seg r, int sel)
 {
-    const SegmentCache *s = &t->env->segs[r];
-    uint64_t base = r == R_GS ? (uintptr_t)t->teb : 0;
-
-    if (s->selector != sel || s->base != base) {
+    if (!xt_ec_seg_loaded(t, r, sel)) {
         load_seg(t, r, sel);
     }
 }
@@ -354,6 +351,32 @@ void xt_ec_import_entry(XtThread *t, uint64_t pc, uint32_t nzcv)
     ec_seg(t, R_ES, 0x2b);
     ec_seg(t, R_FS, 0x53);
     ec_seg(t, R_GS, 0x2b);
+}
+
+/*
+ * xt_ec_import_entry's, for an entry whose selectors are loaded already
+ * (xt_ec_segs_loaded) and that steps past no breakpoint (RF clear, not
+ * the breakpoint last reported), with cpu_exec's entry into the lazy
+ * condition codes (x86_cpu_exec_enter's) made at once: the arithmetic
+ * flags in CC_SRC, DF in env->df, neither in env->eflags.
+ */
+void xt_ec_import_engine(XtThread *t, uint64_t pc, uint32_t nzcv)
+{
+    CPUX86State *env = t->env;
+    uint32_t eflags = (xt_ec_eflags(env) &
+                       ~(CC_S | CC_Z | CC_C | CC_O | TF_MASK)) |
+                      ec_eflags(nzcv);
+
+    eflags = (env->eflags & ~EFLAGS_FROM_CONTEXT) |
+             (eflags & EFLAGS_FROM_CONTEXT) | 0x2;
+    env->eip = pc;
+    CC_SRC = eflags & (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
+    CC_OP = CC_OP_EFLAGS;
+    env->df = 1 - (2 * ((eflags >> 10) & 1));
+    env->eflags = eflags & ~(DF_MASK | CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
+    env_archcpu(env)->eflags_in_tcg = true;
+    t->bp_skip = false;
+    t->bp_hit = 0;
 }
 
 /* An entry's x64 registers from their ARM64EC places in N, then the rest. */
