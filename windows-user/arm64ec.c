@@ -1129,8 +1129,10 @@ static void ec_ring_doorbells(void);
  *   stopped; then each is suspended once more, whose previous count shows
  *   whether something let it run again, and stopped again if so.  A slot
  *   of the registry still being created is waited for first, so that an
- *   internal thread is never mistaken for another.  It all fits in a
- *   budget (EC_FREEZE_MS).
+ *   internal thread is never mistaken for another.  A budget
+ *   (EC_FREEZE_MS) is checked after each pass's stops: it ends a freeze
+ *   that keeps finding threads, not a stop that blocks (Windows' context
+ *   read gives up after about 10 s).
  * - Then the doorbell watcher, which the stops needed, and the region
  *   sampler park, and every registered thread must be parked, or be
  *   call_rcu's worker.
