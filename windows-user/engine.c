@@ -932,13 +932,15 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     }
 #ifdef TARGET_X86_64
     /*
-     * Not yet in the x64 module: it has no termination calls to stop the
-     * cache's writer before the process kills it, and a writer killed
-     * holding the sink's lock would leave a capture at exit waiting for it
-     * forever.  Its in-process cache isn't qualified either.
+     * The cache's files, not yet in the x64 module: their writer must stop
+     * before Windows ends the process's threads, and at ProcessTerm's
+     * first call the other threads still run in the engine.  Nothing
+     * stops them and the writer safely there yet, and a writer ended
+     * holding the sink's lock would leave a capture at exit waiting for
+     * it forever.  The in-process cache (x-cache=on) has no writer.
      */
-    if (tcg_cache_mode == TCG_CACHE_ON) {
-        refuse_settings("x-cache: not in the x64 module");
+    if (tcg_cache_mode == TCG_CACHE_ON && tcg_cache_files) {
+        refuse_settings("x-cache=files: not in the x64 module");
     }
 #endif
     /*
