@@ -604,6 +604,13 @@ XTEXPORT NTSTATUS ProcessInit(void)
 #define XT_EC_THREAD_PAGE 0x1000
 
 /*
+ * EmulatorData's slot that is set while ThreadInit runs, for a stop at the
+ * process's end to know the thread is there: ntdll calls it in an adapter
+ * scope, and it runs nothing of the engine's.
+ */
+#define XT_EC_IN_THREAD_INIT 2
+
+/*
  * A thread's emulator stack, above a page of its own (XtEcFrame): the
  * doorbell word Windows sets to ask a simulating thread to stop
  * (SuspendDoorbell), and the native registers of an entry or exit.
@@ -616,8 +623,13 @@ XTEXPORT NTSTATUS ThreadInit(void)
     uintptr_t stack;
 
     reached |= 0x100;
-    if (!area || alloc_direct(&mem, &size, MEM_RESERVE | MEM_COMMIT,
-                              PAGE_READWRITE) < 0) {
+    if (!area) {
+        return STATUS_NO_MEMORY;
+    }
+    qatomic_set(&area->EmulatorData[XT_EC_IN_THREAD_INIT], (void *)1);
+    if (alloc_direct(&mem, &size, MEM_RESERVE | MEM_COMMIT,
+                     PAGE_READWRITE) < 0) {
+        qatomic_set(&area->EmulatorData[XT_EC_IN_THREAD_INIT], NULL);
         return STATUS_NO_MEMORY;
     }
     stack = (uintptr_t)mem + XT_EC_THREAD_PAGE;
@@ -626,6 +638,7 @@ XTEXPORT NTSTATUS ThreadInit(void)
     area->EmulatorStackBase = stack + XT_EMULATOR_STACK;
     area->EmulatorData[0] = NULL;
     area->EmulatorData[1] = mem;
+    qatomic_store_release(&area->EmulatorData[XT_EC_IN_THREAD_INIT], NULL);
     return STATUS_SUCCESS;
 }
 
@@ -656,7 +669,9 @@ typedef enum EcStopState {
  * thread still inside its scope, so the context read alone proves nothing.
  * The thread's own CPU area does: it is read with NtReadVirtualMemory,
  * since the thread may have ended meanwhile, and a read that fails fails
- * the check.  A thread with no CPU area yet hasn't run, and holds nothing.
+ * the check.  A thread with no CPU area yet hasn't run, and one in
+ * ThreadInit (XT_EC_IN_THREAD_INIT) runs none of the engine's code: both
+ * hold nothing.
  * Then its frame page's operation: one that doesn't block is to be waited
  * for; a read's range is passed back in *READ.
  */
@@ -684,6 +699,9 @@ static EcStopState ec_stopped_state(HANDLE h, const CONTEXT *c,
                             NULL) < 0) {
         ec_stop_why = 2;
         return EC_STOP_INCONSISTENT;
+    }
+    if (area.EmulatorData[XT_EC_IN_THREAD_INIT]) {
+        return EC_STOP_OK;
     }
     if (area.InSimulation || area.InSyscallCallback ||
         (c->Rsp >= area.EmulatorStackLimit &&
