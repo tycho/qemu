@@ -249,7 +249,19 @@ typedef struct XtGate {
  */
 extern XtGate *xt_gate_closed_by;
 
+/* XtGateRoot.state */
+#define XT_ROOT_FREE        0
+#define XT_ROOT_PENDING     1
+#define XT_ROOT_CLAIMED     2
+#define XT_ROOT_TAKEN       3
+
+/* xt_adm_enter's result: the level, and whether it was an attempt. */
+#define XT_ADM_ATTEMPT      0x80000000u
+
 uint32_t xt_adm_enter(XtGate *g);
+int xt_adm_enter_claim(XtGate *g, uint32_t kind, uint64_t addr, uint64_t len);
+void xt_root_push(XtGate *g, uint32_t kind, uint64_t addr, uint64_t len);
+void xt_root_release(XtGate *g, int i);
 void xt_adm_exit(XtGate *g);
 G_NORETURN void xt_adm_park(XtGate *g);
 G_NORETURN void xt_adm_poison_park(XtGate *g);
