@@ -412,7 +412,13 @@ static unsigned __stdcall reader_retirer(void *arg)
     LARGE_INTEGER tick = { .QuadPart = -20 * 10000 };   /* 20 ms */
 
     for (;;) {
-        XtReaderNode *n = qatomic_xchg(&readers, NULL), *keep = NULL;
+        XtReaderNode *n, *keep = NULL;
+
+        /* The process's end: here it holds nothing. */
+        if (xt_internal_stopping()) {
+            xt_internal_park();
+        }
+        n = qatomic_xchg(&readers, NULL);
 
         while (n) {
             XtReaderNode *next = n->next;
@@ -436,7 +442,7 @@ static unsigned __stdcall reader_retirer(void *arg)
             readers_push(keep);
             keep = next;
         }
-        NtDelayExecution(FALSE, &tick);
+        NtDelayExecution(TRUE, &tick);
     }
     return 0;
 }
@@ -454,20 +460,32 @@ static unsigned __stdcall rcu_stress(void *arg)
     LARGE_INTEGER ms = { .QuadPart = -10000 };
 
     for (;;) {
+        if (xt_internal_stopping()) {
+            xt_internal_park();
+        }
         synchronize_rcu();
         qatomic_inc(&rcu_stress_done);
-        NtDelayExecution(FALSE, &ms);
+        NtDelayExecution(TRUE, &ms);
     }
     return 0;
 }
 
+/*
+ * The watchdog sleeps in slices, so that the process's end, which may wait
+ * longer than 5 s for a thread to stop, disarms it first.
+ */
 static unsigned __stdcall rcu_stress_watchdog(void *arg)
 {
-    LARGE_INTEGER s = { .QuadPart = -5 * 1000 * 10000 };    /* 5 s */
+    LARGE_INTEGER slice = { .QuadPart = -10 * 10000 };      /* 10 ms */
     uint64_t seen = 0;
 
     for (;;) {
-        NtDelayExecution(FALSE, &s);
+        for (int i = 0; i < 500; i++) {
+            if (xt_internal_stopping()) {
+                xt_internal_park();
+            }
+            NtDelayExecution(TRUE, &slice);
+        }
         if (qatomic_read(&rcu_stress_done) == seen) {
             fputs("rcustress: no grace period completed in 5 s\n", stderr);
             xt_log_text("rcustress: no grace period completed in 5 s\n");
@@ -1252,6 +1270,8 @@ NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
 static XtThread *ec_threads[XT_EC_MAX_THREADS];
 static int ec_nthreads;
 
+static bool watcher_stop;
+
 static unsigned __stdcall doorbell_watcher(void *arg)
 {
     LARGE_INTEGER tick = { .QuadPart = -10000 };
@@ -1259,6 +1279,13 @@ static unsigned __stdcall doorbell_watcher(void *arg)
     for (;;) {
         int n = MIN(qatomic_read(&ec_nthreads), XT_EC_MAX_THREADS);
 
+        /*
+         * The process's end needs it to stop the other threads, so it
+         * stops on its own request, last; here it holds nothing.
+         */
+        if (qatomic_read(&watcher_stop)) {
+            xt_internal_park();
+        }
         NtDelayExecution(FALSE, &tick);
         xt_record_hold();
         for (int i = 0; i < n; i++) {
