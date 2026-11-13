@@ -94,6 +94,11 @@ static uint64_t *own_slot2(void)
     return (uint64_t *)((char *)NtCurrentTeb() + TEB_TLS_SLOTS + 2 * 8);
 }
 
+/* The x64 module's check (lockcheck); a WOW64 thread's scopes differ. */
+void xt_lock_checked(void *caller)
+{
+}
+
 bool xt_adapter_begin(void)
 {
     uint64_t *f = own_slot2();

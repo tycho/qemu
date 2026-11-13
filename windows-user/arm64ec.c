@@ -1010,6 +1010,8 @@ out:
 }
 
 static bool watcher_stop, watcher_fast;
+static uint32_t lock_misses;      /* lockcheck's (xt_lock_checked) */
+static void *lock_miss_caller;
 static void ec_ring_doorbells(void);
 
 /*
@@ -1301,14 +1303,21 @@ static void ec_exit_flush(void)
 
 static void ec_exit_line(char *line, size_t size)
 {
-    snprintf(line, size, "exit: outcome 0x%x, %u threads stopped (%u "
-             "again), %u passes, %u unsafe terminations, %.1f ms (freeze "
-             "%.1f, parks %.1f, flush %.1f)\n",
-             ec_exit_outcome & ~EC_EXIT_DONE, ec_exit_frozen,
-             ec_exit_refrozen, ec_exit_passes,
-             qatomic_read(&ec_unsafe_terms), ec_exit_ns / 1e6,
-             ec_exit_phase[0] / 1e6, ec_exit_phase[1] / 1e6,
-             ec_exit_phase[2] / 1e6);
+    int n = snprintf(line, size, "exit: outcome 0x%x, %u threads stopped "
+                     "(%u again), %u passes, %u unsafe terminations, %.1f ms "
+                     "(freeze %.1f, parks %.1f, flush %.1f)\n",
+                     ec_exit_outcome & ~EC_EXIT_DONE, ec_exit_frozen,
+                     ec_exit_refrozen, ec_exit_passes,
+                     qatomic_read(&ec_unsafe_terms), ec_exit_ns / 1e6,
+                     ec_exit_phase[0] / 1e6, ec_exit_phase[1] / 1e6,
+                     ec_exit_phase[2] / 1e6);
+
+    if (xt_lock_check && n > 0 && (size_t)n < size) {
+        snprintf(line + n, size - n, "lockcheck: %u acquisitions outside "
+                 "protection, the first from %p (module %p)\n",
+                 qatomic_read(&lock_misses), qatomic_read(&lock_miss_caller),
+                 &__ImageBase);
+    }
 }
 
 static void ec_exit_begin(void)
@@ -1318,7 +1327,7 @@ static void ec_exit_begin(void)
     DWORD owner = qatomic_cmpxchg(&ec_exit_owner, 0, me);
     GArray *frozen, *reads;
     int64_t t0 = get_clock();
-    char line[256];
+    char line[384];
     bool began;
 
     if (owner == me) {
@@ -1405,7 +1414,7 @@ XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
     if (h && !after && xt_exit_report &&
         (qatomic_load_acquire(&ec_exit_outcome) & EC_EXIT_DONE) &&
         qatomic_read(&ec_exit_owner) == GetCurrentThreadId()) {
-        char line[256];
+        char line[384];
 
         ec_exit_line(line, sizeof(line));
         fputs(line, stderr);
@@ -1485,6 +1494,28 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
         xt_continue_native(native);
     }
     return STATUS_SUCCESS;
+}
+
+/*
+ * Testing (lockcheck): the mmap lock taken where a stop of this thread
+ * would not wait for its release: outside simulation (InSimulation, or the
+ * emulator stack, which BeginSimulation's C runs on before it sets the
+ * flag), outside an adapter scope, and not on one of the engine's own
+ * threads.  The process's end relies on there being none.
+ */
+void xt_lock_checked(void *caller)
+{
+    XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+    uintptr_t sp = (uintptr_t)__builtin_frame_address(0);
+
+    if (xt_internal_self || !area || area->InSimulation ||
+        area->InSyscallCallback ||
+        (sp >= area->EmulatorStackLimit && sp < area->EmulatorStackBase)) {
+        return;
+    }
+    if (qatomic_fetch_inc(&lock_misses) == 0) {
+        qatomic_set(&lock_miss_caller, caller);
+    }
 }
 
 /*

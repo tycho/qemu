@@ -239,6 +239,13 @@ extern bool xt_diag;
 extern bool xt_rcu_stress;
 /* Testing (keywords exitstrict, exitreport): the process's end. */
 extern bool xt_exit_strict, xt_exit_report;
+/*
+ * Testing (keyword lockcheck): each outer acquisition of the mmap lock
+ * checked to be where a stop of the thread would wait for its release
+ * (arm64ec.c); the misses counted, the first one's caller kept.
+ */
+extern bool xt_lock_check;
+void xt_lock_checked(void *caller);
 /* Testing (keyword rcuinj=N): registrations interrupted at step N. */
 extern int xt_rcu_inj_step;
 CPUState *xt_cpu_new(void);
