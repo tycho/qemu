@@ -688,20 +688,122 @@ static NTSTATUS ec_stop_for_term(HANDLE h)
     return st < 0 ? st : 0;
 }
 
+NTSTATUS NTAPI NtGetNextThread(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG,
+                               PHANDLE);
+NTSTATUS NTAPI NtCompareObjects(HANDLE, HANDLE);
+
+/*
+ * Terminations Windows went ahead with although the thread wasn't stopped
+ * outside the engine (the stop failed, or the thread couldn't be found):
+ * such a thread may have died holding anything, so the process's end
+ * counts them (ProcessTerm).  Counted before ThreadTerm returns, so before
+ * Windows can act; a termination Windows then refuses is counted all the
+ * same.
+ */
+static uint32_t ec_unsafe_terms;
+
+static void ec_unsafe_term(DWORD tid, NTSTATUS st)
+{
+    qatomic_inc(&ec_unsafe_terms);
+    xt_gevent(XT_EV_THREAD_TERM, tid, 4 | (uint64_t)(uint32_t)st << 32);
+}
+
+/*
+ * THREAD, if it is another thread of this process, opened with what a
+ * stop needs; else NULL.  Found by its id where THREAD can be queried,
+ * else as the same object among the process's threads (TerminateThread
+ * needs THREAD_TERMINATE alone).  *FOUND_NOT says whether NULL means
+ * "not one of ours" rather than "couldn't tell".
+ */
+static HANDLE ec_open_thread(HANDLE thread, bool *found_not)
+{
+    const ACCESS_MASK want = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                             THREAD_QUERY_INFORMATION;
+    HANDLE h = NULL, next;
+
+    *found_not = false;
+    for (;;) {
+        NTSTATUS st = NtGetNextThread(GetCurrentProcess(), h, want, 0, 0,
+                                      &next);
+
+        if (h) {
+            NtClose(h);
+        }
+        if (st < 0) {
+            /* The end of the list: not a thread of this process. */
+            *found_not = st == STATUS_NO_MORE_ENTRIES;
+            return NULL;
+        }
+        h = next;
+        if (NtCompareObjects(thread, h) == 0) {
+            return h;
+        }
+    }
+}
+
+/*
+ * Another thread, which the engine has no record of, about to be ended
+ * through THREAD: stopped and checked as a recorded thread is
+ * (ec_stop_for_term), since a thread without a record can still be inside
+ * the module's callbacks or the engine's start, holding its locks.  Left
+ * suspended for Windows to end.  A thread that can't be stopped so is
+ * counted (ec_unsafe_term).
+ */
+static void ec_stop_other(HANDLE thread)
+{
+    PUBLIC_OBJECT_BASIC_INFORMATION obi;
+    XtThreadBasicInfo tbi;
+    bool not_ours;
+    DWORD tid = 0;
+    HANDLE h;
+    NTSTATUS st;
+
+    if (!thread || thread == GetCurrentThread() ||
+        NtQueryObject(thread, ObjectBasicInformation, &obi, sizeof(obi),
+                      NULL) < 0 ||
+        !(obi.GrantedAccess & THREAD_TERMINATE)) {
+        /* Itself, or a termination Windows won't make. */
+        return;
+    }
+    h = ec_open_thread(thread, &not_ours);
+    if (!h) {
+        if (!not_ours) {
+            ec_unsafe_term(0, STATUS_UNSUCCESSFUL);
+        }
+        return;
+    }
+    if (NtQueryInformationThread(h, 0, &tbi, sizeof(tbi), NULL) >= 0) {
+        tid = (DWORD)(uintptr_t)tbi.ClientId.UniqueThread;
+    }
+    if (tid != GetCurrentThreadId()) {
+        st = ec_stop_for_term(h);
+        if (st < 0) {
+            ec_unsafe_term(tid, st);
+        }
+    }
+    /* A suspension outlives the handle: Windows ends the thread. */
+    NtClose(h);
+}
+
 /*
  * A thread's end, by itself or by another thread (THREAD), before Windows
  * terminates it.  Another thread is found, whatever THREAD allows
  * (TerminateThread needs THREAD_TERMINATE alone), through its record's
  * own handle (xt_terminated_thread), and stopped through that where it
- * holds nothing of the engine's: suspended and its context read
- * (ec_stop_for_term).  It stays suspended for Windows to end.  Then the
- * record leaves the watcher's list and goes: the thread's own at once,
- * another's once its handle is signalled (xt_reap), as the emulator stack
- * and its page; the handles the reaper waits on are made first, and
- * without them the record stays.  A thread that can't be stopped so is
- * left as it is, with its record (the failure is an event): with all
- * access to it, that takes a thread already ending.  A thread Windows
- * won't end, or that the engine has no record of, is left alone.
+ * holds nothing of the engine's: suspended, its context read and its state
+ * checked (ec_stop_for_term).  It stays suspended for Windows to end.  A
+ * thread with no record is stopped the same way (ec_stop_other), and so is
+ * any thread while the engine starts.  Then the record leaves the
+ * watcher's list and goes: the thread's own at once, another's once its
+ * handle is signalled (xt_reap), as the emulator stack and its page; the
+ * handles the reaper waits on are made first, and without them the record
+ * stays.  A thread that can't be stopped so is left as it is, with its
+ * record, and counted (ec_unsafe_term): with all access to it, that takes a
+ * thread already ending.  A thread Windows won't end is left alone.
+ *
+ * The record's work (the lookup, the reaper, the teardown) is in adapter
+ * scopes, so that this thread, stopped meanwhile by another, is stopped
+ * outside it; the stop itself is not, since it waits for the other thread.
  */
 XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
 {
@@ -710,17 +812,25 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
     HANDLE h, own = NULL, stack_ref = NULL, rec_ref = NULL;
     void *teb = NULL;
     DWORD tid;
-    bool self;
+    bool self, began;
+    int state = qatomic_load_acquire(&engine_state);
 
-    if (qatomic_load_acquire(&engine_state) != 2) {
+    if (state == 0) {
+        return STATUS_SUCCESS;
+    }
+    if (state != 2) {
+        ec_stop_other(thread);
         return STATUS_SUCCESS;
     }
     xt_enter();
     tid = xt_terminated_thread(thread, &teb, &own);
     if (!tid) {
+        ec_stop_other(thread);
         return STATUS_SUCCESS;
     }
+    began = xt_adapter_begin();
     xt_reap();
+    xt_adapter_end(began);
     self = teb == NtCurrentTeb();
     if (self) {
         h = GetCurrentThread();
@@ -728,18 +838,19 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
         NTSTATUS st = ec_stop_for_term(own);
 
         if (st < 0) {
-            xt_gevent(XT_EV_THREAD_TERM, tid, 4 | (uint64_t)(uint32_t)st << 32);
+            ec_unsafe_term(tid, st);
             goto out;
         }
         h = own;
     }
+    began = xt_adapter_begin();
     /* Its TEB is read only once it is stopped: it may have ended. */
     area = xt_cpu_area(teb);
     if (!area || !qatomic_read(&area->EmulatorData[0])) {
         if (!self) {
             NtResumeThread(h, NULL);
         }
-        goto out;
+        goto out_scope;
     }
     if (NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
                           &stack_ref, 0, 0, DUPLICATE_SAME_ACCESS) < 0 ||
@@ -747,7 +858,7 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
          NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
                            &rec_ref, 0, 0, DUPLICATE_SAME_ACCESS) < 0)) {
         /* Stopped, and the record stays with it. */
-        goto out;
+        goto out_scope;
     }
     t = qatomic_xchg(&area->EmulatorData[0], NULL);
     if (!t) {
@@ -755,7 +866,7 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
         if (!self) {
             NtResumeThread(h, NULL);
         }
-        goto out;
+        goto out_scope;
     }
     /*
      * Before the CPU state goes: the thread is this one, or stopped, so no
@@ -772,6 +883,8 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
         xt_thread_retire(t, rec_ref);
         rec_ref = NULL;
     }
+out_scope:
+    xt_adapter_end(began);
 out:
     if (stack_ref) {
         NtClose(stack_ref);
