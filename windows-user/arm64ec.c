@@ -14,6 +14,7 @@
 #include "hw/core/cpu.h"
 #include "cpu.h"
 #include "tcg/tcg.h"
+#include "tcg/tcg-cache.h"
 #include "tcg/startup.h"
 #include "tcg/host-fpenv.h"
 #include "accel/tcg/dispatch.h"
@@ -682,7 +683,6 @@ static NTSTATUS ec_process_init(void)
     xt_ec_stub_inject_init();
     return STATUS_SUCCESS;
 }
-
 
 #define XT_EMULATOR_STACK (256 * 1024)
 #define XT_EC_THREAD_PAGE 0x1000
@@ -1798,7 +1798,25 @@ static void ec_exit_begin(void)
  */
 static void ec_process_term(HANDLE h, BOOL after, NTSTATUS status)
 {
+    static bool cache_stats_done;
+
     if (!h && !after) {
+        /*
+         * The translation cache's statistics and dump (testing), while
+         * no other thread can have been stopped holding a lock they take.
+         */
+        if (tcg_cache_mode && !cache_stats_done &&
+            (tcg_cache_stats_at_exit || getenv("XTCG_CACHE_STATS"))) {
+            cache_stats_done = true;
+            tcg_cache_print_stats();
+            xt_cache_print_stats();
+        }
+        if (tcg_cache_mode == TCG_CACHE_ON && cache_dump) {
+            cache_dump = false;
+            WITH_MMAP_LOCK_GUARD() {
+                xt_cache_dump();
+            }
+        }
         xt_ec_stub_inject_report();
         if (xt_rcu_stress) {
             char line[64];
@@ -2676,6 +2694,26 @@ miss:
 }
 
 /*
+ * Testing (cacheselftest): the cache's guarded routines, once, on the
+ * first thread to finish an acquisition, in the engine's state.  A
+ * thread's first entry is never dispatched (ec_dispatch_ready: its reader
+ * isn't registered yet), so the first acquisition comes through here.
+ */
+static void __attribute__((noinline)) ec_cache_selftest_once(void)
+{
+    if (qatomic_xchg(&cache_selftest, false)) {
+        xt_cache_selftest();
+    }
+}
+
+static inline QEMU_ALWAYS_INLINE void ec_cache_selftest(void)
+{
+    if (unlikely(qatomic_read(&cache_selftest))) {
+        ec_cache_selftest_once();
+    }
+}
+
+/*
  * A call, jump or return into x64 code (ExitToX64, DispatchJump,
  * RetToEntryThunk in arm64ec.S), with F's record of it: the x64 registers
  * are in the CPU state already, or, where the frame had none to name (a
@@ -2698,6 +2736,7 @@ void xt_ec_enter(XtEcFrame *f)
         xt_ec_import_call(t, &f->ctx, f->pc, f->nzcv);
     }
     xt_acquire_end(t);
+    ec_cache_selftest();
     if (tcg_retalign) {
         ec_retstack_entry(t, f);
     }
@@ -2816,6 +2855,7 @@ void xt_ec_begin(void)
         xt_ec_import_ymm(t, w);
     }
     xt_acquire_end(t);
+    ec_cache_selftest();
     ec_run(t, (XtEcFrame *)area->EmulatorData[1]);
 }
 
