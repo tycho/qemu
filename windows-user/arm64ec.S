@@ -135,6 +135,15 @@ xt_check_call:
 #define E_FPREGS    0x2f0
 #define E_XMM       0x3d0
 
+/*
+ * The thread's gate (arm64ec.h's XtGate, EmulatorData[3]): its admission
+ * word, its own closure and whether it is an internal thread.
+ */
+#define AREA_GATE       0x48
+#define G_ADM           0x00
+#define G_CLOSED        0x08
+#define G_INTERNAL      0x0c
+
 #define TEB_PEB         0x60
 #define TEB_CPU_AREA    0x1788
 #define PEB_EC_BITMAP   0x368
@@ -183,6 +192,124 @@ xt_check_call:
     add     x\b, x\b, #1
     str     x\b, [x\a, #(0x50 + 8 * \n)]
 .Linj_out\@:
+.endm
+
+/*
+ * An entry's admission (arm64ec-gate.c's xt_adm_enter): its level pushed
+ * on the thread's admission word by compare-and-swap, inherited if the
+ * innermost level is committed, else an attempt that reads the gate and
+ * then commits, or parks for good.  Before the entry writes anything of
+ * the engine's, and in the scratch registers (x14, x16, x17, x23, x24)
+ * with no instruction that sets flags, so NZCV is still the guest's when
+ * entry_tail reads it.  A refusal, a parked or poisoned word, a COUNT
+ * full, or a SEQ that would wrap, goes to C, which never returns.  x14
+ * keeps the COUNT the level was pushed over, for the commit's check.
+ */
+.macro adm_enter
+    ldr     x16, [x18, #TEB_CPU_AREA]
+    ldr     x16, [x16, #AREA_GATE]
+    cbz     x16, xt_ec_adm_nogate
+.Ladm_try\@:
+    ldr     x17, [x16, #G_ADM]
+    tbnz    x17, #60, xt_ec_adm_park_entry
+    tbnz    x17, #61, xt_ec_adm_park_entry
+    mvn     w24, w17
+    cbz     w24, xt_ec_adm_poison_entry
+    ubfx    x14, x17, #32, #14
+    mov     x24, #0x3fff
+    sub     x24, x14, x24
+    cbz     x24, xt_ec_adm_poison_entry
+    ubfx    x23, x17, #46, #14
+    sub     x24, x14, x23
+    cbz     x24, .Ladm_attempt\@
+    /* Inherited: COUNT+1, SEQ+1. */
+    movz    x24, #1, lsl #32
+    add     x24, x17, x24
+    add     x24, x24, #1
+    mov     x23, x17
+    casal   x23, x24, [x16]
+    sub     x23, x23, x17
+    cbnz    x23, .Ladm_try\@
+    b       .Ladm_done\@
+.Ladm_attempt\@:
+    /* An attempt: COUNT+1, UNC+1, SEQ+1, then the gate. */
+    movz    x24, #0x4001, lsl #32
+    add     x24, x17, x24
+    add     x24, x24, #1
+    mov     x23, x17
+    casal   x23, x24, [x16]
+    sub     x23, x23, x17
+    cbnz    x23, .Ladm_try\@
+    ldr     w17, [x16, #G_CLOSED]
+    cbnz    w17, xt_ec_adm_reject_entry
+    adrp    x17, xt_gate_closed_by
+    ldr     x17, [x17, :lo12:xt_gate_closed_by]
+    cbz     x17, .Ladm_commit\@
+    sub     x17, x17, x16
+    cbz     x17, .Ladm_commit\@
+    ldr     w17, [x16, #G_INTERNAL]
+    cbz     w17, xt_ec_adm_reject_entry
+.Ladm_commit\@:
+    /*
+     * Not parked or poisoned by an interruption meanwhile, COUNT and UNC
+     * still this level (x14 + 1): UNC-1, SEQ+1.
+     */
+    ldr     x17, [x16, #G_ADM]
+    tbnz    x17, #60, xt_ec_adm_park_entry
+    tbnz    x17, #61, xt_ec_adm_park_entry
+    ubfx    x23, x17, #32, #14
+    sub     x23, x23, x14
+    sub     x23, x23, #1
+    cbnz    x23, xt_ec_adm_poison_entry
+    ubfx    x23, x17, #46, #14
+    sub     x23, x23, x14
+    sub     x23, x23, #1
+    cbnz    x23, xt_ec_adm_poison_entry
+    mvn     w24, w17
+    cbz     w24, xt_ec_adm_poison_entry
+    movz    x24, #0x4000, lsl #32
+    sub     x24, x17, x24
+    add     x24, x24, #1
+    mov     x23, x17
+    casal   x23, x24, [x16]
+    sub     x23, x23, x17
+    cbnz    x23, .Ladm_commit\@
+.Ladm_done\@:
+.endm
+
+/*
+ * An exit's withdrawal (xt_adm_exit): the innermost level popped, after
+ * the engine's last access.  With no committed level to pop (a pairing
+ * error), or a SEQ that would wrap, the word is poisoned instead.  x14,
+ * x16, x17, x23 and x24 only.
+ */
+.macro adm_exit
+    ldr     x16, [x18, #TEB_CPU_AREA]
+    ldr     x16, [x16, #AREA_GATE]
+    cbz     x16, .Ladm_out\@
+.Ladm_pop\@:
+    ldr     x17, [x16, #G_ADM]
+    ubfx    x14, x17, #32, #14
+    ubfx    x23, x17, #46, #14
+    sub     x24, x14, x23
+    cbz     x24, .Ladm_bad\@
+    mvn     w24, w17
+    cbz     w24, .Ladm_bad\@
+    movz    x23, #1, lsl #32
+    sub     x24, x17, x23
+    add     x24, x24, #1
+    mov     x23, x17
+    casal   x23, x24, [x16]
+    sub     x23, x23, x17
+    cbnz    x23, .Ladm_pop\@
+    b       .Ladm_out\@
+.Ladm_bad\@:
+    orr     x24, x17, #0x2000000000000000
+    mov     x23, x17
+    casal   x23, x24, [x16]
+    sub     x23, x23, x17
+    cbnz    x23, .Ladm_pop\@
+.Ladm_out\@:
 .endm
 
 /* The entries' common part; with INJ, XTAJIT_INJECT's points 1-3. */
@@ -262,6 +389,7 @@ xt_check_call:
     .globl DispatchJump
 DispatchJump:
     cap_check 1
+    adm_enter
     str     lr, [sp, #-8]!      /* the x64 return address */
     mov     w13, #1             /* XT_EC_ENTRY_CALL */
     b       2f
@@ -269,6 +397,7 @@ DispatchJump:
     .globl RetToEntryThunk
 RetToEntryThunk:
     cap_check 2
+    adm_enter
     mov     x9, lr
     mov     w13, #2             /* XT_EC_ENTRY_RETURN */
 2:
@@ -285,6 +414,7 @@ RetToEntryThunk:
     .globl ExitToX64
 ExitToX64:
     cap_check 3
+    adm_enter
     str     lr, [sp, #-8]!      /* the x64 return address */
     mov     w13, #1             /* XT_EC_ENTRY_CALL */
 3:
@@ -295,11 +425,13 @@ ExitToX64:
  * cap_check.
  */
 xt_ec_inj_jump:
+    adm_enter
     str     lr, [sp, #-8]!
     mov     w13, #1
     b       2f
 
 xt_ec_inj_ret:
+    adm_enter
     mov     x9, lr
     mov     w13, #2
 2:
@@ -313,6 +445,7 @@ xt_ec_inj_ret:
     b       3f
 
 xt_ec_inj_call:
+    adm_enter
     str     lr, [sp, #-8]!
     mov     w13, #1
 3:
@@ -321,6 +454,7 @@ xt_ec_inj_call:
     .globl BeginSimulation
 BeginSimulation:
     cap_check 4
+    adm_enter
     /* The registers the dispatcher keeps, for xt_ec_begin. */
     ldr     x17, [x18, #TEB_CPU_AREA]
     ldr     x16, [x17, #AREA_FRAME]
@@ -393,6 +527,7 @@ BeginSimulation:
  */
     .globl xt_ec_exit_dispatch
 xt_ec_exit_dispatch:
+    adm_exit
     ldr     x17, [x18, #TEB_CPU_AREA]
     strb    wzr, [x17]
     ldr     x17, [x17, #AREA_DOORBELL]
@@ -427,6 +562,34 @@ xt_ec_exit_suspend_point:
     brk     #0xcafe
 
 /*
+ * Admission's ends in C (arm64ec-gate.c), none of which returns: a
+ * refused attempt, a parked or poisoned word, a COUNT full or a SEQ that
+ * would wrap.  sp is aligned first, wherever the entry found it.  A
+ * thread with no gate never got its ThreadInit: a module fault.
+ */
+xt_ec_adm_reject_entry:
+    mov     x0, x16
+    add     x1, x14, #1
+    mov     x17, sp
+    and     x17, x17, #0xfffffffffffffff0
+    mov     sp, x17
+    bl      "#xt_adm_reject"
+xt_ec_adm_park_entry:
+    mov     x0, x16
+    mov     x17, sp
+    and     x17, x17, #0xfffffffffffffff0
+    mov     sp, x17
+    bl      "#xt_adm_park"
+xt_ec_adm_poison_entry:
+    mov     x0, x16
+    mov     x17, sp
+    and     x17, x17, #0xfffffffffffffff0
+    mov     sp, x17
+    bl      "#xt_adm_poison_park"
+xt_ec_adm_nogate:
+    brk     #0xf0a0
+
+/*
  * xt_ec_exit_native_env and the dispatch's start with XTAJIT_INJECT's
  * test points; a suspension at the doorbell resumes in the original.
  */
@@ -436,6 +599,7 @@ xt_ec_exit_suspend_point:
     inj_point 4, 3, 4
     exit_loads
     inj_point 5, 16, 17
+    adm_exit
     ldr     x17, [x18, #TEB_CPU_AREA]
     strb    wzr, [x17]
     ldr     x17, [x17, #AREA_DOORBELL]

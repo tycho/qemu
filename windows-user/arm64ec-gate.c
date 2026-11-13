@@ -317,3 +317,178 @@ XtGate *xt_gate_for(HANDLE h, bool create_closed, NTSTATUS *st)
     qatomic_set(&r->closed, 1);
     return r;
 }
+
+/*
+ * Admission (XtGate.adm): every way into the module's code pushes a level
+ * of its own and pops exactly that level on every way out.  An entry made
+ * while the innermost level is committed inherits it (a callback of the
+ * engine's own work, an exception inside it) and checks no gate.  Any
+ * other entry is an attempt: it pushes its level uncommitted, then reads
+ * the gate, then commits, or, refused, parks for good.  An entry that
+ * interrupts an attempt finds that level uncommitted, so it never
+ * inherits it, and the attempt's level stays until the attempt itself
+ * commits or parks: a thread ending the process never sees the thread
+ * idle in between.
+ */
+XtGate *xt_gate_closed_by;
+
+QEMU_BUILD_BUG_ON(offsetof(XtGate, adm) != 0);
+QEMU_BUILD_BUG_ON(offsetof(XtGate, closed) != 8);
+QEMU_BUILD_BUG_ON(offsetof(XtGate, internal) != 12);
+
+#define ADM_ONE_COUNT (1ull << XT_ADM_COUNT_SHIFT)
+#define ADM_ONE_UNC (1ull << XT_ADM_UNC_SHIFT)
+
+static bool adm_cas(XtGate *g, uint64_t old, uint64_t new)
+{
+    return qatomic_cmpxchg(&g->adm, old, new) == old;
+}
+
+/* W's successor N, with SEQ moved; false if SEQ would wrap. */
+static bool adm_next(uint64_t w, uint64_t *n)
+{
+    if ((w & XT_ADM_SEQ_MASK) == XT_ADM_SEQ_MASK) {
+        return false;
+    }
+    *n += 1;
+    return true;
+}
+
+/* G's word poisoned, for good: the thread is never taken as idle again. */
+static void adm_poison(XtGate *g)
+{
+    uint64_t w;
+
+    do {
+        w = qatomic_read(&g->adm);
+    } while (!(w & XT_ADM_POISONED) && !adm_cas(g, w, w | XT_ADM_POISONED));
+}
+
+G_NORETURN void xt_adm_poison_park(XtGate *g)
+{
+    adm_poison(g);
+    xt_adm_park(g);
+}
+
+G_NORETURN void xt_adm_park(XtGate *g)
+{
+    LARGE_INTEGER forever = { .QuadPart = INT64_MIN };
+
+    for (;;) {
+        NtDelayExecution(FALSE, &forever);
+    }
+}
+
+/*
+ * Whether G's thread may not enter: its own closure, or the process's
+ * end's, which neither the end's owner nor an internal thread meets.
+ */
+static bool adm_closed_for(XtGate *g)
+{
+    XtGate *owner = qatomic_read(&xt_gate_closed_by);
+
+    if (qatomic_read(&g->closed)) {
+        return true;
+    }
+    return owner && owner != g && !qatomic_read(&g->internal);
+}
+
+/*
+ * An attempt at LEVEL refused: parked if it was the only level, poisoned
+ * if anything else is outstanding (an attempt it interrupted, or a level
+ * an interruption left above it), and parked either way.
+ */
+G_NORETURN void xt_adm_reject(XtGate *g, uint32_t level)
+{
+    uint64_t w, n;
+
+    do {
+        w = qatomic_read(&g->adm);
+        if (XT_ADM_COUNT(w) == 1 && XT_ADM_UNC(w) == 1 && level == 1) {
+            n = (w - ADM_ONE_COUNT - ADM_ONE_UNC) | XT_ADM_PARKED;
+            if (!adm_next(w, &n)) {
+                n = w | XT_ADM_POISONED;
+            }
+        } else {
+            n = w | XT_ADM_POISONED;
+        }
+    } while (!adm_cas(g, w, n));
+    xt_adm_park(g);
+}
+
+/* The attempt at LEVEL commits, if its level is still the innermost. */
+static void adm_commit(XtGate *g, uint32_t level)
+{
+    uint64_t w, n;
+
+    do {
+        w = qatomic_read(&g->adm);
+        n = w - ADM_ONE_UNC;
+        if (w & (XT_ADM_PARKED | XT_ADM_POISONED)) {
+            /* An interruption poisoned it meanwhile: no engine work now. */
+            xt_adm_park(g);
+        }
+        if (XT_ADM_COUNT(w) != level || XT_ADM_UNC(w) != level ||
+            !adm_next(w, &n)) {
+            adm_poison(g);
+            xt_adm_park(g);
+        }
+    } while (!adm_cas(g, w, n));
+}
+
+/* An entry's level pushed, with the gate checked if it's an attempt. */
+uint32_t xt_adm_enter(XtGate *g)
+{
+    for (;;) {
+        uint64_t w = qatomic_read(&g->adm), n;
+        uint32_t count = XT_ADM_COUNT(w), unc = XT_ADM_UNC(w);
+
+        if (w & (XT_ADM_PARKED | XT_ADM_POISONED)) {
+            xt_adm_park(g);
+        }
+        if (count == XT_ADM_FIELD_MASK) {
+            adm_poison(g);
+            xt_adm_park(g);
+        }
+        n = w + ADM_ONE_COUNT;
+        if (count == unc) {
+            n += ADM_ONE_UNC;
+        }
+        if (!adm_next(w, &n)) {
+            adm_poison(g);
+            xt_adm_park(g);
+        }
+        if (!adm_cas(g, w, n)) {
+            continue;
+        }
+        if (count > unc) {
+            return count + 1;
+        }
+        /* The level published before the gate is read (part of a pair). */
+        barrier();
+        if (adm_closed_for(g)) {
+            xt_adm_reject(g, count + 1);
+        }
+        adm_commit(g, count + 1);
+        return count + 1;
+    }
+}
+
+/*
+ * The innermost level popped.  None committed to pop is a pairing error:
+ * the word is poisoned, so the thread is never taken as idle.
+ */
+void xt_adm_exit(XtGate *g)
+{
+    uint64_t w, n;
+
+    do {
+        w = qatomic_read(&g->adm);
+        n = w - ADM_ONE_COUNT;
+        if (XT_ADM_COUNT(w) <= XT_ADM_UNC(w) || !adm_next(w, &n)) {
+            adm_poison(g);
+            return;
+        }
+    } while (!adm_cas(g, w, n));
+}
+

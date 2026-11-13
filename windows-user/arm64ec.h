@@ -226,6 +226,35 @@ typedef struct XtGate {
     void *rec, *frame;
 } XtGate;
 
+/*
+ * XtGate.adm, changed only by compare-and-swap, so that a transition an
+ * interruption made in between is never written over: SEQ moves on every
+ * change (one that would wrap it poisons the word instead), COUNT is the
+ * levels outstanding, UNC how many of the outermost are attempts still
+ * checking the gate (they lie under every committed level), PARKED and
+ * POISONED stick.  arm64ec.S's stubs use the same layout.
+ */
+#define XT_ADM_SEQ_MASK     0xffffffffull
+#define XT_ADM_COUNT_SHIFT  32
+#define XT_ADM_UNC_SHIFT    46
+#define XT_ADM_FIELD_MASK   0x3fffull
+#define XT_ADM_PARKED       (1ull << 60)
+#define XT_ADM_POISONED     (1ull << 61)
+#define XT_ADM_COUNT(w)     (((w) >> XT_ADM_COUNT_SHIFT) & XT_ADM_FIELD_MASK)
+#define XT_ADM_UNC(w)       (((w) >> XT_ADM_UNC_SHIFT) & XT_ADM_FIELD_MASK)
+
+/*
+ * The gate every thread's fresh entry checks: NULL while open, the exit
+ * owner's gate once the process's end has closed it.
+ */
+extern XtGate *xt_gate_closed_by;
+
+uint32_t xt_adm_enter(XtGate *g);
+void xt_adm_exit(XtGate *g);
+G_NORETURN void xt_adm_park(XtGate *g);
+G_NORETURN void xt_adm_poison_park(XtGate *g);
+G_NORETURN void xt_adm_reject(XtGate *g, uint32_t level);
+
 NTSTATUS xt_ec_alloc_direct(void **base, SIZE_T *size, ULONG type,
                             ULONG prot);
 bool xt_gate_init_process(void);
