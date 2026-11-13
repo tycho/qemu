@@ -24,6 +24,9 @@
 #include "xtajit.h"
 #include "arm64ec.h"
 #include "run.h"
+#include "qemu/timer.h"
+#include "accel/tcg/internal-common.h"
+#include "exec/tb-flush.h"
 
 /* The layouts arm64ec.S's offsets (F_*, C_*, TEB_CPU_AREA, AREA_*) assume. */
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, entry) != 0x04);
@@ -596,18 +599,6 @@ XTEXPORT NTSTATUS ProcessInit(void)
     return STATUS_SUCCESS;
 }
 
-XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
-{
-    xt_ec_stub_inject_report();
-    if (xt_rcu_stress) {
-        char line[64];
-
-        snprintf(line, sizeof(line), "rcustress: %llu grace periods\n",
-                 (unsigned long long)qatomic_read(&rcu_stress_done));
-        fputs(line, stderr);
-        xt_log_text(line);
-    }
-}
 
 #define XT_EMULATOR_STACK (256 * 1024)
 #define XT_EC_THREAD_PAGE 0x1000
@@ -1020,6 +1011,413 @@ out:
     return STATUS_SUCCESS;
 }
 
+static bool watcher_stop, watcher_fast;
+static void ec_ring_doorbells(void);
+
+/*
+ * The process's end, at Windows' first call (NULL, before), on the exiting
+ * thread: every other thread of the process is stopped where it holds
+ * nothing of the engine's, so that what runs after Windows has ended them
+ * (DLL detach code, on this thread) waits for none of them.
+ *
+ * - One thread owns it, the first to get here; another (ending the process
+ *   the same way at once) parks for good where it holds nothing, and is
+ *   stopped with the rest.
+ * - The engine's internal threads (the registry, runtime.c) are asked to
+ *   park: the module's helpers at the top of their loops, rcustress's
+ *   watchdog before it could misread a long stop as a stall.
+ * - The freeze: every other thread, found with NtGetNextThread, is stopped
+ *   and checked (ec_stop_for_term), and left suspended; a read it is in is
+ *   taken as done.  Passes repeat until one finds no thread it hasn't
+ *   stopped; then each is suspended once more, whose previous count shows
+ *   whether something let it run again, and stopped again if so.  A slot
+ *   of the registry still being created is waited for first, so that an
+ *   internal thread is never mistaken for another.  It all fits in a
+ *   budget (EC_FREEZE_MS).
+ * - Then the doorbell watcher, which the stops needed, and the region
+ *   sampler park, and every registered thread must be parked, or be
+ *   call_rcu's worker.
+ * - Every translation goes: a native thread may have written code and
+ *   been stopped before its flush's notification.
+ * - Then, only if all went well, call_rcu's work is drained and its worker
+ *   left at rest (rcu_worker_resting).
+ *
+ * A failure is counted and logged, and the exit goes on (unless the
+ * setting keyword exitstrict makes it fatal): the detach code runs as it
+ * would have.  A termination ThreadTerm let through unstopped
+ * (ec_unsafe_terms) is one.  After the freeze nothing here writes to the
+ * standard streams, whose reader may be a stopped thread; the outcome is
+ * printed at the last call with the keyword exitreport.
+ */
+#define EC_FREEZE_MS 30000
+#define EC_PARK_MS 1000
+
+enum {
+    EC_EXIT_STOP = 1 << 0,          /* a thread not stopped so */
+    EC_EXIT_UNSAFE = 1 << 1,        /* ThreadTerm let one through */
+    EC_EXIT_BUDGET = 1 << 2,        /* the freeze ran out of time */
+    EC_EXIT_CREATING = 1 << 3,      /* an internal thread's creation hung */
+    EC_EXIT_HELPER = 1 << 4,        /* an internal thread didn't park */
+    EC_EXIT_RCU = 1 << 5,           /* call_rcu's worker not at rest */
+    EC_EXIT_DONE = 1u << 31,
+};
+
+static DWORD ec_exit_owner;
+static uint32_t ec_exit_outcome;
+static uint32_t ec_exit_frozen, ec_exit_passes, ec_exit_refrozen;
+static int64_t ec_exit_ns, ec_exit_phase[4];
+
+typedef struct EcFrozen {
+    HANDLE h;
+    DWORD tid;
+} EcFrozen;
+
+typedef struct EcRead {
+    vaddr addr, len;
+} EcRead;
+
+static DWORD ec_thread_id(HANDLE h)
+{
+    XtThreadBasicInfo tbi;
+
+    if (NtQueryInformationThread(h, 0, &tbi, sizeof(tbi), NULL) < 0) {
+        return 0;
+    }
+    return (DWORD)(uintptr_t)tbi.ClientId.UniqueThread;
+}
+
+/* Whether TID is a registered internal thread's (one not yet ended). */
+static bool ec_is_internal(DWORD tid)
+{
+    int n;
+    const XtInternal *r = xt_internal_threads(&n);
+
+    for (int i = 0; i < n; i++) {
+        if (qatomic_load_acquire(&r[i].state) != XT_INTERNAL_FREE &&
+            qatomic_read(&r[i].tid) == tid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Until DEADLINE: no slot of the registry still being created. */
+static bool ec_wait_creations(int64_t deadline)
+{
+    int n;
+    const XtInternal *r = xt_internal_threads(&n);
+
+    for (int i = 0; i < n; i++) {
+        while (qatomic_load_acquire(&r[i].state) == XT_INTERNAL_CREATING) {
+            if (get_clock() > deadline) {
+                return false;
+            }
+            NtYieldExecution();
+        }
+    }
+    return true;
+}
+
+static bool ec_is_frozen(GArray *frozen, DWORD tid)
+{
+    for (guint i = 0; i < frozen->len; i++) {
+        if (g_array_index(frozen, EcFrozen, i).tid == tid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
+{
+    const ACCESS_MASK want = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                             THREAD_QUERY_INFORMATION;
+    int64_t deadline = get_clock() + (int64_t)EC_FREEZE_MS * SCALE_MS;
+    GArray *pending = g_array_sized_new(FALSE, FALSE, sizeof(EcFrozen), 32);
+
+    for (;;) {
+        HANDLE h = NULL, next;
+        bool fresh = false, again = false;
+
+        ec_exit_passes++;
+        if (!ec_wait_creations(deadline)) {
+            ec_exit_outcome |= EC_EXIT_CREATING;
+            return;
+        }
+        /*
+         * Every new thread asked to suspend first, and the doorbells rung
+         * at once, so that the engine's threads all leave it together;
+         * then each is stopped and checked in turn (its context read
+         * waits for it), and the first suspension undone.
+         */
+        while (NtGetNextThread(GetCurrentProcess(), h, want, 0, 0,
+                               &next) >= 0) {
+            EcFrozen f = { NULL, 0 };
+
+            if (h) {
+                NtClose(h);
+            }
+            h = next;
+            f.tid = ec_thread_id(h);
+            if (f.tid == me || ec_is_internal(f.tid) ||
+                ec_is_frozen(frozen, f.tid) ||
+                ec_is_frozen(pending, f.tid) ||
+                NtDuplicateObject(GetCurrentProcess(), h,
+                                  GetCurrentProcess(), &f.h, 0, 0,
+                                  DUPLICATE_SAME_ACCESS) < 0) {
+                continue;
+            }
+            if (NtSuspendThread(f.h, NULL) < 0) {
+                NtClose(f.h);
+                continue;
+            }
+            g_array_append_val(pending, f);
+        }
+        if (h) {
+            NtClose(h);
+            h = NULL;
+        }
+        ec_ring_doorbells();
+        for (guint i = 0; i < pending->len; i++) {
+            EcFrozen f = g_array_index(pending, EcFrozen, i);
+            EcRead r;
+            NTSTATUS st;
+
+            st = ec_stop_for_term(f.h, &r.addr, &r.len);
+            NtResumeThread(f.h, NULL);
+            if (st < 0) {
+                ec_exit_outcome |= EC_EXIT_STOP;
+                xt_gevent(XT_EV_THREAD_TERM, f.tid,
+                          8 | (uint64_t)(uint32_t)st << 32);
+                NtClose(f.h);
+                continue;
+            }
+            if (r.len) {
+                g_array_append_val(reads, r);
+            }
+            g_array_append_val(frozen, f);
+            ec_exit_frozen++;
+            fresh = true;
+        }
+        g_array_set_size(pending, 0);
+        if (get_clock() > deadline) {
+            ec_exit_outcome |= EC_EXIT_BUDGET;
+            return;
+        }
+        if (fresh) {
+            continue;
+        }
+        /* Each stopped thread still stopped, or stopped again. */
+        for (guint i = 0; i < frozen->len; i++) {
+            EcFrozen *f = &g_array_index(frozen, EcFrozen, i);
+            ULONG prev = 1;
+            EcRead r;
+
+            if (NtSuspendThread(f->h, &prev) < 0) {
+                continue;
+            }
+            NtResumeThread(f->h, NULL);
+            if (prev) {
+                continue;
+            }
+            again = true;
+            ec_exit_refrozen++;
+            if (ec_stop_for_term(f->h, &r.addr, &r.len) < 0) {
+                ec_exit_outcome |= EC_EXIT_STOP;
+            } else if (r.len) {
+                g_array_append_val(reads, r);
+            }
+        }
+        if (!again) {
+            return;
+        }
+    }
+}
+
+/* Until EC_PARK_MS: every registered thread parked, or call_rcu's worker. */
+static bool ec_wait_parked(void)
+{
+    int64_t deadline = get_clock() + (int64_t)EC_PARK_MS * SCALE_MS;
+    int n;
+    const XtInternal *r = xt_internal_threads(&n);
+
+    for (int i = 0; i < n; i++) {
+        for (;;) {
+            uint32_t state = qatomic_load_acquire(&r[i].state);
+            DWORD tid = qatomic_read(&r[i].tid);
+            int rcu_tid, sampler_tid;
+            bool sampler_parked = translator_region_sampler_parked(
+                &sampler_tid);
+
+            rcu_worker_resting(&rcu_tid);
+            if (state == XT_INTERNAL_FREE || state == XT_INTERNAL_PARKED ||
+                (tid && tid == (DWORD)rcu_tid) ||
+                (tid && tid == (DWORD)sampler_tid && sampler_parked)) {
+                break;
+            }
+            if (get_clock() > deadline) {
+                return false;
+            }
+            NtYieldExecution();
+        }
+    }
+    return true;
+}
+
+/* Until EC_PARK_MS: call_rcu's worker waiting, with nothing counted. */
+static bool ec_wait_rcu_rest(void)
+{
+    int64_t deadline = get_clock() + (int64_t)EC_PARK_MS * SCALE_MS;
+    int tid;
+
+    while (!rcu_worker_resting(&tid)) {
+        if (get_clock() > deadline) {
+            return false;
+        }
+        NtYieldExecution();
+    }
+    return true;
+}
+
+/*
+ * Every translation goes, as one flush: on this thread's CPU, exclusively
+ * of the others, which are stopped outside the engine.  The flush walks
+ * every CPU, so it is only for an end whose steps all went well: after a
+ * failure (a thread ended without a stop may have left its CPU behind), or
+ * on a thread with no CPU (one that never ran x64 code ends the process),
+ * they are dropped range by range instead, which costs more.
+ */
+static void ec_exit_flush(void)
+{
+    XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+    XtThread *t = area ? area->EmulatorData[0] : NULL;
+    CPUState *prev = current_cpu;
+
+    if (!t || ec_exit_outcome) {
+        xt_invalidate(0, (vaddr)guest_addr_max + 1);
+        return;
+    }
+    current_cpu = t->cpu;
+    start_exclusive();
+    tb_flush__exclusive_or_serial();
+    end_exclusive();
+    current_cpu = prev;
+}
+
+static void ec_exit_line(char *line, size_t size)
+{
+    snprintf(line, size, "exit: outcome 0x%x, %u threads stopped (%u "
+             "again), %u passes, %u unsafe terminations, %.1f ms (freeze "
+             "%.1f, parks %.1f, flush %.1f)\n",
+             ec_exit_outcome & ~EC_EXIT_DONE, ec_exit_frozen,
+             ec_exit_refrozen, ec_exit_passes,
+             qatomic_read(&ec_unsafe_terms), ec_exit_ns / 1e6,
+             ec_exit_phase[0] / 1e6, ec_exit_phase[1] / 1e6,
+             ec_exit_phase[2] / 1e6);
+}
+
+static void ec_exit_begin(void)
+{
+    LARGE_INTEGER forever = { .QuadPart = INT64_MIN };
+    DWORD me = GetCurrentThreadId();
+    DWORD owner = qatomic_cmpxchg(&ec_exit_owner, 0, me);
+    GArray *frozen, *reads;
+    int64_t t0 = get_clock();
+    char line[256];
+    bool began;
+
+    if (owner == me) {
+        return;
+    }
+    if (owner) {
+        /* Another thread is ending the process: stopped with the rest. */
+        XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+
+        if (area) {
+            area->InSyscallCallback = 0;
+        }
+        for (;;) {
+            NtDelayExecution(FALSE, &forever);
+        }
+    }
+    began = xt_adapter_begin();
+    frozen = g_array_sized_new(FALSE, FALSE, sizeof(EcFrozen), 32);
+    reads = g_array_sized_new(FALSE, FALSE, sizeof(EcRead), 8);
+    xt_internal_stop();
+    qatomic_set(&watcher_fast, true);
+    xt_internal_alert();
+    ec_freeze(me, frozen, reads);
+    ec_exit_phase[0] = get_clock() - t0;
+    if (qatomic_read(&ec_unsafe_terms)) {
+        ec_exit_outcome |= EC_EXIT_UNSAFE;
+    }
+    qatomic_set(&watcher_stop, true);
+    translator_region_sampler_park();
+    xt_internal_alert();
+    if (!ec_wait_parked()) {
+        ec_exit_outcome |= EC_EXIT_HELPER;
+    }
+    ec_exit_phase[1] = get_clock() - t0;
+    if (qatomic_load_acquire(&engine_state) == 2) {
+        xt_enter();
+        for (guint i = 0; i < reads->len; i++) {
+            EcRead *r = &g_array_index(reads, EcRead, i);
+
+            xt_invalidate(r->addr, r->len);
+        }
+        /* A flush's notification may be what a stopped thread missed. */
+        ec_exit_flush();
+    }
+    ec_exit_phase[2] = get_clock() - t0;
+    if (!ec_exit_outcome) {
+        drain_call_rcu();
+        if (!ec_wait_rcu_rest()) {
+            ec_exit_outcome |= EC_EXIT_RCU;
+        }
+    }
+    ec_exit_ns = get_clock() - t0;
+    ec_exit_line(line, sizeof(line));
+    xt_log_text(line);
+    qatomic_store_release(&ec_exit_outcome, ec_exit_outcome | EC_EXIT_DONE);
+    if ((ec_exit_outcome & ~EC_EXIT_DONE) && xt_exit_strict) {
+        NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
+    }
+    xt_adapter_end(began);
+}
+
+/*
+ * Windows' calls at the process's end, on the exiting thread: (NULL,
+ * before), with the other threads still running; (NULL, after), once it
+ * has ended them; then (the process, before).  What writes to the
+ * standard streams runs before the first call's freeze (ec_exit_begin),
+ * or, for testing (exitreport), at the last, the other threads gone.
+ */
+XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
+{
+    if (!h && !after) {
+        xt_ec_stub_inject_report();
+        if (xt_rcu_stress) {
+            char line[64];
+
+            snprintf(line, sizeof(line), "rcustress: %llu grace periods\n",
+                     (unsigned long long)qatomic_read(&rcu_stress_done));
+            fputs(line, stderr);
+            xt_log_text(line);
+        }
+        if (qatomic_load_acquire(&engine_state)) {
+            ec_exit_begin();
+        }
+    }
+    if (h && !after && xt_exit_report &&
+        (qatomic_load_acquire(&ec_exit_outcome) & EC_EXIT_DONE) &&
+        qatomic_read(&ec_exit_owner) == GetCurrentThreadId()) {
+        char line[256];
+
+        ec_exit_line(line, sizeof(line));
+        fputs(line, stderr);
+    }
+}
+
 /*
  * The memory service's work (memory.c), from any thread.  Before the engine
  * is up there are no translations or page flags to keep current.
@@ -1270,15 +1668,35 @@ NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
 static XtThread *ec_threads[XT_EC_MAX_THREADS];
 static int ec_nthreads;
 
-static bool watcher_stop;
+/*
+ * The watcher's round: each engine thread whose doorbell Windows rang is
+ * asked to stop.  Also the process's end's, right after it has asked
+ * Windows to suspend every thread, so as not to wait for the watcher's
+ * next tick.
+ */
+static void ec_ring_doorbells(void)
+{
+    int n = MIN(qatomic_read(&ec_nthreads), XT_EC_MAX_THREADS);
+
+    xt_record_hold();
+    for (int i = 0; i < n; i++) {
+        XtThread *t = qatomic_read(&ec_threads[i]);
+
+        if (t && qatomic_read(&t->state) == XT_ENGINE &&
+            qatomic_read(t->ec_doorbell) &&
+            !qatomic_read(&t->suspend_req)) {
+            qatomic_set(&t->suspend_req, 1);
+            cpu_exit(t->cpu);
+        }
+    }
+    xt_record_release();
+}
 
 static unsigned __stdcall doorbell_watcher(void *arg)
 {
     LARGE_INTEGER tick = { .QuadPart = -10000 };
 
     for (;;) {
-        int n = MIN(qatomic_read(&ec_nthreads), XT_EC_MAX_THREADS);
-
         /*
          * The process's end needs it to stop the other threads, so it
          * stops on its own request, last; here it holds nothing.
@@ -1286,19 +1704,17 @@ static unsigned __stdcall doorbell_watcher(void *arg)
         if (qatomic_read(&watcher_stop)) {
             xt_internal_park();
         }
-        NtDelayExecution(FALSE, &tick);
-        xt_record_hold();
-        for (int i = 0; i < n; i++) {
-            XtThread *t = qatomic_read(&ec_threads[i]);
-
-            if (t && qatomic_read(&t->state) == XT_ENGINE &&
-                qatomic_read(t->ec_doorbell) &&
-                !qatomic_read(&t->suspend_req)) {
-                qatomic_set(&t->suspend_req, 1);
-                cpu_exit(t->cpu);
-            }
+        /*
+         * While the process's end stops threads, Windows rings their
+         * doorbells as it waits for them: looked at without the timer's
+         * 15.6 ms granularity.
+         */
+        if (qatomic_read(&watcher_fast)) {
+            NtYieldExecution();
+        } else {
+            NtDelayExecution(TRUE, &tick);
         }
-        xt_record_release();
+        ec_ring_doorbells();
     }
     return 0;
 }

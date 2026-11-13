@@ -726,6 +726,14 @@ static void set_settings(Object *accel, const char *settings)
                 /* Testing: grace periods back to back (arm64ec.c). */
                 xt_rcu_stress = true;
                 applied++;
+            } else if (!strcmp(kv[i], "exitstrict")) {
+                /* A failure of the process's end is fatal (arm64ec.c). */
+                xt_exit_strict = true;
+                applied++;
+            } else if (!strcmp(kv[i], "exitreport")) {
+                /* The process's end's outcome, at the last call. */
+                xt_exit_report = true;
+                applied++;
 #endif
             } else if (!strcmp(kv[i], "diag")) {
                 /* Transition diagnostics (xt_diag). */
@@ -854,6 +862,7 @@ bool xt_fault_context_partial;
 bool xt_native_harness;
 bool xt_diag;
 bool xt_rcu_stress;
+bool xt_exit_strict, xt_exit_report;
 int xt_rcu_inj_step;
 
 /*
