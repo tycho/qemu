@@ -299,6 +299,10 @@ void xt_tls_attach(void);
 void xt_emutls_init(void);
 bool xt_syscalls_ready(void);
 void *xt_alloc_direct(size_t len);
+#ifdef TARGET_X86_64
+/* An internal thread's gate (arm64ec-gate.c), first thing in its start. */
+void xt_gate_install_internal(void);
+#endif
 size_t xt_emutls_roots(void);
 
 /* The emulated TLS's test hooks (xt_emutls_test). */

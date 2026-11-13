@@ -174,7 +174,8 @@ NTSTATUS xt_continue_native(XtNativeContext *ctx)
     return xt_syscall((uintptr_t)ctx, FALSE, 0, 0, 0, 0, nr_continue);
 }
 
-static NTSTATUS alloc_direct(void **base, SIZE_T *size, ULONG type, ULONG prot)
+NTSTATUS xt_ec_alloc_direct(void **base, SIZE_T *size, ULONG type,
+                            ULONG prot)
 {
     return xt_syscall((uintptr_t)GetCurrentProcess(), (uintptr_t)base, 0,
                       (uintptr_t)size, type, prot, nr_alloc);
@@ -195,7 +196,8 @@ void *xt_alloc_direct(size_t len)
     void *p = NULL;
     SIZE_T size = len;
 
-    if (alloc_direct(&p, &size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) < 0) {
+    if (xt_ec_alloc_direct(&p, &size, MEM_RESERVE | MEM_COMMIT,
+                           PAGE_READWRITE) < 0) {
         return NULL;
     }
     return p;
@@ -263,8 +265,9 @@ static bool init_syscalls(void)
         xt_ntdll_lut_size = MAX(xt_ntdll_lut_size, r[i].Source + 1);
     }
     size = xt_ntdll_lut_size * sizeof(uint32_t);
-    if (alloc_direct((void **)&xt_ntdll_lut, &size, MEM_COMMIT | MEM_RESERVE,
-                     PAGE_READWRITE) < 0) {
+    if (xt_ec_alloc_direct((void **)&xt_ntdll_lut, &size,
+                           MEM_COMMIT | MEM_RESERVE,
+                           PAGE_READWRITE) < 0) {
         return false;
     }
     for (ULONG i = 0; i < md->RedirectionMetadataCount; i++) {
@@ -573,9 +576,14 @@ static uint32_t reached;
 
 XTEXPORT NTSTATUS ProcessInit(void)
 {
+    /* The thread's gate first: the static one, until the registry exists. */
+    xt_gate_self();
     reached |= 0x40;
     if (!init_syscalls()) {
         return STATUS_NOT_SUPPORTED;
+    }
+    if (!xt_gate_init_process() || !xt_gate_register_initial()) {
+        return STATUS_NO_MEMORY;
     }
     xt_emutls_init();
     {
@@ -583,7 +591,7 @@ XTEXPORT NTSTATUS ProcessInit(void)
         SIZE_T size = 0x1000;
         ULONG old;
 
-        if (alloc_direct(&p, &size, MEM_RESERVE | MEM_COMMIT,
+        if (xt_ec_alloc_direct(&p, &size, MEM_RESERVE | MEM_COMMIT,
                          PAGE_READWRITE) < 0) {
             return STATUS_NO_MEMORY;
         }
@@ -624,8 +632,9 @@ XTEXPORT NTSTATUS ThreadInit(void)
     if (!area) {
         return STATUS_NO_MEMORY;
     }
+    xt_gate_self();
     qatomic_set(&area->EmulatorData[XT_EC_IN_THREAD_INIT], (void *)1);
-    if (alloc_direct(&mem, &size, MEM_RESERVE | MEM_COMMIT,
+    if (xt_ec_alloc_direct(&mem, &size, MEM_RESERVE | MEM_COMMIT,
                      PAGE_READWRITE) < 0) {
         qatomic_set(&area->EmulatorData[XT_EC_IN_THREAD_INIT], NULL);
         return STATUS_NO_MEMORY;

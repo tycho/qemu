@@ -185,4 +185,65 @@ G_NORETURN void xt_ec_exit_native_env_inj(CPUArchState *env,
 void xt_ec_stub_inject_init(void);
 void xt_ec_stub_inject_report(void);
 
+/*
+ * A thread's gate (arm64ec-gate.c): what another thread needs to know
+ * before it may take the thread as holding nothing of the engine's, kept
+ * for the process's life so that a pointer to it never dangles.  Each
+ * thread has one, found by its identity (the thread ID and creation time)
+ * in a registry that only grows, and cached in its CPU area's
+ * EmulatorData[XT_EC_GATE] for itself.
+ *
+ * ADM is the admission word (XT_ADM_*): the levels of the module's code
+ * the thread is in, how many of the outermost are attempts still checking
+ * the gate, a sequence number every change moves, and two sticky states.
+ * ROOTS are the operations a notification's first half left for its
+ * second.  CLOSED is the thread's own closure, set by a thread ending it;
+ * INTERNAL marks one of the engine's internal threads until it parks or
+ * ends.  RET is the retirement's state (XT_RET_*), the reaper's once the
+ * thread has ended (THREAD, a handle that can be waited on).
+ */
+#define XT_EC_GATE 3
+#define XT_GATE_ROOTS 8
+
+typedef struct XtGateRoot {
+    uint32_t state;             /* XT_ROOT_* */
+    uint32_t kind;              /* XT_MEMOP_* */
+    uint64_t gen;               /* the gate's push count when pushed */
+    uint64_t addr, len;
+} XtGateRoot;
+
+typedef struct XtGate {
+    uint64_t adm;
+    uint32_t closed;
+    uint32_t internal;
+    uint32_t ret;
+    uint32_t published;         /* registered: readable by a scan */
+    uint64_t root_gen;
+    XtGateRoot roots[XT_GATE_ROOTS];
+    uint32_t tid;
+    uint64_t create_time;
+    HANDLE thread;
+    void *rec, *frame;
+} XtGate;
+
+NTSTATUS xt_ec_alloc_direct(void **base, SIZE_T *size, ULONG type,
+                            ULONG prot);
+bool xt_gate_init_process(void);
+bool xt_gate_register_initial(void);
+XtGate *xt_gate_self_slow(void);
+bool xt_gate_identity(HANDLE h, uint32_t *tid, uint64_t *create_time);
+XtGate *xt_gate_lookup(uint32_t tid, uint64_t create_time);
+XtGate *xt_gate_for(HANDLE h, bool create_closed, NTSTATUS *st);
+
+/* The calling thread's gate, installed on its first need. */
+static inline XtGate *xt_gate_self(void)
+{
+    XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+    XtGate *g = area ? qatomic_load_acquire((XtGate **)
+                                            &area->EmulatorData[XT_EC_GATE])
+                     : NULL;
+
+    return likely(g) ? g : xt_gate_self_slow();
+}
+
 #endif
