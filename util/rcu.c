@@ -278,10 +278,24 @@ retry:
     return node;
 }
 
+/*
+ * Whether the worker is waiting for callbacks with none counted, holding
+ * nothing until the next is queued (rcu_worker_resting), and its thread.
+ */
+static bool rcu_worker_rests;
+static int rcu_worker_id;
+
+bool rcu_worker_resting(int *tid)
+{
+    *tid = qatomic_read(&rcu_worker_id);
+    return qatomic_load_acquire(&rcu_worker_rests);
+}
+
 static void *call_rcu_thread(void *opaque)
 {
     struct rcu_head *node;
 
+    qatomic_set(&rcu_worker_id, qemu_get_thread_id());
     rcu_register_thread();
 
     for (;;) {
@@ -301,7 +315,9 @@ static void *call_rcu_thread(void *opaque)
 #if defined(CONFIG_MALLOC_TRIM)
             malloc_trim(4 * 1024 * 1024);
 #endif
+            qatomic_store_release(&rcu_worker_rests, true);
             qemu_event_wait(&rcu_call_ready_event);
+            qatomic_set(&rcu_worker_rests, false);
         }
 
         synchronize_rcu();
