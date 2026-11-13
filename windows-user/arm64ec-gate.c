@@ -743,3 +743,93 @@ void xt_gate_report(char *line, size_t size)
              gate_args_differ, gate_pushed, qatomic_read(&xt_gate_read_open));
 }
 
+/*
+ * Retirement (XtGate.ret): the reaper's, once the gate's thread has ended
+ * (its handle signalled), decided by compare-and-swap so that one retirer
+ * does it.  A quarantined gate is retired with nothing reclaimed: its
+ * thread ended unsafely, maybe holding what its record's teardown would
+ * wait for.
+ */
+#define RET_STATE           0xffu
+#define RET_LIVE            0u
+#define RET_RETIRING        1u
+#define RET_RETIRED         2u
+#define RET_QUARANTINED     0x100u
+
+/* G's thread ended, or will, unsafely: its record is never reclaimed. */
+void xt_gate_quarantine(XtGate *g)
+{
+    uint32_t r;
+
+    do {
+        r = qatomic_read(&g->ret);
+        if ((r & RET_STATE) != RET_LIVE || (r & RET_QUARANTINED)) {
+            return;
+        }
+    } while (qatomic_cmpxchg(&g->ret, r, r | RET_QUARANTINED) != r);
+}
+
+/*
+ * The next gate from *CURSOR whose thread has ended and which this caller
+ * now retires (RETIRING won by compare-and-swap); *QUARANTINED says whether
+ * its record must stay.  NULL past the last.  Retired gates at the start
+ * of the pool are passed over for good.
+ */
+static uint32_t gate_retired_below = 1;
+
+XtGate *xt_gate_retire_next(uint32_t *cursor, bool *quarantined)
+{
+    LARGE_INTEGER zero = { .QuadPart = 0 };
+    uint32_t n = gate_scan_end();
+
+    if (*cursor && *cursor < qatomic_read(&gate_retired_below)) {
+        *cursor = qatomic_read(&gate_retired_below);
+    }
+    for (; *cursor <= n; (*cursor)++) {
+        XtGate *g = gate_scan_at(*cursor);
+        uint32_t r;
+
+        if (!g) {
+            continue;
+        }
+        r = qatomic_load_acquire(&g->ret);
+        if ((r & RET_STATE) == RET_RETIRED) {
+            if (*cursor && *cursor == qatomic_read(&gate_retired_below)) {
+                qatomic_cmpxchg(&gate_retired_below, *cursor, *cursor + 1);
+            }
+            continue;
+        }
+        if ((r & RET_STATE) != RET_LIVE || !g->thread ||
+            NtWaitForSingleObject(g->thread, FALSE, &zero) != STATUS_SUCCESS) {
+            continue;
+        }
+        if (qatomic_cmpxchg(&g->ret, r, (r & ~RET_STATE) | RET_RETIRING) ==
+            r) {
+            *quarantined = r & RET_QUARANTINED;
+            (*cursor)++;
+            return g;
+        }
+    }
+    return NULL;
+}
+
+/* G's retirement given up (it couldn't be done now): LIVE again. */
+void xt_gate_retire_abort(XtGate *g)
+{
+    qatomic_store_release(&g->ret, (qatomic_read(&g->ret) & ~RET_STATE) |
+                                   RET_LIVE);
+}
+
+/* G retired: its handle closed, the record and frame handed to the reaper. */
+void xt_gate_mark_retired(XtGate *g)
+{
+    HANDLE h = g->thread;
+
+    g->thread = NULL;
+    if (h) {
+        NtClose(h);
+    }
+    qatomic_store_release(&g->ret,
+                          (qatomic_read(&g->ret) & ~RET_STATE) | RET_RETIRED);
+}
+
