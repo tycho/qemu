@@ -270,6 +270,7 @@ G_NORETURN void xt_adm_reject(XtGate *g, uint32_t level);
 NTSTATUS xt_ec_alloc_direct(void **base, SIZE_T *size, ULONG type,
                             ULONG prot);
 bool xt_gate_init_process(void);
+void xt_gate_report(char *line, size_t size);
 bool xt_gate_register_initial(void);
 XtGate *xt_gate_self_slow(void);
 bool xt_gate_identity(HANDLE h, uint32_t *tid, uint64_t *create_time);

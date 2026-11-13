@@ -354,7 +354,33 @@ static bool adm_next(uint64_t w, uint64_t *n)
     return true;
 }
 
+static void adm_poison(XtGate *g);
+
+/*
+ * Testing (gatecheck): why words were poisoned, and how notifications'
+ * second halves found their roots; reported with the process's end.
+ */
+enum {
+    POISON_FULL,        /* COUNT full */
+    POISON_WRAP,        /* SEQ about to wrap */
+    POISON_PAIRING,     /* an exit with no committed level */
+    POISON_COMMIT,      /* an attempt's level no longer the innermost */
+    POISON_REJECT,      /* refused with other levels outstanding */
+    POISON_ROOTS,       /* every root taken */
+    POISON_STUB,        /* the stubs' (full, wrap, commit) */
+    POISON_N
+};
+static uint32_t gate_poisons[POISON_N];
+static uint32_t gate_claimed, gate_unclaimed, gate_pushed, gate_args_differ;
+uint32_t xt_gate_read_open;
+
 /* G's word poisoned, for good: the thread is never taken as idle again. */
+static void adm_poison_why(XtGate *g, int why)
+{
+    qatomic_inc(&gate_poisons[why]);
+    adm_poison(g);
+}
+
 static void adm_poison(XtGate *g)
 {
     uint64_t w;
@@ -366,7 +392,7 @@ static void adm_poison(XtGate *g)
 
 G_NORETURN void xt_adm_poison_park(XtGate *g)
 {
-    adm_poison(g);
+    adm_poison_why(g, POISON_STUB);
     xt_adm_park(g);
 }
 
@@ -413,6 +439,9 @@ G_NORETURN void xt_adm_reject(XtGate *g, uint32_t level)
             n = w | XT_ADM_POISONED;
         }
     } while (!adm_cas(g, w, n));
+    if (n & XT_ADM_POISONED) {
+        qatomic_inc(&gate_poisons[POISON_REJECT]);
+    }
     xt_adm_park(g);
 }
 
@@ -430,7 +459,7 @@ static void adm_commit(XtGate *g, uint32_t level)
         }
         if (XT_ADM_COUNT(w) != level || XT_ADM_UNC(w) != level ||
             !adm_next(w, &n)) {
-            adm_poison(g);
+            adm_poison_why(g, POISON_COMMIT);
             xt_adm_park(g);
         }
     } while (!adm_cas(g, w, n));
@@ -475,7 +504,7 @@ static uint32_t adm_enter(XtGate *g, uint32_t kind, uint64_t addr,
             xt_adm_park(g);
         }
         if (count == XT_ADM_FIELD_MASK) {
-            adm_poison(g);
+            adm_poison_why(g, POISON_FULL);
             xt_adm_park(g);
         }
         n = w + ADM_ONE_COUNT;
@@ -483,7 +512,7 @@ static uint32_t adm_enter(XtGate *g, uint32_t kind, uint64_t addr,
             n += ADM_ONE_UNC;
         }
         if (!adm_next(w, &n)) {
-            adm_poison(g);
+            adm_poison_why(g, POISON_WRAP);
             xt_adm_park(g);
         }
         if (!adm_cas(g, w, n)) {
@@ -509,6 +538,13 @@ static uint32_t adm_enter(XtGate *g, uint32_t kind, uint64_t addr,
                 } else {
                     qatomic_store_release(&g->roots[i].state,
                                           XT_ROOT_PENDING);
+                }
+            }
+            if (xt_gate_check) {
+                qatomic_inc(*claimed >= 0 ? &gate_claimed : &gate_unclaimed);
+                if (*claimed >= 0 && (g->roots[*claimed].addr != addr ||
+                                      g->roots[*claimed].len != len)) {
+                    qatomic_inc(&gate_args_differ);
                 }
             }
         }
@@ -556,10 +592,13 @@ void xt_root_push(XtGate *g, uint32_t kind, uint64_t addr, uint64_t len)
             r->len = len;
             r->gen = ++g->root_gen;
             qatomic_store_release(&r->state, XT_ROOT_PENDING);
+            if (xt_gate_check) {
+                qatomic_inc(&gate_pushed);
+            }
             return;
         }
     }
-    adm_poison(g);
+    adm_poison_why(g, POISON_ROOTS);
 }
 
 /* Claimed root I released, after the second half's last access. */
@@ -580,9 +619,92 @@ void xt_adm_exit(XtGate *g)
         w = qatomic_read(&g->adm);
         n = w - ADM_ONE_COUNT;
         if (XT_ADM_COUNT(w) <= XT_ADM_UNC(w) || !adm_next(w, &n)) {
-            adm_poison(g);
+            adm_poison_why(g, POISON_PAIRING);
             return;
         }
     } while (!adm_cas(g, w, n));
+}
+
+/*
+ * Scans (the report, the reaper) go through these: index 0 is the initial
+ * thread's static gate, I the pool's I - 1.  Only a registered gate is
+ * returned (PUBLISHED, set with a release after its fields, by its
+ * registrar or by a scan that finds it in the registry), and nothing past
+ * the committed part of the pool is read.
+ */
+static uint32_t gate_scan_end(void)
+{
+    return MIN(qatomic_load_acquire(&gate_committed) / sizeof(XtGate),
+               XT_GATE_POOL_MAX);
+}
+
+static XtGate *gate_scan_at(uint32_t i)
+{
+    XtGate *g;
+
+    if (!i) {
+        g = &gate_initial;
+    } else if ((uintptr_t)i * sizeof(XtGate) >
+               qatomic_load_acquire(&gate_committed)) {
+        return NULL;
+    } else {
+        g = &gate_pool[i - 1];
+    }
+    if (qatomic_load_acquire(&g->published)) {
+        return g;
+    }
+    /*
+     * The registry is what makes a gate a thread's: one it holds whose
+     * registrar ended before marking it published is marked here.  Fields
+     * read before that are only a key for the lookup, which decides.
+     */
+    if (i && qatomic_read(&g->tid) &&
+        xt_gate_lookup(qatomic_read(&g->tid), qatomic_read(&g->create_time)) ==
+        g) {
+        qatomic_store_release(&g->published, 1);
+        return g;
+    }
+    return NULL;
+}
+
+/*
+ * Testing (gatecheck): the gates' state, for the process's end's report:
+ * how many there are, how many are poisoned (and why, where it was
+ * counted), parked or still holding a root, and how notifications'
+ * second halves found their roots.
+ */
+void xt_gate_report(char *line, size_t size)
+{
+    uint32_t n = gate_scan_end(), gates = 0, poisoned = 0, parked = 0;
+    uint32_t levels = 0, deepest = 0, roots = 0;
+
+    for (uint32_t i = 0; i <= n; i++) {
+        XtGate *g = gate_scan_at(i);
+        uint64_t w;
+
+        if (!g) {
+            continue;
+        }
+        w = qatomic_read(&g->adm);
+        gates++;
+        poisoned += !!(w & XT_ADM_POISONED);
+        parked += !!(w & XT_ADM_PARKED);
+        levels += XT_ADM_COUNT(w);
+        deepest = MAX(deepest, (uint32_t)XT_ADM_COUNT(w));
+        for (int k = 0; k < XT_GATE_ROOTS; k++) {
+            roots += qatomic_read(&g->roots[k].state) != XT_ROOT_FREE;
+        }
+    }
+    snprintf(line, size, "gatecheck: %u gates, %u poisoned (full %u wrap %u "
+             "pairing %u commit %u reject %u roots %u stub %u), %u parked, "
+             "%u levels outstanding (deepest %u), %u roots live; second "
+             "halves %u claimed, %u unclaimed, %u with other arguments; %u "
+             "roots pushed; %u reads taken from threads ended mid-read\n",
+             gates, poisoned, gate_poisons[POISON_FULL],
+             gate_poisons[POISON_WRAP], gate_poisons[POISON_PAIRING],
+             gate_poisons[POISON_COMMIT], gate_poisons[POISON_REJECT],
+             gate_poisons[POISON_ROOTS], gate_poisons[POISON_STUB], parked,
+             levels, deepest, roots, gate_claimed, gate_unclaimed,
+             gate_args_differ, gate_pushed, qatomic_read(&xt_gate_read_open));
 }
 

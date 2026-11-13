@@ -244,7 +244,7 @@ extern bool xt_exit_strict, xt_exit_report;
  * checked to be where a stop of the thread would wait for its release
  * (arm64ec.c); the misses counted, the first one's caller kept.
  */
-extern bool xt_lock_check;
+extern bool xt_lock_check, xt_gate_check;
 void xt_lock_checked(void *caller);
 /* Testing (keyword rcuinj=N): registrations interrupted at step N. */
 extern int xt_rcu_inj_step;
