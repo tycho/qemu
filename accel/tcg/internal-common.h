@@ -203,5 +203,11 @@ typedef struct TranslatorRegionVerdict {
 int translator_region_judge(TranslatorRegionVerdict *v, int max);
 /* Start the profile sampler that finds region heads (tcg_superblock). */
 void translator_region_sampler_start(void);
+/*
+ * Stop the sampler for good, where it holds nothing; whether it has (or
+ * never started), and its thread id in *@tid (0 if it never started).
+ */
+void translator_region_sampler_park(void);
+bool translator_region_sampler_parked(int *tid);
 
 #endif

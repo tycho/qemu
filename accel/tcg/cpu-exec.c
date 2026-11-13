@@ -445,14 +445,39 @@ static GHashTable *region_samples;          /* head pc -> samples */
 static unsigned region_samples_total;
 static QemuMutex region_sample_lock;
 
+/*
+ * A process's end may ask the sampler to stop: it parks at the top of its
+ * loop, outside its read section, and stays there.
+ */
+static bool region_sampler_stop, region_sampler_stopped;
+static int region_sampler_id;
+
+void translator_region_sampler_park(void)
+{
+    qatomic_set(&region_sampler_stop, true);
+}
+
+bool translator_region_sampler_parked(int *tid)
+{
+    *tid = qatomic_read(&region_sampler_id);
+    return !*tid || qatomic_load_acquire(&region_sampler_stopped);
+}
+
 static void *region_sampler(void *opaque)
 {
     unsigned period = REGION_SAMPLE_US, quiet = 0, promotions = 0;
 
+    qatomic_set(&region_sampler_id, qemu_get_thread_id());
     rcu_register_thread();
     for (;;) {
         CPUState *cpu;
 
+        if (qatomic_read(&region_sampler_stop)) {
+            qatomic_store_release(&region_sampler_stopped, true);
+            for (;;) {
+                g_usleep(G_USEC_PER_SEC);
+            }
+        }
         g_usleep(period);
         if (qatomic_read(&region_promotions) != promotions) {
             promotions = qatomic_read(&region_promotions);
