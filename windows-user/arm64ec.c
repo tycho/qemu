@@ -574,10 +574,8 @@ static XtThread *enter_engine(void)
  */
 static uint32_t reached;
 
-XTEXPORT NTSTATUS ProcessInit(void)
+static NTSTATUS ec_process_init(void)
 {
-    /* The thread's gate first: the static one, until the registry exists. */
-    xt_gate_self();
     reached |= 0x40;
     if (!init_syscalls()) {
         return STATUS_NOT_SUPPORTED;
@@ -586,7 +584,7 @@ XTEXPORT NTSTATUS ProcessInit(void)
         return STATUS_NO_MEMORY;
     }
     xt_emutls_init();
-    {
+{
         void *p = NULL;
         SIZE_T size = 0x1000;
         ULONG old;
@@ -621,7 +619,7 @@ XTEXPORT NTSTATUS ProcessInit(void)
  * doorbell word Windows sets to ask a simulating thread to stop
  * (SuspendDoorbell), and the native registers of an entry or exit.
  */
-XTEXPORT NTSTATUS ThreadInit(void)
+static NTSTATUS ec_thread_init(void)
 {
     XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
     PVOID mem = NULL;
@@ -802,7 +800,7 @@ static NTSTATUS ec_stop_for_term(HANDLE h, ULONG held, vaddr *read_addr,
             ec_resume_n(h, held);
             return ec_thread_ending(h) ? STATUS_THREAD_IS_TERMINATING : st;
         }
-        {
+{
             int64_t g0 = get_clock();
 
             st = NtGetContextThread(h, &c);
@@ -1015,7 +1013,7 @@ static void ec_stop_other(HANDLE thread)
  * scopes, so that this thread, stopped meanwhile by another, is stopped
  * outside it; the stop itself is not, since it waits for the other thread.
  */
-XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
+static NTSTATUS ec_thread_term(HANDLE thread, LONG code)
 {
     XtCpuArea *area;
     XtThread *t;
@@ -1542,7 +1540,7 @@ static void ec_exit_begin(void)
  * standard streams runs before the first call's freeze (ec_exit_begin),
  * or, for testing (exitreport), at the last, the other threads gone.
  */
-XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
+static void ec_process_term(HANDLE h, BOOL after, NTSTATUS status)
 {
     if (!h && !after) {
         xt_ec_stub_inject_report();
@@ -1595,15 +1593,48 @@ static bool note_ready(void)
  *   page gets its write permission back and the store is retried.
  * Anything else goes on to the dispatch.
  */
+/*
+ * A continuation of this exception that leaves its level: popped first (an
+ * outer level, the engine's own work it interrupted, stays), and a
+ * continuation that fails ends the process rather than go on with the
+ * level gone.
+ */
+static G_NORETURN void ec_continue_level(XtGate *g, ARM64_NT_CONTEXT *native)
+{
+    if (g) {
+        xt_adm_exit(g);
+    }
+    xt_continue_native(native);
+    NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
+    __builtin_unreachable();
+}
+
 XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
                                          ARM64_NT_CONTEXT *native)
 {
     XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
-    XtThread *t = area ? area->EmulatorData[0] : NULL;
+    XtThread *t;
+    XtGate *g;
 
-    if (xt_ec_probe_rtcs(er, guest, native)) {
-        xt_continue_native(native);
+    /*
+     * The exit stub's trap at a rung doorbell (arm64ec.S), redirected to
+     * its resume point, where the suspension completes: the stub has
+     * popped its level already, and this touches only the thread's own
+     * frame and doorbell.
+     */
+    if (native->Pc == (uintptr_t)xt_ec_exit_suspend_point) {
+        ((XtEcFrame *)area->EmulatorData[1])->inj_armed = 1;
+        qatomic_set(area->SuspendDoorbell, 0);
+        native->Pc = (uintptr_t)xt_ec_exit_resume_point;
+        ec_continue_level(NULL, native);
     }
+    /* The start-up probe (xt_ec_probe_rtcs), before any gate can close. */
+    if (xt_ec_probe_rtcs(er, guest, native)) {
+        ec_continue_level(NULL, native);
+    }
+    g = xt_gate_self();
+    xt_adm_enter(g);
+    t = area ? area->EmulatorData[0] : NULL;
     /* The module's int3, past the debugger: at the int3 for the dispatch. */
     if (t && t->int3_rip && er->ExceptionCode == STATUS_BREAKPOINT &&
         native->Pc == t->int3_rip) {
@@ -1613,12 +1644,6 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
         }
         t->int3_rip = 0;
     }
-    if (native->Pc == (uintptr_t)xt_ec_exit_suspend_point) {
-        ((XtEcFrame *)area->EmulatorData[1])->inj_armed = 1;
-        qatomic_set(area->SuspendDoorbell, 0);
-        native->Pc = (uintptr_t)xt_ec_exit_resume_point;
-        xt_continue_native(native);
-    }
     if (t && t == xt_self && t->state != XT_WINDOWS) {
         bool prev = area->InSyscallCallback;
         bool handled;
@@ -1627,7 +1652,7 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
         handled = xt_fault_redirect(er, native);
         area->InSyscallCallback = prev;
         if (handled) {
-            xt_continue_native(native);
+            ec_continue_level(g, native);
         }
         /* An exception in the engine it doesn't recover: logged. */
         xt_event(t, XT_EV_FAULT, (uint64_t)t->fault.busy << 32 | t->active,
@@ -1638,8 +1663,9 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
                er->NumberParameters >= 2 && er->ExceptionInformation[0] == 1 &&
                note_ready() &&
                xt_unprotect_for_native(er->ExceptionInformation[1])) {
-        xt_continue_native(native);
+        ec_continue_level(g, native);
     }
+    xt_adm_exit(g);
     return STATUS_SUCCESS;
 }
 
@@ -1687,8 +1713,8 @@ void xt_adapter_end(bool began)
     }
 }
 
-XTEXPORT void NotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type, ULONG prot,
-                                BOOL after, NTSTATUS status)
+static void ec_notify_memory_alloc(void *addr, SIZE_T len, ULONG type,
+                                   ULONG prot, BOOL after, NTSTATUS status)
 {
     if (after) {
         ec_memop(XT_MEMOP_NONE, NULL, 0);
@@ -1701,8 +1727,8 @@ XTEXPORT void NotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type, ULONG prot,
     }
 }
 
-XTEXPORT void NotifyMemoryFree(void *addr, SIZE_T len, ULONG type, BOOL after,
-                               NTSTATUS status)
+static void ec_notify_memory_free(void *addr, SIZE_T len, ULONG type,
+                                  BOOL after, NTSTATUS status)
 {
     if (after) {
         ec_memop(XT_MEMOP_NONE, NULL, 0);
@@ -1715,8 +1741,8 @@ XTEXPORT void NotifyMemoryFree(void *addr, SIZE_T len, ULONG type, BOOL after,
     }
 }
 
-XTEXPORT void NotifyMemoryProtect(void *addr, SIZE_T len, ULONG prot,
-                                  BOOL after, NTSTATUS status)
+static void ec_notify_memory_protect(void *addr, SIZE_T len, ULONG prot,
+                                     BOOL after, NTSTATUS status)
 {
     if (after) {
         ec_memop(XT_MEMOP_NONE, NULL, 0);
@@ -1729,8 +1755,9 @@ XTEXPORT void NotifyMemoryProtect(void *addr, SIZE_T len, ULONG prot,
     }
 }
 
-XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
-                                         SIZE_T len, ULONG type, ULONG prot)
+static NTSTATUS ec_notify_map_view_of_section(void *unk1, void *addr,
+                                              void *unk2, SIZE_T len,
+                                              ULONG type, ULONG prot)
 {
     if (note_ready()) {
         xt_note_map(addr, len, prot);
@@ -1738,7 +1765,8 @@ XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
     return STATUS_SUCCESS;
 }
 
-XTEXPORT void NotifyUnmapViewOfSection(void *addr, BOOL after, NTSTATUS status)
+static void ec_notify_unmap_view_of_section(void *addr, BOOL after,
+                                            NTSTATUS status)
 {
     if (after) {
         ec_memop(XT_MEMOP_NONE, NULL, 0);
@@ -1751,29 +1779,29 @@ XTEXPORT void NotifyUnmapViewOfSection(void *addr, BOOL after, NTSTATUS status)
     }
 }
 
-XTEXPORT void FlushInstructionCacheHeavy(const void *addr, SIZE_T len)
+static void ec_flush_instruction_cache_heavy(const void *addr, SIZE_T len)
 {
     if (note_ready()) {
         xt_note_flush(addr, len);
     }
 }
 
-XTEXPORT void BTCpu64FlushInstructionCache(const void *addr, SIZE_T len)
+static void ec_btcpu64_flush_instruction_cache(const void *addr, SIZE_T len)
 {
     if (note_ready()) {
         xt_note_flush(addr, len);
     }
 }
 
-XTEXPORT void BTCpu64NotifyMemoryDirty(void *addr, SIZE_T len)
+static void ec_btcpu64_notify_memory_dirty(void *addr, SIZE_T len)
 {
     if (note_ready()) {
         xt_note_flush(addr, len);
     }
 }
 
-XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
-                                    BOOL after, NTSTATUS status)
+static void ec_btcpu64_notify_read_file(HANDLE h, void *addr, SIZE_T len,
+                                        BOOL after, NTSTATUS status)
 {
     if (after) {
         ec_memop(XT_MEMOP_NONE, NULL, 0);
@@ -1792,12 +1820,12 @@ XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
  * until the first entry makes a CPU.  The processor information needs
  * that CPU.
  */
-XTEXPORT BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT feature)
+static BOOLEAN ec_btcpu64_is_processor_feature_present(UINT feature)
 {
     return xt_feature_present(feature);
 }
 
-XTEXPORT void UpdateProcessorInformation(void *info)
+static void ec_update_processor_information(void *info)
 {
     if (qatomic_load_acquire(&engine_state) == 2) {
         xt_processor_info(info, PROCESSOR_ARCHITECTURE_AMD64);
@@ -2003,6 +2031,8 @@ static G_NORETURN void leave_syscall(XtThread *t)
     }
     k.rec.ExceptionCode = STATUS_EMULATION_SYSCALL;
     xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
+    /* K is ntdll's from here: the engine's last access is behind. */
+    xt_adm_exit(xt_gate_self());
     xt_ec_jump_set_stack(ki_exception_dispatcher, (uintptr_t)&k);
 }
 
@@ -2053,6 +2083,7 @@ static G_NORETURN void leave_exception(XtThread *t, XtExit *x)
     t->int3_rip = x->vector == EXCP03_INT3 ? t->env->eip : 0;
     leave(t, &n, true);
     xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
+    xt_adm_exit(xt_gate_self());
     xt_syscall((uintptr_t)r, (uintptr_t)&n, first, 0, 0, 0, nr_raise);
     NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
     __builtin_unreachable();
@@ -2072,6 +2103,7 @@ static G_NORETURN void leave_suspend(XtThread *t, XtEcFrame *f)
     f->inj_armed = 1;
     t->ec_suspended = true;
     xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
+    xt_adm_exit(xt_gate_self());
     xt_ec_continue_kept(&n, nr_continue);
     NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
     __builtin_unreachable();
@@ -2550,7 +2582,7 @@ static void from_ec_view(const ARM64EC_NT_CONTEXT *ec, ARM64_NT_CONTEXT *n)
     n->Cpsr = (f & 0x80 ? 1u << 31 : 0) | (f & 0x40 ? 1u << 30 : 0) |
               (f & 0x01 ? 1u << 29 : 0) | (f & 0x800 ? 1u << 28 : 0);
     memcpy(n->V, ec->V, sizeof(ec->V));
-    {
+{
         uint64_t fpcr, fpsr;
 
         asm volatile("mrs %0, fpcr" : "=r"(fpcr));
@@ -2749,4 +2781,162 @@ XTEXPORT void xt_ec_test_syscalls(int64_t nr[4], uint32_t *lut_size)
 XTEXPORT uint32_t xt_ec_test_reached(void)
 {
     return reached;
+}
+
+/*
+ * Windows' calls into the module: each runs inside a level of its own on
+ * the thread's admission word (arm64ec-gate.c), entered before anything
+ * else and left on its way out, so that a thread inside one is never
+ * taken as idle, and one entered once the process's end has closed the
+ * gate parks before it does anything.
+ */
+
+XTEXPORT NTSTATUS ProcessInit(void)
+{
+    XtGate *g = xt_gate_self();
+    NTSTATUS r;
+
+    xt_adm_enter(g);
+    r = ec_process_init();
+    xt_adm_exit(g);
+    return r;
+}
+
+XTEXPORT NTSTATUS ThreadInit(void)
+{
+    XtGate *g = xt_gate_self();
+    NTSTATUS r;
+
+    xt_adm_enter(g);
+    r = ec_thread_init();
+    xt_adm_exit(g);
+    return r;
+}
+
+XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
+{
+    XtGate *g = xt_gate_self();
+    NTSTATUS r;
+
+    xt_adm_enter(g);
+    r = ec_thread_term(thread, code);
+    xt_adm_exit(g);
+    return r;
+}
+
+XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_process_term(h, after, status);
+    xt_adm_exit(g);
+}
+
+XTEXPORT void NotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type, ULONG prot,
+                                BOOL after, NTSTATUS status)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_notify_memory_alloc(addr, len, type, prot, after, status);
+    xt_adm_exit(g);
+}
+
+XTEXPORT void NotifyMemoryFree(void *addr, SIZE_T len, ULONG type, BOOL after,
+                               NTSTATUS status)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_notify_memory_free(addr, len, type, after, status);
+    xt_adm_exit(g);
+}
+
+XTEXPORT void NotifyMemoryProtect(void *addr, SIZE_T len, ULONG prot,
+                                  BOOL after, NTSTATUS status)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_notify_memory_protect(addr, len, prot, after, status);
+    xt_adm_exit(g);
+}
+
+XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
+                                         SIZE_T len, ULONG type, ULONG prot)
+{
+    XtGate *g = xt_gate_self();
+    NTSTATUS r;
+
+    xt_adm_enter(g);
+    r = ec_notify_map_view_of_section(unk1, addr, unk2, len, type, prot);
+    xt_adm_exit(g);
+    return r;
+}
+
+XTEXPORT void NotifyUnmapViewOfSection(void *addr, BOOL after, NTSTATUS status)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_notify_unmap_view_of_section(addr, after, status);
+    xt_adm_exit(g);
+}
+
+XTEXPORT void FlushInstructionCacheHeavy(const void *addr, SIZE_T len)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_flush_instruction_cache_heavy(addr, len);
+    xt_adm_exit(g);
+}
+
+XTEXPORT void BTCpu64FlushInstructionCache(const void *addr, SIZE_T len)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_btcpu64_flush_instruction_cache(addr, len);
+    xt_adm_exit(g);
+}
+
+XTEXPORT void BTCpu64NotifyMemoryDirty(void *addr, SIZE_T len)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_btcpu64_notify_memory_dirty(addr, len);
+    xt_adm_exit(g);
+}
+
+XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
+                                    BOOL after, NTSTATUS status)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_btcpu64_notify_read_file(h, addr, len, after, status);
+    xt_adm_exit(g);
+}
+
+XTEXPORT BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT feature)
+{
+    XtGate *g = xt_gate_self();
+    BOOLEAN r;
+
+    xt_adm_enter(g);
+    r = ec_btcpu64_is_processor_feature_present(feature);
+    xt_adm_exit(g);
+    return r;
+}
+
+XTEXPORT void UpdateProcessorInformation(void *info)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_update_processor_information(info);
+    xt_adm_exit(g);
 }
