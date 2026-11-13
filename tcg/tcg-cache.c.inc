@@ -389,8 +389,9 @@ static bool cap_form_adrp(int form)
 /*
  * A value whose meaning depends on placement: in QEMU's image, in this
  * TB's struct or code, a stub or the chunk's thunk.  Not the rest of the
- * code buffer: the Windows modules put it below 4 GiB, among the values
- * a 32-bit guest uses.
+ * code buffer, where a guest's own constants can fall: the WOW64 module
+ * puts it below 4 GiB, among the values a 32-bit guest uses, and an x64
+ * guest's can be any address.
  */
 static bool cap_addr_suspect(TCGContext *s, const CapParts *p, uintptr_t v,
                              uintptr_t img_lo, uintptr_t img_hi)
