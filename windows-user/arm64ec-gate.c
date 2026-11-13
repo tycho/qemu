@@ -436,9 +436,37 @@ static void adm_commit(XtGate *g, uint32_t level)
     } while (!adm_cas(g, w, n));
 }
 
-/* An entry's level pushed, with the gate checked if it's an attempt. */
-uint32_t xt_adm_enter(XtGate *g)
+/*
+ * The newest root that isn't free (the highest push count), or -1.  All
+ * of them are scanned: completing one never hides another.
+ */
+static int root_newest(XtGate *g)
 {
+    int best = -1;
+    uint64_t gen = 0;
+
+    for (int i = 0; i < XT_GATE_ROOTS; i++) {
+        if (qatomic_load_acquire(&g->roots[i].state) != XT_ROOT_FREE &&
+            (best < 0 || g->roots[i].gen > gen)) {
+            best = i;
+            gen = g->roots[i].gen;
+        }
+    }
+    return best;
+}
+
+/*
+ * An entry's level pushed, with the gate checked if it's an attempt; with
+ * KIND (a notification's second half), an attempt first tries to claim the
+ * newest root, if that one is pending and of its kind, and if it does it
+ * commits whatever the gate says: it finishes an operation its first half
+ * began.  The level, with XT_ADM_ATTEMPT if it was an attempt; *CLAIMED
+ * the root claimed, or -1.
+ */
+static uint32_t adm_enter(XtGate *g, uint32_t kind, uint64_t addr,
+                          uint64_t len, int *claimed)
+{
+    *claimed = -1;
     for (;;) {
         uint64_t w = qatomic_read(&g->adm), n;
         uint32_t count = XT_ADM_COUNT(w), unc = XT_ADM_UNC(w);
@@ -466,12 +494,78 @@ uint32_t xt_adm_enter(XtGate *g)
         }
         /* The level published before the gate is read (part of a pair). */
         barrier();
-        if (adm_closed_for(g)) {
+        if (kind) {
+            int i = root_newest(g);
+
+            if (i >= 0 && g->roots[i].kind == kind &&
+                qatomic_cmpxchg(&g->roots[i].state, XT_ROOT_PENDING,
+                                XT_ROOT_CLAIMED) == XT_ROOT_PENDING) {
+                /*
+                 * Still the newest, or an interruption between the choice
+                 * and the claim left a newer one: then it is given back.
+                 */
+                if (root_newest(g) == i) {
+                    *claimed = i;
+                } else {
+                    qatomic_store_release(&g->roots[i].state,
+                                          XT_ROOT_PENDING);
+                }
+            }
+        }
+        if (*claimed < 0 && adm_closed_for(g)) {
             xt_adm_reject(g, count + 1);
         }
         adm_commit(g, count + 1);
-        return count + 1;
+        return (count + 1) | XT_ADM_ATTEMPT;
     }
+}
+
+uint32_t xt_adm_enter(XtGate *g)
+{
+    int claimed;
+
+    return adm_enter(g, 0, 0, 0, &claimed);
+}
+
+/*
+ * A notification's second half entering: the root it claimed (its first
+ * half's), or -1, inherited levels claiming nothing.
+ */
+int xt_adm_enter_claim(XtGate *g, uint32_t kind, uint64_t addr, uint64_t len)
+{
+    int claimed;
+
+    adm_enter(g, kind, addr, len, &claimed);
+    return claimed;
+}
+
+/*
+ * A notification's first half, entered as an attempt, leaves its operation
+ * for its second: the fields first, then PENDING with a release.  With
+ * every root taken, the word is poisoned: the thread can't be taken as
+ * idle with an operation nobody would see.
+ */
+void xt_root_push(XtGate *g, uint32_t kind, uint64_t addr, uint64_t len)
+{
+    for (int i = 0; i < XT_GATE_ROOTS; i++) {
+        XtGateRoot *r = &g->roots[i];
+
+        if (qatomic_read(&r->state) == XT_ROOT_FREE) {
+            r->kind = kind;
+            r->addr = addr;
+            r->len = len;
+            r->gen = ++g->root_gen;
+            qatomic_store_release(&r->state, XT_ROOT_PENDING);
+            return;
+        }
+    }
+    adm_poison(g);
+}
+
+/* Claimed root I released, after the second half's last access. */
+void xt_root_release(XtGate *g, int i)
+{
+    qatomic_store_release(&g->roots[i].state, XT_ROOT_FREE);
 }
 
 /*

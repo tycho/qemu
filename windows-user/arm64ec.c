@@ -2851,6 +2851,35 @@ XTEXPORT uint32_t xt_ec_test_reached(void)
 }
 
 /*
+ * A notification's halves (arm64ec-gate.c): the first, entered as an
+ * attempt (not as a callback of the engine's own work), leaves its
+ * operation on the gate for the second, which claims it as it enters, and
+ * releases it once its work is done.
+ */
+static uint32_t ec_half_enter(XtGate *g, BOOL after, uint32_t kind,
+                              const void *addr, SIZE_T len, int *claimed)
+{
+    if (after) {
+        *claimed = xt_adm_enter_claim(g, kind, (uintptr_t)addr, len);
+        return 0;
+    }
+    *claimed = -1;
+    return xt_adm_enter(g);
+}
+
+static void ec_half_exit(XtGate *g, uint32_t level, int claimed,
+                         uint32_t kind, const void *addr, SIZE_T len)
+{
+    if (level & XT_ADM_ATTEMPT) {
+        xt_root_push(g, kind, (uintptr_t)addr, len);
+    }
+    if (claimed >= 0) {
+        xt_root_release(g, claimed);
+    }
+    xt_adm_exit(g);
+}
+
+/*
  * Windows' calls into the module: each runs inside a level of its own on
  * the thread's admission word (arm64ec-gate.c), entered before anything
  * else and left on its way out, so that a thread inside one is never
@@ -2904,30 +2933,36 @@ XTEXPORT void NotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type, ULONG prot,
                                 BOOL after, NTSTATUS status)
 {
     XtGate *g = xt_gate_self();
+    uint32_t level;
+    int claimed;
 
-    xt_adm_enter(g);
+    level = ec_half_enter(g, after, XT_MEMOP_ALLOC, addr, len, &claimed);
     ec_notify_memory_alloc(addr, len, type, prot, after, status);
-    xt_adm_exit(g);
+    ec_half_exit(g, level, claimed, XT_MEMOP_ALLOC, addr, len);
 }
 
 XTEXPORT void NotifyMemoryFree(void *addr, SIZE_T len, ULONG type, BOOL after,
                                NTSTATUS status)
 {
     XtGate *g = xt_gate_self();
+    uint32_t level;
+    int claimed;
 
-    xt_adm_enter(g);
+    level = ec_half_enter(g, after, XT_MEMOP_FREE, addr, len, &claimed);
     ec_notify_memory_free(addr, len, type, after, status);
-    xt_adm_exit(g);
+    ec_half_exit(g, level, claimed, XT_MEMOP_FREE, addr, len);
 }
 
 XTEXPORT void NotifyMemoryProtect(void *addr, SIZE_T len, ULONG prot,
                                   BOOL after, NTSTATUS status)
 {
     XtGate *g = xt_gate_self();
+    uint32_t level;
+    int claimed;
 
-    xt_adm_enter(g);
+    level = ec_half_enter(g, after, XT_MEMOP_PROTECT, addr, len, &claimed);
     ec_notify_memory_protect(addr, len, prot, after, status);
-    xt_adm_exit(g);
+    ec_half_exit(g, level, claimed, XT_MEMOP_PROTECT, addr, len);
 }
 
 XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
@@ -2945,10 +2980,12 @@ XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
 XTEXPORT void NotifyUnmapViewOfSection(void *addr, BOOL after, NTSTATUS status)
 {
     XtGate *g = xt_gate_self();
+    uint32_t level;
+    int claimed;
 
-    xt_adm_enter(g);
+    level = ec_half_enter(g, after, XT_MEMOP_UNMAP, addr, 0, &claimed);
     ec_notify_unmap_view_of_section(addr, after, status);
-    xt_adm_exit(g);
+    ec_half_exit(g, level, claimed, XT_MEMOP_UNMAP, addr, 0);
 }
 
 XTEXPORT void FlushInstructionCacheHeavy(const void *addr, SIZE_T len)
@@ -2982,10 +3019,12 @@ XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
                                     BOOL after, NTSTATUS status)
 {
     XtGate *g = xt_gate_self();
+    uint32_t level;
+    int claimed;
 
-    xt_adm_enter(g);
+    level = ec_half_enter(g, after, XT_MEMOP_READ, addr, len, &claimed);
     ec_btcpu64_notify_read_file(h, addr, len, after, status);
-    xt_adm_exit(g);
+    ec_half_exit(g, level, claimed, XT_MEMOP_READ, addr, len);
 }
 
 XTEXPORT BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT feature)
