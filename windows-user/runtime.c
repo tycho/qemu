@@ -17,26 +17,122 @@
 NTSTATUS NTAPI NtCreateThreadEx(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
                                 HANDLE, PVOID, PVOID, ULONG, SIZE_T, SIZE_T,
                                 SIZE_T, PVOID);
+NTSTATUS NTAPI NtResumeThread(HANDLE, PULONG);
+NTSTATUS NTAPI NtAlertThread(HANDLE);
 #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x01
 #define THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH 0x02
 #define THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER 0x04
 #define THREAD_CREATE_FLAGS_SKIP_LOADER_INIT 0x20
 #define THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE 0x40
 
+/*
+ * The engine's internal threads, registered: each slot is claimed before
+ * the thread is created, created suspended, given its id, then let run, so
+ * that a look at the registry (xt_internal_threads) never misses a running
+ * internal thread nor mistakes one for another of the process's.  A slot
+ * still being created (XT_INTERNAL_CREATING) is to be waited for.  The
+ * thread marks itself (xt_internal_self) before anything of its own runs,
+ * and is running from just before its routine.  At the process's end a
+ * thread asked to stop (xt_internal_stop) parks for good where it holds
+ * nothing (xt_internal_park), and one returning from its routine then
+ * parks instead of ending, since a thread's end runs the CRT's and
+ * Windows' teardown.
+ */
+#define XT_INTERNAL_MAX 64
+
+static XtInternal internals[XT_INTERNAL_MAX];
+static bool internal_stop;
+__thread bool xt_internal_self;
+
 typedef struct ThreadStart {
     unsigned (__stdcall *fn)(void *);
     void *arg;
+    XtInternal *slot;
 } ThreadStart;
+
+const XtInternal *xt_internal_threads(int *n)
+{
+    *n = XT_INTERNAL_MAX;
+    return internals;
+}
+
+/*
+ * Wake every registered thread from an alertable sleep (their sleeps are,
+ * g_usleep's included), so that one asked to park sees it at once rather
+ * than after its period, which Windows' timer may stretch to 15.6 ms.
+ */
+void xt_internal_alert(void)
+{
+    for (int i = 0; i < XT_INTERNAL_MAX; i++) {
+        uint32_t state = qatomic_load_acquire(&internals[i].state);
+        HANDLE h = qatomic_read(&internals[i].h);
+
+        if (state != XT_INTERNAL_FREE && state != XT_INTERNAL_CREATING &&
+            h) {
+            NtAlertThread(h);
+        }
+    }
+}
+
+void xt_internal_stop(void)
+{
+    qatomic_set(&internal_stop, true);
+    xt_internal_alert();
+}
+
+bool xt_internal_stopping(void)
+{
+    return qatomic_read(&internal_stop);
+}
+
+/* The calling internal thread's slot: found by id (a thread knows its own). */
+static XtInternal *internal_mine(void)
+{
+    DWORD me = GetCurrentThreadId();
+
+    for (int i = 0; i < XT_INTERNAL_MAX; i++) {
+        if (qatomic_read(&internals[i].tid) == me) {
+            return &internals[i];
+        }
+    }
+    return NULL;
+}
+
+void xt_internal_park(void)
+{
+    LARGE_INTEGER forever = { .QuadPart = INT64_MIN };
+    XtInternal *slot = internal_mine();
+
+    if (slot) {
+        qatomic_store_release(&slot->state, XT_INTERNAL_PARKED);
+    }
+    for (;;) {
+        NtDelayExecution(FALSE, &forever);
+    }
+}
 
 static NTSTATUS NTAPI thread_start(void *p)
 {
     ThreadStart s = *(ThreadStart *)p;
+    unsigned code;
 
     xt_tls_attach();
+    xt_internal_self = true;
     xt_crt_thread_init();
     g_free(p);
     xt_placement("internal thread stack", &s);
-    RtlExitUserThread(s.fn(s.arg));
+    qatomic_store_release(&s.slot->state, XT_INTERNAL_RUNNING);
+    code = s.fn(s.arg);
+    if (xt_internal_stopping()) {
+        xt_internal_park();
+    }
+    qatomic_set(&s.slot->tid, 0);
+    if (s.slot->h) {
+        NtClose(s.slot->h);
+        s.slot->h = NULL;
+    }
+    qatomic_store_release(&s.slot->state, XT_INTERNAL_FREE);
+    RtlExitUserThread(code);
     return 0;
 }
 
@@ -52,27 +148,49 @@ uintptr_t __cdecl _beginthreadex(void *security, unsigned stack,
 {
     ThreadStart *s = g_new(ThreadStart, 1);
     XtThreadBasicInfo tbi;
+    XtInternal *slot = NULL;
+    DWORD id = 0;
     HANDLE h;
 
-    s->fn = fn;
-    s->arg = arg;
-    if (NtCreateThreadEx(&h, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(),
-                         thread_start, s,
-                         THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH |
-                         THREAD_CREATE_FLAGS_SKIP_LOADER_INIT |
-                         THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE |
-                         THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER |
-                         ((flags & CREATE_SUSPENDED) ?
-                          THREAD_CREATE_FLAGS_CREATE_SUSPENDED : 0),
-                         0, stack, 0, NULL) < 0) {
+    for (int i = 0; i < XT_INTERNAL_MAX && !slot; i++) {
+        if (qatomic_cmpxchg(&internals[i].state, XT_INTERNAL_FREE,
+                            XT_INTERNAL_CREATING) == XT_INTERNAL_FREE) {
+            slot = &internals[i];
+        }
+    }
+    if (!slot) {
         g_free(s);
         return 0;
     }
+    s->fn = fn;
+    s->arg = arg;
+    s->slot = slot;
+    if (NtCreateThreadEx(&h, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(),
+                         thread_start, s,
+                         THREAD_CREATE_FLAGS_CREATE_SUSPENDED |
+                         THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH |
+                         THREAD_CREATE_FLAGS_SKIP_LOADER_INIT |
+                         THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE |
+                         THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
+                         0, stack, 0, NULL) < 0) {
+        g_free(s);
+        qatomic_store_release(&slot->state, XT_INTERNAL_FREE);
+        return 0;
+    }
+    if (NtQueryInformationThread(h, 0, &tbi, sizeof(tbi), NULL) >= 0) {
+        id = (DWORD)(uintptr_t)tbi.ClientId.UniqueThread;
+    }
+    qatomic_set(&slot->tid, id);
+    if (NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
+                          &slot->h, 0, 0, DUPLICATE_SAME_ACCESS) < 0) {
+        slot->h = NULL;
+    }
+    qatomic_store_release(&slot->state, XT_INTERNAL_STARTING);
+    if (!(flags & CREATE_SUSPENDED)) {
+        NtResumeThread(h, NULL);
+    }
     if (tid) {
-        *tid = 0;
-        if (NtQueryInformationThread(h, 0, &tbi, sizeof(tbi), NULL) >= 0) {
-            *tid = (unsigned)(uintptr_t)tbi.ClientId.UniqueThread;
-        }
+        *tid = id;
     }
     return (uintptr_t)h;
 }
