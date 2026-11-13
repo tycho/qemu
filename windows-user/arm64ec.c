@@ -660,6 +660,9 @@ typedef enum EcStopState {
  * Then its frame page's operation: one that doesn't block is to be waited
  * for; a read's range is passed back in *READ.
  */
+static int ec_stop_why;     /* diagnostic: the last check that failed */
+static char ec_slow_stop[200];
+
 static EcStopState ec_stopped_state(HANDLE h, const CONTEXT *c,
                                     XtEcFrame *read)
 {
@@ -671,6 +674,7 @@ static EcStopState ec_stopped_state(HANDLE h, const CONTEXT *c,
         NtReadVirtualMemory(GetCurrentProcess(),
                             (char *)tbi.TebBaseAddress + XT_TEB_CPU_AREA,
                             &ap, sizeof(ap), NULL) < 0) {
+        ec_stop_why = 1;
         return EC_STOP_INCONSISTENT;
     }
     if (!ap) {
@@ -678,11 +682,15 @@ static EcStopState ec_stopped_state(HANDLE h, const CONTEXT *c,
     }
     if (NtReadVirtualMemory(GetCurrentProcess(), ap, &area, sizeof(area),
                             NULL) < 0) {
+        ec_stop_why = 2;
         return EC_STOP_INCONSISTENT;
     }
     if (area.InSimulation || area.InSyscallCallback ||
         (c->Rsp >= area.EmulatorStackLimit &&
          c->Rsp < area.EmulatorStackBase)) {
+        ec_stop_why = 0x10 | area.InSimulation << 1 | area.InSyscallCallback << 2 |
+                      (c->Rsp >= area.EmulatorStackLimit &&
+                       c->Rsp < area.EmulatorStackBase) << 3;
         return EC_STOP_INCONSISTENT;
     }
     if (!area.EmulatorData[1]) {
@@ -733,10 +741,39 @@ static NTSTATUS ec_stop_for_term(HANDLE h, vaddr *read_addr,
 
         st = NtSuspendThread(h, NULL);
         if (st < 0) {
+            ec_stop_why = 0x80;
             return st;
         }
-        st = NtGetContextThread(h, &c);
+        {
+            int64_t g0 = get_clock();
+
+            st = NtGetContextThread(h, &c);
+            if (get_clock() - g0 > 100 * SCALE_MS && !ec_slow_stop[0]) {
+                XtThreadBasicInfo tbi;
+                XtCpuArea *ap = NULL, area = { 0 };
+                ULONG_PTR start = 0;
+
+                NtQueryInformationThread(h, 0, &tbi, sizeof(tbi), NULL);
+                NtQueryInformationThread(h, 9, &start, sizeof(start), NULL);
+                NtReadVirtualMemory(GetCurrentProcess(),
+                                    (char *)tbi.TebBaseAddress +
+                                    XT_TEB_CPU_AREA, &ap, sizeof(ap), NULL);
+                if (ap) {
+                    NtReadVirtualMemory(GetCurrentProcess(), ap, &area,
+                                        sizeof(area), NULL);
+                }
+                snprintf(ec_slow_stop, sizeof(ec_slow_stop), "slow stop: "
+                         "t%lu %.0f ms st 0x%lx area %p sim %d scope %d "
+                         "rec %p start %llx rip %llx rsp %llx",
+                         (unsigned long)(uintptr_t)tbi.ClientId.UniqueThread,
+                         (get_clock() - g0) / 1e6, (unsigned long)st, ap,
+                         area.InSimulation, area.InSyscallCallback,
+                         area.EmulatorData[0], (unsigned long long)start,
+                         (unsigned long long)c.Rip, (unsigned long long)c.Rsp);
+            }
+        }
         if (st < 0) {
+            ec_stop_why = 0x40;
             NtResumeThread(h, NULL);
             return st;
         }
@@ -748,6 +785,9 @@ static NTSTATUS ec_stop_for_term(HANDLE h, vaddr *read_addr,
         }
         NtResumeThread(h, NULL);
         if (state == EC_STOP_INCONSISTENT || get_clock() > until) {
+            if (state != EC_STOP_INCONSISTENT) {
+                ec_stop_why = 0x20;
+            }
             return STATUS_UNSUCCESSFUL;
         }
         /* Not a timed wait: Windows' timer would make it 15.6 ms. */
@@ -1068,6 +1108,8 @@ static DWORD ec_exit_owner;
 static uint32_t ec_exit_outcome;
 static uint32_t ec_exit_frozen, ec_exit_passes, ec_exit_refrozen;
 static int64_t ec_exit_ns, ec_exit_phase[4];
+static NTSTATUS ec_exit_first_fail;
+static int ec_exit_first_why;
 
 typedef struct EcFrozen {
     HANDLE h;
@@ -1189,6 +1231,10 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
             NtResumeThread(f.h, NULL);
             if (st < 0) {
                 ec_exit_outcome |= EC_EXIT_STOP;
+                if (!ec_exit_first_fail) {
+                    ec_exit_first_fail = st;
+                    ec_exit_first_why = ec_stop_why;
+                }
                 xt_gevent(XT_EV_THREAD_TERM, f.tid,
                           8 | (uint64_t)(uint32_t)st << 32);
                 NtClose(f.h);
@@ -1310,12 +1356,15 @@ static void ec_exit_line(char *line, size_t size)
 {
     int n = snprintf(line, size, "exit: outcome 0x%x, %u threads stopped "
                      "(%u again), %u passes, %u unsafe terminations, %.1f ms "
-                     "(freeze %.1f, parks %.1f, flush %.1f)\n",
+                     "(freeze %.1f, parks %.1f, flush %.1f), first stop "
+                     "failure 0x%lx why 0x%x %s\n",
                      ec_exit_outcome & ~EC_EXIT_DONE, ec_exit_frozen,
                      ec_exit_refrozen, ec_exit_passes,
                      qatomic_read(&ec_unsafe_terms), ec_exit_ns / 1e6,
                      ec_exit_phase[0] / 1e6, ec_exit_phase[1] / 1e6,
-                     ec_exit_phase[2] / 1e6);
+                     ec_exit_phase[2] / 1e6,
+                     (unsigned long)ec_exit_first_fail, ec_exit_first_why,
+                     ec_slow_stop);
 
     if (xt_lock_check && n > 0 && (size_t)n < size) {
         snprintf(line + n, size - n, "lockcheck: %u acquisitions outside "
@@ -1332,7 +1381,7 @@ static void ec_exit_begin(void)
     DWORD owner = qatomic_cmpxchg(&ec_exit_owner, 0, me);
     GArray *frozen, *reads;
     int64_t t0 = get_clock();
-    char line[384];
+    char line[640];
     bool began;
 
     if (owner == me) {
@@ -1420,7 +1469,7 @@ XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
     if (h && !after && xt_exit_report &&
         (qatomic_load_acquire(&ec_exit_outcome) & EC_EXIT_DONE) &&
         qatomic_read(&ec_exit_owner) == GetCurrentThreadId()) {
-        char line[384];
+        char line[640];
 
         ec_exit_line(line, sizeof(line));
         fputs(line, stderr);
