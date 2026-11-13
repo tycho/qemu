@@ -627,6 +627,17 @@ NTSTATUS NTAPI NtDuplicateObject(HANDLE, HANDLE, HANDLE, PHANDLE,
 static void ec_unregister(XtThread *t);
 
 /*
+ * What a stop (ec_stop_for_term) found: the thread inconsistent, or
+ * between the halves of an operation's notifications (XtEcFrame.op), or
+ * neither.
+ */
+typedef enum EcStopState {
+    EC_STOP_INCONSISTENT,
+    EC_STOP_MID_OP,
+    EC_STOP_OK,
+} EcStopState;
+
+/*
  * Whether a thread stopped by ec_stop_for_term (suspended, its control
  * context in C) is where Windows' wait meant to leave it: outside
  * simulation and any adapter scope, off its emulator stack.  Windows gives
@@ -635,55 +646,141 @@ static void ec_unregister(XtThread *t);
  * The thread's own CPU area does: it is read with NtReadVirtualMemory,
  * since the thread may have ended meanwhile, and a read that fails fails
  * the check.  A thread with no CPU area yet hasn't run, and holds nothing.
+ * Then its frame page's operation: one that doesn't block is to be waited
+ * for; a read's range is passed back in *READ.
  */
-static bool ec_stopped_consistent(HANDLE h, const CONTEXT *c)
+static EcStopState ec_stopped_state(HANDLE h, const CONTEXT *c,
+                                    XtEcFrame *read)
 {
     XtThreadBasicInfo tbi;
     XtCpuArea *ap, area;
+    XtEcFrame f;
 
     if (NtQueryInformationThread(h, 0, &tbi, sizeof(tbi), NULL) < 0 ||
         NtReadVirtualMemory(GetCurrentProcess(),
                             (char *)tbi.TebBaseAddress + XT_TEB_CPU_AREA,
                             &ap, sizeof(ap), NULL) < 0) {
-        return false;
+        return EC_STOP_INCONSISTENT;
     }
     if (!ap) {
-        return true;
+        return EC_STOP_OK;
     }
     if (NtReadVirtualMemory(GetCurrentProcess(), ap, &area, sizeof(area),
                             NULL) < 0) {
-        return false;
+        return EC_STOP_INCONSISTENT;
     }
-    return !area.InSimulation && !area.InSyscallCallback &&
-           !(c->Rsp >= area.EmulatorStackLimit &&
-             c->Rsp < area.EmulatorStackBase);
+    if (area.InSimulation || area.InSyscallCallback ||
+        (c->Rsp >= area.EmulatorStackLimit &&
+         c->Rsp < area.EmulatorStackBase)) {
+        return EC_STOP_INCONSISTENT;
+    }
+    if (!area.EmulatorData[1]) {
+        return EC_STOP_OK;
+    }
+    if (NtReadVirtualMemory(GetCurrentProcess(),
+                            (char *)area.EmulatorData[1] +
+                            offsetof(XtEcFrame, op),
+                            &f.op, sizeof(f) - offsetof(XtEcFrame, op),
+                            NULL) < 0) {
+        return EC_STOP_INCONSISTENT;
+    }
+    switch (f.op) {
+    case XT_MEMOP_NONE:
+        return EC_STOP_OK;
+    case XT_MEMOP_READ:
+        read->op_addr = f.op_addr;
+        read->op_len = f.op_len;
+        return EC_STOP_OK;
+    default:
+        return EC_STOP_MID_OP;
+    }
 }
 
 /*
  * Another thread out of the engine, through H: it is suspended and its
  * context read, which waits for it to answer the doorbell or to leave an
  * adapter scope (InSyscallCallback), as FEX's module does, and then its
- * own state is checked (ec_stopped_consistent).  0 with it suspended
- * there, holding nothing of the engine's; else the status of the step
- * that failed (STATUS_UNSUCCESSFUL for the check), the suspension undone.
+ * own state is checked (ec_stopped_state).  A thread caught between an
+ * operation's halves is let go and stopped again, until it is past them
+ * or EC_STOP_MID_OP_MS has gone by.  0 with it suspended there, holding
+ * nothing of the engine's, and the range of a read it is in (*READ_ADDR,
+ * *READ_LEN; 0 if none); else the status of the step that failed
+ * (STATUS_UNSUCCESSFUL for the check), the suspension undone.
  */
-static NTSTATUS ec_stop_for_term(HANDLE h)
-{
-    CONTEXT c = { .ContextFlags = CONTEXT_CONTROL };
-    NTSTATUS st;
+#define EC_STOP_MID_OP_MS 100
 
-    st = NtSuspendThread(h, NULL);
-    if (st < 0) {
-        return st;
-    }
-    st = NtGetContextThread(h, &c);
-    if (st >= 0 && !ec_stopped_consistent(h, &c)) {
-        st = STATUS_UNSUCCESSFUL;
-    }
-    if (st < 0) {
+static NTSTATUS ec_stop_for_term(HANDLE h, vaddr *read_addr,
+                                 vaddr *read_len)
+{
+    int64_t until = get_clock() + (int64_t)EC_STOP_MID_OP_MS * SCALE_MS;
+    XtEcFrame read = { 0 };
+
+    for (;;) {
+        CONTEXT c = { .ContextFlags = CONTEXT_CONTROL };
+        EcStopState state;
+        NTSTATUS st;
+
+        st = NtSuspendThread(h, NULL);
+        if (st < 0) {
+            return st;
+        }
+        st = NtGetContextThread(h, &c);
+        if (st < 0) {
+            NtResumeThread(h, NULL);
+            return st;
+        }
+        state = ec_stopped_state(h, &c, &read);
+        if (state == EC_STOP_OK) {
+            *read_addr = read.op_addr;
+            *read_len = read.op_len;
+            return 0;
+        }
         NtResumeThread(h, NULL);
+        if (state == EC_STOP_INCONSISTENT || get_clock() > until) {
+            return STATUS_UNSUCCESSFUL;
+        }
+        /* Not a timed wait: Windows' timer would make it 15.6 ms. */
+        NtYieldExecution();
     }
-    return st < 0 ? st : 0;
+}
+
+/*
+ * A read another thread was in when it was stopped, maybe written already:
+ * its translations go, as the read's own end would have had them go.
+ */
+static void ec_stopped_read(vaddr addr, vaddr len)
+{
+    bool began;
+
+    if (!len || qatomic_load_acquire(&engine_state) != 2) {
+        return;
+    }
+    began = xt_adapter_begin();
+    xt_invalidate(addr, len);
+    xt_adapter_end(began);
+}
+
+/*
+ * The calling thread's operation between its notifications' halves
+ * (XtEcFrame.op), for a stop of it to see: set when the first half ends,
+ * after any notification the module's own work in it made, and cleared
+ * when the second begins.
+ */
+static void ec_memop(uint32_t op, const void *addr, SIZE_T len)
+{
+    XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+    XtEcFrame *f = area ? area->EmulatorData[1] : NULL;
+
+    if (!f) {
+        return;
+    }
+    if (op) {
+        f->op_addr = (uintptr_t)addr;
+        f->op_len = len;
+        qatomic_store_release(&f->op, op);
+    } else {
+        qatomic_set(&f->op, XT_MEMOP_NONE);
+    }
 }
 
 NTSTATUS NTAPI NtGetNextThread(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG,
@@ -774,9 +871,13 @@ static void ec_stop_other(HANDLE thread)
         tid = (DWORD)(uintptr_t)tbi.ClientId.UniqueThread;
     }
     if (tid != GetCurrentThreadId()) {
-        st = ec_stop_for_term(h);
+        vaddr ra, rl;
+
+        st = ec_stop_for_term(h, &ra, &rl);
         if (st < 0) {
             ec_unsafe_term(tid, st);
+        } else {
+            ec_stopped_read(ra, rl);
         }
     }
     /* A suspension outlives the handle: Windows ends the thread. */
@@ -833,12 +934,14 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
     if (self) {
         h = GetCurrentThread();
     } else {
-        NTSTATUS st = ec_stop_for_term(own);
+        vaddr ra, rl;
+        NTSTATUS st = ec_stop_for_term(own, &ra, &rl);
 
         if (st < 0) {
             ec_unsafe_term(tid, st);
             goto out;
         }
+        ec_stopped_read(ra, rl);
         h = own;
     }
     began = xt_adapter_begin();
@@ -997,24 +1100,42 @@ void xt_adapter_end(bool began)
 XTEXPORT void NotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type, ULONG prot,
                                 BOOL after, NTSTATUS status)
 {
+    if (after) {
+        ec_memop(XT_MEMOP_NONE, NULL, 0);
+    }
     if (note_ready()) {
         xt_note_alloc(addr, len, type, prot, after, status);
+    }
+    if (!after) {
+        ec_memop(XT_MEMOP_ALLOC, addr, len);
     }
 }
 
 XTEXPORT void NotifyMemoryFree(void *addr, SIZE_T len, ULONG type, BOOL after,
                                NTSTATUS status)
 {
+    if (after) {
+        ec_memop(XT_MEMOP_NONE, NULL, 0);
+    }
     if (note_ready()) {
         xt_note_free(addr, len, type, after, status);
+    }
+    if (!after) {
+        ec_memop(XT_MEMOP_FREE, addr, len);
     }
 }
 
 XTEXPORT void NotifyMemoryProtect(void *addr, SIZE_T len, ULONG prot,
                                   BOOL after, NTSTATUS status)
 {
+    if (after) {
+        ec_memop(XT_MEMOP_NONE, NULL, 0);
+    }
     if (note_ready()) {
         xt_note_protect(addr, len, prot, after, status);
+    }
+    if (!after) {
+        ec_memop(XT_MEMOP_PROTECT, addr, len);
     }
 }
 
@@ -1029,8 +1150,14 @@ XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
 
 XTEXPORT void NotifyUnmapViewOfSection(void *addr, BOOL after, NTSTATUS status)
 {
+    if (after) {
+        ec_memop(XT_MEMOP_NONE, NULL, 0);
+    }
     if (note_ready()) {
         xt_note_unmap(addr, after);
+    }
+    if (!after) {
+        ec_memop(XT_MEMOP_UNMAP, addr, 0);
     }
 }
 
@@ -1058,8 +1185,14 @@ XTEXPORT void BTCpu64NotifyMemoryDirty(void *addr, SIZE_T len)
 XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
                                     BOOL after, NTSTATUS status)
 {
+    if (after) {
+        ec_memop(XT_MEMOP_NONE, NULL, 0);
+    }
     if (note_ready()) {
         xt_note_read_file(addr, len, after, status);
+    }
+    if (!after) {
+        ec_memop(XT_MEMOP_READ, addr, len);
     }
 }
 
