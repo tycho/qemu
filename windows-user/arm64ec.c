@@ -716,10 +716,28 @@ static EcStopState ec_stopped_state(HANDLE h, const CONTEXT *c,
 }
 
 /*
+ * Whether the thread behind H is already ending: Windows then neither
+ * suspends it nor gives its context, and its CPU area is gone.  It holds
+ * nothing of the engine's, as long as whatever ended it stopped it first
+ * (ThreadTerm), or it ended itself; a termination that didn't is counted
+ * there (ec_unsafe_term).
+ */
+static bool ec_thread_ending(HANDLE h)
+{
+    ULONG ended = 0;
+
+    return NtQueryInformationThread(h, 20 /* ThreadIsTerminated */, &ended,
+                                    sizeof(ended), NULL) >= 0 && ended;
+}
+
+/*
  * Another thread out of the engine, through H: it is suspended and its
  * context read, which waits for it to answer the doorbell or to leave an
  * adapter scope (InSyscallCallback), as FEX's module does, and then its
- * own state is checked (ec_stopped_state).  A thread caught between an
+ * own state is checked (ec_stopped_state).  A thread already ending
+ * (ec_thread_ending) gives STATUS_THREAD_IS_TERMINATING, for the caller to
+ * take as done: it isn't suspended, and its TEB may be gone.  A thread
+ * caught between an
  * operation's halves is let go and stopped again, until it is past them
  * or EC_STOP_MID_OP_MS has gone by.  0 with it suspended there, holding
  * nothing of the engine's, and the range of a read it is in (*READ_ADDR,
@@ -742,7 +760,7 @@ static NTSTATUS ec_stop_for_term(HANDLE h, vaddr *read_addr,
         st = NtSuspendThread(h, NULL);
         if (st < 0) {
             ec_stop_why = 0x80;
-            return st;
+            return ec_thread_ending(h) ? STATUS_THREAD_IS_TERMINATING : st;
         }
         {
             int64_t g0 = get_clock();
@@ -775,7 +793,7 @@ static NTSTATUS ec_stop_for_term(HANDLE h, vaddr *read_addr,
         if (st < 0) {
             ec_stop_why = 0x40;
             NtResumeThread(h, NULL);
-            return st;
+            return ec_thread_ending(h) ? STATUS_THREAD_IS_TERMINATING : st;
         }
         state = ec_stopped_state(h, &c, &read);
         if (state == EC_STOP_OK) {
@@ -925,9 +943,9 @@ static void ec_stop_other(HANDLE thread)
         vaddr ra, rl;
 
         st = ec_stop_for_term(h, &ra, &rl);
-        if (st < 0) {
+        if (st < 0 && st != STATUS_THREAD_IS_TERMINATING) {
             ec_unsafe_term(tid, st);
-        } else {
+        } else if (st >= 0) {
             ec_stopped_read(ra, rl);
         }
     }
@@ -988,6 +1006,10 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
         vaddr ra, rl;
         NTSTATUS st = ec_stop_for_term(own, &ra, &rl);
 
+        if (st == STATUS_THREAD_IS_TERMINATING) {
+            /* Being ended already, by what stopped it; its record stays. */
+            goto out;
+        }
         if (st < 0) {
             ec_unsafe_term(tid, st);
             goto out;
@@ -1229,6 +1251,11 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
 
             st = ec_stop_for_term(f.h, &r.addr, &r.len);
             NtResumeThread(f.h, NULL);
+            if (st == STATUS_THREAD_IS_TERMINATING) {
+                /* Ending: it holds nothing (ec_thread_ending). */
+                NtClose(f.h);
+                continue;
+            }
             if (st < 0) {
                 ec_exit_outcome |= EC_EXIT_STOP;
                 if (!ec_exit_first_fail) {
@@ -1260,6 +1287,7 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
             EcFrozen *f = &g_array_index(frozen, EcFrozen, i);
             ULONG prev = 1;
             EcRead r;
+            NTSTATUS st;
 
             if (NtSuspendThread(f->h, &prev) < 0) {
                 continue;
@@ -1270,7 +1298,8 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
             }
             again = true;
             ec_exit_refrozen++;
-            if (ec_stop_for_term(f->h, &r.addr, &r.len) < 0) {
+            st = ec_stop_for_term(f->h, &r.addr, &r.len);
+            if (st < 0 && st != STATUS_THREAD_IS_TERMINATING) {
                 ec_exit_outcome |= EC_EXIT_STOP;
             } else if (r.len) {
                 g_array_append_val(reads, r);
