@@ -237,6 +237,8 @@ int xt_engine_init(const char *settings, int *applied, int *rejected);
 extern bool xt_diag;
 /* Testing (keyword rcustress): grace periods back to back. */
 extern bool xt_rcu_stress;
+/* Testing (keywords exitstrict, exitreport): the process's end. */
+extern bool xt_exit_strict, xt_exit_report;
 /* Testing (keyword rcuinj=N): registrations interrupted at step N. */
 extern int xt_rcu_inj_step;
 CPUState *xt_cpu_new(void);

@@ -699,6 +699,12 @@ static void ga_resize(XArray *x, guint len)
     }
 }
 
+GArray *g_array_set_size(GArray *a, guint len)
+{
+    ga_resize((XArray *)a, len);
+    return a;
+}
+
 GArray *g_array_append_vals(GArray *a, gconstpointer data, guint n)
 {
     XArray *x = (XArray *)a;

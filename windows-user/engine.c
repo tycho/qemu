@@ -615,6 +615,7 @@ void xt_invalidate(vaddr start, vaddr len)
 CPUState *xt_spare_cpu;
 bool xt_diag;
 bool xt_rcu_stress;
+bool xt_exit_strict, xt_exit_report;
 int xt_rcu_inj_step;
 static int applied, rejected;
 
@@ -635,6 +636,14 @@ static void set_settings(Object *accel, const char *settings)
             } else if (!strcmp(kv[i], "rcustress")) {
                 /* Testing: grace periods back to back (arm64ec.c). */
                 xt_rcu_stress = true;
+                applied++;
+            } else if (!strcmp(kv[i], "exitstrict")) {
+                /* A failure of the process's end is fatal (arm64ec.c). */
+                xt_exit_strict = true;
+                applied++;
+            } else if (!strcmp(kv[i], "exitreport")) {
+                /* The process's end's outcome, at the last call. */
+                xt_exit_report = true;
                 applied++;
 #endif
             } else if (!strcmp(kv[i], "diag")) {
