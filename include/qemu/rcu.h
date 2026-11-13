@@ -162,6 +162,12 @@ struct rcu_head {
 
 void call_rcu1(struct rcu_head *head, RCUCBFunc *func);
 void drain_call_rcu(void);
+/*
+ * Whether call_rcu's worker is waiting with no callback counted, where it
+ * holds nothing until one is queued; its thread id in *@tid (0 before it
+ * starts).  For a process's end that must leave it so.
+ */
+bool rcu_worker_resting(int *tid);
 
 /* The operands of the minus operator must have the same type,
  * which must be the one that we specify in the cast.
