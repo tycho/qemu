@@ -88,6 +88,7 @@ extern IMAGE_DOS_HEADER __ImageBase;
 NTSTATUS xt_syscall(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                     uint64_t a4, uint64_t a5, uint64_t nr);
 
+static int64_t nr_flush_buffers = -1;
 static int64_t nr_continue = -1, nr_raise = -1, nr_alloc = -1,
                nr_protect = -1;
 
@@ -181,6 +182,20 @@ NTSTATUS xt_ec_alloc_direct(void **base, SIZE_T *size, ULONG type,
                       (uintptr_t)size, type, prot, nr_alloc);
 }
 
+/*
+ * Every processor running a thread of the process made to see this one's
+ * writes, and to have its own seen (FlushProcessWriteBuffers): the
+ * process's end's half of the barrier pair whose other half, a thread's
+ * entry, costs it nothing (arm64ec-gate.c).
+ */
+static NTSTATUS ec_flush_write_buffers(void)
+{
+    if (nr_flush_buffers < 0) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    return xt_syscall(0, 0, 0, 0, 0, 0, nr_flush_buffers);
+}
+
 /* Whether ProcessInit has found the system calls the module makes itself. */
 bool xt_syscalls_ready(void)
 {
@@ -252,6 +267,7 @@ static bool init_syscalls(void)
     nr_raise = find_syscall_nr(md, "NtRaiseException");
     nr_alloc = find_syscall_nr(md, "NtAllocateVirtualMemory");
     nr_protect = find_syscall_nr(md, "NtProtectVirtualMemory");
+    nr_flush_buffers = find_syscall_nr(md, "NtFlushProcessWriteBuffers");
     ki_exception_dispatcher = ntdll_native(md, "KiUserExceptionDispatcher");
     cross_process_work = (void (*)(void))
         ntdll_native(md, "ProcessPendingCrossProcessEmulatorWork");
@@ -1156,6 +1172,7 @@ static void ec_ring_doorbells(void);
  * printed at the last call with the keyword exitreport.
  */
 #define EC_FREEZE_MS 30000
+#define EC_STOP_ACTIVE_MS 200
 #define EC_PARK_MS 1000
 
 enum {
@@ -1165,10 +1182,10 @@ enum {
     EC_EXIT_CREATING = 1 << 3,      /* an internal thread's creation hung */
     EC_EXIT_HELPER = 1 << 4,        /* an internal thread didn't park */
     EC_EXIT_RCU = 1 << 5,           /* call_rcu's worker not at rest */
+    EC_EXIT_FLUSH = 1 << 6,         /* the write-buffer flush failed */
     EC_EXIT_DONE = 1u << 31,
 };
 
-static DWORD ec_exit_owner;
 static uint32_t ec_exit_outcome;
 static uint32_t ec_exit_frozen, ec_exit_passes, ec_exit_refrozen;
 static int64_t ec_exit_ns, ec_exit_phase[4];
@@ -1178,6 +1195,7 @@ static int ec_exit_first_why;
 typedef struct EcFrozen {
     HANDLE h;
     DWORD tid;
+    bool suspended;         /* by the freeze, and not undone */
 } EcFrozen;
 
 typedef struct EcRead {
@@ -1247,17 +1265,116 @@ static void ec_freeze_failed(DWORD tid, NTSTATUS st, int why)
     xt_gevent(XT_EV_THREAD_TERM, tid, 8 | (uint64_t)(uint32_t)st << 32);
 }
 
+/*
+ * A certificate (ec_certify): the thread has no level in the module and
+ * no operation outstanding that isn't handed over, and the gate keeps it
+ * out from here on.  Or it can't be had yet (active), or ever (failed).
+ */
+typedef enum EcCert {
+    EC_CERT_ACTIVE,
+    EC_CERT_FAILED,
+    EC_CERT_IDLE,
+    EC_CERT_PARKED,
+    EC_CERT_TAKEN,          /* idle or parked, a read taken over */
+    EC_CERT_NEW,            /* no gate yet: its first call meets the gate */
+    EC_CERT_ENDING,         /* Windows says it is ending */
+} EcCert;
+
+static uint32_t ec_certs[EC_CERT_ENDING + 1];
+
+/*
+ * G's certificate, from a snapshot: its admission word, every root, the
+ * word again.  The word's sequence number moves on every change and never
+ * recurs, so equal words mean the thread made no admission change in
+ * between; each root stands on its own: free, or taken (its range, for a
+ * read pending since its first half, is the taker's, added to READS, or
+ * left on its root for the reaper without READS).  Called with the gate
+ * closed and every processor's writes flushed.  A word that keeps changing
+ * between the reads is taken as active, so that the call is bounded.
+ */
+static EcCert ec_certify(XtGate *g, GArray *reads)
+{
+    /* A thread changing its word all the while is still active. */
+    for (int tries = 0; tries < 64; tries++) {
+        uint64_t w1 = qatomic_load_acquire(&g->adm), w2;
+        uint32_t state[XT_GATE_ROOTS];
+        bool taken = false;
+
+        for (int i = 0; i < XT_GATE_ROOTS; i++) {
+            state[i] = qatomic_load_acquire(&g->roots[i].state);
+        }
+        w2 = qatomic_load_acquire(&g->adm);
+        if (w1 != w2) {
+            continue;
+        }
+        if (w1 & XT_ADM_POISONED) {
+            return EC_CERT_FAILED;
+        }
+        if (XT_ADM_COUNT(w1) && !(w1 & XT_ADM_PARKED)) {
+            return EC_CERT_ACTIVE;
+        }
+        for (int i = 0; i < XT_GATE_ROOTS; i++) {
+            XtGateRoot *r = &g->roots[i];
+
+            if (state[i] == XT_ROOT_FREE || state[i] == XT_ROOT_TAKEN) {
+                continue;
+            }
+            if (state[i] == XT_ROOT_PENDING && r->kind == XT_MEMOP_READ &&
+                qatomic_cmpxchg(&r->state, XT_ROOT_PENDING,
+                                XT_ROOT_TAKEN) == XT_ROOT_PENDING) {
+                if (reads) {
+                    EcRead rd = { r->addr, r->len };
+
+                    g_array_append_val(reads, rd);
+                } else {
+                    /* Left on its root, for the reaper once it has ended. */
+                    qatomic_inc(&xt_gate_read_open);
+                }
+                taken = true;
+                continue;
+            }
+            /* Another operation owed: a parked thread never finishes it. */
+            return w1 & XT_ADM_PARKED ? EC_CERT_FAILED : EC_CERT_ACTIVE;
+        }
+        if (taken) {
+            return EC_CERT_TAKEN;
+        }
+        return w1 & XT_ADM_PARKED ? EC_CERT_PARKED : EC_CERT_IDLE;
+    }
+    return EC_CERT_ACTIVE;
+}
+
+/*
+ * The thread behind H's certificate: through its gate, found by its
+ * identity; none registered yet is a thread whose first call will meet the
+ * gate.  An identity that can't be read is a failure, unless Windows says
+ * the thread is ending.
+ */
+static EcCert ec_certify_thread(HANDLE h, GArray *reads)
+{
+    NTSTATUS st;
+    XtGate *g = xt_gate_for(h, false, &st);
+
+    if (ec_thread_ending(h)) {
+        return EC_CERT_ENDING;
+    }
+    if (st < 0) {
+        return EC_CERT_FAILED;
+    }
+    return g ? ec_certify(g, reads) : EC_CERT_NEW;
+}
+
 static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
 {
-    const ACCESS_MASK want = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
-                             THREAD_QUERY_INFORMATION;
+    const ACCESS_MASK want = THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION;
     int64_t deadline = get_clock() + (int64_t)EC_FREEZE_MS * SCALE_MS;
     GArray *pending = g_array_sized_new(FALSE, FALSE, sizeof(EcFrozen), 32);
 
     for (;;) {
         HANDLE h = NULL, next;
-        bool fresh = false, again = false;
+        bool fresh = false;
         NTSTATUS st;
+        int64_t until;
 
         ec_exit_passes++;
         if (!ec_wait_creations(deadline)) {
@@ -1265,20 +1382,27 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
             return;
         }
         /*
-         * Every new thread asked to suspend first, and the doorbells rung
-         * at once, so that the engine's threads all leave it together;
-         * then each is stopped and checked in turn (its context read
-         * waits for it), which undoes the first suspension.
+         * Every new thread asked to suspend, and the doorbells rung at
+         * once: a thread in the engine leaves it at its next consistent
+         * point (leave_suspend, which pops its level), one in the module's
+         * other code finishes, and native code stays still.  None of that
+         * is the certificate; it gets threads to one sooner.
          */
         while ((st = NtGetNextThread(GetCurrentProcess(), h, want, 0, 0,
                                      &next)) >= 0) {
-            EcFrozen f = { NULL, 0 };
+            EcFrozen f = { NULL, 0, false };
 
             if (h) {
                 NtClose(h);
             }
             h = next;
             f.tid = ec_thread_id(h);
+            if (!f.tid) {
+                if (!ec_thread_ending(h)) {
+                    ec_freeze_failed(0, STATUS_INVALID_HANDLE, 0x400);
+                }
+                continue;
+            }
             if (f.tid == me || ec_is_internal(f.tid) ||
                 ec_is_frozen(frozen, f.tid) ||
                 ec_is_frozen(pending, f.tid)) {
@@ -1294,13 +1418,10 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
                 }
                 continue;
             }
-            st = NtSuspendThread(f.h, NULL);
-            if (st < 0) {
-                if (!ec_thread_ending(f.h)) {
-                    ec_freeze_failed(f.tid, st, 0x80);
-                }
-                NtClose(f.h);
-                continue;
+            if (NtSuspendThread(f.h, NULL) < 0) {
+                f.suspended = false;
+            } else {
+                f.suspended = true;
             }
             g_array_append_val(pending, f);
         }
@@ -1313,64 +1434,80 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
             h = NULL;
         }
         ec_ring_doorbells();
-        for (guint i = 0; i < pending->len; i++) {
-            EcFrozen f = g_array_index(pending, EcFrozen, i);
-            EcRead r;
+        /*
+         * Each certified from its gate, no context read; those still
+         * active are let go together, their suspensions undone, to finish
+         * what they are in, and certified as they do, until
+         * EC_STOP_ACTIVE_MS has gone by.
+         */
+        until = get_clock() + (int64_t)EC_STOP_ACTIVE_MS * SCALE_MS;
+        for (bool released = false;;) {
+            bool active = false;
 
-            /* The first suspension is the stop's to undo. */
-            st = ec_stop_for_term(f.h, 1, &r.addr, &r.len);
-            if (st == STATUS_THREAD_IS_TERMINATING) {
-                /* Ending: it holds nothing (ec_thread_ending). */
-                NtClose(f.h);
-                continue;
+            for (guint i = 0; i < pending->len; i++) {
+                EcFrozen *f = &g_array_index(pending, EcFrozen, i);
+                EcCert c;
+
+                if (!f->h) {
+                    continue;
+                }
+                c = ec_certify_thread(f->h, reads);
+                if (c == EC_CERT_ACTIVE) {
+                    active = true;
+                    continue;
+                }
+                qatomic_inc(&ec_certs[c]);
+                if (c == EC_CERT_FAILED) {
+                    ec_freeze_failed(f->tid, STATUS_UNSUCCESSFUL, 0x800);
+                    NtClose(f->h);
+                } else {
+                    g_array_append_val(frozen, *f);
+                    ec_exit_frozen++;
+                    fresh = true;
+                }
+                f->h = NULL;
             }
-            if (st < 0) {
-                ec_freeze_failed(f.tid, st, ec_stop_why);
-                NtClose(f.h);
-                continue;
+            if (!active) {
+                break;
             }
-            if (r.len) {
-                g_array_append_val(reads, r);
+            if (get_clock() > until) {
+                for (guint i = 0; i < pending->len; i++) {
+                    EcFrozen *f = &g_array_index(pending, EcFrozen, i);
+
+                    if (f->h) {
+                        qatomic_inc(&ec_certs[EC_CERT_ACTIVE]);
+                        ec_freeze_failed(f->tid, STATUS_TIMEOUT, 0x1000);
+                        NtClose(f->h);
+                        f->h = NULL;
+                    }
+                }
+                break;
             }
-            g_array_append_val(frozen, f);
-            ec_exit_frozen++;
-            fresh = true;
+            if (!released) {
+                for (guint i = 0; i < pending->len; i++) {
+                    EcFrozen *f = &g_array_index(pending, EcFrozen, i);
+
+                    if (f->h && f->suspended) {
+                        NtResumeThread(f->h, NULL);
+                        f->suspended = false;
+                    }
+                }
+                released = true;
+            }
+            /* Not a timed wait: Windows' timer would make it 15.6 ms. */
+            NtYieldExecution();
         }
         g_array_set_size(pending, 0);
         if (get_clock() > deadline) {
             ec_exit_outcome |= EC_EXIT_BUDGET;
             return;
         }
-        if (fresh) {
-            continue;
-        }
-        /* Each stopped thread still stopped, or stopped again. */
-        for (guint i = 0; i < frozen->len; i++) {
-            EcFrozen *f = &g_array_index(frozen, EcFrozen, i);
-            ULONG prev = 1;
-            EcRead r;
-
-            st = NtSuspendThread(f->h, &prev);
-            if (st < 0) {
-                if (!ec_thread_ending(f->h)) {
-                    ec_freeze_failed(f->tid, st, 0x80);
-                }
-                continue;
-            }
-            NtResumeThread(f->h, NULL);
-            if (prev) {
-                continue;
-            }
-            again = true;
-            ec_exit_refrozen++;
-            st = ec_stop_for_term(f->h, 0, &r.addr, &r.len);
-            if (st < 0 && st != STATUS_THREAD_IS_TERMINATING) {
-                ec_freeze_failed(f->tid, st, ec_stop_why);
-            } else if (r.len) {
-                g_array_append_val(reads, r);
-            }
-        }
-        if (!again) {
+        if (!fresh) {
+            /*
+             * A pass that found no thread it hadn't certified: every
+             * certificate holds while the gate is closed, as a thread let
+             * run again meets the gate at its next way in.
+             */
             return;
         }
     }
@@ -1448,14 +1585,19 @@ static void ec_exit_line(char *line, size_t size)
     int n = snprintf(line, size, "exit: outcome 0x%x, %u threads stopped "
                      "(%u again), %u passes, %u unsafe terminations, %.1f ms "
                      "(freeze %.1f, parks %.1f, flush %.1f), first stop "
-                     "failure 0x%lx why 0x%x %s\n",
+                     "failure 0x%lx why 0x%x; certified idle %u parked %u "
+                     "taken %u new %u ending %u, failed %u, still active %u "
+                     "%s\n",
                      ec_exit_outcome & ~EC_EXIT_DONE, ec_exit_frozen,
                      ec_exit_refrozen, ec_exit_passes,
                      qatomic_read(&ec_unsafe_terms), ec_exit_ns / 1e6,
                      ec_exit_phase[0] / 1e6, ec_exit_phase[1] / 1e6,
                      ec_exit_phase[2] / 1e6,
                      (unsigned long)ec_exit_first_fail, ec_exit_first_why,
-                     ec_slow_stop);
+                     ec_certs[EC_CERT_IDLE], ec_certs[EC_CERT_PARKED],
+                     ec_certs[EC_CERT_TAKEN], ec_certs[EC_CERT_NEW],
+                     ec_certs[EC_CERT_ENDING], ec_certs[EC_CERT_FAILED],
+                     ec_certs[EC_CERT_ACTIVE], ec_slow_stop);
 
     if (xt_lock_check && n > 0 && (size_t)n < size) {
         n += snprintf(line + n, size - n, "lockcheck: %u acquisitions "
@@ -1470,27 +1612,33 @@ static void ec_exit_line(char *line, size_t size)
 
 static void ec_exit_begin(void)
 {
-    LARGE_INTEGER forever = { .QuadPart = INT64_MIN };
     DWORD me = GetCurrentThreadId();
-    DWORD owner = qatomic_cmpxchg(&ec_exit_owner, 0, me);
+    XtGate *g = xt_gate_self();
+    XtGate *owner = qatomic_cmpxchg(&xt_gate_closed_by, NULL, g);
     GArray *frozen, *reads;
     int64_t t0 = get_clock();
     char line[1024];
     bool began;
 
-    if (owner == me) {
+    if (owner == g) {
         return;
     }
     if (owner) {
-        /* Another thread is ending the process: stopped with the rest. */
-        XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
-
-        if (area) {
-            area->InSyscallCallback = 0;
-        }
-        for (;;) {
-            NtDelayExecution(FALSE, &forever);
-        }
+        /*
+         * Another thread is ending the process and has closed the gate:
+         * this thread parks for good in one terminal transition, parked
+         * if this call's level is all it has (certified with the rest),
+         * poisoned if it holds an outer level (a failed stop).
+         */
+        xt_adm_park_terminal(g);
+    }
+    /*
+     * The gate closed (the swap above, which also elected this thread),
+     * then every processor's writes flushed: from here a thread's entry
+     * either sees the gate closed, or its level is visible to ec_freeze.
+     */
+    if (ec_flush_write_buffers() < 0) {
+        ec_exit_outcome |= EC_EXIT_FLUSH;
     }
     began = xt_adapter_begin();
     frozen = g_array_sized_new(FALSE, FALSE, sizeof(EcFrozen), 32);
@@ -1509,7 +1657,11 @@ static void ec_exit_begin(void)
         ec_exit_outcome |= EC_EXIT_HELPER;
     }
     ec_exit_phase[1] = get_clock() - t0;
-    if (qatomic_load_acquire(&engine_state) == 2) {
+    /*
+     * The rest relies on every other thread being out of the engine: after
+     * a failure none of it runs (a failed thread may hold what it needs).
+     */
+    if (!ec_exit_outcome && qatomic_load_acquire(&engine_state) == 2) {
         xt_enter();
         for (guint i = 0; i < reads->len; i++) {
             EcRead *r = &g_array_index(reads, EcRead, i);
@@ -1561,7 +1713,7 @@ static void ec_process_term(HANDLE h, BOOL after, NTSTATUS status)
     }
     if (h && !after && xt_exit_report &&
         (qatomic_load_acquire(&ec_exit_outcome) & EC_EXIT_DONE) &&
-        qatomic_read(&ec_exit_owner) == GetCurrentThreadId()) {
+        qatomic_read(&xt_gate_closed_by) == xt_gate_self()) {
         char line[1024];
 
         ec_exit_line(line, sizeof(line));
