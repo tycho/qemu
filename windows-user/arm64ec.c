@@ -763,9 +763,9 @@ static bool ec_thread_ending(HANDLE h)
  * an operation's halves (which they would otherwise keep from finishing),
  * and before it returns.  0 with the thread suspended once, by the stop,
  * holding nothing of the engine's, and the range of a read it is in
- * (*READ_ADDR, *READ_LEN; 0 if none); else the status of the step that
- * failed (STATUS_UNSUCCESSFUL for the check), with no suspension of the
- * stop's or the caller's left.
+ * (*READ_ADDR, *READ_LEN; 0 if none, and on any other return); else the
+ * status of the step that failed (STATUS_UNSUCCESSFUL for the check), with
+ * no suspension of the stop's or the caller's left.
  */
 #define EC_STOP_MID_OP_MS 100
 
@@ -782,6 +782,8 @@ static NTSTATUS ec_stop_for_term(HANDLE h, ULONG held, vaddr *read_addr,
     int64_t until = get_clock() + (int64_t)EC_STOP_MID_OP_MS * SCALE_MS;
     XtEcFrame read = { 0 };
 
+    *read_addr = 0;
+    *read_len = 0;
     for (;;) {
         CONTEXT c = { .ContextFlags = CONTEXT_CONTROL };
         EcStopState state;
