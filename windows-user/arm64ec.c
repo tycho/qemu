@@ -755,16 +755,28 @@ static bool ec_thread_ending(HANDLE h)
  * own state is checked (ec_stopped_state).  A thread already ending
  * (ec_thread_ending) gives STATUS_THREAD_IS_TERMINATING, for the caller to
  * take as done: it isn't suspended, and its TEB may be gone.  A thread
- * caught between an
- * operation's halves is let go and stopped again, until it is past them
- * or EC_STOP_MID_OP_MS has gone by.  0 with it suspended there, holding
- * nothing of the engine's, and the range of a read it is in (*READ_ADDR,
- * *READ_LEN; 0 if none); else the status of the step that failed
- * (STATUS_UNSUCCESSFUL for the check), the suspension undone.
+ * caught between an operation's halves is let go and stopped again, until
+ * it is past them or EC_STOP_MID_OP_MS has gone by.
+ *
+ * The caller may hold HELD suspensions of the thread already; they become
+ * the stop's, and the stop undoes them: when it lets the thread go between
+ * an operation's halves (which they would otherwise keep from finishing),
+ * and before it returns.  0 with the thread suspended once, by the stop,
+ * holding nothing of the engine's, and the range of a read it is in
+ * (*READ_ADDR, *READ_LEN; 0 if none); else the status of the step that
+ * failed (STATUS_UNSUCCESSFUL for the check), with no suspension of the
+ * stop's or the caller's left.
  */
 #define EC_STOP_MID_OP_MS 100
 
-static NTSTATUS ec_stop_for_term(HANDLE h, vaddr *read_addr,
+static void ec_resume_n(HANDLE h, ULONG n)
+{
+    while (n--) {
+        NtResumeThread(h, NULL);
+    }
+}
+
+static NTSTATUS ec_stop_for_term(HANDLE h, ULONG held, vaddr *read_addr,
                                  vaddr *read_len)
 {
     int64_t until = get_clock() + (int64_t)EC_STOP_MID_OP_MS * SCALE_MS;
@@ -778,6 +790,7 @@ static NTSTATUS ec_stop_for_term(HANDLE h, vaddr *read_addr,
         st = NtSuspendThread(h, NULL);
         if (st < 0) {
             ec_stop_why = 0x80;
+            ec_resume_n(h, held);
             return ec_thread_ending(h) ? STATUS_THREAD_IS_TERMINATING : st;
         }
         {
@@ -810,16 +823,18 @@ static NTSTATUS ec_stop_for_term(HANDLE h, vaddr *read_addr,
         }
         if (st < 0) {
             ec_stop_why = 0x40;
-            NtResumeThread(h, NULL);
+            ec_resume_n(h, held + 1);
             return ec_thread_ending(h) ? STATUS_THREAD_IS_TERMINATING : st;
         }
         state = ec_stopped_state(h, &c, &read);
         if (state == EC_STOP_OK) {
+            ec_resume_n(h, held);
             *read_addr = read.op_addr;
             *read_len = read.op_len;
             return 0;
         }
-        NtResumeThread(h, NULL);
+        ec_resume_n(h, held + 1);
+        held = 0;
         if (state == EC_STOP_INCONSISTENT || get_clock() > until) {
             if (state != EC_STOP_INCONSISTENT) {
                 ec_stop_why = 0x20;
@@ -960,7 +975,7 @@ static void ec_stop_other(HANDLE thread)
     if (tid != GetCurrentThreadId()) {
         vaddr ra, rl;
 
-        st = ec_stop_for_term(h, &ra, &rl);
+        st = ec_stop_for_term(h, 0, &ra, &rl);
         if (st < 0 && st != STATUS_THREAD_IS_TERMINATING) {
             ec_unsafe_term(tid, st);
         } else if (st >= 0) {
@@ -1022,7 +1037,7 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
         h = GetCurrentThread();
     } else {
         vaddr ra, rl;
-        NTSTATUS st = ec_stop_for_term(own, &ra, &rl);
+        NTSTATUS st = ec_stop_for_term(own, 0, &ra, &rl);
 
         if (st == STATUS_THREAD_IS_TERMINATING) {
             /* Being ended already, by what stopped it; its record stays. */
@@ -1232,7 +1247,7 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
          * Every new thread asked to suspend first, and the doorbells rung
          * at once, so that the engine's threads all leave it together;
          * then each is stopped and checked in turn (its context read
-         * waits for it), and the first suspension undone.
+         * waits for it), which undoes the first suspension.
          */
         while (NtGetNextThread(GetCurrentProcess(), h, want, 0, 0,
                                &next) >= 0) {
@@ -1267,8 +1282,8 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
             EcRead r;
             NTSTATUS st;
 
-            st = ec_stop_for_term(f.h, &r.addr, &r.len);
-            NtResumeThread(f.h, NULL);
+            /* The first suspension is the stop's to undo. */
+            st = ec_stop_for_term(f.h, 1, &r.addr, &r.len);
             if (st == STATUS_THREAD_IS_TERMINATING) {
                 /* Ending: it holds nothing (ec_thread_ending). */
                 NtClose(f.h);
@@ -1316,7 +1331,7 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
             }
             again = true;
             ec_exit_refrozen++;
-            st = ec_stop_for_term(f->h, &r.addr, &r.len);
+            st = ec_stop_for_term(f->h, 0, &r.addr, &r.len);
             if (st < 0 && st != STATUS_THREAD_IS_TERMINATING) {
                 ec_exit_outcome |= EC_EXIT_STOP;
             } else if (r.len) {
