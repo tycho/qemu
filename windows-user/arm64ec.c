@@ -1227,6 +1227,17 @@ static bool ec_is_frozen(GArray *frozen, DWORD tid)
     return false;
 }
 
+/* A thread the freeze couldn't stop (TID, 0 if unknown), with ST and WHY. */
+static void ec_freeze_failed(DWORD tid, NTSTATUS st, int why)
+{
+    ec_exit_outcome |= EC_EXIT_STOP;
+    if (!ec_exit_first_fail) {
+        ec_exit_first_fail = st;
+        ec_exit_first_why = why;
+    }
+    xt_gevent(XT_EV_THREAD_TERM, tid, 8 | (uint64_t)(uint32_t)st << 32);
+}
+
 static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
 {
     const ACCESS_MASK want = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
@@ -1237,6 +1248,7 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
     for (;;) {
         HANDLE h = NULL, next;
         bool fresh = false, again = false;
+        NTSTATUS st;
 
         ec_exit_passes++;
         if (!ec_wait_creations(deadline)) {
@@ -1249,8 +1261,8 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
          * then each is stopped and checked in turn (its context read
          * waits for it), which undoes the first suspension.
          */
-        while (NtGetNextThread(GetCurrentProcess(), h, want, 0, 0,
-                               &next) >= 0) {
+        while ((st = NtGetNextThread(GetCurrentProcess(), h, want, 0, 0,
+                                     &next)) >= 0) {
             EcFrozen f = { NULL, 0 };
 
             if (h) {
@@ -1260,17 +1272,32 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
             f.tid = ec_thread_id(h);
             if (f.tid == me || ec_is_internal(f.tid) ||
                 ec_is_frozen(frozen, f.tid) ||
-                ec_is_frozen(pending, f.tid) ||
-                NtDuplicateObject(GetCurrentProcess(), h,
-                                  GetCurrentProcess(), &f.h, 0, 0,
-                                  DUPLICATE_SAME_ACCESS) < 0) {
+                ec_is_frozen(pending, f.tid)) {
                 continue;
             }
-            if (NtSuspendThread(f.h, NULL) < 0) {
+            /* Only a thread that is ending may be passed over. */
+            st = NtDuplicateObject(GetCurrentProcess(), h,
+                                   GetCurrentProcess(), &f.h, 0, 0,
+                                   DUPLICATE_SAME_ACCESS);
+            if (st < 0) {
+                if (!ec_thread_ending(h)) {
+                    ec_freeze_failed(f.tid, st, 0x100);
+                }
+                continue;
+            }
+            st = NtSuspendThread(f.h, NULL);
+            if (st < 0) {
+                if (!ec_thread_ending(f.h)) {
+                    ec_freeze_failed(f.tid, st, 0x80);
+                }
                 NtClose(f.h);
                 continue;
             }
             g_array_append_val(pending, f);
+        }
+        if (st != STATUS_NO_MORE_ENTRIES) {
+            /* The list ended early: a thread after it was never seen. */
+            ec_freeze_failed(0, st, 0x200);
         }
         if (h) {
             NtClose(h);
@@ -1280,7 +1307,6 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
         for (guint i = 0; i < pending->len; i++) {
             EcFrozen f = g_array_index(pending, EcFrozen, i);
             EcRead r;
-            NTSTATUS st;
 
             /* The first suspension is the stop's to undo. */
             st = ec_stop_for_term(f.h, 1, &r.addr, &r.len);
@@ -1290,13 +1316,7 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
                 continue;
             }
             if (st < 0) {
-                ec_exit_outcome |= EC_EXIT_STOP;
-                if (!ec_exit_first_fail) {
-                    ec_exit_first_fail = st;
-                    ec_exit_first_why = ec_stop_why;
-                }
-                xt_gevent(XT_EV_THREAD_TERM, f.tid,
-                          8 | (uint64_t)(uint32_t)st << 32);
+                ec_freeze_failed(f.tid, st, ec_stop_why);
                 NtClose(f.h);
                 continue;
             }
@@ -1320,9 +1340,12 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
             EcFrozen *f = &g_array_index(frozen, EcFrozen, i);
             ULONG prev = 1;
             EcRead r;
-            NTSTATUS st;
 
-            if (NtSuspendThread(f->h, &prev) < 0) {
+            st = NtSuspendThread(f->h, &prev);
+            if (st < 0) {
+                if (!ec_thread_ending(f->h)) {
+                    ec_freeze_failed(f->tid, st, 0x80);
+                }
                 continue;
             }
             NtResumeThread(f->h, NULL);
@@ -1333,7 +1356,7 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
             ec_exit_refrozen++;
             st = ec_stop_for_term(f->h, 0, &r.addr, &r.len);
             if (st < 0 && st != STATUS_THREAD_IS_TERMINATING) {
-                ec_exit_outcome |= EC_EXIT_STOP;
+                ec_freeze_failed(f->tid, st, ec_stop_why);
             } else if (r.len) {
                 g_array_append_val(reads, r);
             }
