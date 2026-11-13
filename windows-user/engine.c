@@ -62,6 +62,9 @@ static __thread int mmap_lock_count;
 void mmap_lock(void)
 {
     if (mmap_lock_count++ == 0) {
+        if (unlikely(xt_lock_check)) {
+            xt_lock_checked(__builtin_return_address(0));
+        }
         qemu_mutex_lock(&mmap_mutex);
     }
 }
@@ -730,6 +733,10 @@ static void set_settings(Object *accel, const char *settings)
                 /* A failure of the process's end is fatal (arm64ec.c). */
                 xt_exit_strict = true;
                 applied++;
+            } else if (!strcmp(kv[i], "lockcheck")) {
+                /* Where the mmap lock is taken (xt_lock_checked). */
+                xt_lock_check = true;
+                applied++;
             } else if (!strcmp(kv[i], "exitreport")) {
                 /* The process's end's outcome, at the last call. */
                 xt_exit_report = true;
@@ -862,7 +869,7 @@ bool xt_fault_context_partial;
 bool xt_native_harness;
 bool xt_diag;
 bool xt_rcu_stress;
-bool xt_exit_strict, xt_exit_report;
+bool xt_exit_strict, xt_exit_report, xt_lock_check;
 int xt_rcu_inj_step;
 
 /*
