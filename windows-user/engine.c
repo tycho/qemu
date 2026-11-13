@@ -737,6 +737,10 @@ static void set_settings(Object *accel, const char *settings)
                 /* Where the mmap lock is taken (xt_lock_checked). */
                 xt_lock_check = true;
                 applied++;
+            } else if (!strcmp(kv[i], "gatecheck")) {
+                /* Testing: the gates' counts (arm64ec-gate.c). */
+                xt_gate_check = true;
+                applied++;
             } else if (!strcmp(kv[i], "exitreport")) {
                 /* The process's end's outcome, at the last call. */
                 xt_exit_report = true;
@@ -869,7 +873,7 @@ bool xt_fault_context_partial;
 bool xt_native_harness;
 bool xt_diag;
 bool xt_rcu_stress;
-bool xt_exit_strict, xt_exit_report, xt_lock_check;
+bool xt_exit_strict, xt_exit_report, xt_lock_check, xt_gate_check;
 int xt_rcu_inj_step;
 
 /*

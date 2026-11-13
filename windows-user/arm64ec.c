@@ -1463,10 +1463,13 @@ static void ec_exit_line(char *line, size_t size)
                      ec_slow_stop);
 
     if (xt_lock_check && n > 0 && (size_t)n < size) {
-        snprintf(line + n, size - n, "lockcheck: %u acquisitions outside "
-                 "protection, the first from %p (module %p)\n",
-                 qatomic_read(&lock_misses), qatomic_read(&lock_miss_caller),
-                 &__ImageBase);
+        n += snprintf(line + n, size - n, "lockcheck: %u acquisitions "
+                      "outside protection, the first from %p (module %p)\n",
+                      qatomic_read(&lock_misses),
+                      qatomic_read(&lock_miss_caller), &__ImageBase);
+    }
+    if (xt_gate_check && n > 0 && (size_t)n < size) {
+        xt_gate_report(line + n, size - n);
     }
 }
 
@@ -1477,7 +1480,7 @@ static void ec_exit_begin(void)
     DWORD owner = qatomic_cmpxchg(&ec_exit_owner, 0, me);
     GArray *frozen, *reads;
     int64_t t0 = get_clock();
-    char line[640];
+    char line[1024];
     bool began;
 
     if (owner == me) {
@@ -1565,7 +1568,7 @@ static void ec_process_term(HANDLE h, BOOL after, NTSTATUS status)
     if (h && !after && xt_exit_report &&
         (qatomic_load_acquire(&ec_exit_outcome) & EC_EXIT_DONE) &&
         qatomic_read(&ec_exit_owner) == GetCurrentThreadId()) {
-        char line[640];
+        char line[1024];
 
         ec_exit_line(line, sizeof(line));
         fputs(line, stderr);
