@@ -93,30 +93,120 @@ void WINAPI WakeAllConditionVariable(PCONDITION_VARIABLE c)
     RtlWakeAllConditionVariable(c);
 }
 
+/*
+ * Address waits (QEMU's futexes), the module's own: a waiter lists itself
+ * in one of a fixed set of buckets, under that bucket's lock, and sleeps on
+ * its thread's alert (NtWaitForAlertByThreadId); a waker takes it off the
+ * list and alerts it.  ntdll's WaitOnAddress keeps its buckets in the PEB,
+ * shared with every thread of the process, and a wake there can be left to
+ * whichever thread is working on the same bucket: a thread stopped there
+ * (the process's end stops every thread but the module's) would hold up
+ * the module's own wakes.  Here a bucket is only ever the module's.  As
+ * with any futex, a wait may return early: callers check the value again.
+ */
+NTSTATUS NTAPI NtWaitForAlertByThreadId(PVOID, PLARGE_INTEGER);
+NTSTATUS NTAPI NtAlertThreadByThreadId(HANDLE);
+
+typedef struct XtAddrWaiter {
+    const void *addr;
+    HANDLE tid;
+    struct XtAddrWaiter *next;
+    bool woken;
+} XtAddrWaiter;
+
+#define XT_ADDR_BUCKETS 64
+
+static struct {
+    SRWLOCK lock;
+    XtAddrWaiter *head;
+} addr_buckets[XT_ADDR_BUCKETS];
+
+static unsigned addr_bucket(const void *addr)
+{
+    uintptr_t a = (uintptr_t)addr;
+
+    return (a ^ (a >> 6) ^ (a >> 12)) % XT_ADDR_BUCKETS;
+}
+
 /* addr is volatile in the Win32 interface. */
 WINBOOL WINAPI WaitOnAddress(volatile void *addr, PVOID cmp, SIZE_T size,
                              DWORD ms)
 {
+    unsigned b = addr_bucket((const void *)addr);
+    XtAddrWaiter w = {
+        .addr = (const void *)addr,
+        .tid = (HANDLE)(uintptr_t)GetCurrentThreadId(),
+    };
     LARGE_INTEGER t;
-    NTSTATUS st = RtlWaitOnAddress((const void *)addr, cmp, size,
-                                   nt_timeout(&t, ms));
+    NTSTATUS st;
+    bool woken;
 
-    if (st != STATUS_SUCCESS) {
-        SetLastError(st == STATUS_TIMEOUT ? ERROR_TIMEOUT
-                                          : ERROR_INVALID_PARAMETER);
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    RtlAcquireSRWLockExclusive(&addr_buckets[b].lock);
+    if (memcmp((const void *)addr, cmp, size)) {
+        RtlReleaseSRWLockExclusive(&addr_buckets[b].lock);
+        return TRUE;
+    }
+    w.next = addr_buckets[b].head;
+    addr_buckets[b].head = &w;
+    RtlReleaseSRWLockExclusive(&addr_buckets[b].lock);
+
+    st = NtWaitForAlertByThreadId((PVOID)addr, nt_timeout(&t, ms));
+
+    RtlAcquireSRWLockExclusive(&addr_buckets[b].lock);
+    woken = w.woken;
+    if (!woken) {
+        XtAddrWaiter **p = &addr_buckets[b].head;
+
+        while (*p != &w) {
+            p = &(*p)->next;
+        }
+        *p = w.next;
+    }
+    RtlReleaseSRWLockExclusive(&addr_buckets[b].lock);
+    if (!woken && st == STATUS_TIMEOUT) {
+        SetLastError(ERROR_TIMEOUT);
         return FALSE;
     }
     return TRUE;
 }
 
+static void wake_by_address(PVOID addr, bool all)
+{
+    unsigned b = addr_bucket(addr);
+    XtAddrWaiter **p;
+
+    RtlAcquireSRWLockExclusive(&addr_buckets[b].lock);
+    p = &addr_buckets[b].head;
+    while (*p) {
+        XtAddrWaiter *w = *p;
+
+        if (w->addr != addr) {
+            p = &w->next;
+            continue;
+        }
+        *p = w->next;
+        /* Its frame stays until it takes the bucket's lock again. */
+        w->woken = true;
+        NtAlertThreadByThreadId(w->tid);
+        if (!all) {
+            break;
+        }
+    }
+    RtlReleaseSRWLockExclusive(&addr_buckets[b].lock);
+}
+
 void WINAPI WakeByAddressSingle(PVOID addr)
 {
-    RtlWakeAddressSingle(addr);
+    wake_by_address(addr, false);
 }
 
 void WINAPI WakeByAddressAll(PVOID addr)
 {
-    RtlWakeAddressAll(addr);
+    wake_by_address(addr, true);
 }
 
 /*
