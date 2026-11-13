@@ -260,6 +260,7 @@ extern XtGate *xt_gate_closed_by;
 
 uint32_t xt_adm_enter(XtGate *g);
 int xt_adm_enter_claim(XtGate *g, uint32_t kind, uint64_t addr, uint64_t len);
+G_NORETURN void xt_adm_park_terminal(XtGate *g);
 void xt_root_push(XtGate *g, uint32_t kind, uint64_t addr, uint64_t len);
 void xt_root_release(XtGate *g, int i);
 void xt_adm_exit(XtGate *g);
@@ -271,6 +272,7 @@ NTSTATUS xt_ec_alloc_direct(void **base, SIZE_T *size, ULONG type,
                             ULONG prot);
 bool xt_gate_init_process(void);
 void xt_gate_report(char *line, size_t size);
+extern uint32_t xt_gate_read_open;
 bool xt_gate_register_initial(void);
 XtGate *xt_gate_self_slow(void);
 bool xt_gate_identity(HANDLE h, uint32_t *tid, uint64_t *create_time);

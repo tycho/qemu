@@ -103,6 +103,10 @@ void xt_internal_park(void)
     LARGE_INTEGER forever = { .QuadPart = INT64_MIN };
     XtInternal *slot = internal_mine();
 
+#ifdef TARGET_X86_64
+    /* No longer exempt from a closed gate: parked, it enters nothing. */
+    xt_gate_end_internal();
+#endif
     if (slot) {
         qatomic_store_release(&slot->state, XT_INTERNAL_PARKED);
     }
@@ -130,6 +134,10 @@ static NTSTATUS NTAPI thread_start(void *p)
     if (xt_internal_stopping()) {
         xt_internal_park();
     }
+#ifdef TARGET_X86_64
+    /* Leaving the registry, it leaves the exemption first. */
+    xt_gate_end_internal();
+#endif
     qatomic_set(&s.slot->tid, 0);
     if (s.slot->h) {
         NtClose(s.slot->h);

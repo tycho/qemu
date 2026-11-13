@@ -280,6 +280,15 @@ void xt_gate_install_internal(void)
 }
 
 /*
+ * An internal thread's exemption ended, as it parks for good or leaves the
+ * registry: a later entry of its meets a closed gate like any other.
+ */
+void xt_gate_end_internal(void)
+{
+    qatomic_store_release(&xt_gate_self()->internal, 0);
+}
+
+/*
  * The gate of the thread behind H (which another thread holds), from the
  * registry; with CREATE_CLOSED, one is made and registered closed if it
  * has none yet, which the thread adopts at its first call (or the one it
@@ -573,6 +582,32 @@ int xt_adm_enter_claim(XtGate *g, uint32_t kind, uint64_t addr, uint64_t len)
 
     adm_enter(g, kind, addr, len, &claimed);
     return claimed;
+}
+
+/*
+ * The calling thread parks for good where it is, in one transition: if
+ * its current level (one committed level) is all it has, that level goes
+ * and the word is parked; if anything else is outstanding (an outer level
+ * it would hold while parked), the word is poisoned with its levels kept,
+ * so that it is never taken as idle holding that (the second thread ending
+ * the process).
+ */
+G_NORETURN void xt_adm_park_terminal(XtGate *g)
+{
+    uint64_t w, n;
+
+    do {
+        w = qatomic_read(&g->adm);
+        if (XT_ADM_COUNT(w) == 1 && XT_ADM_UNC(w) == 0) {
+            n = (w - ADM_ONE_COUNT) | XT_ADM_PARKED;
+            if (!adm_next(w, &n)) {
+                n = w | XT_ADM_POISONED;
+            }
+        } else {
+            n = w | XT_ADM_POISONED;
+        }
+    } while (!adm_cas(g, w, n));
+    xt_adm_park(g);
 }
 
 /*

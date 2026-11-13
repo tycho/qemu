@@ -330,6 +330,7 @@ void *xt_alloc_direct(size_t len);
 #ifdef TARGET_X86_64
 /* An internal thread's gate (arm64ec-gate.c), first thing in its start. */
 void xt_gate_install_internal(void);
+void xt_gate_end_internal(void);
 #endif
 size_t xt_emutls_roots(void);
 
