@@ -629,11 +629,45 @@ NTSTATUS NTAPI NtDuplicateObject(HANDLE, HANDLE, HANDLE, PHANDLE,
 static void ec_unregister(XtThread *t);
 
 /*
- * Another thread out of the engine for Windows to end, through H: it is
- * suspended and its context read, which waits for it to answer the
- * doorbell or to leave an adapter scope (InSyscallCallback), as FEX's
- * module does.  0 with it suspended there; else the status of the step
- * that failed, the suspension undone.
+ * Whether a thread stopped by ec_stop_for_term (suspended, its control
+ * context in C) is where Windows' wait meant to leave it: outside
+ * simulation and any adapter scope, off its emulator stack.  Windows gives
+ * up waiting after about 10 s and reports success all the same, with the
+ * thread still inside its scope, so the context read alone proves nothing.
+ * The thread's own CPU area does: it is read with NtReadVirtualMemory,
+ * since the thread may have ended meanwhile, and a read that fails fails
+ * the check.  A thread with no CPU area yet hasn't run, and holds nothing.
+ */
+static bool ec_stopped_consistent(HANDLE h, const CONTEXT *c)
+{
+    XtThreadBasicInfo tbi;
+    XtCpuArea *ap, area;
+
+    if (NtQueryInformationThread(h, 0, &tbi, sizeof(tbi), NULL) < 0 ||
+        NtReadVirtualMemory(GetCurrentProcess(),
+                            (char *)tbi.TebBaseAddress + XT_TEB_CPU_AREA,
+                            &ap, sizeof(ap), NULL) < 0) {
+        return false;
+    }
+    if (!ap) {
+        return true;
+    }
+    if (NtReadVirtualMemory(GetCurrentProcess(), ap, &area, sizeof(area),
+                            NULL) < 0) {
+        return false;
+    }
+    return !area.InSimulation && !area.InSyscallCallback &&
+           !(c->Rsp >= area.EmulatorStackLimit &&
+             c->Rsp < area.EmulatorStackBase);
+}
+
+/*
+ * Another thread out of the engine, through H: it is suspended and its
+ * context read, which waits for it to answer the doorbell or to leave an
+ * adapter scope (InSyscallCallback), as FEX's module does, and then its
+ * own state is checked (ec_stopped_consistent).  0 with it suspended
+ * there, holding nothing of the engine's; else the status of the step
+ * that failed (STATUS_UNSUCCESSFUL for the check), the suspension undone.
  */
 static NTSTATUS ec_stop_for_term(HANDLE h)
 {
@@ -645,6 +679,9 @@ static NTSTATUS ec_stop_for_term(HANDLE h)
         return st;
     }
     st = NtGetContextThread(h, &c);
+    if (st >= 0 && !ec_stopped_consistent(h, &c)) {
+        st = STATUS_UNSUCCESSFUL;
+    }
     if (st < 0) {
         NtResumeThread(h, NULL);
     }
