@@ -1843,6 +1843,8 @@ static bool note_ready(void)
  * - the doorbell found set at an exit to native code (arm64ec.S): the
  *   exit stub is consistent there, so continuing it completes the
  *   suspension;
+ * - a read by the translation cache's guarded routines, whatever the
+ *   thread's state (xt_cache_guard_fault);
  * - a fault the engine recovers (xt_fault_redirect: generated code,
  *   helpers, translation), while it owns the thread;
  * - otherwise, native code's store into a page QEMU write-protected for
@@ -1911,6 +1913,13 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
             guest->Rip--;
         }
         t->int3_rip = 0;
+    }
+    /*
+     * A read by one of the translation cache's guarded routines: theirs
+     * to contain in whatever state the thread is, not only the engine's.
+     */
+    if (xt_cache_guard_fault(er, native)) {
+        ec_continue_level(g, native);
     }
     /*
      * Generated code's return stack push or pop ran into its ring's guard
