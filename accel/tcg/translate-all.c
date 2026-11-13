@@ -405,83 +405,11 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
 #define TB_CACHE_CFLAGS  (CF_PARALLEL | CF_CLUSTER_MASK | CF_COUNT_MASK)
 
 /*
- * The guarded routines (tcg-cache.h).  The source loads are at the
- * tcg_cache_gload* labels; nothing else in them may fault on the
- * caller's behalf, and they keep LR, SP and the callee-saved registers,
- * so that a handler can return to LR.  Results: 0 copied or equal, 1
- * different.
+ * The guarded routines (tcg-cache.h): in tcg-cache-guard.S on aarch64
+ * hosts, an ARM64EC build's included, with their loads listed in
+ * tcg_cache_gloads.
  */
-#if defined(__aarch64__) && (defined(__linux__) || defined(_WIN32))
-asm("   .text\n"
-    "   .balign 16\n"
-    "   .globl tcg_cache_gcopy\n"
-    "tcg_cache_gcopy:\n"
-    "   cmp     x2, #8\n"
-    "   b.lo    2f\n"
-    "1:\n"
-    "   .globl tcg_cache_gload0\n"
-    "tcg_cache_gload0:\n"
-    "   ldr     x3, [x1], #8\n"
-    "   str     x3, [x0], #8\n"
-    "   sub     x2, x2, #8\n"
-    "   cmp     x2, #8\n"
-    "   b.hs    1b\n"
-    "2:\n"
-    "   cbz     x2, 4f\n"
-    "3:\n"
-    "   .globl tcg_cache_gload1\n"
-    "tcg_cache_gload1:\n"
-    "   ldrb    w3, [x1], #1\n"
-    "   strb    w3, [x0], #1\n"
-    "   subs    x2, x2, #1\n"
-    "   b.ne    3b\n"
-    "4:\n"
-    "   mov     x0, #0\n"
-    "   ret\n"
-    "   .balign 16\n"
-    "   .globl tcg_cache_gcmp\n"
-    "tcg_cache_gcmp:\n"
-    "   cmp     x2, #8\n"
-    "   b.lo    2f\n"
-    "1:\n"
-    "   .globl tcg_cache_gload2\n"
-    "tcg_cache_gload2:\n"
-    "   ldr     x3, [x0], #8\n"
-    "   .globl tcg_cache_gload3\n"
-    "tcg_cache_gload3:\n"
-    "   ldr     x4, [x1], #8\n"
-    "   cmp     x3, x4\n"
-    "   b.ne    5f\n"
-    "   sub     x2, x2, #8\n"
-    "   cmp     x2, #8\n"
-    "   b.hs    1b\n"
-    "2:\n"
-    "   cbz     x2, 4f\n"
-    "3:\n"
-    "   .globl tcg_cache_gload4\n"
-    "tcg_cache_gload4:\n"
-    "   ldrb    w3, [x0], #1\n"
-    "   .globl tcg_cache_gload5\n"
-    "tcg_cache_gload5:\n"
-    "   ldrb    w4, [x1], #1\n"
-    "   cmp     w3, w4\n"
-    "   b.ne    5f\n"
-    "   subs    x2, x2, #1\n"
-    "   b.ne    3b\n"
-    "4:\n"
-    "   mov     x0, #0\n"
-    "   ret\n"
-    "5:\n"
-    "   mov     x0, #1\n"
-    "   ret\n"
-    "   .data\n"
-    "   .balign 8\n"
-    "   .globl tcg_cache_gloads\n"
-    "tcg_cache_gloads:\n"
-    "   .quad   tcg_cache_gload0, tcg_cache_gload1, tcg_cache_gload2\n"
-    "   .quad   tcg_cache_gload3, tcg_cache_gload4, tcg_cache_gload5\n"
-    "   .text\n");
-
+#if defined(HOST_AARCH64) && (defined(CONFIG_LINUX) || defined(CONFIG_WIN32))
 bool tcg_cache_guard_pc(uintptr_t pc)
 {
     for (int i = 0; i < TCG_CACHE_GLOADS; i++) {
@@ -575,7 +503,7 @@ int tcg_cache_selftest(uint8_t *p, size_t page)
                   t, r);
 #undef FAULTED
     }
-#if defined(__aarch64__) && (defined(__linux__) || defined(_WIN32))
+#if defined(HOST_AARCH64) && (defined(CONFIG_LINUX) || defined(CONFIG_WIN32))
     /* Only the loads are recognised. */
     SELFCHECK(!tcg_cache_guard_pc((uintptr_t)tcg_cache_gcopy) &&
               !tcg_cache_guard_pc((uintptr_t)tcg_cache_gcmp) &&
