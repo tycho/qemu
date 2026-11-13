@@ -107,10 +107,8 @@ void xt_check_call(void);
  * and where the registers went), the native registers of an entry that
  * had no CPU state to store them into, and that CPU state, ENV: NULL
  * until the thread's record exists (enter_engine), and again from when
- * the record is taken (ThreadTerm), so that when it is set it is
- * EmulatorData[0]'s.  And the memory operation the thread is between the
- * two halves of the notifications of (OP, XT_MEMOP_*), which a stop
- * (ec_stop_for_term) reads: for any thread, not only the engine's.
+ * the record is taken (its own end, or the reaper's after another thread
+ * ended it), so that when it is set it is EmulatorData[0]'s.
  */
 typedef struct XtEcFrame {
     ULONG doorbell;
@@ -121,14 +119,12 @@ typedef struct XtEcFrame {
     CPUArchState *env;
     uint32_t inj_armed;         /* XTAJIT_INJECT=sN: suspended before */
     ARM64_NT_CONTEXT ctx;
-    uint32_t op;                /* XT_MEMOP_*, set last, cleared first */
-    uint64_t op_addr, op_len;
 } XtEcFrame;
 
 /*
- * XtEcFrame.op: the system call between a notification's halves.  The
- * first four never block, and a stop waits for them to finish; a read
- * may block for good, and a stop takes its range as written instead.
+ * The operation a notification's two halves surround (XtGateRoot.kind).
+ * The first four never block; a read may block for good, and whoever
+ * certifies the thread meanwhile takes its range over.
  */
 #define XT_MEMOP_NONE       0
 #define XT_MEMOP_ALLOC      1
@@ -272,6 +268,10 @@ NTSTATUS xt_ec_alloc_direct(void **base, SIZE_T *size, ULONG type,
                             ULONG prot);
 bool xt_gate_init_process(void);
 void xt_gate_report(char *line, size_t size);
+void xt_gate_quarantine(XtGate *g);
+XtGate *xt_gate_retire_next(uint32_t *cursor, bool *quarantined);
+void xt_gate_mark_retired(XtGate *g);
+void xt_gate_retire_abort(XtGate *g);
 extern uint32_t xt_gate_read_open;
 bool xt_gate_register_initial(void);
 XtGate *xt_gate_self_slow(void);
