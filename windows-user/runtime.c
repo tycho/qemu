@@ -116,6 +116,10 @@ static NTSTATUS NTAPI thread_start(void *p)
     ThreadStart s = *(ThreadStart *)p;
     unsigned code;
 
+#ifdef TARGET_X86_64
+    /* Its gate before anything that could call back into the module. */
+    xt_gate_install_internal();
+#endif
     xt_tls_attach();
     xt_internal_self = true;
     xt_crt_thread_init();
