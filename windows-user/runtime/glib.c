@@ -1639,7 +1639,8 @@ void g_usleep(gulong us)
     LARGE_INTEGER t;
 
     t.QuadPart = -(LONGLONG)us * 10;
-    NtDelayExecution(FALSE, &t);
+    /* Alertable: the process's end wakes internal threads to park them. */
+    NtDelayExecution(TRUE, &t);
 }
 
 struct _GRand {

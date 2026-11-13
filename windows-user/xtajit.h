@@ -284,6 +284,33 @@ bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed);
 bool xt_mem_stale_write(vaddr addr);
 void xt_invalidate(vaddr start, vaddr len);
 
+/*
+ * The engine's internal threads (runtime.c), registered: their slots, in
+ * XT_INTERNAL_* states; a stop request for all of them, which each meets
+ * by parking for good where it holds nothing (xt_internal_park); and the
+ * calling thread's mark.
+ */
+typedef struct XtInternal {
+    uint32_t state;
+    DWORD tid;
+    HANDLE h;                   /* the registry's own, to alert it */
+} XtInternal;
+
+enum {
+    XT_INTERNAL_FREE,
+    XT_INTERNAL_CREATING,       /* claimed, being created: to wait for */
+    XT_INTERNAL_STARTING,       /* created, its routine not yet running */
+    XT_INTERNAL_RUNNING,
+    XT_INTERNAL_PARKED,
+};
+
+const XtInternal *xt_internal_threads(int *n);
+void xt_internal_stop(void);
+void xt_internal_alert(void);
+bool xt_internal_stopping(void);
+G_NORETURN void xt_internal_park(void);
+extern __thread bool xt_internal_self;
+
 /* thread.c */
 void *xt_alloc_high(size_t len);
 bool xt_tls_ready(void);
