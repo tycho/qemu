@@ -65,8 +65,6 @@ QEMU_BUILD_BUG_ON(offsetof(CPUX86State, xmm_regs) != 0x3d0);
 QEMU_BUILD_BUG_ON(sizeof(ZMMReg) != 64);
 
 NTSTATUS NTAPI NtContinue(PCONTEXT, BOOLEAN);
-NTSTATUS NTAPI NtTerminateThread(HANDLE, NTSTATUS);
-PVOID NTAPI RtlAddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
 PVOID NTAPI RtlImageDirectoryEntryToData(PVOID, BOOLEAN, USHORT, PULONG);
 NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
                                            SIZE_T, PSIZE_T);
@@ -544,6 +542,7 @@ static int process_init(void)
 }
 
 static int engine_state;    /* 0 none, 1 starting, 2 ready, -1 failed */
+static void ec_tp_publish(void);
 
 /*
  * The engine, once per process, and the calling thread's record, once
@@ -560,6 +559,7 @@ static XtThread *enter_engine(void)
 
     if (qatomic_read(&engine_state) != 2) {
         if (qatomic_cmpxchg(&engine_state, 0, 1) == 0) {
+            XT_TP(XT_TP_ENGINE_STARTING, xt_gate_self(), 1);
             qatomic_store_release(&engine_state,
                                   process_init() < 0 ? -1 : 2);
         }
@@ -604,6 +604,7 @@ static NTSTATUS ec_process_init(void)
     if (!xt_gate_init_process() || !xt_gate_register_initial()) {
         return STATUS_NO_MEMORY;
     }
+    ec_tp_publish();
     xt_emutls_init();
 {
         void *p = NULL;
@@ -703,6 +704,7 @@ static uint32_t ec_unsafe_terms;
 static void ec_unsafe_term(DWORD tid, NTSTATUS st)
 {
     qatomic_inc(&ec_unsafe_terms);
+    XT_TP_NOTE(XT_TPN_UNSAFE, tid, (uint32_t)st, 0);
     xt_gevent(XT_EV_THREAD_TERM, tid, 4 | (uint64_t)(uint32_t)st << 32);
 }
 
@@ -720,6 +722,9 @@ static HANDLE ec_open_thread(HANDLE thread, bool *found_not)
     HANDLE h = NULL, next;
 
     *found_not = false;
+    if (XT_TP_FAIL(XT_TPF_OPEN)) {
+        return NULL;
+    }
     for (;;) {
         NTSTATUS st = NtGetNextThread(GetCurrentProcess(), h, want, 0, 0,
                                       &next);
@@ -912,6 +917,7 @@ static EcCert ec_certify(XtGate *g, GArray *reads)
         for (int i = 0; i < XT_GATE_ROOTS; i++) {
             state[i] = qatomic_load_acquire(&g->roots[i].state);
         }
+        XT_TP(XT_TP_FREEZE_CERT, g, tries);
         w2 = qatomic_load_acquire(&g->adm);
         if (w1 != w2) {
             continue;
@@ -931,6 +937,7 @@ static EcCert ec_certify(XtGate *g, GArray *reads)
             if (state[i] == XT_ROOT_PENDING && r->kind == XT_MEMOP_READ &&
                 qatomic_cmpxchg(&r->state, XT_ROOT_PENDING,
                                 XT_ROOT_TAKEN) == XT_ROOT_PENDING) {
+                XT_TP(XT_TP_ROOT_TAKEN, g, i);
                 if (reads) {
                     EcRead rd = { r->addr, r->len };
 
@@ -1027,7 +1034,8 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
                 }
                 continue;
             }
-            if (NtSuspendThread(f.h, NULL) < 0) {
+            if (XT_TP_FAIL(XT_TPF_SUSPEND_FREEZE) ||
+                NtSuspendThread(f.h, NULL) < 0) {
                 f.suspended = false;
             } else {
                 f.suspended = true;
@@ -1153,6 +1161,8 @@ static void ec_reap_gates(void)
         XtThread *t;
         XtEcFrame *f;
 
+        XT_TP(XT_TP_REAP_PASS, g, quarantined);
+
         /*
          * Read after this gate's thread was seen ended: a terminator that
          * couldn't find its target's gate set the hold before Windows ended
@@ -1165,9 +1175,11 @@ static void ec_reap_gates(void)
 
         /* The handles the reaper waits on, before anything is taken. */
         if (!quarantined &&
-            (NtDuplicateObject(GetCurrentProcess(), g->thread,
+            (XT_TP_FAIL(XT_TPF_DUP_REAP1) ||
+             NtDuplicateObject(GetCurrentProcess(), g->thread,
                                GetCurrentProcess(), &hr, 0, 0,
                                DUPLICATE_SAME_ACCESS) < 0 ||
+             XT_TP_FAIL(XT_TPF_DUP_REAP2) ||
              NtDuplicateObject(GetCurrentProcess(), g->thread,
                                GetCurrentProcess(), &hf, 0, 0,
                                DUPLICATE_SAME_ACCESS) < 0)) {
@@ -1182,6 +1194,8 @@ static void ec_reap_gates(void)
 
             if (qatomic_load_acquire(&r->state) == XT_ROOT_TAKEN) {
                 xt_invalidate(r->addr, r->len);
+                XT_TP_NOTE(XT_TPN_INVALIDATE, r->addr, r->len, (uintptr_t)g);
+                XT_TP(XT_TP_RETIRE_INVALIDATED, g, i);
                 qatomic_store_release(&r->state, XT_ROOT_FREE);
             }
         }
@@ -1224,6 +1238,7 @@ static void ec_term_self(XtGate *g)
 
     began = xt_adapter_begin();
     if (!area || !qatomic_read(&area->EmulatorData[0]) ||
+        XT_TP_FAIL(XT_TPF_DUP_SELF) ||
         NtDuplicateObject(GetCurrentProcess(), GetCurrentThread(),
                           GetCurrentProcess(), &stack_ref, 0, 0,
                           DUPLICATE_SAME_ACCESS) < 0) {
@@ -1254,6 +1269,7 @@ out:
 static void ec_unsafe_term_quiet(void)
 {
     qatomic_inc(&ec_unsafe_terms);
+    XT_TP_NOTE(XT_TPN_UNSAFE, 0, 0, 1);
 }
 
 /*
@@ -1287,22 +1303,26 @@ static void ec_term_other(HANDLE own, DWORD tid, XtGate *me, uint32_t level,
     if (!g) {
         if (st < 0 && !ec_thread_ending(own)) {
             qatomic_store_release(&ec_reap_held, true);
+            XT_TP_NOTE(XT_TPN_REAP_HELD, tid, 0, 0);
             ec_unsafe_term(tid, st);
         }
         return;
     }
+    XT_TP(XT_TP_TERM_CLOSED, g, tid);
     if (qatomic_read(&g->internal) || ec_is_internal(tid)) {
         /* Its creator registers it before it runs: startup included. */
         xt_gate_quarantine(g);
         ec_unsafe_term(tid, STATUS_UNSUCCESSFUL);
         return;
     }
-    if (ec_flush_write_buffers() < 0) {
+    if (XT_TP_FAIL(XT_TPF_FLUSH_TERM) || ec_flush_write_buffers() < 0) {
         xt_gate_quarantine(g);
         ec_unsafe_term(tid, STATUS_UNSUCCESSFUL);
         return;
     }
-    suspended = NtSuspendThread(own, NULL) >= 0;
+    suspended = !XT_TP_FAIL(XT_TPF_SUSPEND_TERM) &&
+                NtSuspendThread(own, NULL) >= 0;
+    XT_TP(XT_TP_TERM_SUSPENDED, g, suspended);
     if (qatomic_load_acquire(&engine_state) == 2) {
         ec_ring_doorbells();
     }
@@ -1313,6 +1333,7 @@ static void ec_term_other(HANDLE own, DWORD tid, XtGate *me, uint32_t level,
     until = get_clock() + (int64_t)EC_STOP_ACTIVE_MS * SCALE_MS;
     for (;;) {
         c = ec_thread_ending(own) ? EC_CERT_ENDING : ec_certify(g, NULL);
+        XT_TP(XT_TP_TERM_CERT, g, c);
         if (c != EC_CERT_ACTIVE || get_clock() > until) {
             break;
         }
@@ -1377,10 +1398,12 @@ static NTSTATUS ec_thread_term(HANDLE thread, LONG code, XtGate *me,
     void *teb = NULL;
     DWORD tid = 0;
 
+    XT_TP_NOTE(XT_TPN_THREAD_TERM, (uintptr_t)thread, level, 0);
     if (thread && thread != GetCurrentThread() &&
         (NtQueryObject(thread, ObjectBasicInformation, &obi, sizeof(obi),
                        NULL) < 0 ||
-         !(obi.GrantedAccess & THREAD_TERMINATE))) {
+         !(obi.GrantedAccess & THREAD_TERMINATE)) &&
+        !XT_TP_FAIL(XT_TPF_TERMACCESS)) {
         return STATUS_SUCCESS;
     }
     if (!thread || thread == GetCurrentThread() ||
@@ -1396,6 +1419,7 @@ static NTSTATUS ec_thread_term(HANDLE thread, LONG code, XtGate *me,
         if (!own) {
             if (!not_ours) {
                 qatomic_store_release(&ec_reap_held, true);
+                XT_TP_NOTE(XT_TPN_REAP_HELD, 0, 0, 0);
                 ec_unsafe_term(0, STATUS_UNSUCCESSFUL);
             }
             return STATUS_SUCCESS;
@@ -1412,6 +1436,7 @@ static NTSTATUS ec_thread_term(HANDLE thread, LONG code, XtGate *me,
     return STATUS_SUCCESS;
 
 self:
+    XT_TP(XT_TP_TERM_SELF, me, level);
     /* The live word, not the level returned: a leak may sit above it. */
     if (nested || qatomic_read(&me->internal) || !xt_adm_alone(me)) {
         xt_gate_quarantine(me);
@@ -1523,6 +1548,18 @@ static void ec_exit_line(char *line, size_t size)
     }
 }
 
+/* Testing: where the counts are, for the test points' controller. */
+static void ec_tp_publish(void)
+{
+    xt_gate_tp_publish();
+    xt_record_tp_publish();
+    xt_tp_publish(XT_TPA_UNSAFE, &ec_unsafe_terms);
+    xt_tp_publish(XT_TPA_REAP_HELD, &ec_reap_held);
+    xt_tp_publish(XT_TPA_CERTS, ec_certs);
+    xt_tp_publish(XT_TPA_EXIT_OUTCOME, &ec_exit_outcome);
+    xt_tp_publish(XT_TPA_ENGINE_STATE, &engine_state);
+}
+
 static void ec_exit_begin(void)
 {
     DWORD me = GetCurrentThreadId();
@@ -1550,7 +1587,8 @@ static void ec_exit_begin(void)
      * then every processor's writes flushed: from here a thread's entry
      * either sees the gate closed, or its level is visible to ec_freeze.
      */
-    if (ec_flush_write_buffers() < 0) {
+    XT_TP(XT_TP_EXIT_ELECTED, g, 0);
+    if (XT_TP_FAIL(XT_TPF_FLUSH_PROCESS) || ec_flush_write_buffers() < 0) {
         ec_exit_outcome |= EC_EXIT_FLUSH;
     }
     began = xt_adapter_begin();
@@ -1577,6 +1615,7 @@ static void ec_exit_begin(void)
      * may have left one above it): after a failure none of it runs (a
      * failed thread may hold what it needs).
      */
+    XT_TP(XT_TP_EXIT_SELF, g, 0);
     if (!xt_adm_alone(g)) {
         ec_exit_outcome |= EC_EXIT_SELF;
     }
@@ -1586,6 +1625,7 @@ static void ec_exit_begin(void)
             EcRead *r = &g_array_index(reads, EcRead, i);
 
             xt_invalidate(r->addr, r->len);
+            XT_TP_NOTE(XT_TPN_INVALIDATE, r->addr, r->len, 0);
         }
         /* A flush's notification may be what a stopped thread missed. */
         ec_exit_flush();
@@ -1598,6 +1638,8 @@ static void ec_exit_begin(void)
         }
     }
     ec_exit_ns = get_clock() - t0;
+    XT_TP_NOTE(XT_TPN_EXIT, ec_exit_outcome, ec_exit_frozen,
+               qatomic_read(&ec_unsafe_terms));
     ec_exit_line(line, sizeof(line));
     xt_log_text(line);
     qatomic_store_release(&ec_exit_outcome, ec_exit_outcome | EC_EXIT_DONE);
@@ -1678,7 +1720,9 @@ static G_NORETURN void ec_continue_level(XtGate *g, ARM64_NT_CONTEXT *native)
     if (g) {
         xt_adm_exit(g);
     }
-    xt_continue_native(native);
+    if (!XT_TP_FAIL(XT_TPF_CONTINUE)) {
+        xt_continue_native(native);
+    }
     NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
     __builtin_unreachable();
 }
@@ -1687,6 +1731,7 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
                                          ARM64_NT_CONTEXT *native)
 {
     XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+    uint32_t level;
     XtThread *t;
     XtGate *g;
 
@@ -1708,7 +1753,14 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
         ec_continue_level(NULL, native);
     }
     g = xt_gate_self();
-    xt_adm_enter(g);
+    level = xt_adm_enter(g);
+    /* Testing: the test points' fault action, a nested entry, continued. */
+    if (unlikely(xt_tp_block) && native->Pc == (uintptr_t)xt_tp_fault_pc) {
+        XT_TP_NOTE(XT_TPN_FAULT, 1, level, qatomic_read(&g->adm));
+        XT_TP(XT_TP_FAULT_NESTED, g, level);
+        native->Pc += 4;
+        ec_continue_level(g, native);
+    }
     t = area ? area->EmulatorData[0] : NULL;
     /* The module's int3, past the debugger: at the int3 for the dispatch. */
     if (t && t->int3_rip && er->ExceptionCode == STATUS_BREAKPOINT &&
@@ -2915,6 +2967,9 @@ static void ec_half_exit(XtGate *g, uint32_t level, int claimed,
         xt_root_release(g, claimed);
     }
     xt_adm_exit(g);
+    if (level & XT_ADM_ATTEMPT) {
+        XT_TP(XT_TP_HALF_EXITED, g, kind);
+    }
 }
 
 /*

@@ -121,6 +121,7 @@ static NTSTATUS NTAPI thread_start(void *p)
     unsigned code;
 
 #ifdef TARGET_X86_64
+    XT_TP(XT_TP_INTERNAL_START, NULL, 0);
     /* Its gate before anything that could call back into the module. */
     xt_gate_install_internal();
 #endif
@@ -130,11 +131,13 @@ static NTSTATUS NTAPI thread_start(void *p)
     g_free(p);
     xt_placement("internal thread stack", &s);
     qatomic_store_release(&s.slot->state, XT_INTERNAL_RUNNING);
+    XT_TP(XT_TP_INTERNAL_BODY, NULL, 0);
     code = s.fn(s.arg);
     if (xt_internal_stopping()) {
         xt_internal_park();
     }
 #ifdef TARGET_X86_64
+    XT_TP(XT_TP_INTERNAL_END, NULL, 0);
     /* Leaving the registry, it leaves the exemption first. */
     xt_gate_end_internal();
 #endif

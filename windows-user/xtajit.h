@@ -320,6 +320,130 @@ bool xt_internal_stopping(void);
 G_NORETURN void xt_internal_park(void);
 extern __thread bool xt_internal_self;
 
+/*
+ * The thread gates' test points (test-tp.c; the block in arm64ec.h):
+ * dormant, a load and a branch, unless a controller process mapped its
+ * block at process init.
+ */
+#ifdef TARGET_X86_64
+/* The C points. */
+typedef enum XtTpId {
+    /*
+     * adm_enter: after the word's read, the byte's mark, the cas, the
+     * push (before the gate's read), the re-read, before the byte's
+     * clear.
+     */
+    XT_TP_ENTER_READ = 1,
+    XT_TP_ENTER_MARKED,
+    XT_TP_ENTER_CASDONE,
+    XT_TP_ENTER_PUSHED,
+    XT_TP_ENTER_REREAD,
+    XT_TP_ENTER_CLEARADDR,
+    XT_TP_ALONE_READ = 8,           /* xt_adm_alone, its word loaded */
+    XT_TP_REJECT_ARG,               /* xt_adm_reject, with its level */
+    XT_TP_ROOT_PUSHED = 10,         /* a root PENDING */
+    XT_TP_ROOT_CHOSEN,              /* the newest chosen, not claimed */
+    XT_TP_ROOT_CLAIMED,
+    XT_TP_ROOT_TAKEN,               /* PENDING to TAKEN, nothing else */
+    XT_TP_HALF_EXITED,              /* a first half done, its root left */
+    XT_TP_FAULT_NESTED,             /* the fault action's nested entry */
+    XT_TP_POOL_RESERVE = 16,        /* an index, its memory not committed */
+    XT_TP_POOL_COMMIT,
+    XT_TP_GATE_INIT,                /* the fields filled */
+    XT_TP_REG_CAS,                  /* before the registry's cas */
+    XT_TP_REG_PUBLISHED,            /* registered, not yet PUBLISHED */
+    XT_TP_CACHE_CAS,                /* before the CPU area's cas */
+    XT_TP_TERM_CLOSED = 24,         /* ec_term_other, the target's gate */
+    XT_TP_TERM_SUSPENDED,
+    XT_TP_TERM_CERT,                /* between certification tries */
+    XT_TP_TERM_SELF,                /* the self path, before its check */
+    XT_TP_TERM_LISTS,               /* inside the record lists' lock */
+    XT_TP_EXIT_ELECTED = 32,
+    XT_TP_FREEZE_CERT,              /* ec_certify, between the words: its try */
+    XT_TP_EXIT_SELF,                /* the owner's, before its check */
+    XT_TP_REAP_PASS = 40,           /* a gate taken for retirement */
+    XT_TP_RETIRE_CLAIMED,           /* RETIRING won */
+    XT_TP_RETIRE_INVALIDATED,       /* a root's range invalidated */
+    XT_TP_INTERNAL_START = 48,      /* before its gate */
+    XT_TP_INTERNAL_BODY,
+    XT_TP_INTERNAL_END,
+    XT_TP_ENGINE_STARTING = 56,     /* the engine's bring-up, state 1 */
+} XtTpId;
+
+/* The failure sites. */
+typedef enum XtTpFail {
+    XT_TPF_IDENTITY = 1,            /* xt_gate_identity */
+    XT_TPF_DUP_GATE,                /* gate_new's handle */
+    XT_TPF_DUP_REAP1,               /* the reaper's two handles */
+    XT_TPF_DUP_REAP2,
+    XT_TPF_DUP_SELF,                /* ec_term_self's */
+    XT_TPF_SUSPEND_TERM,            /* ec_term_other's suspension */
+    XT_TPF_SUSPEND_FREEZE,
+    XT_TPF_FLUSH_TERM,              /* the write buffers' flush */
+    XT_TPF_FLUSH_PROCESS,
+    XT_TPF_COMMIT,                  /* the pool's commit */
+    XT_TPF_REGISTRY,                /* the registry full */
+    XT_TPF_OPEN,                    /* ec_open_thread */
+    XT_TPF_CONTINUE,                /* ec_continue_level's continuation */
+    XT_TPF_TERMACCESS,              /* ThreadTerm's access check passes */
+} XtTpFail;
+
+/* The notes: KIND, the thread, and A, B, C. */
+typedef enum XtTpNote {
+    XT_TPN_GATE = 1,                /* a gate: tid, gate, 1 if made closed */
+    XT_TPN_INVALIDATE,              /* addr, len, gate (0: the exit's) */
+    XT_TPN_EXIT,                    /* the process's end: outcome */
+    XT_TPN_THREAD_TERM,             /* handle, level, own end */
+    XT_TPN_QUARANTINE,              /* gate */
+    XT_TPN_UNSAFE,                  /* tid, status */
+    XT_TPN_RETIRED,                 /* gate, quarantined */
+    XT_TPN_REAP_HELD,
+    XT_TPN_REAP_ABORT,              /* gate */
+    XT_TPN_ACT,                     /* an unheld act: point, arg, word */
+    XT_TPN_FAULT,                   /* the fault action: 1 nested, 2 handler */
+} XtTpNote;
+
+/* XtTpBlock.addr[] (arm64ec.h): the module's counters, in the subject. */
+typedef enum XtTpAddr {
+    XT_TPA_POISONS,                 /* uint32_t[7], arm64ec-gate.c */
+    XT_TPA_UNSAFE,                  /* uint32_t */
+    XT_TPA_REAP_HELD,               /* bool */
+    XT_TPA_READ_OPEN,               /* uint32_t */
+    XT_TPA_CERTS,                   /* uint32_t[7] */
+    XT_TPA_EXIT_OUTCOME,            /* uint32_t */
+    XT_TPA_GATE_INITIAL,            /* XtGate */
+    XT_TPA_GATE_POOL,               /* XtGate *, the pool */
+    XT_TPA_GATE_USED,               /* uint32_t */
+    XT_TPA_ENGINE_STATE,            /* int */
+    XT_TPA_RECORD_USERS,            /* int */
+    XT_TPA_APC_END,                 /* a native APC routine ending its thread */
+} XtTpAddr;
+
+extern struct XtTpBlock *xt_tp_block;
+void xt_tp_hit(unsigned id, void *gate, uint64_t arg);
+bool xt_tp_fail(unsigned id);
+void xt_tp_note(unsigned kind, uint64_t a, uint64_t b, uint64_t c);
+void xt_tp_publish(unsigned i, const void *p);
+void xt_record_tp_publish(void);
+#define XT_TP(id, gate, arg) \
+    do { \
+        if (unlikely(xt_tp_block)) { \
+            xt_tp_hit(id, gate, arg); \
+        } \
+    } while (0)
+#define XT_TP_FAIL(id) (unlikely(xt_tp_block) && xt_tp_fail(id))
+#define XT_TP_NOTE(kind, a, b, c) \
+    do { \
+        if (unlikely(xt_tp_block)) { \
+            xt_tp_note(kind, a, b, c); \
+        } \
+    } while (0)
+#else
+#define XT_TP(id, gate, arg) do { } while (0)
+#define XT_TP_FAIL(id) false
+#define XT_TP_NOTE(kind, a, b, c) do { } while (0)
+#endif
+
 /* thread.c */
 void *xt_alloc_high(size_t len);
 bool xt_tls_ready(void);
