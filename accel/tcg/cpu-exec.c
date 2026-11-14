@@ -55,6 +55,7 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "tcg/startup.h"
+#include "qemu/xtcg-stats.h"
 #if !defined(CONFIG_USER_ONLY)
 #include "accel/tcg/iommu.h"
 #endif
@@ -325,7 +326,8 @@ static bool tb_jmp_cache_global(CPUState *cpu, TranslationBlock *tb, vaddr pc)
 bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
 bool tcg_cpu_bound;
 
-static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
+static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s,
+                                          bool from_helper)
 {
     TranslationBlock *tb;
     CPUJumpCache *jc;
@@ -340,6 +342,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb_jmp_cache_hit(jc, &jc->array[hash].pc, tb, &s))) {
+        xtcg_stat_inc(from_helper ? XS_LOOKUP_PTR_JC_HIT : XS_LOOP_JC_HIT);
         goto hit;
     }
 
@@ -380,6 +383,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     if (tb == NULL) {
         return NULL;
     }
+    xtcg_stat_inc(from_helper ? XS_LOOKUP_PTR_HT_HIT : XS_LOOP_HT_HIT);
 
     key = tb_jmp_cache_key(jc, s.pc, tb_jmp_cache_global(cpu, tb, s.pc));
     jc->array[hash].pc = key;
@@ -825,8 +829,10 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
         cpu_loop_exit(cpu);
     }
 
-    tb = tb_lookup(cpu, s);
+    xtcg_stat_inc(XS_LOOKUP_PTR);
+    tb = tb_lookup(cpu, s, true);
     if (tb == NULL) {
+        xtcg_stat_inc(XS_LOOKUP_PTR_MISS);
         /*
          * Code that isn't the guest's: the exit to it is raised here,
          * where the lookup has just classified it, and cpu_exec_loop
@@ -962,6 +968,7 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
         log_cpu_exec(log_pc(cpu, itb), cpu, itb);
     }
 
+    xtcg_stat_inc(XS_TB_EXEC);
 #ifdef CONFIG_DEBUG_TCG
     /* x-retalign: no landing above 0 outside generated code. */
     tcg_retstack_check(cpu);
@@ -994,6 +1001,8 @@ TranslationBlock *cpu_tb_exec_after(CPUState *cpu, uintptr_t ret,
      */
     last_tb = tcg_splitwx_to_rw((void *)(ret & ~TB_EXIT_MASK));
     *tb_exit = ret & TB_EXIT_MASK;
+    xtcg_stat_inc(*tb_exit == TB_EXIT_REQUESTED ? XS_EXIT_REQUESTED :
+                  last_tb ? XS_EXIT_NOCHAIN : XS_EXIT_NOTB);
 
     trace_exec_tb_exit(last_tb, *tb_exit);
 
@@ -1058,6 +1067,7 @@ void cpu_exec_longjmp_cleanup(CPUState *cpu)
 {
     /* Non-buggy compilers preserve this; assert the correct value. */
     g_assert(cpu == current_cpu);
+    xtcg_stat_inc(XS_LONGJMP);
     tcg_retstack_settle(cpu);
 
 #ifdef CONFIG_USER_ONLY
@@ -1123,7 +1133,7 @@ void cpu_exec_step_atomic(CPUState *cpu)
          * Any breakpoint for this insn will have been recognized earlier.
          */
 
-        tb = tb_lookup(cpu, s);
+        tb = tb_lookup(cpu, s, false);
         if (tb == NULL) {
             mmap_lock();
             tb = tb_gen_code(cpu, s);
@@ -1179,6 +1189,7 @@ void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
 static inline void tb_add_jump(TranslationBlock *tb, int n,
                                TranslationBlock *tb_next)
 {
+    xtcg_stat_inc(XS_TB_ADD_JUMP);
     uintptr_t old;
 
     qemu_thread_jit_write();
@@ -1287,6 +1298,7 @@ bool cpu_handle_exception(CPUState *cpu, int *excp)
         return false;
     }
 
+    xtcg_hist_inc(XH_EXCP, xtcg_excp_bucket(cpu->exception_index));
     if (cpu->exception_index >= EXCP_INTERRUPT) {
         /* exit request from the cpu execution loop */
         *excp = cpu->exception_index;
@@ -1297,6 +1309,7 @@ bool cpu_handle_exception(CPUState *cpu, int *excp)
         return true;
     }
 
+    xtcg_stat_inc(XS_EXCEPTION);
 #if defined(CONFIG_USER_ONLY)
     /*
      * If user mode only, we simulate a fake exception which will be
@@ -1435,6 +1448,7 @@ bool cpu_handle_interrupt(CPUState *cpu, TranslationBlock **last_tb)
              * and via longjmp via cpu_loop_exit.
              */
             if (tcg_ops->cpu_exec_interrupt(cpu, interrupt_request)) {
+                xtcg_stat_inc(XS_INTERRUPT);
                 if (!tcg_ops->need_replay_interrupt ||
                     tcg_ops->need_replay_interrupt(interrupt_request)) {
                     replay_interrupt();
@@ -1617,7 +1631,8 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 break;
             }
 
-            tb = tb_lookup(cpu, s);
+            xtcg_stat_inc(XS_LOOP_LOOKUP);
+            tb = tb_lookup(cpu, s, false);
             if (tb == NULL && unlikely(tcg_foreign_pc) &&
                 tcg_foreign_pc(cpu, s.pc, true)) {
                 /* Out through cpu_handle_exception, no fault. */
