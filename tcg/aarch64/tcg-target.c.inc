@@ -2012,6 +2012,55 @@ static bool acqrel_onepath(MemOp memop)
 #define MIN_TLB_MASK_TABLE_OFS  -512
 
 /*
+ * x-zext32: with no guest base, a 32-bit guest address register is the
+ * host address, since the backend keeps it zero-extended (the 32-bit
+ * operations zero-extend; tcg.c extends the rest).
+ */
+#define TCG_TARGET_HAS_ZEXT32
+
+/* BRK's immediate for a failed x-zext32 check: the tag, plus the register. */
+#define ZEXT32_BRK_TAG  0x3200
+#define ZEXT32_BRK_MASK 0xffe0
+
+/* Set bits 48-63 of @r, for x-zext32's tests (tcg_zext32_poison). */
+static void tcg_out_zext32_poison(TCGContext *s, TCGReg r)
+{
+    tcg_out_insn(s, movw, MOVK, TCG_TYPE_I64, r, 0xdead, 48);
+}
+
+/*
+ * TCG_ZEXT32_CHECK: trap unless @r is zero-extended from 32 bits, in the
+ * access's own code, so the trap's pc unwinds to the guest insn.
+ */
+static void tcg_out_zext32_check(TCGContext *s, TCGReg r)
+{
+    /* cmp xr, wr, uxtw */
+    tcg_out32(s, 0xeb200000 | r << 16 | 2 << 13 | r << 5 | TCG_REG_XZR);
+    /* b.eq .+8 */
+    tcg_out32(s, 0x54000000 | 2 << 5 | COND_EQ);
+    /* brk #(tag | r) */
+    tcg_out32(s, 0xd4200000 | (ZEXT32_BRK_TAG | r) << 5);
+}
+
+/* The register a failed check at @pc names, or -1 if @pc isn't one. */
+static int tcg_target_zext32_trap_reg(uintptr_t pc)
+{
+    uint32_t insn = *(const uint32_t *)pc;
+
+    if ((insn & 0xffe0001f) == 0xd4200000 &&
+        ((insn >> 5) & ZEXT32_BRK_MASK) == ZEXT32_BRK_TAG) {
+        return (insn >> 5) & 31;
+    }
+    return -1;
+}
+
+/* Whether a 32-bit guest address register is the host address. */
+static bool zext32_addr(TCGType addr_type)
+{
+    return addr_type == TCG_TYPE_I32 && tcg_zext32_active;
+}
+
+/*
  * For system-mode, perform the TLB load and compare.
  * For user-mode, perform any required alignment tests.
  * In both cases, return a TCGLabelQemuLdst structure if the slow path
@@ -2147,11 +2196,15 @@ static TCGLabelQemuLdst *prepare_host_addr(TCGContext *s, HostAddress *h,
             tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
         }
 
-        if (guest_base || addr_type == TCG_TYPE_I32) {
+        if (guest_base ||
+            (addr_type == TCG_TYPE_I32 && !zext32_addr(addr_type))) {
             h->base = TCG_REG_GUEST_BASE;
             h->index = addr_reg;
             h->index_ext = addr_type;
         } else {
+            if (tcg_zext32 == TCG_ZEXT32_CHECK && addr_type == TCG_TYPE_I32) {
+                tcg_out_zext32_check(s, addr_reg);
+            }
             h->base = addr_reg;
             h->index = TCG_REG_XZR;
             h->index_ext = TCG_TYPE_I64;
@@ -2425,6 +2478,7 @@ static void tcg_out_qemu_ld_direct(TCGContext *s, MemOp memop, TCGType ext,
                               h.index);
         break;
     case MO_SL:
+        tcg_debug_assert(ext == TCG_TYPE_I64);
         tcg_out_insn_ldst_reg(s, Ildst_imm_LDRSWX, data_r, h.base, h.index_ext,
                               h.index);
         break;
@@ -2751,6 +2805,113 @@ static void tcg_out_qemu_ldst_vec(TCGContext *s, TCGReg data,
         ldst->raddr = tcg_splitwx_to_rx(s->code_ptr);
     }
 }
+
+/*
+ * x-lean: in user mode without a guest base the guest address is the
+ * host address, so a guest access can use the host's addressing modes:
+ * base + (index << shift), with shift 0 or the access size, or base + a
+ * signed 9-bit or unsigned scaled 12-bit offset (qemu_ld_x, qemu_st_x).
+ */
+#define TCG_TARGET_HAS_LDST_X
+
+/* A 32-bit operation zero-extends its result to the 64-bit register. */
+#define TCG_TARGET_I32_OPS_ZEXT
+static bool tcg_target_ldst_x_ok(void)
+{
+    return !tcg_use_softmmu && !guest_base;
+}
+
+/* LDR/STR (register offset), the index shifted by the access size or 0. */
+static void tcg_out_ldst_rx(TCGContext *s, AArch64Insn insn, TCGReg rd,
+                            TCGReg base, TCGReg index, unsigned shift)
+{
+    tcg_out32(s, insn | ldst_imm_to_reg | index << 16 | 0x6000 |
+              (shift ? 1 << 12 : 0) | base << 5 | (rd & 0x1f));
+}
+
+static AArch64Insn ld_insn(MemOp mop, TCGType ext)
+{
+    switch (mop & MO_SSIZE) {
+    case MO_UB:
+        return Ildst_imm_LDRB;
+    case MO_SB:
+        return ext ? Ildst_imm_LDRSBX : Ildst_imm_LDRSBW;
+    case MO_UW:
+        return Ildst_imm_LDRH;
+    case MO_SW:
+        return ext ? Ildst_imm_LDRSHX : Ildst_imm_LDRSHW;
+    case MO_UL:
+        return Ildst_imm_LDRW;
+    case MO_SL:
+        tcg_debug_assert(ext);
+        return Ildst_imm_LDRSWX;
+    case MO_UQ:
+        return Ildst_imm_LDRX;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static AArch64Insn st_insn(MemOp mop)
+{
+    static const AArch64Insn insn[4] = {
+        Ildst_imm_STRB, Ildst_imm_STRH, Ildst_imm_STRW, Ildst_imm_STRX
+    };
+    return insn[mop & MO_SIZE];
+}
+
+/*
+ * The offset form's index is the constant 0, which arrives as XZR, or as a
+ * register when an earlier op has loaded the constant into one: an offset
+ * means the offset form whatever the index register.  (A register index
+ * never comes with an offset; base + a register holding 0 is right too.)
+ */
+static void tgen_qemu_ld_x(TCGContext *s, TCGType type, TCGReg data,
+                           TCGReg base, TCGReg index, bool index_zero,
+                           TCGArg arg)
+{
+    MemOp mop = get_memop(tcg_ldst_x_oi(arg));
+    unsigned shift = tcg_ldst_x_shift(arg);
+    int ofs = tcg_ldst_x_ofs(arg);
+
+    if (shift == TCG_LDST_X_SCALED) {
+        tcg_out_insn_ldst_uimm(s, ld_insn(mop, type), data, base, ofs);
+    } else if (index != TCG_REG_XZR && !ofs) {
+        tcg_out_ldst_rx(s, ld_insn(mop, type), data, base, index, shift);
+    } else {
+        tcg_out_insn_ldst_imm(s, ld_insn(mop, type), data, base, ofs);
+    }
+}
+
+static void tgen_qemu_st_x(TCGContext *s, TCGType type, TCGReg data,
+                           TCGReg base, TCGReg index, bool index_zero,
+                           TCGArg arg)
+{
+    MemOp mop = get_memop(tcg_ldst_x_oi(arg));
+    unsigned shift = tcg_ldst_x_shift(arg);
+    int ofs = tcg_ldst_x_ofs(arg);
+
+    if (shift == TCG_LDST_X_SCALED) {
+        tcg_out_insn_ldst_uimm(s, st_insn(mop), data, base, ofs);
+    } else if (index != TCG_REG_XZR && !ofs) {
+        tcg_out_ldst_rx(s, st_insn(mop), data, base, index, shift);
+    } else {
+        tcg_out_insn_ldst_imm(s, st_insn(mop), data, base, ofs);
+    }
+}
+
+/* x-lean: a shift feeding an add as lea, ADD (shifted register). */
+#define TCG_TARGET_SHL_ADD_LEA
+
+static const TCGOutOpQemuLdStX outop_qemu_ld_x = {
+    .base.static_constraint = C_O1_I2(r, r, rz),
+    .out = tgen_qemu_ld_x,
+};
+
+static const TCGOutOpQemuLdStX outop_qemu_st_x = {
+    .base.static_constraint = C_O0_I3(rz, r, rz),
+    .out = tgen_qemu_st_x,
+};
 
 static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
                                    TCGReg addr_reg, MemOpIdx oi, bool is_ld)
@@ -4101,6 +4262,8 @@ static void tgen_bswap32(TCGContext *s, TCGType type,
 {
     tcg_out_rev(s, TCG_TYPE_I32, MO_32, a0, a1);
     if (flags & TCG_BSWAP_OS) {
+        /* A 32-bit value's register stays zero-extended (x-zext32). */
+        tcg_debug_assert(type == TCG_TYPE_I64);
         tcg_out_ext32s(s, a0, a0);
     }
 }
@@ -4129,6 +4292,7 @@ static void tgen_revbit32(TCGContext *s, TCGType type,
 {
     tcg_out_insn(s, rr_sf, RBIT, TCG_TYPE_I32, a0, a1);
     if (flags & TCG_BSWAP_OS) {
+        tcg_debug_assert(type == TCG_TYPE_I64);
         tcg_out_ext32s(s, a0, a0);
     }
 }
@@ -4374,6 +4538,7 @@ static const TCGOutOpLoad outop_ld32u = {
 static void tgen_ld32s(TCGContext *s, TCGType type, TCGReg dest,
                        TCGReg base, ptrdiff_t offset)
 {
+    tcg_debug_assert(type == TCG_TYPE_I64);
     tcg_out_ldst(s, Ildst_imm_LDRSWX, dest, base, offset, 2);
 }
 

@@ -1170,6 +1170,16 @@ typedef struct TCGOutOpQemuLdSt {
 } TCGOutOpQemuLdSt;
 
 /*
+ * qemu_ld_x, qemu_st_x: the guest address is @base + (@index << shift), or
+ * @base + offset with @index the constant 0 (tcg_ldst_x_arg).
+ */
+typedef struct TCGOutOpQemuLdStX {
+    TCGOutOp base;
+    void (*out)(TCGContext *s, TCGType type, TCGReg data, TCGReg base,
+                TCGReg index, bool index_zero, TCGArg arg);
+} TCGOutOpQemuLdStX;
+
+/*
  * qemu_atomic: @ret = the old value at @addr, updated with @val by @aop
  * (TCGAtomicOp); for TCG_ATOMIC_CMPXCHG, only if it equals @cmp.
  */
@@ -1481,6 +1491,15 @@ static void tcg_out_spin_hint(TCGContext *s)
 }
 #endif
 
+#ifndef TCG_TARGET_HAS_LDST_X
+static const TCGOutOpQemuLdStX outop_qemu_ld_x = {
+    .base.static_constraint = C_NotImplemented,
+};
+static const TCGOutOpQemuLdStX outop_qemu_st_x = {
+    .base.static_constraint = C_NotImplemented,
+};
+#endif
+
 #ifndef CONFIG_TCG_INTERPRETER
 /* Validate CPUTLBDescFast placement. */
 QEMU_BUILD_BUG_ON((int)(offsetof(CPUNegativeOffsetState, tlb.f[0]) -
@@ -1631,6 +1650,8 @@ static const TCGOutOp * const all_outop[NB_OPS] = {
     OUTOP(INDEX_op_qemu_ld, TCGOutOpQemuLdSt, outop_qemu_ld),
     OUTOP(INDEX_op_qemu_ld2, TCGOutOpQemuLdSt2, outop_qemu_ld2),
     OUTOP(INDEX_op_qemu_st, TCGOutOpQemuLdSt, outop_qemu_st),
+    OUTOP(INDEX_op_qemu_ld_x, TCGOutOpQemuLdStX, outop_qemu_ld_x),
+    OUTOP(INDEX_op_qemu_st_x, TCGOutOpQemuLdStX, outop_qemu_st_x),
     OUTOP(INDEX_op_qemu_atomic, TCGOutOpQemuAtomic, outop_qemu_atomic),
     OUTOP(INDEX_op_qemu_st2, TCGOutOpQemuLdSt2, outop_qemu_st2),
     OUTOP(INDEX_op_rems, TCGOutOpBinary, outop_rems),
@@ -2492,6 +2513,23 @@ void tcg_prologue_init(void)
 
     s->pool_labels = NULL;
 
+#ifdef CONFIG_USER_ONLY
+    tcg_zext32_active = tcg_zext32 != TCG_ZEXT32_OFF && tcg_guest_addr32 &&
+                        !guest_base;
+#endif
+    if (tcg_zext32 == TCG_ZEXT32_CHECK) {
+        if (tcg_zext32_report || tcg_zext32_poison || tcg_zext32_nofix) {
+            /* Development only: say whether the checks will be there. */
+            info_report("x-zext32=check: %s",
+                        tcg_zext32_active ? "active" :
+                        tcg_guest_addr32 ? "inactive (a guest base)" :
+                        "inactive (not a 32-bit guest)");
+        }
+    } else if (tcg_zext32_poison || tcg_zext32_nofix || tcg_zext32_report) {
+        warn_report("x-zext32: poison, nofix and report need check: ignored");
+        tcg_zext32_poison = tcg_zext32_nofix = tcg_zext32_report = false;
+    }
+
     qemu_thread_jit_write();
     /* Generate the prologue.  */
     tcg_target_qemu_prologue(s);
@@ -2567,6 +2605,7 @@ void tcg_prologue_init(void)
 
 void tcg_func_start(TCGContext *s)
 {
+    s->align_access = false;
     s->tso_run_ld = false;
     s->tso_run_st = false;
     s->tso_run_emit = false;
@@ -3118,6 +3157,11 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_qemu_ld2:
     case INDEX_op_qemu_st2:
         tcg_debug_assert(type == TCG_TYPE_I128);
+        goto do_lookup;
+
+    case INDEX_op_qemu_ld_x:
+    case INDEX_op_qemu_st_x:
+        tcg_debug_assert(type <= TCG_TYPE_REG);
         goto do_lookup;
 
     case INDEX_op_add:
@@ -3745,7 +3789,8 @@ void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs)
             case INDEX_op_qemu_atomic:
                 {
                     const char *s_al, *s_tlb, *s_op, *s_at;
-                    MemOpIdx oi = op->args[k++];
+                    TCGArg xarg = op->args[k];
+                    MemOpIdx oi = (MemOpIdx)op->args[k++];
                     MemOp mop = get_memop(oi);
                     unsigned ix = get_mmuidx(oi);
 
@@ -3763,6 +3808,17 @@ void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs)
                     } else {
                         mop = get_memop(oi);
                         col += ne_fprintf(f, ",$0x%x,%u", mop, ix);
+                    }
+                    if (c == INDEX_op_qemu_ld_x || c == INDEX_op_qemu_st_x) {
+                        unsigned xs = tcg_ldst_x_shift(xarg);
+
+                        if (xs == TCG_LDST_X_SCALED) {
+                            col += ne_fprintf(f, ",ofs %d*size",
+                                              tcg_ldst_x_ofs(xarg));
+                        } else {
+                            col += ne_fprintf(f, ",lsl %u,ofs %d", xs,
+                                              tcg_ldst_x_ofs(xarg));
+                        }
                     }
                     i = 1;
                 }
@@ -5333,10 +5389,28 @@ liveness_pass_0(TCGContext *s)
     size_t size = BITS_TO_LONGS(ng) * sizeof(unsigned long);
     unsigned long *seen = tcg_malloc(size);
     TCGOp *op, *ebb;
+    /*
+     * With x-lean, also the number of the EBB that last wrote each
+     * TEMP_TB (wrote), and whether an EBB read one before writing it
+     * (read_in).  Control enters an EBB only at its start, so a TEMP_TB
+     * that no EBB reads before writing carries no value across a label:
+     * it can be a TEMP_EBB too, which liveness need not keep in memory
+     * at the end of a basic block.  Front ends reuse a few TB-lifetime
+     * scratch temps in every guest instruction this way.
+     */
+    int *wrote = NULL;
+    unsigned long *read_in = NULL;
+    int ebb_no = 1;
 
     memset(seen, 0, size);
     for (int i = s->nb_globals; i < nb_temps; ++i) {
         s->temps[i].state_ptr = NULL;
+    }
+    if (tcg_lean) {
+        wrote = tcg_malloc(nb_temps * sizeof(int));
+        read_in = tcg_malloc(BITS_TO_LONGS(nb_temps) * sizeof(unsigned long));
+        memset(wrote, 0, nb_temps * sizeof(int));
+        memset(read_in, 0, BITS_TO_LONGS(nb_temps) * sizeof(unsigned long));
     }
 
     /*
@@ -5353,6 +5427,7 @@ liveness_pass_0(TCGContext *s)
         switch (op->opc) {
         case INDEX_op_set_label:
             ebb = op;
+            ebb_no++;
             continue;
         case INDEX_op_discard:
             if (temp_idx(arg_temp(op->args[0])) < ng) {
@@ -5386,6 +5461,16 @@ liveness_pass_0(TCGContext *s)
             } else if (ts->state_ptr != ebb) {
                 ts->state_ptr = multiple_ebb;
             }
+            if (read_in && i >= nb_oargs && wrote[temp_idx(ts)] != ebb_no) {
+                set_bit(temp_idx(ts), read_in);
+            }
+        }
+        for (int i = 0; wrote && i < nb_oargs; ++i) {
+            TCGTemp *ts = arg_temp(op->args[i]);
+
+            if (ts->kind == TEMP_TB) {
+                wrote[temp_idx(ts)] = ebb_no;
+            }
         }
     }
 
@@ -5395,7 +5480,9 @@ liveness_pass_0(TCGContext *s)
      */
     for (int i = s->nb_globals; i < nb_temps; ++i) {
         TCGTemp *ts = &s->temps[i];
-        if (ts->kind == TEMP_TB && ts->state_ptr != multiple_ebb) {
+        if (ts->kind == TEMP_TB &&
+            (ts->state_ptr != multiple_ebb ||
+             (read_in && !test_bit(i, read_in)))) {
             ts->kind = TEMP_EBB;
         }
     }
@@ -7130,6 +7217,24 @@ static void tcg_reg_alloc_do_movi(TCGContext *s, TCGTemp *ots,
 }
 
 /*
+ * x-zext32: zero-extend a 32-bit value that @reg received from outside
+ * the 32-bit operations, which may leave other bits above it: the low
+ * half of a 64-bit register, or a helper's result (the calling
+ * convention doesn't define the high half).
+ */
+static void tcg_zext32_normalize(TCGContext *s, TCGReg reg)
+{
+#ifdef TCG_TARGET_HAS_ZEXT32
+    if (tcg_zext32_poison) {
+        tcg_out_zext32_poison(s, reg);
+    }
+    if (!tcg_zext32_nofix) {
+        tcg_out_ext32u(s, reg, reg);
+    }
+#endif
+}
+
+/*
  * Specialized code generation for INDEX_op_mov_*.
  */
 static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
@@ -7217,6 +7322,11 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
          */
         temp_dead(s, ts);
         oreg = ireg;
+        if (tcg_zext32_active && otype == TCG_TYPE_I32 &&
+            itype == TCG_TYPE_I64) {
+            /* extrl_i64_i32 taking over the 64-bit value's register. */
+            tcg_zext32_normalize(s, oreg);
+        }
     } else {
         if (ots->val_type == TEMP_VAL_REG) {
             oreg = ots->reg;
@@ -8398,6 +8508,10 @@ static void tcg_reg_alloc_call(TCGContext *s, TCGOp *op)
             if (ts->pinned) {
                 tcg_out_mov(s, ts->type, ts->reg, reg);
                 continue;
+            }
+            if (tcg_zext32_active && ts->type == TCG_TYPE_I32 &&
+                !IS_DEAD_ARG(i)) {
+                tcg_zext32_normalize(s, reg);
             }
             set_temp_val_reg(s, ts, reg);
             ts->mem_coherent = 0;

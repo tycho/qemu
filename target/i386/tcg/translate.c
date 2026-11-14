@@ -2257,9 +2257,23 @@ static void gen_push_v(DisasContext *s, TCGv val)
     MemOp d_ot = mo_pushpop(s, s->dflag);
     MemOp a_ot = mo_stacksize(s);
     int size = 1 << d_ot;
-    TCGv new_esp = tcg_temp_new();
-    bool old;
+    TCGv new_esp;
 
+    if (tcg_lean && a_ot == MO_64) {
+        /*
+         * The address apart from the new stack pointer, which is updated
+         * after the store: an access at rsp - size can take the offset in
+         * the host's addressing mode.
+         */
+        TCGv addr = tcg_temp_new();
+
+        gen_lea_ss_ofs(s, addr, cpu_regs[R_ESP], -size);
+        gen_op_st_v(s, d_ot, val, addr);
+        tcg_gen_subi_tl(cpu_regs[R_ESP], cpu_regs[R_ESP], size);
+        return;
+    }
+
+    new_esp = tcg_temp_new();
     tcg_gen_subi_tl(new_esp, cpu_regs[R_ESP], size);
 
     /* Now reduce the value to the address size and apply SS base.  */
@@ -4429,6 +4443,9 @@ void tcg_x86_init(void)
     tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_src));
     tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_src2));
     tcg_chain_dead_add(tcgv_tl_temp(cpu_cc_dst2));
+#ifndef TARGET_X86_64
+    tcg_guest_addr32 = true;
+#endif
 
     for (i = 0; i < CPU_NB_EREGS; ++i) {
         cpu_regs[i] = tcg_global_mem_new(tcg_env,
