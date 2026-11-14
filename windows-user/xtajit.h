@@ -404,6 +404,7 @@ typedef enum XtTpNote {
     XT_TPN_REAP_ABORT,              /* gate */
     XT_TPN_ACT,                     /* an unheld act: point, arg, word */
     XT_TPN_FAULT,                   /* the fault action: 1 nested, 2 handler */
+    XT_TPN_DIED,                    /* a death found: gate, XtDeath */
 } XtTpNote;
 
 /* XtTpBlock.addr[] (arm64ec.h): the module's counters, in the subject. */

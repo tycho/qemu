@@ -839,18 +839,99 @@ void xt_gate_report(char *line, size_t size)
 #define RET_RETIRED         2u
 #define RET_QUARANTINED     0x100u
 
-/* G's thread ended, or will, unsafely: its record is never reclaimed. */
-void xt_gate_quarantine(XtGate *g)
+/*
+ * G's thread ended, or will, unsafely: its record is never reclaimed.
+ * Whether this call quarantined it (it wasn't, and isn't being retired).
+ */
+bool xt_gate_quarantine(XtGate *g)
 {
     uint32_t r;
 
     do {
         r = qatomic_read(&g->ret);
         if ((r & RET_STATE) != RET_LIVE || (r & RET_QUARANTINED)) {
-            return;
+            return false;
         }
     } while (qatomic_cmpxchg(&g->ret, r, r | RET_QUARANTINED) != r);
     XT_TP_NOTE(XT_TPN_QUARANTINE, (uintptr_t)g, g->tid, 0);
+    return true;
+}
+
+/*
+ * What the thread of G, whose handle has signalled, left behind: its own
+ * code no longer changes its gate.  OWNED: its word isn't parked and a
+ * level of it was admitted (its checking byte clear) and never withdrawn,
+ * so it was inside the module's work when it ended, unannounced (a kill
+ * from another process; a self end inside a notification, which Windows
+ * doesn't notify), and may have held anything the engine has.  A level
+ * still in its window holds nothing: the admission takes nothing before
+ * its byte's clear.  This is conservative: a death right after the clear,
+ * or just before an exit's pop, counts as OWNED too.  UNFINISHED: no such
+ * level, but a protection's or an allocation's root still PENDING or
+ * CLAIMED: its second half's page-flag work never ran (a read's only
+ * invalidates, which a flush does).  Only published roots are read.
+ */
+XtDeath xt_gate_death(XtGate *g)
+{
+    uint64_t w = qatomic_load_acquire(&g->adm);
+    uint32_t c = MIN(XT_ADM_COUNT(w), XT_ADM_MAX_LEVELS);
+
+    if (!(w & XT_ADM_PARKED)) {
+        for (uint32_t i = 0; i < c; i++) {
+            if (!qatomic_read(&g->checking[i])) {
+                return XT_DEATH_OWNED;
+            }
+        }
+    }
+    for (int i = 0; i < XT_GATE_ROOTS; i++) {
+        uint32_t s = qatomic_load_acquire(&g->roots[i].state);
+
+        if ((s == XT_ROOT_PENDING || s == XT_ROOT_CLAIMED) &&
+            (g->roots[i].kind == XT_MEMOP_PROTECT ||
+             g->roots[i].kind == XT_MEMOP_ALLOC)) {
+            return XT_DEATH_UNFINISHED;
+        }
+    }
+    return XT_DEATH_CLEAN;
+}
+
+/*
+ * The process's end, every other thread certified out of the module: each
+ * gate whose thread has ended judged (xt_gate_death), the deaths counted
+ * and noted (unless certification counted them, quarantining them, or
+ * retirement had quarantined them).  Ended: retired (retirement waited
+ * for its handle first; gates and their words outlive it), or its handle
+ * signalled.  No retirement is under way, which would close a handle: a
+ * retirer works at an admitted level, so it is certified only after it.
+ */
+void xt_gate_find_deaths(uint32_t *owned, uint32_t *unfinished)
+{
+    LARGE_INTEGER zero = { .QuadPart = 0 };
+    uint32_t n = gate_scan_end();
+
+    for (uint32_t i = 0; i <= n; i++) {
+        XtGate *g = gate_scan_at(i);
+        uint32_t r;
+        XtDeath d;
+
+        if (!g) {
+            continue;
+        }
+        r = qatomic_load_acquire(&g->ret);
+        if ((r & RET_QUARANTINED) ||
+            ((r & RET_STATE) != RET_RETIRED &&
+             (!g->thread || NtWaitForSingleObject(g->thread, FALSE, &zero) !=
+                            STATUS_SUCCESS))) {
+            continue;
+        }
+        d = xt_gate_death(g);
+        if (d == XT_DEATH_CLEAN) {
+            continue;
+        }
+        xt_gate_quarantine(g);
+        (*(d == XT_DEATH_OWNED ? owned : unfinished))++;
+        XT_TP_NOTE(XT_TPN_DIED, (uintptr_t)g, d, 1);
+    }
 }
 
 /*

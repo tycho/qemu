@@ -750,6 +750,18 @@ static bool ec_thread_ending(HANDLE h)
 }
 
 /*
+ * Whether the thread behind H (which must allow SYNCHRONIZE) has ended, by
+ * its handle's signal, within TIMEOUT_MS: "ending" is set before its
+ * termination runs, and only the signal says its code has stopped.
+ */
+static bool ec_thread_dead(HANDLE h, uint32_t timeout_ms)
+{
+    LARGE_INTEGER t = { .QuadPart = -(int64_t)timeout_ms * 10000 };
+
+    return NtWaitForSingleObject(h, FALSE, &t) == STATUS_SUCCESS;
+}
+
+/*
  * Terminations Windows went ahead with although the thread wasn't stopped
  * outside the engine (the stop failed, or the thread couldn't be found):
  * such a thread may have died holding anything, so the process's end
@@ -855,6 +867,7 @@ enum {
     EC_EXIT_RCU = 1 << 5,           /* call_rcu's worker not at rest */
     EC_EXIT_FLUSH = 1 << 6,         /* the write-buffer flush failed */
     EC_EXIT_SELF = 1 << 7,          /* the owner's word: not its level alone */
+    EC_EXIT_DIED = 1 << 8,          /* a thread died inside, or mid-operation */
     EC_EXIT_DONE = 1u << 31,
 };
 
@@ -942,6 +955,8 @@ static void ec_freeze_failed(DWORD tid, NTSTATUS st, int why)
  * no operation outstanding that isn't handed over, and the gate keeps it
  * out from here on.  Or it can't be had yet (active), or ever (failed).
  */
+static uint32_t ec_died_owned, ec_died_unfinished;
+
 typedef enum EcCert {
     EC_CERT_ACTIVE,
     EC_CERT_FAILED,
@@ -1024,13 +1039,39 @@ static EcCert ec_certify(XtGate *g, GArray *reads)
  * gate.  An identity that can't be read is a failure, unless Windows says
  * the thread is ending.
  */
+/*
+ * The certificate of an ending thread (H, its gate G or NULL): none until
+ * its handle has signalled; then, from its gate, a failure if it died
+ * inside the module or with an operation unfinished (xt_gate_death),
+ * quarantined and counted, else ENDING.
+ */
+static EcCert ec_cert_ended(HANDLE h, XtGate *g)
+{
+    XtDeath d;
+
+    if (!ec_thread_dead(h, 0)) {
+        return EC_CERT_ACTIVE;
+    }
+    d = g ? xt_gate_death(g) : XT_DEATH_CLEAN;
+    if (d == XT_DEATH_CLEAN) {
+        return EC_CERT_ENDING;
+    }
+    /* Counted once: the freeze may meet it again in a later pass. */
+    if (xt_gate_quarantine(g)) {
+        qatomic_inc(d == XT_DEATH_OWNED ? &ec_died_owned
+                                        : &ec_died_unfinished);
+        XT_TP_NOTE(XT_TPN_DIED, (uintptr_t)g, d, 0);
+    }
+    return EC_CERT_FAILED;
+}
+
 static EcCert ec_certify_thread(HANDLE h, GArray *reads)
 {
     NTSTATUS st;
     XtGate *g = xt_gate_for(h, false, &st);
 
     if (ec_thread_ending(h)) {
-        return EC_CERT_ENDING;
+        return st < 0 ? EC_CERT_FAILED : ec_cert_ended(h, g);
     }
     if (st < 0) {
         return EC_CERT_FAILED;
@@ -1040,7 +1081,8 @@ static EcCert ec_certify_thread(HANDLE h, GArray *reads)
 
 static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
 {
-    const ACCESS_MASK want = THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION;
+    const ACCESS_MASK want = THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION |
+                             SYNCHRONIZE;
     int64_t deadline = get_clock() + (int64_t)EC_FREEZE_MS * SCALE_MS;
     GArray *pending = g_array_sized_new(FALSE, FALSE, sizeof(EcFrozen), 32);
 
@@ -1072,7 +1114,8 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
             h = next;
             f.tid = ec_thread_id(h);
             if (!f.tid) {
-                if (!ec_thread_ending(h)) {
+                /* Passed over only once ended: the gates' walk judges it. */
+                if (!ec_thread_dead(h, EC_STOP_ACTIVE_MS)) {
                     ec_freeze_failed(0, STATUS_INVALID_HANDLE, 0x400);
                 }
                 continue;
@@ -1087,7 +1130,7 @@ static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
                                    GetCurrentProcess(), &f.h, 0, 0,
                                    DUPLICATE_SAME_ACCESS);
             if (st < 0) {
-                if (!ec_thread_ending(h)) {
+                if (!ec_thread_dead(h, EC_STOP_ACTIVE_MS)) {
                     ec_freeze_failed(f.tid, st, 0x100);
                 }
                 continue;
@@ -1359,7 +1402,7 @@ static void ec_term_other(HANDLE own, DWORD tid, XtGate *me, uint32_t level,
     EcCert c;
 
     if (!g) {
-        if (st < 0 && !ec_thread_ending(own)) {
+        if (st < 0 && !ec_thread_dead(own, 0)) {
             qatomic_store_release(&ec_reap_held, true);
             XT_TP_NOTE(XT_TPN_REAP_HELD, tid, 0, 0);
             ec_unsafe_term(tid, st);
@@ -1390,7 +1433,7 @@ static void ec_term_other(HANDLE own, DWORD tid, XtGate *me, uint32_t level,
     }
     until = get_clock() + (int64_t)EC_STOP_ACTIVE_MS * SCALE_MS;
     for (;;) {
-        c = ec_thread_ending(own) ? EC_CERT_ENDING : ec_certify(g, NULL);
+        c = ec_thread_ending(own) ? ec_cert_ended(own, g) : ec_certify(g, NULL);
         XT_TP(XT_TP_TERM_CERT, g, c);
         if (c != EC_CERT_ACTIVE || get_clock() > until) {
             break;
@@ -1576,24 +1619,48 @@ static void ec_exit_flush(void)
     current_cpu = prev;
 }
 
+/*
+ * NS in milliseconds, its whole part and tenths, rounded half up: the
+ * exit's report formats integers only, which neither allocates nor locks
+ * (a float's conversion does both), as a thread that died inside the
+ * module may hold either.
+ */
+static uint64_t ec_ms_whole(int64_t ns)
+{
+    return (uint64_t)(ns + 50000) / 1000000;
+}
+
+static uint32_t ec_ms_tenth(int64_t ns)
+{
+    return (uint32_t)((uint64_t)(ns + 50000) / 100000 % 10);
+}
+
 static void ec_exit_line(char *line, size_t size)
 {
     int n = snprintf(line, size, "exit: outcome 0x%x, %u threads stopped "
-                     "(%u again), %u passes, %u unsafe terminations, %.1f ms "
-                     "(freeze %.1f, parks %.1f, flush %.1f), first stop "
-                     "failure 0x%lx why 0x%x; certified idle %u parked %u "
-                     "taken %u new %u ending %u, failed %u, still active "
-                     "%u\n",
+                     "(%u again), %u passes, %u unsafe terminations, "
+                     "%llu.%u ms (freeze %llu.%u, parks %llu.%u, flush "
+                     "%llu.%u), first stop failure 0x%lx why 0x%x; "
+                     "certified idle %u parked %u taken %u new %u ending %u, "
+                     "failed %u, still active %u; died inside %u, "
+                     "mid-operation %u\n",
                      ec_exit_outcome & ~EC_EXIT_DONE, ec_exit_frozen,
                      ec_exit_refrozen, ec_exit_passes,
-                     qatomic_read(&ec_unsafe_terms), ec_exit_ns / 1e6,
-                     ec_exit_phase[0] / 1e6, ec_exit_phase[1] / 1e6,
-                     ec_exit_phase[2] / 1e6,
+                     qatomic_read(&ec_unsafe_terms),
+                     (unsigned long long)ec_ms_whole(ec_exit_ns),
+                     ec_ms_tenth(ec_exit_ns),
+                     (unsigned long long)ec_ms_whole(ec_exit_phase[0]),
+                     ec_ms_tenth(ec_exit_phase[0]),
+                     (unsigned long long)ec_ms_whole(ec_exit_phase[1]),
+                     ec_ms_tenth(ec_exit_phase[1]),
+                     (unsigned long long)ec_ms_whole(ec_exit_phase[2]),
+                     ec_ms_tenth(ec_exit_phase[2]),
                      (unsigned long)ec_exit_first_fail, ec_exit_first_why,
                      ec_certs[EC_CERT_IDLE], ec_certs[EC_CERT_PARKED],
                      ec_certs[EC_CERT_TAKEN], ec_certs[EC_CERT_NEW],
                      ec_certs[EC_CERT_ENDING], ec_certs[EC_CERT_FAILED],
-                     ec_certs[EC_CERT_ACTIVE]);
+                     ec_certs[EC_CERT_ACTIVE], qatomic_read(&ec_died_owned),
+                     qatomic_read(&ec_died_unfinished));
 
     if (xt_lock_check && n > 0 && (size_t)n < size) {
         n += snprintf(line + n, size - n, "lockcheck: %u acquisitions "
@@ -1676,6 +1743,21 @@ static void ec_exit_begin(void)
     XT_TP(XT_TP_EXIT_SELF, g, 0);
     if (!xt_adm_alone(g)) {
         ec_exit_outcome |= EC_EXIT_SELF;
+    }
+    /*
+     * Threads that died unannounced, which the freeze may not list: only
+     * with every other thread certified out (the outcome still 0), when
+     * no gate is being retired and no gate's handle closed.
+     */
+    if (!ec_exit_outcome) {
+        uint32_t owned = 0, unfinished = 0;
+
+        xt_gate_find_deaths(&owned, &unfinished);
+        qatomic_add(&ec_died_owned, owned);
+        qatomic_add(&ec_died_unfinished, unfinished);
+    }
+    if (qatomic_read(&ec_died_owned) || qatomic_read(&ec_died_unfinished)) {
+        ec_exit_outcome |= EC_EXIT_DIED;
     }
     if (!ec_exit_outcome && qatomic_load_acquire(&engine_state) == 2) {
         xt_enter();
