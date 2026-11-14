@@ -781,6 +781,15 @@ NTSTATUS xt_continue_native(XtNativeContext *ctx);
 #ifndef STATUS_ASSERTION_FAILURE
 #define STATUS_ASSERTION_FAILURE ((NTSTATUS)0xC0000420)
 #endif
+#ifndef STATUS_THREAD_IS_TERMINATING
+#define STATUS_THREAD_IS_TERMINATING ((NTSTATUS)0xC000004B)
+#endif
+#ifndef STATUS_NO_MORE_ENTRIES
+#define STATUS_NO_MORE_ENTRIES ((NTSTATUS)0x8000001A)
+#endif
+#ifndef STATUS_UNSUCCESSFUL
+#define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001)
+#endif
 #ifndef STATUS_INVALID_PARAMETER
 #define STATUS_INVALID_PARAMETER ((NTSTATUS)0xC000000DL)
 #endif
@@ -839,15 +848,6 @@ typedef struct XtTestExit XtTestExit;
 typedef struct XtTestState XtTestState;
 XTEXPORT int xt_test_init(int *rejected);
 XTEXPORT void *xt_test_thread(void);
-#ifndef STATUS_THREAD_IS_TERMINATING
-#define STATUS_THREAD_IS_TERMINATING ((NTSTATUS)0xC000004B)
-#endif
-#ifndef STATUS_NO_MORE_ENTRIES
-#define STATUS_NO_MORE_ENTRIES ((NTSTATUS)0x8000001A)
-#endif
-#ifndef STATUS_UNSUCCESSFUL
-#define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001)
-#endif
 XTEXPORT int xt_test_run(WOW64_CONTEXT *ctx, XtTestExit *out);
 XTEXPORT void xt_test_roundtrip(const WOW64_CONTEXT *in, WOW64_CONTEXT *out);
 XTEXPORT void xt_test_invalidate(void *addr, size_t len);

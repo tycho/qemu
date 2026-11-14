@@ -20,7 +20,6 @@
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
 #include "tcg/startup.h"
-#include "tcg/startup.h"
 #include "qemu/units.h"
 #include "qemu/cutils.h"
 #include "qemu/qemu-print.h"

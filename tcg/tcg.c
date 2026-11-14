@@ -133,6 +133,12 @@ struct TCGLabelQemuLdst {
     tcg_insn_unit *label_ptr[2]; /* label pointers to be updated */
     bool fallback;          /* backend-specific out-of-line code, no helper */
     uint64_t site;          /* fallback: guest pc of the access's insn */
+    TCGRegSet save_regs;    /* to save around the slow path's call */
+    /* tcg_lazysync: dirty globals the slow path stores before its call */
+    const TCGLdstWriteback *wb;
+    unsigned nb_wb;
+    /* label_ptr[0] is a B to the slow path, in cold code (tcg_tblayout). */
+    bool veneer;
     /* qemu_atomic: its TCGAtomicOp + 1 (else 0), and its compare operand */
     int atomic;
     TCGReg cmp_reg;
@@ -276,6 +282,67 @@ TCGContext tcg_init_ctx;
 bool tcg_fpcheck_runtime;
 bool tcg_iopl_runtime;
 
+TCGTsoMode tcg_tso_mode;
+bool tcg_reserial;
+bool tcg_tso_stack;
+bool tcg_tso_vec_group;
+bool tcg_tso_vec_none;
+bool tcg_tso_vec_atomic;
+
+/*
+ * A guest insn is promoted (see tcg_tso_cross_count) once its MO_ACQ_REL
+ * accesses have crossed a 16-byte boundary this many times.
+ */
+#define TSO_PROMOTE_THRESHOLD 1
+
+/* Crossings seen per guest insn pc (all vCPUs). */
+static QemuMutex tso_cross_lock;
+static GHashTable *tso_cross_counts;
+
+bool tcg_tso_cross_count(uint64_t pc)
+{
+    gpointer key = &pc, orig, val;
+    unsigned n;
+
+    qemu_mutex_lock(&tso_cross_lock);
+    if (g_hash_table_lookup_extended(tso_cross_counts, key, &orig, &val)) {
+        n = GPOINTER_TO_UINT(val) + 1;
+        if (n <= TSO_PROMOTE_THRESHOLD) {
+            g_hash_table_insert(tso_cross_counts, orig, GUINT_TO_POINTER(n));
+        }
+    } else {
+        n = 1;
+        g_hash_table_insert(tso_cross_counts, g_memdup2(&pc, sizeof(pc)),
+                            GUINT_TO_POINTER(n));
+    }
+    qemu_mutex_unlock(&tso_cross_lock);
+    return n >= TSO_PROMOTE_THRESHOLD;
+}
+
+bool tcg_tso_cross_faults;
+
+bool tcg_tso_cross_promoted(uint64_t pc)
+{
+    unsigned n;
+
+    qemu_mutex_lock(&tso_cross_lock);
+    n = GPOINTER_TO_UINT(g_hash_table_lookup(tso_cross_counts, &pc));
+    qemu_mutex_unlock(&tso_cross_lock);
+    return n && n >= TSO_PROMOTE_THRESHOLD;
+}
+
+bool tcg_can_ldst_acqrel(void)
+{
+    return TCG_TARGET_HAS_qemu_ldst_acqrel;
+}
+
+bool tcg_vecld;
+bool tcg_vecmem;
+bool tcg_vperm;
+bool tcg_vpermvar;
+bool tcg_vint;
+bool tcg_ssefp_vec;
+bool tcg_ssefp_native;
 bool tcg_dse;
 bool tcg_ldstkeep;
 bool tcg_lazysync;
@@ -299,9 +366,31 @@ bool tcg_retstack_env;
 intptr_t tcg_retep_off;
 bool tcg_retalign;
 bool tcg_tb_flags_canon;
+bool tcg_addr32;
+bool tcg_tsc_counter;
+bool tcg_pause_hint;
+TCGCR3Flush tcg_cr3_flush;
+bool tcg_tlb_nglist;
+bool tcg_tlb_dirtyfilter;
+bool tcg_pcid;
+
+bool tcg_lean;
+bool tcg_alignfold;
+bool tcg_tlbpin;
+bool tcg_atomic;
 TCGJumpCacheLayout tcg_jc_layout;
 const void *tcg_xpage_stub;
 bool tcg_repstr;
+bool tcg_hyperv;
+bool tcg_hvtimers;
+bool tcg_vexzero;
+bool tcg_crypto;
+TCGZext32Mode tcg_zext32;
+bool tcg_zext32_poison;
+bool tcg_zext32_nofix;
+bool tcg_zext32_report;
+bool tcg_guest_addr32;
+bool tcg_zext32_active;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
@@ -1509,6 +1598,13 @@ static void tcg_out_spin_hint(TCGContext *s)
 }
 #endif
 
+#ifndef TCG_TARGET_HAS_RETSTACK
+static void tcg_out_ret_cancel(TCGContext *s)
+{
+    g_assert_not_reached();
+}
+#endif
+
 #ifndef TCG_TARGET_HAS_QEMU_ATOMIC
 static const TCGOutOpQemuAtomic outop_qemu_atomic = {
     .base.static_constraint = C_NotImplemented,
@@ -1586,11 +1682,6 @@ bool tcg_sysret_supported(void)
 }
 
 #ifndef TCG_TARGET_HAS_RETSTACK
-static void tcg_out_ret_cancel(TCGContext *s)
-{
-    g_assert_not_reached();
-}
-
 static const TCGOutOp outop_retstack = {
     .static_constraint = C_NotImplemented,
 };
@@ -3219,7 +3310,6 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_qemu_ld_x:
     case INDEX_op_qemu_st_x:
     case INDEX_op_qemu_atomic:
-    case INDEX_op_shladd:
         tcg_debug_assert(type <= TCG_TYPE_REG);
         goto do_lookup;
 
@@ -3375,6 +3465,46 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
         return has_type && TCG_TARGET_HAS_extract_vec;
     case INDEX_op_insert_vec:
         return has_type && TCG_TARGET_HAS_insert_vec;
+    case INDEX_op_fadd_vec:
+    case INDEX_op_fsub_vec:
+    case INDEX_op_fmul_vec:
+    case INDEX_op_fdiv_vec:
+    case INDEX_op_fmin_vec:
+    case INDEX_op_fmax_vec:
+    case INDEX_op_fsqrt_vec:
+    case INDEX_op_fneg_vec:
+    case INDEX_op_fmla_vec:
+    case INDEX_op_fmls_vec:
+    case INDEX_op_fcmp_vec:
+    case INDEX_op_scvtf_vec:
+    case INDEX_op_fcvtzs_vec:
+    case INDEX_op_frintx_vec:
+    case INDEX_op_frint_vec:
+    case INDEX_op_frint32_vec:
+    case INDEX_op_fadds_vec:
+    case INDEX_op_fsubs_vec:
+    case INDEX_op_fmuls_vec:
+    case INDEX_op_fdivs_vec:
+    case INDEX_op_fmins_vec:
+    case INDEX_op_fmaxs_vec:
+    case INDEX_op_fsqrts_vec:
+    case INDEX_op_frintxs_vec:
+    case INDEX_op_frints_vec:
+    case INDEX_op_fmadds_vec:
+    case INDEX_op_fmsubs_vec:
+    case INDEX_op_fnmadds_vec:
+    case INDEX_op_fnmsubs_vec:
+    case INDEX_op_fcmps_vec:
+    case INDEX_op_fcvts_vec:
+    case INDEX_op_movs_vec:
+    case INDEX_op_fcmp3_vec:
+    case INDEX_op_scvtfs_vec:
+    case INDEX_op_fcvtzsi_vec:
+    case INDEX_op_frecpe_vec:
+    case INDEX_op_frsqrte_vec:
+    case INDEX_op_frecpes_vec:
+    case INDEX_op_frsqrtes_vec:
+        return has_type && TCG_TARGET_HAS_fp_vec;
     case INDEX_op_movz_vec:
         return has_type && TCG_TARGET_HAS_movz_vec;
 
@@ -4816,120 +4946,6 @@ static void goto_tb_cold_pass(TCGContext *s)
 }
 
 /*
- */
-
-
-
-{
-
-    }
-        }
-    }
-        }
-    }
-    }
-        }
-    }
-}
-
-{
-    }
-}
-
-static void __attribute__((noinline))
-{
-
-    }
-
-
-            continue;
-        }
-                }
-            }
-        }
-        case INDEX_op_qemu_ld:
-        case INDEX_op_qemu_st:
-        case INDEX_op_qemu_ld2:
-        case INDEX_op_qemu_st2:
-
-                break;
-            }
-
-                }
-            }
-
-                }
-            }
-            break;
-        }
-        default:
-            break;
-        }
-
-
-
-                }
-            }
-            } else {
-            }
-        }
-
-            }
-        }
-    }
-}
-
-/*
- */
-{
-
-
-        switch (op->opc) {
-        case INDEX_op_qemu_ld:
-        case INDEX_op_qemu_st:
-        case INDEX_op_qemu_ld2:
-        case INDEX_op_qemu_st2:
-            break;
-        default:
-            break;
-        }
-    }
-        }
-    }
-    }
-}
-#endif
-
-/*
- */
-{
-
-}
-
-{
-
-    }
-}
-
-{
-
-    }
-}
-
-{
-    }
-}
-
-{
-}
-
-{
-    return false;
-#endif
-}
-
-
-/*
  * tcg_alignfold: alignment checks implied by an earlier one.  A guest
  * access whose address is the sum of the same globals, unchanged, as an
  * earlier access checked for at least the same alignment, plus a constant
@@ -5751,18 +5767,17 @@ typedef struct XblkLoopReg {
 
 static TCGLabel *op_branch_label(const TCGOp *op)
 {
-    int ng = s->nb_globals;
-
-    s->la_globals = tcg_malloc(sizeof(uint16_t) * ng);
-    s->nb_la_globals = 0;
-    for (int i = find_first_bit(seen, ng); i < ng;
-         i = find_next_bit(seen, ng, i + 1)) {
-        s->la_globals[s->nb_la_globals++] = i;
+    switch (op->opc) {
+    case INDEX_op_br:
+        return arg_label(op->args[0]);
+    case INDEX_op_brcond:
+        return arg_label(op->args[3]);
+    default:
+        return NULL;
     }
 }
 
-/* liveness analysis: list the globals that the ops name. */
-static void la_find_globals(TCGContext *s)
+static bool op_falls_through(const TCGOp *op)
 {
     switch (op->opc) {
     case INDEX_op_br:
@@ -7130,9 +7145,11 @@ liveness_pass_1(TCGContext *s)
                 }
             } else if (def->flags & TCG_OPF_COND_BRANCH) {
                 assert_carry_dead(s);
-                la_bb_sync(s, nb_globals, nb_temps);
-                if (s->boundary_in) {
-                    la_boundary_live(s);
+                if (!la_xblk_branch(s, op, nb_temps, true)) {
+                    la_bb_sync(s, nb_globals, nb_temps);
+                    if (s->boundary_in) {
+                        la_boundary_live(s);
+                    }
                 }
             } else if (def->flags & TCG_OPF_BB_END) {
                 assert_carry_dead(s);
@@ -7140,6 +7157,9 @@ liveness_pass_1(TCGContext *s)
                     ? !la_xblk_label(s, op, nb_temps)
                     : !la_xblk_branch(s, op, nb_temps, false)) {
                     la_bb_end(s, nb_globals, nb_temps);
+                    if (s->boundary_in) {
+                        la_boundary_live(s);
+                    }
                 }
             } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
                 assert_carry_dead(s);
@@ -8701,6 +8721,11 @@ static void tcg_reg_alloc_dup(TCGContext *s, const TCGOp *op)
         if (IS_DEAD_ARG(1)) {
             temp_dead(s, its);
         }
+        if (ots->pinned) {
+            /* Into the pinned global's own register. */
+            tcg_out_dupi_vec(s, vtype, MO_64, ots->reg, val);
+            return;
+        }
         tcg_reg_alloc_do_movi(s, ots, val, arg_life,
                               xblk_pref(s, ots, output_pref(op, 0)));
         return;
@@ -9485,15 +9510,6 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
                 container_of(all_outop[op->opc], TCGOutOpQemuLdSt, base);
 
             out->out(s, type, new_args[0], new_args[1], new_args[2]);
-        }
-        break;
-
-    case INDEX_op_shladd:
-        {
-            const TCGOutOpShlAdd *out = &outop_shladd;
-
-            out->out(s, type, new_args[0], new_args[1], new_args[2],
-                     new_args[3]);
         }
         break;
 
@@ -10801,7 +10817,7 @@ static void pinned_fold_pass(TCGContext *s)
     }
 }
 
-#if defined(TCG_TARGET_HAS_LDST_X) || defined(TCG_TARGET_HAS_SHLADD) || \
+#if defined(TCG_TARGET_HAS_LDST_X) || defined(TCG_TARGET_SHL_ADD_LEA) || \
     defined(TCG_TARGET_I32_OPS_ZEXT)
 /* Whether @op names @t among its arguments (inputs or outputs). */
 static bool op_uses_temp(const TCGOp *op, const TCGTemp *t)
@@ -10906,7 +10922,7 @@ static void ldst_fold_pass(TCGContext *s)
     QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
         bool is_ld, is_vec;
         const int ai = 1;   /* the address, for loads and stores */
-        TCGOp *add, *shl;
+        TCGOp *add, *shl, *lea;
         TCGTemp *t, *base, *index;
         MemOpIdx oi;
         MemOp mop;
@@ -10939,6 +10955,11 @@ static void ldst_fold_pass(TCGContext *s)
             continue;
         }
         add = ldst_fold_def(s, op, t, INDEX_op_add);
+        lea = !add ? ldst_fold_def(s, op, t, INDEX_op_lea) : NULL;
+        if (lea) {
+            /* lea t, b, i, k, 0: a base plus an index the access scales. */
+            add = lea;
+        }
         /* A TB temp's address may have to reach memory too (SYNC_ARG). */
         if (!add || (add->life & SYNC_ARG)) {
             continue;
@@ -10946,7 +10967,17 @@ static void ldst_fold_pass(TCGContext *s)
         base = arg_temp(add->args[1]);
         index = arg_temp(add->args[2]);
         shl = NULL;
-        if (index->kind == TEMP_CONST) {
+        if (lea) {
+            shift = lea->args[3];
+            /* As for a shifted register, below. */
+            if ((mop & MO_ACQ_REL && !(mop & MO_ACQ_REL_CROSS)) || abits ||
+                lea->args[4] != 0 ||
+                (shift != 0 && (shift != (mop & MO_SIZE) || is_vec)) ||
+                base->kind == TEMP_CONST || index->kind == TEMP_CONST ||
+                base == t || index == t) {
+                continue;
+            }
+        } else if (index->kind == TEMP_CONST) {
             int64_t v = index->val;
 
             /* An ordered vector access is aligned: it can't cross. */
@@ -11021,6 +11052,26 @@ static void ldst_fold_pass(TCGContext *s)
 }
 
 #endif
+
+bool tcg_can_zext32(void)
+{
+#if defined(CONFIG_USER_ONLY) && defined(TCG_TARGET_HAS_ZEXT32)
+    return true;
+#else
+    return false;
+#endif
+}
+
+int tcg_zext32_trap(uintptr_t pc)
+{
+#ifdef TCG_TARGET_HAS_ZEXT32
+    if (tcg_zext32 == TCG_ZEXT32_CHECK &&
+        in_code_gen_buffer((void *)(pc - tcg_splitwx_diff))) {
+        return tcg_target_zext32_trap_reg(pc);
+    }
+#endif
+    return -1;
+}
 
 bool tcg_lean_narrow32(void)
 {
@@ -11485,20 +11536,21 @@ static void narrow32_pass(TCGContext *s)
 }
 #endif
 
-#ifdef TCG_TARGET_HAS_SHLADD
+#ifdef TCG_TARGET_SHL_ADD_LEA
 /*
  * x-lean: shl t, a, $k feeding add r, t, b (or b, t), where t dies, is
- * shladd r, a, b, k: the host's add with a shifted operand.  The add may
+ * lea r, b, a, k, 0: the host's add with a shifted operand.  The add may
  * be an I32 op (narrow32_pass): its low 32 bits depend on those of
  * (a << k) alone.
  */
-static void shladd_pass(TCGContext *s)
+static void shl_add_lea_pass(TCGContext *s)
 {
     TCGOp *op, *next;
 
     QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
-        TCGOp *x = NULL, *sa;
+        TCGOp *x = NULL, *lea;
         TCGTemp *t = NULL, *a, *other;
+        TCGType type;
         unsigned k;
         int ti;
 
@@ -11521,25 +11573,29 @@ static void shladd_pass(TCGContext *s)
             arg_temp(x->args[2])->kind != TEMP_CONST) {
             continue;
         }
+        type = TCGOP_TYPE(op);
         k = arg_temp(x->args[2])->val;
         a = arg_temp(x->args[1]);
         other = arg_temp(op->args[3 - ti]);
-        if (k == 0 || k >= (TCGOP_TYPE(op) == TCG_TYPE_I32 ? 32 : 64) ||
+        if (k == 0 || k >= (type == TCG_TYPE_I32 ? 32 : 64) ||
+            !TCG_TARGET_lea_sh_valid(type, k) ||
+            !tcg_op_supported(INDEX_op_lea, type, 0) ||
             a->kind == TEMP_CONST || other->kind == TEMP_CONST || a == t) {
             continue;
         }
-        sa = tcg_op_insert_before(s, op, INDEX_op_shladd, TCGOP_TYPE(op), 4);
-        sa->args[0] = op->args[0];
-        sa->args[1] = temp_arg(a);
-        sa->args[2] = temp_arg(other);
-        sa->args[3] = k;
-        sa->life = op->life & (DEAD_ARG | SYNC_ARG);
-        sa->output_pref[0] = op->output_pref[0];
-        if ((x->life & (DEAD_ARG << 1)) && a != other) {
-            sa->life |= DEAD_ARG << 1;
-        }
+        lea = tcg_op_insert_before(s, op, INDEX_op_lea, type, 5);
+        lea->args[0] = op->args[0];
+        lea->args[1] = temp_arg(other);
+        lea->args[2] = temp_arg(a);
+        lea->args[3] = k;
+        lea->args[4] = 0;
+        lea->life = op->life & (DEAD_ARG | SYNC_ARG);
+        lea->output_pref[0] = op->output_pref[0];
         if (op->life & (DEAD_ARG << (3 - ti))) {
-            sa->life |= DEAD_ARG << 2;
+            lea->life |= DEAD_ARG << 1;
+        }
+        if ((x->life & (DEAD_ARG << 1)) && a != other) {
+            lea->life |= DEAD_ARG << 2;
         }
         tcg_op_remove(s, op);
         ldst_fold_remove(s, x, 2);
@@ -11765,9 +11821,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         narrow32_pass(s);
     }
 #endif
-#ifdef TCG_TARGET_HAS_SHLADD
+#ifdef TCG_TARGET_SHL_ADD_LEA
     if (tcg_lean) {
-        shladd_pass(s);
+        shl_add_lea_pass(s);
     }
 #endif
     if (tcg_lean) {
@@ -11979,9 +12035,6 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             if (s->boundary_in) {
                 tcg_reg_alloc_boundary_place(s);
             }
-            if (s->chain_dead_used) {
-                tcg_reg_alloc_chain_store(s, true);
-            }
             tcg_out_exit_tb(s, op->args[0]);
             break;
         case INDEX_op_goto_tb:
@@ -11992,7 +12045,6 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
                 tcg_reg_alloc_boundary_place(s);
             }
             tcg_out_goto_tb(s, op->args[0]);
-            tcg_note_cond_link(s, op->args[0]);
             break;
         case INDEX_op_goto_tb_dead:
             tcg_reg_alloc_chain_store(s, false);
@@ -12009,12 +12061,6 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             break;
 #ifdef TCG_TARGET_HAS_GOTO_TB_COLD
         case INDEX_op_goto_tb_cold:
-            if (s->chain_dead_used) {
-                tcg_reg_alloc_chain_store(s, true);
-            }
-            if (s->boundary_in) {
-                tcg_reg_alloc_boundary_place(s);
-            }
             if (s->chain_dead_used) {
                 tcg_reg_alloc_chain_store(s, true);
             }

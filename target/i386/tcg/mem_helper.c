@@ -315,7 +315,6 @@ uint32_t HELPER(rep_fast)(CPUX86State *env, uint32_t desc)
     return done != 0;
 }
 
-
 /* After a failed locked CMPXCHG: that its write could have happened. */
 void HELPER(cmpxchg_probe)(CPUX86State *env, target_ulong a0, uint32_t size,
                            uint32_t mmu_idx)

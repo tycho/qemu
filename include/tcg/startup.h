@@ -25,6 +25,8 @@
 #ifndef TCG_STARTUP_H
 #define TCG_STARTUP_H
 
+#include "exec/vaddr.h"
+
 /*
  * x86 guests: CR0.MP, EM and TS are not part of the TB flags; the first
  * instruction in a TB that depends on them checks them at run time.
@@ -588,6 +590,30 @@ extern bool tcg_tlb_dirtyfilter;
 extern bool tcg_pcid;
 
 /*
+ * x-lean: leaner code for common guest patterns, where the host allows:
+ * guest accesses whose address is a register plus a shifted register or
+ * an offset use the host's addressing modes (qemu_ld_x, qemu_st_x); an
+ * operation whose result is only zero-extended from 32 bits is a 32-bit
+ * operation, and so are compares and right shifts of 32-bit extensions,
+ * whose extensions are then dropped; a shift feeding an add is an add
+ * with a shifted operand (lea).
+ */
+extern bool tcg_lean;
+
+/*
+ * tcg_lean_narrow32: tcg_lean, on a host whose 32-bit operations
+ * zero-extend into the 64-bit register: a front end can leave a 64-bit
+ * result whose only use is its low 32 bits to be computed in 32 bits.
+ */
+bool tcg_lean_narrow32(void);
+
+/*
+ * tcg_alignfold: a guest access's alignment check is dropped where an
+ * earlier check on the same globals plus a constant implies it.
+ */
+extern bool tcg_alignfold;
+
+/*
  * x86 guests (accel property x-repstr): REP STOS and REP MOVS a page at
  * a time with the host's widest stores where they can, as CPUs with fast
  * string operations do.
@@ -613,7 +639,54 @@ extern bool tcg_hvtimers;
 extern bool tcg_tlbpin;
 bool tcg_tlbpin_supported(void);
 
-#endif
+/*
+ * x-zext32: in user mode with no guest base, a guest whose addresses are
+ * all 32-bit (tcg_guest_addr32) accesses memory at its address register
+ * itself.  The backend then keeps every defined, live 32-bit value in a
+ * host register zero-extended at each op's boundary, extending where a
+ * value could otherwise carry other bits above it.  TCG_ZEXT32_CHECK
+ * also tests the register before each such access, and traps if its
+ * high half isn't zero.
+ */
+typedef enum TCGZext32Mode {
+    TCG_ZEXT32_OFF,
+    TCG_ZEXT32_ON,
+    TCG_ZEXT32_CHECK,
+} TCGZext32Mode;
+
+extern TCGZext32Mode tcg_zext32;
+
+/*
+ * Development switches for TCG_ZEXT32_CHECK's own tests: tcg_zext32_poison
+ * puts other bits above every 32-bit value the backend zero-extends for
+ * x-zext32 before it does so, and tcg_zext32_nofix leaves them there;
+ * tcg_zext32_report (implied by either) says on stderr, once the prologue
+ * is generated, whether the checks are active.
+ */
+extern bool tcg_zext32_poison;
+extern bool tcg_zext32_nofix;
+extern bool tcg_zext32_report;
+
+/*
+ * Set by the front end, before the prologue is generated, if every guest
+ * address is a 32-bit (I32) temp.
+ */
+extern bool tcg_guest_addr32;
+
+/* Whether x-zext32 applies, decided when the prologue is generated. */
+extern bool tcg_zext32_active;
+
+/*
+ * tcg_foreign_pc: set by a user-mode front end whose guest calls into
+ * code that isn't the guest's (an x64 process's native ARM64EC code on
+ * Windows): whether @pc is such code, which lookups then skip without
+ * probing its page.  With @exit, the call also prepares the CPU's exit to
+ * it (its exception_index), for cpu_exec to return: from the main loop's
+ * lookup, or from helper_lookup_tb_ptr's after a TB, which then leaves
+ * through the epilogue to the main loop, which returns.
+ */
+extern bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
+
 /*
  * tcg_cpu_bound: set by a user-mode front end that sets current_cpu
  * itself, whenever a thread takes a CPU, and calls cpu_exec only with the
@@ -621,3 +694,13 @@ bool tcg_tlbpin_supported(void);
  */
 extern bool tcg_cpu_bound;
 
+/* Whether x-zext32 can be on: user mode on a host that supports it. */
+bool tcg_can_zext32(void);
+
+/*
+ * The host register named by a failed TCG_ZEXT32_CHECK trap at host @pc
+ * (a synchronous trap in generated code), or -1 if @pc isn't one.
+ */
+int tcg_zext32_trap(uintptr_t pc);
+
+#endif

@@ -256,6 +256,50 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
                       ms->smp.max_cpus == 1);
 
     /*
+     * x-apictimer: the x86 local APIC timer fires on its vCPU (from a
+     * deadline thread), not on the main loop.  x-apicpost: fixed edge
+     * IPIs are posted to their targets without the BQL.  Both need
+     * multi-threaded TCG without icount or record/replay; auto means on
+     * where they can be.  Compat properties, so an explicit -global
+     * still wins.
+     */
+    {
+        static GlobalProperty apictimer_props[] = {
+            { "apic", "x-vcpu-timer", "on" },
+        };
+        static GlobalProperty apicpost_props[] = {
+            { "apic", "x-posted", "on" },
+        };
+        AccelClass *ac = ACCEL_GET_CLASS(as);
+        bool can = s->mttcg_enabled == ON_OFF_AUTO_ON && !icount_enabled() &&
+                   replay_mode == REPLAY_MODE_NONE;
+
+        if (!can && (s->apictimer == ON_OFF_AUTO_ON ||
+                     s->apicpost == ON_OFF_AUTO_ON)) {
+            error_report("x-apictimer and x-apicpost need multi-threaded TCG "
+                         "without icount or record/replay");
+            return -EINVAL;
+        }
+        if (can && !ac->compat_props) {
+            ac->compat_props = g_ptr_array_new();
+        }
+        if (can && s->apictimer != ON_OFF_AUTO_OFF) {
+            compat_props_add(ac->compat_props, apictimer_props,
+                             G_N_ELEMENTS(apictimer_props));
+        }
+        if (can && s->apicpost != ON_OFF_AUTO_OFF) {
+            compat_props_add(ac->compat_props, apicpost_props,
+                             G_N_ELEMENTS(apicpost_props));
+        }
+    }
+
+    /* x-haltpoll: how long a halted vCPU spins before it sleeps */
+    mttcg_haltpoll_ns = (int64_t)s->haltpoll_us * 1000;
+
+    /* x-hostpoll: how the main loop waits for a timeout (no ppoll) */
+    qemu_host_poll = s->hostpoll;
+
+    /*
      * With x-cr3-flush=nonglobal, each tlb also lists the slots it fills
      * with non-global entries, and keeps a bitmap of the host pages it
      * maps writable.  Both start empty: they are kept from the start or
@@ -301,6 +345,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
      * initialize the prologue now; or, where guest registers may be
      * pinned, once the front end has pinned them (tcg_exec_realizefn).
      */
+    tcg_jc_layout_init();
     if (tcg_pin && tcg_pin_system_ok()) {
         tcg_prologue_deferred = true;
     } else {
@@ -1117,6 +1162,107 @@ static void tcg_set_alignfold(Object *obj, bool value, Error **errp)
     tcg_alignfold = value;
 }
 
+static bool tcg_get_repstr(Object *obj, Error **errp)
+{
+    return tcg_repstr;
+}
+
+static void tcg_set_repstr(Object *obj, bool value, Error **errp)
+{
+    tcg_repstr = value;
+}
+
+static bool tcg_get_hyperv(Object *obj, Error **errp)
+{
+    return TCG_STATE(obj)->hyperv;
+}
+
+static void tcg_set_hyperv(Object *obj, bool value, Error **errp)
+{
+    TCG_STATE(obj)->hyperv = value;
+}
+
+static bool tcg_get_hvtimers(Object *obj, Error **errp)
+{
+    return TCG_STATE(obj)->hvtimers;
+}
+
+static void tcg_set_hvtimers(Object *obj, bool value, Error **errp)
+{
+    TCG_STATE(obj)->hvtimers = value;
+}
+
+static bool tcg_get_tlbpin(Object *obj, Error **errp)
+{
+    return tcg_tlbpin;
+}
+
+static void tcg_set_tlbpin(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_tlbpin_supported()) {
+        error_setg(errp, "x-tlbpin: not supported by this TCG backend");
+        return;
+    }
+    tcg_tlbpin = value;
+}
+
+static char *tcg_get_smc(Object *obj, Error **errp)
+{
+    return g_strdup(!tcg_smc_check ? "protect" :
+                    tcg_smc_call ? "check-call" : "check");
+}
+
+static void tcg_set_smc(Object *obj, const char *value, Error **errp)
+{
+    if (!strcmp(value, "protect")) {
+        tcg_smc_check = false;
+        tcg_smc_call = false;
+    } else if (!strcmp(value, "check") || !strcmp(value, "check-call")) {
+#ifdef CONFIG_USER_ONLY
+        tcg_smc_check = true;
+        tcg_smc_call = !strcmp(value, "check-call");
+#else
+        error_setg(errp, "x-smc=check is only available in user mode");
+#endif
+    } else {
+        error_setg(errp, "x-smc must be protect, check or check-call");
+    }
+}
+
+static char *tcg_get_cache(Object *obj, Error **errp)
+{
+    switch (tcg_cache_mode) {
+    case TCG_CACHE_ON:
+        return g_strdup(tcg_cache_files ? "files" : "on");
+    case TCG_CACHE_CAPTURE:
+        return g_strdup("capture");
+    case TCG_CACHE_STRESS:
+        return g_strdup("stress");
+    default:
+        return g_strdup("off");
+    }
+}
+
+static void tcg_set_cache(Object *obj, const char *value, Error **errp)
+{
+    bool files = !strcmp(value, "files");
+
+    if (!strcmp(value, "off")) {
+        tcg_cache_mode = TCG_CACHE_OFF;
+        tcg_cache_files = false;
+    } else if (files || !strcmp(value, "on")) {
+        if (!tcg_can_cache()) {
+            error_setg(errp, "x-cache=%s: only in user mode on an aarch64 "
+                       "host", value);
+            return;
+        }
+        tcg_cache_mode = TCG_CACHE_ON;
+        tcg_cache_files = files;
+    } else {
+        error_setg(errp, "x-cache must be off, on or files");
+    }
+}
+
 static char *tcg_get_zext32(Object *obj, Error **errp)
 {
     switch (tcg_zext32) {
@@ -1169,40 +1315,6 @@ static void tcg_set_zext32(Object *obj, const char *value, Error **errp)
                                             "report");
     }
 #endif
-}
-
-static char *tcg_get_cache(Object *obj, Error **errp)
-{
-    switch (tcg_cache_mode) {
-    case TCG_CACHE_ON:
-        return g_strdup(tcg_cache_files ? "files" : "on");
-    case TCG_CACHE_CAPTURE:
-        return g_strdup("capture");
-    case TCG_CACHE_STRESS:
-        return g_strdup("stress");
-    default:
-        return g_strdup("off");
-    }
-}
-
-static void tcg_set_cache(Object *obj, const char *value, Error **errp)
-{
-    bool files = !strcmp(value, "files");
-
-    if (!strcmp(value, "off")) {
-        tcg_cache_mode = TCG_CACHE_OFF;
-        tcg_cache_files = false;
-    } else if (files || !strcmp(value, "on")) {
-        if (!tcg_can_cache()) {
-            error_setg(errp, "x-cache=%s: only in user mode on an aarch64 "
-                       "host", value);
-            return;
-        }
-        tcg_cache_mode = TCG_CACHE_ON;
-        tcg_cache_files = files;
-    } else {
-        error_setg(errp, "x-cache must be off, on or files");
-    }
 }
 
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
@@ -1435,6 +1547,15 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "counter, read inline, invariant, with IA32_TSC_ADJUST (not with "
         "icount)");
 
+    object_class_property_add(oc, "x-tlb-grow", "uint32", &uint32_type_info,
+                              tcg_get_tlb_grow, tcg_set_tlb_grow,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "x-tlb-grow",
+        "Grow a softmmu TLB between flushes once it has had this many "
+        "times its size in fills within 100 ms while over 35% used, and "
+        "size it for 15-35% use instead of 30-70% (0: QEMU's sizing, "
+        "only at flushes, the default)");
+
     object_class_property_add_str(oc, "x-jitwx", tcg_get_jitwx, tcg_set_jitwx);
     object_class_property_set_description(oc, "x-jitwx",
         "macOS MAP_JIT write/execute toggles: always (default) or lazy "
@@ -1517,7 +1638,7 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "kqueue timer), spin (kqueue, waking early and polling until the "
         "deadline)");
 
-    object_class_property_add(oc, "x-haltpoll", "uint32",
+    object_class_property_add(oc, "x-haltpoll", "uint32", &uint32_type_info,
                               tcg_get_haltpoll, tcg_set_haltpoll, NULL, NULL);
     object_class_property_set_description(oc, "x-haltpoll",
         "multi-threaded TCG: the longest a halted vCPU spins, watching for "
@@ -1525,6 +1646,7 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "never spins); the spin adapts below it");
 
     object_class_property_add(oc, "x-apicpost", "OnOffAuto",
+                              &OnOffAuto_type_info,
                               tcg_get_apicpost, tcg_set_apicpost, NULL, NULL);
     object_class_property_set_description(oc, "x-apicpost",
         "x86: fixed edge IPIs written to the ICR are posted to their "
@@ -1532,6 +1654,7 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "TCG, without icount or record/replay)");
 
     object_class_property_add(oc, "x-apictimer", "OnOffAuto",
+                              &OnOffAuto_type_info,
                               tcg_get_apictimer, tcg_set_apictimer, NULL, NULL);
     object_class_property_set_description(oc, "x-apictimer",
         "x86: the local APIC timer fires on its vCPU, woken by a deadline "
@@ -1572,6 +1695,7 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "translation of image code kept in the process and installed again "
         "before translating the same code) or files (kept in and read from "
         "files too, which other processes share)");
+
     object_class_property_add_str(oc, "x-zext32", tcg_get_zext32,
                                   tcg_set_zext32);
     object_class_property_set_description(oc, "x-zext32",

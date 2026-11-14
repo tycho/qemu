@@ -1887,8 +1887,9 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
         native->Pc = (uintptr_t)xt_ec_exit_resume_point;
         ec_continue_level(NULL, native);
     }
-    /* The start-up probe (xt_ec_probe_rtcs), before any gate can close. */
-    if (xt_ec_probe_rtcs(er, guest, native)) {
+    /* The start-up probes (xt_cross_probe), before any gate can close. */
+    if (xt_cross_probe_take(er->ExceptionCode, &native->Pc) ||
+        xt_ec_probe_rtcs(er, guest, native)) {
         ec_continue_level(NULL, native);
     }
     g = xt_gate_self();
@@ -1925,7 +1926,7 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
 
         if (top) {
             native->X[tcg_retstack_reg] = top;
-            xt_continue_native(native);
+            ec_continue_level(g, native);
         }
     }
     if (t && t == xt_self && t->state != XT_WINDOWS) {

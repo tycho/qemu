@@ -2398,6 +2398,9 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     MemOp opc = get_memop(lb->oi);
 
+    if (lb->fallback) {
+        return tcg_out_acqrel_fallback(s, lb);
+    }
     if (!tcg_out_ldst_slow_entry(s, lb)) {
         return false;
     }
@@ -2408,8 +2411,6 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     tcg_out_ldst_addr_ofs(s, lb);
     tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
     tcg_out_pinned_clobbered(s, false, 0);
-    tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
-    tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
     if (lb->type == TCG_TYPE_V128) {
         /* The Int128 result in X0:X1 goes to the vector. */
         tcg_out_insn(s, fmov, DX, lb->datalo_reg, TCG_REG_X0);
@@ -2417,6 +2418,7 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     } else {
         tcg_out_ld_helper_ret(s, lb, false, &ldst_helper_param);
     }
+    tcg_out_ldst_save(s, lb->save_regs, true, ldst_outputs(lb));
     tcg_out_goto(s, lb->raddr);
     return true;
 }
@@ -2425,13 +2427,15 @@ static bool tcg_out_qemu_st_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
 {
     MemOp opc = get_memop(lb->oi);
 
+    if (lb->fallback) {
+        return tcg_out_acqrel_fallback(s, lb);
+    }
     if (!tcg_out_ldst_slow_entry(s, lb)) {
         return false;
     }
 
     tcg_out_ldst_writeback(s, lb);
     tcg_out_ldst_save(s, lb->save_regs, false, 0);
-    tcg_out_st_helper_args(s, lb, &ldst_helper_param);
     if (lb->type == TCG_TYPE_V128) {
         /* The vector as an Int128 argument, by way of two scratch registers. */
         TCGLabelQemuLdst l = *lb;
@@ -3910,18 +3914,6 @@ static void tcg_out_call_ptr(TCGContext *s, TCGReg a0)
 }
 
 /*
- * CCMP Rn, #0, #4, EQ: NE only if EQ before and Rn isn't zero.  After a
- * return stack entry's checks, NE predicts: an entry whose landing is
- * zero (never pushed since the ring was cleared) doesn't, whatever guest
- * address it matched.
- */
-static void tcg_out_ccmp_nz(TCGContext *s, TCGReg rn)
-{
-    tcg_out32(s, 0x7a400800 | TCG_TYPE_I64 << 31
-              | tcg_cond_to_aarch64[TCG_COND_EQ] << 12 | rn << 5 | 4);
-}
-
-/*
  * Whether generated code may reach a return stack landing by BR: the
  * landings carry no BTI pad, so not where the code buffer is guarded
  * (host_prot_read_exec).
@@ -4042,6 +4034,18 @@ static void tcg_out_retstack_walk(TCGContext *s)
     tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, rep - s->code_ptr);
     patch_bcond(hi, TCG_COND_GTU, s->code_ptr);
     *cbz = Icbz_CBZ | 1u << 31 | ((s->code_ptr - cbz) & 0x7ffff) << 5 | n;
+}
+
+/*
+ * CCMP Rn, #0, #4, EQ: NE only if EQ before and Rn isn't zero.  After a
+ * return stack entry's checks, NE predicts: an entry whose landing is
+ * zero (never pushed since the ring was cleared) doesn't, whatever guest
+ * address it matched.
+ */
+static void tcg_out_ccmp_nz(TCGContext *s, TCGReg rn)
+{
+    tcg_out32(s, 0x7a400800 | TCG_TYPE_I64 << 31
+              | tcg_cond_to_aarch64[TCG_COND_EQ] << 12 | rn << 5 | 4);
 }
 
 static void tcg_out_ret_tb(TCGContext *s, TCGReg key, unsigned tag)
@@ -6967,10 +6971,12 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     }
 
     tcg_out_mov(s, TCG_TYPE_PTR, TCG_AREG0, tcg_target_call_iarg_regs[0]);
+    tcg_out_pinned_ld(s);
     if (tcg_retstack_reg >= 0) {
         tcg_out_ld(s, TCG_TYPE_I64, tcg_retstack_reg, TCG_AREG0,
                    tcg_retsp_off);
     }
+    tcg_out_boundary_ldst(s, true);
     tcg_out_insn(s, bcond_reg, BR, tcg_target_call_iarg_regs[1]);
 
     /*
@@ -6984,10 +6990,12 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     /* TB epilogue */
     tb_ret_addr = tcg_splitwx_to_rx(s->code_ptr);
     tcg_out_bti(s, BTI_J);
+    tcg_out_pinned_st(s);
     if (tcg_retstack_reg >= 0) {
         tcg_out_st(s, TCG_TYPE_I64, tcg_retstack_reg, TCG_AREG0,
                    tcg_retsp_off);
     }
+    tcg_out_boundary_ldst(s, false);
     if (tcg_retstack_reg >= 0 && tcg_retalign) {
         tcg_out_retstack_walk(s);
     }
