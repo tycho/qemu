@@ -41,6 +41,7 @@ typedef ram_addr_t tb_page_addr_t;
 struct tb_tc {
     const void *ptr;    /* pointer to the translated code */
     size_t size;
+    const uint8_t *search;  /* the unwind data */
 };
 
 struct TranslationBlock {
@@ -130,9 +131,35 @@ struct TranslationBlock {
      * setting one of the jump targets (or patching the jump instruction). Only
      * two of such jumps are supported.
      */
-#define TB_JMP_OFFSET_INVALID 0xffff /* indicates no jump generated */
-    uint16_t jmp_reset_offset[2]; /* offset of original jump target */
-    uint16_t jmp_insn_offset[2];  /* offset of direct jump insn */
+#define TB_JMP_OFFSET_INVALID UINT32_MAX /* indicates no jump generated */
+    uint32_t jmp_reset_offset[2]; /* offset of original jump target */
+    /*
+     * The goto_tb slots that leave by a host call (tcg_gen_call_tb), and
+     * TB_JMP_RET_LANDING if host returns may enter the TB
+     * (tcg_gen_push_ret).
+     */
+    uint16_t jmp_call;
+#define TB_JMP_RET_LANDING 0x100
+    /*
+     * The goto_tb slots whose unlinked path is out of line, at the TB's
+     * end (tcg_goto_tb_cold): a slot is one direct branch, to the TB it
+     * is linked to if in range, else to a trampoline right before its
+     * reset address, else to the reset address.
+     */
+    uint8_t jmp_cold;
+    /*
+     * The slots whose trampoline loads the target address from afar
+     * (the TB struct out of literal range): one insn longer.
+     */
+    uint8_t jmp_far;
+    /*
+     * For a goto_tb slot that is the first insn at a label which one
+     * conditional branch reaches: 1 + that branch's offset, else 0.
+     * Linking the slot points the branch at the same TB when it can reach
+     * it, so that the taken path doesn't take a second branch.
+     */
+    uint32_t jmp_cond[2];
+    uint32_t jmp_insn_offset[2];  /* offset of direct jump insn */
     uintptr_t jmp_target_addr[2]; /* target address */
 
     /*

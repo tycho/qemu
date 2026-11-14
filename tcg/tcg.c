@@ -34,6 +34,7 @@
 #include "qemu/cacheflush.h"
 #include "qemu/cacheinfo.h"
 #include "qemu/timer.h"
+#include "qemu/units.h"
 #include "exec/target_page.h"
 #include "exec/translation-block.h"
 #include "exec/tlb-common.h"
@@ -276,6 +277,20 @@ bool tcg_vecglobal;
 bool tcg_ymmglobal;
 bool tcg_vregs_all;
 bool tcg_region;
+bool tcg_tbpack;
+bool tcg_tblayout;
+bool tcg_bti = true;
+bool tcg_retstack;
+intptr_t tcg_retsp_off;
+int tcg_retstack_reg = -1;
+bool tcg_retstack_addr64;
+bool tcg_sysret;
+bool tcg_retstack_env;
+intptr_t tcg_retep_off;
+bool tcg_retalign;
+bool tcg_tb_flags_canon;
+TCGJumpCacheLayout tcg_jc_layout;
+const void *tcg_xpage_stub;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
@@ -1487,6 +1502,37 @@ static const TCGOutOp outop_goto_ptr = {
     .static_constraint = C_O0_I1(r),
 };
 
+#ifdef TCG_TARGET_HAS_RETSTACK
+static const TCGOutOp outop_retstack = {
+    .static_constraint = C_O0_I1(r),
+};
+#endif
+
+bool tcg_sysret_supported(void)
+{
+#ifdef TCG_TARGET_HAS_RETSTACK_ENV
+    return true;
+#else
+    return false;
+#endif
+}
+
+#ifndef TCG_TARGET_HAS_RETSTACK
+static void tcg_out_ret_cancel(TCGContext *s)
+{
+    g_assert_not_reached();
+}
+
+static const TCGOutOp outop_retstack = {
+    .static_constraint = C_NotImplemented,
+};
+
+bool tcg_retstack_access(uintptr_t pc)
+{
+    return false;
+}
+#endif
+
 static const TCGOutOpLoad outop_ld = {
     .base.static_constraint = C_O1_I1(r, r),
     .out = tcg_out_ld,
@@ -1590,6 +1636,9 @@ static const TCGOutOp * const all_outop[NB_OPS] = {
     OUTOP(INDEX_op_xor, TCGOutOpBinary, outop_xor),
 
     [INDEX_op_goto_ptr] = &outop_goto_ptr,
+    [INDEX_op_push_ret] = &outop_retstack,
+    [INDEX_op_call_ptr] = &outop_retstack,
+    [INDEX_op_ret_tb] = &outop_retstack,
 };
 
 #undef OUTOP
@@ -2270,16 +2319,119 @@ void tcg_init(size_t tb_size, int splitwx, unsigned max_threads)
 }
 
 /*
- * Allocate TBs right before their corresponding translated code, making
- * sure that TBs and code are on different cache lines.
+ * tcg_tblayout: a region is used in chunks of up to TBLAYOUT_CHUNK bytes,
+ * hot code first, TB structs and cold code in the rest, so every branch
+ * between them stays in range.  A chunk ends when either part has less
+ * than TBLAYOUT_RESERVE left, more than one TB's worth.  The hot part's
+ * share, in 64ths, follows the share the hot code took of the chunks
+ * before (s->lay_hot64), starting from TBLAYOUT_HOT64, so that neither
+ * part is left with much unused when the other fills.
+ */
+#define TBLAYOUT_CHUNK          (16 * MiB)
+#define TBLAYOUT_HOT64          24
+#define TBLAYOUT_RESERVE        (64 * KiB)
+
+bool tcg_can_tblayout(void)
+{
+#ifdef TCG_TARGET_HAS_TBLAYOUT
+    return true;
+#else
+    return false;
+#endif
+}
+
+/*
+ * Keep code_gen_ptr in the hot part of the current chunk with room for a
+ * TB in both parts, else start the next chunk; s->lay_on says whether
+ * this TB gets the layout (not in a region too small for a chunk).  While
+ * it does, the hot part's end is the code's high water mark: a TB that
+ * doesn't fit fails (-1), which uses the chunk up, and tb_gen_code
+ * allocates it again in the next one.
+ */
+static void tb_layout_chunk(TCGContext *s)
+{
+    uint8_t *p = s->code_gen_ptr, *base = s->lay_chunk;
+    uint8_t *end = (uint8_t *)s->code_gen_buffer + s->code_gen_buffer_size;
+    size_t size;
+
+    s->lay_on = false;
+    s->lay_retry = false;
+    if (!tcg_tblayout || !p) {
+        return;
+    }
+    s->code_gen_highwater = end - TCG_HIGHWATER;
+    if (base && p >= base && p + TBLAYOUT_RESERVE <= (uint8_t *)s->lay_hot_end
+        && (uint8_t *)s->lay_cold + TBLAYOUT_RESERVE
+           <= (uint8_t *)s->lay_cold_end) {
+        s->code_gen_highwater = (uint8_t *)s->lay_hot_end - TCG_HIGHWATER;
+        s->lay_on = true;
+        return;
+    }
+    if (base && p >= base && p < (uint8_t *)s->lay_cold_end) {
+        /* Not after a failed TB used the chunk up (lay_hot_end reset). */
+        if (s->lay_hot_end != base) {
+            uint64_t hot = p - base;
+            uint64_t cold = (uint8_t *)s->lay_cold - (uint8_t *)s->lay_hot_end;
+            unsigned last = s->lay_hot64 ? s->lay_hot64 : TBLAYOUT_HOT64;
+            unsigned h = (hot * 64 + (hot + cold) / 2) / (hot + cold);
+
+            /* Averaged with the chunks before. */
+            s->lay_hot64 = MIN(MAX((last + h + 1) / 2, 8), 56);
+        }
+        p = s->lay_cold_end;
+    }
+    p = (uint8_t *)ROUND_UP((uintptr_t)p, 16);
+    size = MIN(TBLAYOUT_CHUNK, end > p ? end - p : 0);
+    if (size < 8 * TBLAYOUT_RESERVE) {
+        /* The rest of the region, after the last chunk, packed. */
+        qatomic_set(&s->code_gen_ptr, MIN(p, end));
+        s->lay_chunk = NULL;
+        return;
+    }
+    s->lay_chunk = p;
+    s->lay_hot_end = p + ROUND_DOWN(size / 64 *
+                                    (s->lay_hot64 ? s->lay_hot64
+                                                  : TBLAYOUT_HOT64), 16);
+    s->lay_cold = s->lay_hot_end;
+    s->lay_cold_end = p + size;
+    qatomic_set(&s->code_gen_ptr, p);
+    s->code_gen_highwater = (uint8_t *)s->lay_hot_end - TCG_HIGHWATER;
+    s->lay_on = true;
+}
+
+/*
+ * tcg_tblayout: the high water mark of TB data written at s->lay_cold,
+ * in the current chunk's cold part.
+ */
+void *tcg_tb_data_highwater(TCGContext *s)
+{
+    return (uint8_t *)s->lay_cold_end - TCG_HIGHWATER;
+}
+
+/* tcg_tbpack: the alignment of a packed TB struct and of its code. */
+#define TCG_TBPACK_ALIGN 16
+
+/*
+ * Allocate TBs right before their corresponding translated code.  By
+ * default TBs and code are on different cache lines; tcg_tbpack packs
+ * them.
  */
 TranslationBlock *tcg_tb_alloc(TCGContext *s)
 {
-    uintptr_t align = qemu_icache_linesize;
+    uintptr_t align = tcg_tbpack ? TCG_TBPACK_ALIGN : qemu_icache_linesize;
     TranslationBlock *tb;
     void *next;
 
+    QEMU_BUILD_BUG_ON(TCG_TBPACK_ALIGN < __alignof__(TranslationBlock));
     while (1) {
+        tb_layout_chunk(s);
+        if (s->lay_on) {
+            /* The struct in the chunk's cold part; the code where it was. */
+            tb = (void *)ROUND_UP((uintptr_t)s->lay_cold, TCG_TBPACK_ALIGN);
+            s->lay_cold = (void *)ROUND_UP((uintptr_t)(tb + 1),
+                                           TCG_TBPACK_ALIGN);
+            return tb;
+        }
         tb = (void *)ROUND_UP((uintptr_t)s->code_gen_ptr, align);
 
         /*
@@ -2317,6 +2469,17 @@ void tcg_prologue_init(void)
     qemu_thread_jit_write();
     /* Generate the prologue.  */
     tcg_target_qemu_prologue(s);
+
+    /*
+     * x-retalign keeps its account in the register that holds the return
+     * stack's top, which the prologue has now chosen or not.
+     */
+    if (tcg_retalign && tcg_retstack_reg < 0) {
+        error_report("x-retalign: needs x-retstack with its top in a host "
+                     "register (a 64-bit guest, no guest base, an AArch64 "
+                     "host)");
+        exit(EXIT_FAILURE);
+    }
 
     /* Allow the prologue to put e.g. guest_base into a pool entry.  */
     {
@@ -2405,6 +2568,8 @@ void tcg_func_start(TCGContext *s)
 
     s->nb_ops = 0;
     s->nb_labels = 0;
+    s->call_ret = s->call_land = NULL;
+    s->call_ret_set = false;
     s->current_frame_offset = s->frame_start;
 
 #ifdef CONFIG_DEBUG_TCG
@@ -2890,6 +3055,24 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_goto_tb:
     case INDEX_op_goto_ptr:
         return true;
+
+    case INDEX_op_goto_tb_cold:
+#ifdef TCG_TARGET_HAS_GOTO_TB_COLD
+        return true;
+#else
+        return false;
+#endif
+    case INDEX_op_call_tb:
+    case INDEX_op_ret_cancel:
+#ifdef TCG_TARGET_HAS_RETSTACK
+        return true;
+#else
+        return false;
+#endif
+    case INDEX_op_push_ret:
+    case INDEX_op_call_ptr:
+    case INDEX_op_ret_tb:
+        goto do_lookup;
 
     case INDEX_op_qemu_ld:
     case INDEX_op_qemu_st:
@@ -4066,6 +4249,11 @@ void tcg_op_remove(TCGContext *s, TCGOp *op)
     case INDEX_op_brcond:
         remove_label_use(op, 3);
         break;
+    case INDEX_op_push_ret:
+    case INDEX_op_call_tb:
+    case INDEX_op_goto_tb_cold:
+        remove_label_use(op, 1);
+        break;
     default:
         break;
     }
@@ -4177,6 +4365,11 @@ static void move_label_uses(TCGLabel *to, TCGLabel *from)
             break;
         case INDEX_op_brcond:
             op->args[3] = label_arg(to);
+            break;
+        case INDEX_op_push_ret:
+        case INDEX_op_call_tb:
+        case INDEX_op_goto_tb_cold:
+            op->args[1] = label_arg(to);
             break;
         default:
             g_assert_not_reached();
@@ -4386,6 +4579,79 @@ dead_env_store_pass(TCGContext *s)
     }
 }
 
+/*
+ * tcg_goto_tb_cold: move each goto_tb's unlinked path (the ops after it up
+ * to its exit_tb) to the end of the TB, behind a label the slot branches
+ * to while unlinked; the goto_tb becomes goto_tb_cold.
+ */
+bool tcg_goto_tb_cold;
+
+static void goto_tb_cold_pass(TCGContext *s)
+{
+#ifdef TCG_TARGET_HAS_GOTO_TB_COLD
+    TCGOp *op, *next, *last = QTAILQ_LAST(&s->ops);
+    bool done = false;
+
+    for (op = QTAILQ_FIRST(&s->ops); op && !done; op = next) {
+        TCGOp *p, *end = NULL, *cold, *after;
+        TCGLabel *l;
+
+        next = QTAILQ_NEXT(op, link);
+        done = op == last;
+        if (op->opc != INDEX_op_goto_tb) {
+            continue;
+        }
+        for (p = next; p; p = QTAILQ_NEXT(p, link)) {
+            const TCGOpDef *def = &tcg_op_defs[p->opc];
+
+            if (p->opc == INDEX_op_exit_tb) {
+                end = p;
+                break;
+            }
+            if (p->opc == INDEX_op_set_label ||
+                p->opc == INDEX_op_insn_start || p->opc == INDEX_op_call ||
+                (def->flags & (TCG_OPF_BB_END | TCG_OPF_BB_EXIT |
+                               TCG_OPF_COND_BRANCH))) {
+                break;
+            }
+            if (p == last) {
+                break;
+            }
+        }
+        if (!end) {
+            continue;
+        }
+        l = gen_new_label();
+        cold = tcg_op_insert_before(s, op, INDEX_op_goto_tb_cold, 0, 2);
+        cold->args[0] = op->args[0];
+        cold->args[1] = label_arg(l);
+        {
+            TCGLabelUse *u = tcg_malloc(sizeof(TCGLabelUse));
+
+            u->op = cold;
+            QSIMPLEQ_INSERT_TAIL(&l->branches, u, next);
+        }
+        after = QTAILQ_NEXT(end, link);
+        done = done || end == last;
+        /* The label, then the unlinked path, at the end. */
+        gen_set_label(l);
+        l->cold = true;
+        for (p = next;; p = cold) {
+            bool was_end = p == end;
+
+            cold = QTAILQ_NEXT(p, link);
+            QTAILQ_REMOVE(&s->ops, p, link);
+            QTAILQ_INSERT_TAIL(&s->ops, p, link);
+            if (was_end) {
+                break;
+            }
+        }
+        tcg_op_remove(s, op);
+        next = done ? NULL : after;
+    }
+#endif
+}
+
 /* Reachable analysis : remove unreachable code.  */
 static void __attribute__((noinline))
 reachable_code_pass(TCGContext *s)
@@ -4424,7 +4690,7 @@ reachable_code_pass(TCGContext *s)
              * and label had not yet been removed.
              */
             if (op_prev && op_prev->opc == INDEX_op_br &&
-                label == arg_label(op_prev->args[0])) {
+                label == arg_label(op_prev->args[0]) && !label->cold) {
                 tcg_op_remove(s, op_prev);
                 /* Fall through means insns become live again.  */
                 dead = false;
@@ -4449,7 +4715,12 @@ reachable_code_pass(TCGContext *s)
         case INDEX_op_br:
         case INDEX_op_exit_tb:
         case INDEX_op_goto_ptr:
-            /* Unconditional branches; everything following is dead.  */
+        case INDEX_op_goto_tb_cold:
+            /*
+             * Unconditional branches; everything following is dead.
+             * goto_tb_cold branches to its target or, unlinked, to its
+             * label: unlike goto_tb, it never falls through.
+             */
             dead = true;
             break;
 
@@ -7531,6 +7802,19 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         tcg_out_goto_ptr(s, new_args[0]);
         break;
 
+#ifdef TCG_TARGET_HAS_RETSTACK
+    case INDEX_op_push_ret:
+        tcg_out_push_ret(s, new_args[0], arg_label(new_args[1]),
+                         new_args[2]);
+        break;
+    case INDEX_op_call_ptr:
+        tcg_out_call_ptr(s, new_args[0]);
+        break;
+    case INDEX_op_ret_tb:
+        tcg_out_ret_tb(s, new_args[0], new_args[1]);
+        break;
+#endif
+
     default:
         tcg_debug_assert(def->flags & TCG_OPF_VECTOR);
         tcg_out_vec_op(s, op->opc, type - TCG_TYPE_V64,
@@ -8761,6 +9045,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
                 tcg_reg_alloc_boundary_place(s);
             }
             tcg_out_goto_tb(s, op->args[0]);
+            tcg_note_cond_link(s, op->args[0]);
             break;
         case INDEX_op_goto_tb_dead:
             tcg_reg_alloc_chain_store(s, false);

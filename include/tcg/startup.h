@@ -326,4 +326,140 @@ extern bool tcg_vexzero;
  */
 extern bool tcg_crypto;
 
+/*
+ * tcg_tbpack: tcg_tb_alloc puts a TB's struct right below its code, both
+ * 16-byte aligned, instead of each in its own instruction-cache lines.
+ */
+extern bool tcg_tbpack;
+
+/*
+ * tcg_tblayout: hot code packed; TB structs and the code of exits not yet
+ * linked out of the code stream, in the cold part of a chunk (tcg_tb_alloc).
+ */
+extern bool tcg_tblayout;
+
+/* Whether the backend can do tcg_tblayout. */
+bool tcg_can_tblayout(void);
+
+/*
+ * tcg_bti: where the host has BTI, the code buffer is mapped as guarded
+ * pages and generated code has landing pads at indirect branch targets
+ * (the default).  Without it neither: fewer host insns, no BTI checks on
+ * generated code.  Read when the code buffer is mapped and at code
+ * generation, so it must be set before tcg_init().
+ */
+extern bool tcg_bti;
+
+/*
+ * tcg_retstack: guest calls and returns through a return stack in host
+ * code (tcg_gen_push_ret).  The front end sets tcg_retsp_off, the offset
+ * in env where the stack's top is kept outside generated code, and
+ * tcg_retstack_addr64 if all its guest addresses are 64-bit; the backend
+ * sets tcg_retstack_reg, the host register that holds the top in
+ * generated code, if it has one to spare, else -1.
+ */
+extern bool tcg_retstack;
+
+/*
+ * tcg_goto_tb_cold: a goto_tb's unlinked path goes to the end of the TB,
+ * so that the TB's code on its linked paths is contiguous and each goto_tb
+ * is one branch where the backend allows (TCG_TARGET_HAS_GOTO_TB_COLD).
+ */
+extern bool tcg_goto_tb_cold;
+extern intptr_t tcg_retsp_off;
+extern int tcg_retstack_reg;
+extern bool tcg_retstack_addr64;
+/*
+ * tcg_sysret: the return stack in system mode too, where the backend
+ * implements it (tcg_sysret_supported), with its top in env
+ * (tcg_retstack_env, set when the front end has set tcg_retep_off): an
+ * entry is good only under the vCPU's epoch at tcg_retep_off in env,
+ * which tcg_retstack_bump() moves on wherever the jump cache is
+ * invalidated.
+ */
+extern bool tcg_sysret;
+extern bool tcg_retstack_env;
+extern intptr_t tcg_retep_off;
+bool tcg_sysret_supported(void);
+void tcg_retstack_bump(CPUState *cpu);
+#define TCG_RETSTACK_SIZE (16 * 1024)
+/*
+ * User mode: the mapping for a ring aligned to twice its size, which
+ * generated code's walk relies on (tcg_retalign), with a guard page of
+ * size @page at each end.
+ */
+#define TCG_RETSTACK_MAP_SIZE(page) (3 * TCG_RETSTACK_SIZE + 2 * (page))
+/*
+ * The tags of tcg_gen_push_ret() are below this; the epoch at
+ * tcg_retep_off counts in steps of it.
+ */
+#define TCG_RETSTACK_TAGS 128
+void tcg_retstack_reset(CPUState *cpu);
+/*
+ * tcg_retalign (x-retalign, user mode): keep the return stack in step
+ * with the host's calls where guest code is entered from outside it.
+ * With the top in tcg_retstack_reg (outside generated code, in env):
+ * tcg_retstack_pop_key() pops the top entry if its key is @key, and
+ * tcg_retstack_push_key() pushes @key with no landing, an entry that a
+ * return with that key reaches by the lookup.  Both stay within the ring
+ * and return whether they changed it.
+ */
+extern bool tcg_retalign;
+bool tcg_retstack_pop_key(CPUState *cpu, uint64_t key);
+bool tcg_retstack_push_key(CPUState *cpu, uint64_t key);
+/*
+ * tcg_retalign: after generated code was left without its epilogue (a
+ * longjmp), mark old every landing above 0 from the top in env up, as
+ * the epilogue would its run of them, but return nothing: the host's
+ * return predictor is past repair.
+ */
+void tcg_retstack_settle(CPUState *cpu);
+/* tcg_retalign: assert that no landing from the top in env up is above 0. */
+void tcg_retstack_check(CPUState *cpu);
+/*
+ * Whether the insn at @pc in the code buffer is a return stack push or
+ * pop with its top in tcg_retstack_reg.
+ */
+bool tcg_retstack_access(uintptr_t pc);
+/*
+ * A fault at @addr by the insn at @pc in generated code: if that insn is
+ * a return stack push or pop and @addr is on a guard page of @cpu's ring
+ * (pushed or popped past an end), the top to retry with, else 0.  A
+ * guest access that happens to address a guard page is the guest's own.
+ */
+uintptr_t tcg_retstack_fault(CPUState *cpu, uintptr_t pc, uintptr_t addr);
+
+/*
+ * tcg_tb_flags_canon: targets leave out of a TB's flags the state that
+ * can't change its code in the current mode, so one TB serves them all
+ * (x86: SS.B in 64-bit code).
+ */
+extern bool tcg_tb_flags_canon;
+
+/*
+ * x-xpage=stub: the layout of the vCPU's jump cache, which the backend's
+ * shared jump-cache probe (tcg_xpage_stub) reads; filled in by the
+ * accelerator before the prologue is generated.  Offsets marked env are
+ * relative to the env pointer.
+ */
+typedef struct TCGJumpCacheLayout {
+    bool valid;
+    bool global;            /* tcg_jc_global: also match gsalt */
+    int jc_ofs;             /* env: CPUState.tb_jmp_cache */
+    int bp_ofs;             /* env: CPUState.breakpoints.tqh_first */
+    int cflags_ofs;         /* env: CPUState.tcg_cflags */
+    int salt_ofs, gsalt_ofs;
+    int entry_tb_ofs, entry_pc_ofs, entry_shift;
+    int fold_shift, group_shift, mix_shift, page_bits, cache_bits;
+    int tb_cs_base_ofs, tb_flags_ofs, tb_cflags_ofs, tb_ptr_ofs;
+} TCGJumpCacheLayout;
+
+extern TCGJumpCacheLayout tcg_jc_layout;
+
+/*
+ * The backend's shared jump-cache probe, called as
+ * helper_lookup_tb_ptr_jcp (env, pc, cs_base, flags) is, or NULL.
+ */
+extern const void *tcg_xpage_stub;
+
 #endif

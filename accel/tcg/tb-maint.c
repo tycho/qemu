@@ -782,7 +782,7 @@ void tb_flush__exclusive_or_serial(void)
            (current_cpu && cpu_in_serial_context(current_cpu)));
 
     CPU_FOREACH(cpu) {
-        tcg_flush_jmp_cache(cpu);
+        tcg_clear_jmp_cache(cpu);
     }
 
     qht_reset_size(&tb_ctx.htable, CODE_GEN_HTABLE_SIZE);
@@ -898,21 +898,25 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
 static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
 {
     CPUState *cpu;
+    uint32_t h;
 
+    /*
+     * A CF_PCREL TB may be at any virtual address, so its entries can't be
+     * found.  They can stay: CF_INVALID is set, and every jump-cache lookup
+     * compares the TB's cflags with the current ones, so they never match
+     * again; the TB's memory is reused only after tb_flush, which flushes
+     * every jump cache.
+     */
     if (tb_cflags(tb) & CF_PCREL) {
-        /* A TB may be at any virtual address */
-        CPU_FOREACH(cpu) {
-            tcg_flush_jmp_cache(cpu);
-        }
-    } else {
-        uint32_t h = tb_jmp_cache_hash_func(tb->pc);
+        return;
+    }
 
-        CPU_FOREACH(cpu) {
-            CPUJumpCache *jc = cpu->tb_jmp_cache;
+    h = tb_jmp_cache_hash_func(tb->pc);
+    CPU_FOREACH(cpu) {
+        CPUJumpCache *jc = cpu->tb_jmp_cache;
 
-            if (qatomic_read(&jc->array[h].tb) == tb) {
-                qatomic_set(&jc->array[h].tb, NULL);
-            }
+        if (qatomic_read(&jc->array[h].tb) == tb) {
+            qatomic_set(&jc->array[h].tb, NULL);
         }
     }
 }
@@ -970,6 +974,18 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
 
         /* suppress any remaining jumps to this TB */
         tb_jmp_unlink(tb);
+
+        /*
+         * A host return may still enter a TB that pushed its return
+         * landing (tcg_gen_push_ret): its own jumps lead to its exits.
+         */
+        if (tb->jmp_call) {
+            for (int n = 0; n < ARRAY_SIZE(tb->jmp_reset_offset); n++) {
+                if (tb->jmp_reset_offset[n] != TB_JMP_OFFSET_INVALID) {
+                    tb_reset_jump(tb, n);
+                }
+            }
+        }
 
         qatomic_set(&tb_ctx.tb_phys_invalidate_count,
                     tb_ctx.tb_phys_invalidate_count + 1);
