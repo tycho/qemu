@@ -231,4 +231,7 @@ static inline void tcg_gen_extu(TCGTemp *dst, TCGTemp *src)
     tcg_gen_op_tt(INDEX_op_extu_i32_i64, TCG_TYPE_I64, dst, src);
 }
 
+/* End the open run of grouped guest accesses (tcg_tso_vec_group). */
+void tcg_tso_run_end(void);
+
 #endif /* TCG_INTERNAL_H */
