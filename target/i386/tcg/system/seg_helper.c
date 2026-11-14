@@ -128,7 +128,7 @@ void x86_cpu_do_interrupt(CPUState *cs)
     }
 }
 
-void x86_cpu_poll_during_halt(CPUState *cpu)
+bool x86_cpu_poll_during_halt(CPUState *cpu)
 {
     X86CPU *x86_cpu = X86_CPU(cpu);
 
@@ -138,6 +138,8 @@ void x86_cpu_poll_during_halt(CPUState *cpu)
         cpu_reset_interrupt(cpu, CPU_INTERRUPT_POLL);
         bql_unlock();
     }
+
+    return cpu_has_work(cpu);
 }
 
 void x86_cpu_leaving_halt(CPUState *cpu)

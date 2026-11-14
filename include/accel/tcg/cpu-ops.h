@@ -176,8 +176,11 @@ struct TCGCPUOps {
      * Called when the CPU is halted to handle target-specific asynchronous
      * event processing before instruction execution begins.
      * The caller does not hold the BQL.
+     *
+     * Returns: whether the CPU has an event that ends the halt.  Without
+     * this hook, any work for the CPU (cpu_has_work) ends it.
      */
-    void (*poll_during_halt)(CPUState *cpu);
+    bool (*poll_during_halt)(CPUState *cpu);
     /**
      * @leaving_halt: Perform target-specific cleanup before resuming
      *                execution.
