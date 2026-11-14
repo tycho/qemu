@@ -13,6 +13,7 @@ memory_notdirty_set_dirty(uint64_t vaddr) "0x%" PRIx64
 # translate-all.c
 translate_block(void *tb, uintptr_t pc, const void *tb_code) "tb:%p, pc:0x%"PRIxPTR", tb_code:%p"
 tb_gen_code_buffer_overflow(const char *reason) "reason: %s"
+tb_io_insn_add(uint64_t pc, bool added) "pc 0x%" PRIx64 " added %d"
 
 # ldst_atomicity
 load_atom2_fallback(uint32_t memop, uintptr_t ra) "mop:0x%"PRIx32", ra:0x%"PRIxPTR""
