@@ -386,8 +386,23 @@ NTSTATUS xt_ec_alloc_direct(void **base, SIZE_T *size, ULONG type,
                             ULONG prot);
 bool xt_gate_init_process(void);
 void xt_gate_report(char *line, size_t size);
+
+/*
+ * What a thread whose handle has signalled left on its gate
+ * (xt_gate_death): nothing (CLEAN), an operation's second half that never
+ * ran (UNFINISHED), or a level of the module's work still held (OWNED:
+ * it may have died holding any of the engine's resources).
+ */
+typedef enum XtDeath {
+    XT_DEATH_CLEAN,
+    XT_DEATH_UNFINISHED,
+    XT_DEATH_OWNED,
+} XtDeath;
+
+XtDeath xt_gate_death(XtGate *g);
+void xt_gate_find_deaths(uint32_t *owned, uint32_t *unfinished);
 void xt_gate_tp_publish(void);
-void xt_gate_quarantine(XtGate *g);
+bool xt_gate_quarantine(XtGate *g);
 XtGate *xt_gate_retire_next(uint32_t *cursor, bool *quarantined);
 void xt_gate_mark_retired(XtGate *g);
 void xt_gate_retire_abort(XtGate *g);
