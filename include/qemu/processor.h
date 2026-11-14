@@ -7,10 +7,10 @@
 #ifndef QEMU_PROCESSOR_H
 #define QEMU_PROCESSOR_H
 
-#if defined(__x86_64__)
+#if defined(HOST_X86_64)
 # define cpu_relax() asm volatile("rep; nop" ::: "memory")
 
-#elif defined(__aarch64__)
+#elif defined(HOST_AARCH64)
 # define cpu_relax() asm volatile("yield" ::: "memory")
 
 #elif defined(__powerpc64__)

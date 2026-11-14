@@ -24,6 +24,7 @@
 #include "qapi/type-helpers.h"
 #include "hw/core/cpu.h"
 #include "accel/tcg/cpu-loop.h"
+#include "accel/tcg/dispatch.h"
 #include "accel/tcg/cpu-ops.h"
 #include "accel/tcg/helper-retaddr.h"
 #include "accel/tcg/host-fp.h"
@@ -283,6 +284,16 @@ static bool tb_jmp_cache_global(CPUState *cpu, TranslationBlock *tb, vaddr pc)
 #endif
 }
 
+/*
+ * The loop's steps that accel/tcg/dispatch.h exports have a second caller
+ * in user mode: always inline in the loop there, as with one caller.
+ */
+#ifdef CONFIG_USER_ONLY
+#define DISPATCH_INLINE QEMU_ALWAYS_INLINE
+#else
+#define DISPATCH_INLINE
+#endif
+
 /**
  * tb_lookup:
  * @cpu: CPU that will execute the returned translation block
@@ -297,6 +308,24 @@ static bool tb_jmp_cache_global(CPUState *cpu, TranslationBlock *tb, vaddr pc)
  *
  * Returns: an existing translation block or NULL.
  */
+bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
+bool tcg_cpu_bound;
+
+/*
+ * Whether @tb, read from a jump-cache entry whose key is at @key, is the
+ * TB for state @s.
+ */
+static inline bool tb_jmp_cache_hit(CPUJumpCache *jc, const vaddr *key,
+                                    TranslationBlock *tb,
+                                    const TCGTBCPUState *s)
+{
+    return tb &&
+           *key == s->pc &&
+           tb->cs_base == s->cs_base &&
+           tb->flags == s->flags &&
+           tb_cflags(tb) == s->cflags;
+}
+
 static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     TranslationBlock *tb;
@@ -311,43 +340,16 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     jc = cpu->tb_jmp_cache;
 
     tb = qatomic_read(&jc->array[hash].tb);
-    if (likely(tb &&
-               tb_jmp_cache_key_match(jc, jc->array[hash].pc, s.pc) &&
-               tb->cs_base == s.cs_base &&
-               tb->flags == s.flags &&
-               tb_cflags(tb) == s.cflags)) {
+    if (likely(tb_jmp_cache_hit(jc, &jc->array[hash].pc, tb, &s))) {
         goto hit;
     }
 
-    /*
-     * tcg_jc_ctx: entries are made only for the TB state of the current
-     * salt; in another state, move the salt on first.  The generated
-     * lookup runs in the state its TB was made for (the front end sends a
-     * TB that changes it to the helper), which is then the cache's.
-     */
-    if (tcg_jc_ctx && !tb_jmp_cache_ctx_match(jc, s)) {
-        /* A one-off state (a TB of a single insn, say) isn't cached. */
-        if (s.cflags & CF_COUNT_MASK) {
-            return tb_htable_lookup(cpu, s);
-        }
-        tcg_flush_jmp_cache(cpu);
-        jc->ctx_cs_base = s.cs_base;
-        jc->ctx_flags = s.flags;
-        jc->ctx_cflags = s.cflags;
+    /* Code that isn't the guest's has no TB, nor a page to probe. */
+    if (unlikely(tcg_foreign_pc) && tcg_foreign_pc(cpu, s.pc, false)) {
+        return NULL;
     }
 
-    /*
-     * With x-tblookup, an entry for this pc made under an older salt (a
-     * flush since: a TLB flush, a CR3 write) holds the TB that was right
-     * then; it is again if it matches the current state and pages, as
-     * the hash table's would.
-     */
-    if (tcg_ijmp_inline && tb && tcg_jcgen &&
-        !((jc->array[hash].pc ^ s.pc) & (jc->salt_step - 1))) {
-        tb = tb_htable_lookup_stale(cpu, s, tb);
-    } else {
-        tb = tb_htable_lookup(cpu, s);
-    }
+    tb = tb_htable_lookup(cpu, s);
     if (tb == NULL) {
         return NULL;
     }
@@ -367,6 +369,27 @@ hit:
     assert((tb_cflags(tb) & CF_PCREL) || tb->pc == s.pc);
     return tb;
 }
+
+#ifdef CONFIG_USER_ONLY
+TranslationBlock *cpu_exec_tb_cached(CPUState *cpu, TCGTBCPUState s)
+{
+    CPUJumpCache *jc = cpu->tb_jmp_cache;
+    uint32_t hash = tb_jmp_cache_hash_func(s.pc);
+    TranslationBlock *tb = qatomic_read(&jc->array[hash].tb);
+
+    return tb_jmp_cache_hit(jc, &jc->array[hash].pc, tb, &s) ? tb : NULL;
+}
+#endif
+
+#ifdef CONFIG_USER_ONLY
+TCGTBCPUState cpu_exec_tb_state(CPUState *cpu)
+{
+    TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
+
+    s.cflags = curr_cflags(cpu);
+    return s;
+}
+#endif
 
 static void log_cpu_exec(vaddr pc, CPUState *cpu,
                          const TranslationBlock *tb)
@@ -774,6 +797,14 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
 
     tb = tb_lookup(cpu, s);
     if (tb == NULL) {
+        /*
+         * Code that isn't the guest's: the exit to it is raised here,
+         * where the lookup has just classified it, and cpu_exec_loop
+         * leaves after the epilogue without looking it up again.
+         */
+        if (unlikely(tcg_foreign_pc)) {
+            tcg_foreign_pc(cpu, s.pc, true);
+        }
         return tcg_code_gen_epilogue;
     }
 
@@ -877,6 +908,10 @@ static vaddr log_pc(CPUState *cpu, const TranslationBlock *tb)
     }
 }
 
+static inline TranslationBlock *cpu_tb_exec_after(CPUState *cpu,
+                                                  uintptr_t ret,
+                                                  int *tb_exit);
+
 /* Execute a TB, and fix up the CPU state afterwards if necessary */
 /*
  * Disable CFI checks.
@@ -891,7 +926,6 @@ static inline TranslationBlock * QEMU_DISABLE_CFI
 cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
 {
     uintptr_t ret;
-    TranslationBlock *last_tb;
     const void *tb_ptr = itb->tc.ptr;
 
     if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
@@ -904,6 +938,20 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
 #endif
     qemu_thread_jit_execute();
     ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
+    return cpu_tb_exec_after(cpu, ret, tb_exit);
+}
+
+/*
+ * After a TB's code has returned @ret: the TB it left from and how
+ * (*@tb_exit), the guest PC restored if it left before starting, and the
+ * single-step's debug exception raised.
+ */
+static inline QEMU_ALWAYS_INLINE
+TranslationBlock *cpu_tb_exec_after(CPUState *cpu, uintptr_t ret,
+                                    int *tb_exit)
+{
+    TranslationBlock *last_tb;
+
     cpu->neg.can_do_io = true;
     qemu_plugin_disable_mem_helpers(cpu);
     /*
@@ -976,7 +1024,7 @@ static void cpu_exec_exit(CPUState *cpu)
     }
 }
 
-static void cpu_exec_longjmp_cleanup(CPUState *cpu)
+void cpu_exec_longjmp_cleanup(CPUState *cpu)
 {
     /* Non-buggy compilers preserve this; assert the correct value. */
     g_assert(cpu == current_cpu);
@@ -1135,6 +1183,22 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     qemu_spin_unlock(&tb_next->jmp_lock);
 }
 
+/* Link @last_tb's exit *@tb_exit to @tb. */
+static inline QEMU_ALWAYS_INLINE
+void tb_link(TranslationBlock *last_tb, const int *tb_exit,
+             TranslationBlock *tb)
+{
+    tb_add_jump(last_tb, *tb_exit, tb);
+}
+
+#ifdef CONFIG_USER_ONLY
+void cpu_exec_tb_link(TranslationBlock *last_tb, int tb_exit,
+                      TranslationBlock *tb)
+{
+    tb_link(last_tb, &tb_exit, tb);
+}
+#endif
+
 #ifndef CONFIG_USER_ONLY
 static bool cpu_poll_while_halted(CPUState *cpu)
 {
@@ -1174,7 +1238,8 @@ static inline void cpu_handle_debug_exception(CPUState *cpu)
     }
 }
 
-static inline bool cpu_handle_exception(CPUState *cpu, int *excp)
+static inline DISPATCH_INLINE
+bool cpu_handle_exception(CPUState *cpu, int *excp)
 {
     if (cpu->exception_index < 0) {
 #ifndef CONFIG_USER_ONLY
@@ -1239,6 +1304,13 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *excp)
     return false;
 }
 
+#ifdef CONFIG_USER_ONLY
+bool cpu_exec_exception(CPUState *cpu, int *excp)
+{
+    return cpu_handle_exception(cpu, excp);
+}
+#endif
+
 void tcg_kick_vcpu_thread(CPUState *cpu)
 {
     /*
@@ -1264,8 +1336,8 @@ static inline bool icount_exit_request(CPUState *cpu)
     return cpu->neg.icount_decr.u16.low + cpu->icount_extra == 0;
 }
 
-static inline bool cpu_handle_interrupt(CPUState *cpu,
-                                        TranslationBlock **last_tb)
+static inline DISPATCH_INLINE
+bool cpu_handle_interrupt(CPUState *cpu, TranslationBlock **last_tb)
 {
     /*
      * If we have requested custom cflags with CF_NOIRQ we should
@@ -1373,18 +1445,21 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
     return false;
 }
 
-/*
- * tcg_superblock with edge checks: a request seen at an exit that names no
- * TB (exit_tb(NULL, 0)) samples the next TB the main loop runs instead.
- */
-static __thread bool region_sample_next;
-
-static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
-                                    vaddr pc, TranslationBlock **last_tb,
-                                    int *tb_exit)
+#ifdef CONFIG_USER_ONLY
+bool cpu_exec_interrupted(CPUState *cpu, TranslationBlock **last_tb)
 {
-    trace_exec_tb(tb, pc);
-    tb = cpu_tb_exec(cpu, tb, tb_exit);
+    return cpu_handle_interrupt(cpu, last_tb);
+}
+#endif
+
+/*
+ * The loop's work after a TB: *@last_tb for the next TB's link, the
+ * region sample on a requested exit, the icount budget refilled.
+ */
+static inline QEMU_ALWAYS_INLINE
+void cpu_loop_tb_after(CPUState *cpu, TranslationBlock *tb,
+                       TranslationBlock **last_tb, int *tb_exit)
+{
     if (*tb_exit != TB_EXIT_REQUESTED) {
         *last_tb = tb;
         /* A TB that checks the request on its exits left on it. */
@@ -1435,6 +1510,26 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
     }
 #endif
 }
+
+static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
+                                    vaddr pc, TranslationBlock **last_tb,
+                                    int *tb_exit)
+{
+    trace_exec_tb(tb, pc);
+    tb = cpu_tb_exec(cpu, tb, tb_exit);
+    cpu_loop_tb_after(cpu, tb, last_tb, tb_exit);
+}
+
+#ifdef CONFIG_USER_ONLY
+TranslationBlock *cpu_exec_tb_done(CPUState *cpu, uintptr_t ret,
+                                   TranslationBlock **last_tb, int *tb_exit)
+{
+    TranslationBlock *tb = cpu_tb_exec_after(cpu, ret, tb_exit);
+
+    cpu_loop_tb_after(cpu, tb, last_tb, tb_exit);
+    return tb;
+}
+#endif
 
 /* main execution loop */
 
@@ -1489,6 +1584,11 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             }
 
             tb = tb_lookup(cpu, s);
+            if (tb == NULL && unlikely(tcg_foreign_pc) &&
+                tcg_foreign_pc(cpu, s.pc, true)) {
+                /* Out through cpu_handle_exception, no fault. */
+                break;
+            }
             if (tb == NULL) {
                 CPUJumpCache *jc;
                 uint32_t h;
@@ -1526,11 +1626,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 #endif
             /* See if we can patch the calling TB. */
             if (last_tb) {
-                tb_add_jump(last_tb, tb_exit, tb);
-                /* Its goto_tb_dead too, if tb writes them first. */
-                if (last_tb->jmp[tb_exit].dead && tb->chain_dead_in) {
-                    tb_add_jump(last_tb, last_tb->jmp[tb_exit].dead - 1, tb);
-                }
+                tb_link(last_tb, &tb_exit, tb);
             }
 
             if (unlikely(region_sample_next)) {
@@ -1538,6 +1634,16 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 region_sample(cpu, tb);
             }
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
+
+            /*
+             * An exit to code that isn't the guest's, raised by
+             * helper_lookup_tb_ptr: out through cpu_handle_exception, as
+             * from the lookup above.  Nothing else leaves a TB normally
+             * with an exception pending.
+             */
+            if (unlikely(tcg_foreign_pc) && cpu->exception_index >= 0) {
+                break;
+            }
 
             /* Try to align the host and virtual clocks
                if the guest is in advance */
@@ -1559,11 +1665,14 @@ static int cpu_exec_setjmp(CPUState *cpu, SyncClocks *sc)
 
 int cpu_exec(CPUState *cpu)
 {
+    struct rcu_reader_data *rcu;
     int excp;
     SyncClocks sc = { 0 };
 
     /* replay_interrupt may need current_cpu */
-    current_cpu = cpu;
+    if (!tcg_cpu_bound) {
+        current_cpu = cpu;
+    }
 
 #ifndef CONFIG_USER_ONLY
     if (cpu->halted) {
@@ -1574,7 +1683,8 @@ int cpu_exec(CPUState *cpu)
     }
 #endif
 
-    RCU_READ_LOCK_GUARD();
+    rcu = get_ptr_rcu_reader();
+    rcu_read_lock_reader(rcu);
     cpu_exec_enter(cpu);
 
     /*
@@ -1588,6 +1698,7 @@ int cpu_exec(CPUState *cpu)
     excp = cpu_exec_setjmp(cpu, &sc);
 
     cpu_exec_exit(cpu);
+    rcu_read_unlock_reader(rcu);
     return excp;
 }
 

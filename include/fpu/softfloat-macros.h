@@ -90,7 +90,7 @@ this code that are retained.
  */
 static inline uint64_t shl_double(uint64_t l, uint64_t r, int c)
 {
-#if defined(__x86_64__)
+#if defined(HOST_X86_64)
     asm("shld %b2, %1, %0" : "+r"(l) : "r"(r), "ci"(c));
     return l;
 #else
@@ -108,7 +108,7 @@ static inline uint64_t shl_double(uint64_t l, uint64_t r, int c)
  */
 static inline uint64_t shr_double(uint64_t l, uint64_t r, int c)
 {
-#if defined(__x86_64__)
+#if defined(HOST_X86_64)
     asm("shrd %b2, %1, %0" : "+r"(r) : "r"(l), "ci"(c));
     return r;
 #else

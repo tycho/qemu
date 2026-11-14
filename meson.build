@@ -65,13 +65,16 @@ target_dirs = config_host['TARGET_DIRS'].split()
 # type of binaries to build
 have_linux_user = false
 have_bsd_user = false
+have_windows_user = false
 have_system = false
 foreach target : target_dirs
   have_linux_user = have_linux_user or target.endswith('linux-user')
   have_bsd_user = have_bsd_user or target.endswith('bsd-user')
+  have_windows_user = have_windows_user or target.endswith('windows-user')
   have_system = have_system or target.endswith('-softmmu')
 endforeach
-have_user = have_linux_user or have_bsd_user
+have_posix_user = have_linux_user or have_bsd_user
+have_user = have_posix_user or have_windows_user
 
 ############
 # Programs #
@@ -717,6 +720,23 @@ endif
 
 qemu_common_flags += hardening_flags
 
+# ARM64EC: AArch64 code with an x64-compatible ABI, for an x64 process.
+# The compiler defines __x86_64__ as well as __arm64ec__.
+host_arm64ec = host_os == 'windows' and cc.get_define('__arm64ec__') != ''
+
+# ARM64EC's module runs in an x64 process, on threads the loader doesn't
+# count among those with PE TLS: its thread-local variables are emulated,
+# in storage of its own (windows-user/runtime/emutls.c).
+if host_arm64ec and have_windows_user
+  qemu_common_flags += ['-femulated-tls']
+endif
+
+# The Windows user-mode module imports from ntdll alone: the linker drops
+# the code that calls other DLLs, function by function.
+if have_windows_user
+  qemu_common_flags += ['-ffunction-sections', '-fdata-sections']
+endif
+
 # Collect warning flags we want to set, sorted alphabetically
 warn_flags = [
   # First enable interesting warnings
@@ -844,6 +864,7 @@ midl = not_found
 widl = not_found
 pathcch = not_found
 synchronization = not_found
+ntdll = not_found
 host_dsosuf = '.so'
 if host_os == 'windows'
   midl = find_program('midl', required: false)
@@ -852,6 +873,7 @@ if host_os == 'windows'
   # MinGW uses lowercase for library names
   pathcch = cc.find_library('pathcch', required: true)
   synchronization = cc.find_library('synchronization', required: true)
+  ntdll = cc.find_library('ntdll', required: true)
   socket = cc.find_library('ws2_32', required: true)
   winmm = cc.find_library('winmm', required: true)
 
@@ -1167,7 +1189,9 @@ if not get_option('pixman').auto() or have_system or have_tools
                       method: 'pkg-config')
 endif
 
-zlib = dependency('zlib', required: true)
+# The Windows user-mode module links nothing but ntdll; no target it
+# builds uses zlib.
+zlib = dependency('zlib', required: have_system or have_tools or have_posix_user)
 
 libaio = not_found
 if not get_option('linux_aio').auto() or have_block
@@ -3267,7 +3291,8 @@ if host_os == 'windows'
     }
   ''', name: 'mingw setjmp and longjmp')
 
-  if cpu == 'aarch64' and not mingw_has_setjmp_longjmp
+  # For ARM64EC, mingw doesn't build them: windows-user provides its own.
+  if cpu == 'aarch64' and not host_arm64ec and not mingw_has_setjmp_longjmp
     error('mingw must provide setjmp/longjmp for windows-arm64')
   endif
 endif
@@ -3372,6 +3397,19 @@ foreach target : target_dirs
       error('Target @0@ is only available on a BSD host'.format(target))
     endif
     config_target += { 'CONFIG_BSD_USER': 'y' }
+  elif target.endswith('windows-user')
+    # The i386 module runs in WOW64's native (AArch64) half; the x86_64
+    # one in an x64 process, whose native code is ARM64EC.
+    windows_user_host = target.startswith('x86_64-') ? 'ARM64EC' : 'AArch64'
+    if host_os != 'windows' or cpu != 'aarch64' or \
+       (windows_user_host == 'ARM64EC') != host_arm64ec
+      if default_targets
+        continue
+      endif
+      error('Target @0@ is only available on an @1@ Windows host'.format(
+            target, windows_user_host))
+    endif
+    config_target += { 'CONFIG_WINDOWS_USER': 'y' }
   elif target.endswith('softmmu')
     config_target += { 'CONFIG_SYSTEM_ONLY': 'y' }
     config_target += { 'CONFIG_SOFTMMU': 'y' }
@@ -3960,6 +3998,7 @@ common_user_inc = []
 subdir('common-user')
 subdir('bsd-user')
 subdir('linux-user')
+subdir('windows-user')
 
 # needed for fuzzing binaries
 subdir('tests/qtest/libqos')
@@ -4426,10 +4465,18 @@ foreach target : target_dirs
       dir = base_dir / abi
       arch_srcs += files(dir / 'signal.c', dir / 'target_arch_cpu.c')
     endif
-    target_inc += include_directories(
-      base_dir,
-      base_dir / abi,
-    )
+    if 'CONFIG_WINDOWS_USER' in config_target
+      base_dir = 'windows-user'
+      t = windows_user_ss.apply(config_target, strict: false)
+      arch_srcs += t.sources()
+      arch_deps += t.dependencies()
+      target_inc += include_directories(base_dir)
+    else
+      target_inc += include_directories(
+        base_dir,
+        base_dir / abi,
+      )
+    endif
     if 'CONFIG_LINUX_USER' in config_target
       dir = base_dir / abi
       arch_srcs += files(
@@ -4553,6 +4600,19 @@ foreach target : target_dirs
         'dependencies': specific_fuzz.dependencies(),
       }]
     endif
+  elif 'CONFIG_WINDOWS_USER' in config_target
+    # A DLL that Windows loads as a process's x86 or x64 emulator, not an
+    # executable: wow64.dll's for i386, ntdll's for x86_64.
+    module_name = target_name == 'x86_64' ? 'libarm64ecxtcg' : 'libwow64xtcg'
+    emulators += {module_name: shared_module(module_name,
+                  name_prefix: '',
+                  install: true,
+                  c_args: c_args,
+                  dependencies: arch_deps + [target_stubs],
+                  objects: lib.extract_all_objects(recursive: true),
+                  link_args: windows_user_link_args,
+                  link_depends: windows_user_link_depends)}
+    execs = []
   else
     execs = [{
       'name': 'qemu-' + target_name,

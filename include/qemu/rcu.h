@@ -75,9 +75,14 @@ struct rcu_reader_data {
 
 QEMU_DECLARE_CO_TLS(struct rcu_reader_data, rcu_reader)
 
-static inline void rcu_read_lock(void)
+/*
+ * rcu_read_lock_reader and rcu_read_unlock_reader are rcu_read_lock and
+ * rcu_read_unlock for a caller that looks up the calling thread's reader
+ * (get_ptr_rcu_reader) once for both.  Not for coroutines, which can move
+ * to another thread, and so another reader, inside the section.
+ */
+static inline void rcu_read_lock_reader(struct rcu_reader_data *p_rcu_reader)
 {
-    struct rcu_reader_data *p_rcu_reader = get_ptr_rcu_reader();
     unsigned ctr;
 
     if (p_rcu_reader->depth++ > 0) {
@@ -94,10 +99,8 @@ static inline void rcu_read_lock(void)
     smp_mb_placeholder();
 }
 
-static inline void rcu_read_unlock(void)
+static inline void rcu_read_unlock_reader(struct rcu_reader_data *p_rcu_reader)
 {
-    struct rcu_reader_data *p_rcu_reader = get_ptr_rcu_reader();
-
     assert(p_rcu_reader->depth != 0);
     if (--p_rcu_reader->depth > 0) {
         return;
@@ -118,6 +121,16 @@ static inline void rcu_read_unlock(void)
     }
 }
 
+static inline void rcu_read_lock(void)
+{
+    rcu_read_lock_reader(get_ptr_rcu_reader());
+}
+
+static inline void rcu_read_unlock(void)
+{
+    rcu_read_unlock_reader(get_ptr_rcu_reader());
+}
+
 void synchronize_rcu(void);
 
 /*
@@ -125,6 +138,13 @@ void synchronize_rcu(void);
  */
 void rcu_register_thread(void);
 void rcu_unregister_thread(void);
+/*
+ * Unregister @reader, another thread's, which has ended outside any read
+ * section, if it is registered; its storage must stay valid until this
+ * returns.  A thread that ended while registering is either registered or
+ * not: the registry's lock covers the insertion.
+ */
+void rcu_unregister_reader(struct rcu_reader_data *reader);
 
 /*
  * Support for fork().  fork() support is enabled at startup.
@@ -142,6 +162,12 @@ struct rcu_head {
 
 void call_rcu1(struct rcu_head *head, RCUCBFunc *func);
 void drain_call_rcu(void);
+/*
+ * Whether call_rcu's worker is waiting with no callback counted, where it
+ * holds nothing until one is queued; its thread id in *@tid (0 before it
+ * starts).  For a process's end that must leave it so.
+ */
+bool rcu_worker_resting(int *tid);
 
 /* The operands of the minus operator must have the same type,
  * which must be the one that we specify in the cast.

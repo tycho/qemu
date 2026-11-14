@@ -1033,6 +1033,13 @@ static void host_sigsegv_handler(CPUState *cpu, siginfo_t *info,
     MMUAccessType access_type;
     bool maperr;
 
+    /* Reading a TB's guest bytes at its entry: the TB has gone stale. */
+    if (cpu->smc_check_tb) {
+        sigprocmask(SIG_SETMASK, host_signal_mask(uc), NULL);
+        tb_smc_check_fault(cpu);
+    }
+    access_type = adjust_signal_pc(&pc, is_write);
+
     host_signal_lazysync(uc);
 
     /* Reading a TB's guest bytes at its entry: the TB has gone stale. */
@@ -1093,6 +1100,14 @@ static uintptr_t host_sigbus_handler(CPUState *cpu, siginfo_t *info,
     access_type = adjust_signal_pc(&pc, is_write);
 
     host_signal_lazysync(uc);
+    MMUAccessType access_type;
+
+    /* Reading a TB's guest bytes at its entry: the TB has gone stale. */
+    if (cpu->smc_check_tb) {
+        sigprocmask(SIG_SETMASK, host_signal_mask(uc), NULL);
+        tb_smc_check_fault(cpu);
+    }
+    access_type = adjust_signal_pc(&pc, is_write);
 
     /*
      * If the access was not on behalf of the guest, within the executable

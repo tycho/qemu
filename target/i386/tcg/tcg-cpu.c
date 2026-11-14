@@ -29,12 +29,14 @@
 #include "tcg/startup.h"
 #include "host-fpenv.h"
 
-/* Frob eflags into and out of the CPU temporary format.  */
-
+/*
+ * Frob eflags into and out of the CPU temporary format.  These run at
+ * every cpu_exec, so they reach the CPU without the checked QOM cast.
+ */
 static void x86_cpu_exec_enter(CPUState *cs)
 {
-    X86CPU *cpu = X86_CPU(cs);
-    CPUX86State *env = &cpu->env;
+    CPUX86State *env = cpu_env(cs);
+    X86CPU *cpu = env_archcpu(env);
 
     CC_SRC = env->eflags & (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
     env->df = 1 - (2 * ((env->eflags >> 10) & 1));
@@ -46,8 +48,8 @@ static void x86_cpu_exec_enter(CPUState *cs)
 
 static void x86_cpu_exec_exit(CPUState *cs)
 {
-    X86CPU *cpu = X86_CPU(cs);
-    CPUX86State *env = &cpu->env;
+    CPUX86State *env = cpu_env(cs);
+    X86CPU *cpu = env_archcpu(env);
 
     env->eflags = cpu_compute_eflags(env);
     cpu->eflags_in_tcg = false;

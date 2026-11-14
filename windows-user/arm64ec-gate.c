@@ -1,0 +1,1004 @@
+/*
+ * xtajit: the x64 module's gates (arm64ec.h, XtGate).
+ *
+ * A gate is a thread's record of what another thread needs before it may
+ * take the thread as holding nothing of the engine's.  Gates come from a
+ * pool that is never freed, so that a gate found once stays valid for
+ * the process's life, and each belongs to one thread, found by its
+ * identity (its thread ID and creation time, which together never recur
+ * in a process) in a registry that only grows.  A thread caches its own
+ * gate in its CPU area; another thread finds it through the registry,
+ * from the identity of a handle it holds, and never reads or writes the
+ * other thread's TEB.
+ *
+ * Both live in memory the module allocates with the system call itself
+ * (xt_ec_alloc_direct), which no notification of the module's sees, so
+ * that installing a gate never re-enters the module.
+ *
+ * Copyright (c) 2026 Steven Noonan
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+#include "qemu/osdep.h"
+#include "qemu/atomic.h"
+#include "xtajit.h"
+#include "arm64ec.h"
+
+NTSTATUS NTAPI NtDuplicateObject(HANDLE, HANDLE, HANDLE, PHANDLE,
+                                 ACCESS_MASK, ULONG, ULONG);
+NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
+
+/*
+ * The pool: XT_GATE_POOL_MAX gates reserved at start, committed a block at
+ * a time as they are handed out.  The registry: XT_GATE_REG_SLOTS gate
+ * pointers, open addressing with linear probing, insert-only; it refuses
+ * an insert past three quarters full.
+ */
+#define XT_GATE_POOL_MAX (1u << 20)
+#define XT_GATE_COMMIT_BLOCK 0x10000
+#define XT_GATE_REG_SLOTS (1u << 20)
+
+static XtGate *gate_pool;
+static uint32_t gate_used;
+static uintptr_t gate_committed;        /* bytes of the pool committed */
+static XtGate **gate_reg;
+static uint32_t gate_registered;
+
+/* The initial thread's, published by ProcessInit before anything else. */
+static XtGate gate_initial;
+
+bool xt_gate_init_process(void)
+{
+    SIZE_T size = (SIZE_T)XT_GATE_POOL_MAX * sizeof(XtGate);
+    void *p = NULL;
+
+    if (xt_ec_alloc_direct(&p, &size, MEM_RESERVE, PAGE_READWRITE) < 0) {
+        return false;
+    }
+    gate_pool = p;
+    p = NULL;
+    size = (SIZE_T)XT_GATE_REG_SLOTS * sizeof(XtGate *);
+    if (xt_ec_alloc_direct(&p, &size, MEM_RESERVE | MEM_COMMIT,
+                           PAGE_READWRITE) < 0) {
+        return false;
+    }
+    gate_reg = p;
+    xt_tp_publish(XT_TPA_GATE_INITIAL, &gate_initial);
+    xt_tp_publish(XT_TPA_GATE_POOL, gate_pool);
+    xt_tp_publish(XT_TPA_GATE_USED, &gate_used);
+    return true;
+}
+
+/* A fresh gate from the pool, zeroed; NULL when the pool is spent. */
+static XtGate *gate_alloc(void)
+{
+    uint32_t i = qatomic_fetch_inc(&gate_used);
+    uintptr_t end = (uintptr_t)(i + 1) * sizeof(XtGate);
+    uintptr_t done;
+
+    if (i >= XT_GATE_POOL_MAX) {
+        return NULL;
+    }
+    XT_TP(XT_TP_POOL_RESERVE, NULL, i);
+    while ((done = qatomic_load_acquire(&gate_committed)) < end) {
+        uintptr_t to = ROUND_UP(end, XT_GATE_COMMIT_BLOCK);
+        void *p = (char *)gate_pool + done;
+        SIZE_T size = to - done;
+
+        /* Committing a range twice is harmless: a racing thread may. */
+        if (XT_TP_FAIL(XT_TPF_COMMIT) ||
+            xt_ec_alloc_direct(&p, &size, MEM_COMMIT, PAGE_READWRITE) < 0) {
+            return NULL;
+        }
+        qatomic_cmpxchg(&gate_committed, done, to);
+    }
+    XT_TP(XT_TP_POOL_COMMIT, &gate_pool[i], i);
+    return &gate_pool[i];
+}
+
+static uint32_t gate_hash(uint32_t tid, uint64_t create_time)
+{
+    uint64_t h = (create_time ^ ((uint64_t)tid << 32 | tid)) *
+                 0x9e3779b97f4a7c15ull;
+
+    return (uint32_t)(h >> 40) & (XT_GATE_REG_SLOTS - 1);
+}
+
+/*
+ * The registered gate of (TID, CREATE_TIME), or NULL.  A gate is inserted
+ * into the first empty slot of its probe sequence, and slots are never
+ * emptied, so a registered gate lies before the sequence's first empty
+ * slot.
+ */
+XtGate *xt_gate_lookup(uint32_t tid, uint64_t create_time)
+{
+    uint32_t i = gate_hash(tid, create_time);
+
+    for (uint32_t n = 0; n < XT_GATE_REG_SLOTS; n++) {
+        XtGate *g = qatomic_load_acquire(&gate_reg[i]);
+
+        if (!g) {
+            return NULL;
+        }
+        if (g->tid == tid && g->create_time == create_time) {
+            return g;
+        }
+        i = (i + 1) & (XT_GATE_REG_SLOTS - 1);
+    }
+    return NULL;
+}
+
+/*
+ * G registered for its identity, or the gate registered for it first, which
+ * the caller then uses instead (G, never published, is abandoned).
+ * Two threads registering one identity race for the same first empty slot
+ * of the same sequence: the loser finds the winner's gate there.  NULL if
+ * the registry is full.
+ */
+static XtGate *gate_register(XtGate *g)
+{
+    uint32_t i = gate_hash(g->tid, g->create_time);
+
+    if (qatomic_fetch_inc(&gate_registered) >= XT_GATE_REG_SLOTS / 4 * 3 ||
+        XT_TP_FAIL(XT_TPF_REGISTRY)) {
+        return NULL;
+    }
+    for (uint32_t n = 0; n < XT_GATE_REG_SLOTS; n++) {
+        XtGate *old = qatomic_load_acquire(&gate_reg[i]);
+
+        if (!old) {
+            /* The fields filled before: a release, as the reader's acquire. */
+            XT_TP(XT_TP_REG_CAS, g, i);
+            old = qatomic_cmpxchg(&gate_reg[i], NULL, g);
+            if (!old) {
+                XT_TP(XT_TP_REG_PUBLISHED, g, i);
+                qatomic_store_release(&g->published, 1);
+                return g;
+            }
+        }
+        if (old->tid == g->tid && old->create_time == g->create_time) {
+            if (g->thread) {
+                NtClose(g->thread);
+                g->thread = NULL;
+            }
+            qatomic_dec(&gate_registered);
+            return old;
+        }
+        i = (i + 1) & (XT_GATE_REG_SLOTS - 1);
+    }
+    return NULL;
+}
+
+/* The identity of the thread behind H: its ID and creation time. */
+bool xt_gate_identity(HANDLE h, uint32_t *tid, uint64_t *create_time)
+{
+    XtThreadBasicInfo tbi;
+    LARGE_INTEGER times[4];
+
+    if (XT_TP_FAIL(XT_TPF_IDENTITY)) {
+        return false;
+    }
+    if (NtQueryInformationThread(h, 0 /* ThreadBasicInformation */, &tbi,
+                                 sizeof(tbi), NULL) < 0 ||
+        NtQueryInformationThread(h, 1 /* ThreadTimes */, times,
+                                 sizeof(times), NULL) < 0) {
+        return false;
+    }
+    *tid = (uint32_t)(uintptr_t)tbi.ClientId.UniqueThread;
+    *create_time = times[0].QuadPart;
+    return true;
+}
+
+/*
+ * A gate for the thread behind H, filled but not registered: its handle
+ * (one that can be waited on, from H), CLOSED and INTERNAL as given.
+ */
+static XtGate *gate_new(HANDLE h, uint32_t tid, uint64_t create_time,
+                        bool closed, bool internal)
+{
+    XtGate *g = gate_alloc();
+
+    if (!g) {
+        return NULL;
+    }
+    g->tid = tid;
+    g->create_time = create_time;
+    g->closed = closed;
+    g->internal = internal;
+    /* The reaper waits on it: a gate without one could never retire. */
+    if (XT_TP_FAIL(XT_TPF_DUP_GATE) ||
+        NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
+                          &g->thread, SYNCHRONIZE, 0, 0) < 0) {
+        g->thread = NULL;
+        return NULL;
+    }
+    XT_TP(XT_TP_GATE_INIT, g, tid);
+    return g;
+}
+
+/*
+ * The calling thread's gate, cached in its CPU area by compare-and-swap
+ * from NULL: an interrupt that cached it first cached the same one.
+ */
+static XtGate *gate_cache(XtGate *g)
+{
+    XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+    XtGate *old;
+
+    XT_TP(XT_TP_CACHE_CAS, g, 0);
+    old = qatomic_cmpxchg((XtGate **)&area->EmulatorData[XT_EC_GATE], NULL, g);
+    if (!old) {
+        XT_TP_NOTE(XT_TPN_GATE, GetCurrentThreadId(), (uintptr_t)g, 0);
+    }
+    return old ? old : g;
+}
+
+/*
+ * The calling thread's gate where its CPU area has none yet: the one
+ * registered for its identity (a thread ending it may have made it), else
+ * a new one.  The process's first call (ProcessInit) gets the static one
+ * before the registry exists.  A thread that can get none ends the
+ * process: a notification can't be skipped, and the engine can't be
+ * entered without one.
+ */
+XtGate *xt_gate_self_slow(void)
+{
+    uint32_t tid = GetCurrentThreadId();
+    uint64_t create_time;
+    XtGate *g, *r;
+
+    if (!xt_cpu_area(NtCurrentTeb())) {
+        NtTerminateProcess(GetCurrentProcess(), STATUS_NO_MEMORY);
+    }
+    if (!gate_reg) {
+        gate_initial.tid = tid;
+        return gate_cache(&gate_initial);
+    }
+    if (!xt_gate_identity(GetCurrentThread(), &tid, &create_time)) {
+        NtTerminateProcess(GetCurrentProcess(), STATUS_NO_MEMORY);
+    }
+    g = xt_gate_lookup(tid, create_time);
+    if (!g) {
+        g = gate_new(GetCurrentThread(), tid, create_time, false, false);
+        r = g ? gate_register(g) : NULL;
+        if (!r) {
+            NtTerminateProcess(GetCurrentProcess(), STATUS_NO_MEMORY);
+        }
+        g = r;
+    }
+    return gate_cache(g);
+}
+
+/*
+ * The initial thread's static gate, registered once the registry exists
+ * (ProcessInit, which runs before any other thread).
+ */
+bool xt_gate_register_initial(void)
+{
+    if (!xt_gate_identity(GetCurrentThread(), &gate_initial.tid,
+                          &gate_initial.create_time) ||
+        NtDuplicateObject(GetCurrentProcess(), GetCurrentThread(),
+                          GetCurrentProcess(), &gate_initial.thread,
+                          SYNCHRONIZE, 0, 0) < 0) {
+        return false;
+    }
+    if (gate_register(&gate_initial) != &gate_initial) {
+        return false;
+    }
+    return true;
+}
+
+/*
+ * An internal thread's gate, installed first thing in its start
+ * (runtime.c's thread_start), before its TLS: INTERNAL set.
+ */
+void xt_gate_install_internal(void)
+{
+    qatomic_set(&xt_gate_self()->internal, 1);
+}
+
+/*
+ * An internal thread's exemption ended, as it parks for good or leaves the
+ * registry: a later entry of its meets a closed gate like any other.
+ */
+void xt_gate_end_internal(void)
+{
+    qatomic_store_release(&xt_gate_self()->internal, 0);
+}
+
+/*
+ * The gate of the thread behind H (which another thread holds), from the
+ * registry; with CREATE_CLOSED, one is made and registered closed if it
+ * has none yet, which the thread adopts at its first call (or the one it
+ * has is closed).  NULL with *ST set if its identity can't be read or no
+ * gate can be had.
+ */
+XtGate *xt_gate_for(HANDLE h, bool create_closed, NTSTATUS *st)
+{
+    uint32_t tid;
+    uint64_t create_time;
+    XtGate *g, *r;
+
+    *st = STATUS_SUCCESS;
+    if (!qatomic_load_acquire(&gate_reg)) {
+        /* Before ProcessInit: no thread has run the module's code. */
+        return NULL;
+    }
+    if (!xt_gate_identity(h, &tid, &create_time)) {
+        *st = STATUS_INVALID_HANDLE;
+        return NULL;
+    }
+    g = xt_gate_lookup(tid, create_time);
+    if (g || !create_closed) {
+        if (g && create_closed) {
+            qatomic_set(&g->closed, 1);
+        }
+        return g;
+    }
+    g = gate_new(h, tid, create_time, true, false);
+    r = g ? gate_register(g) : NULL;
+    if (!r) {
+        *st = STATUS_NO_MEMORY;
+        return NULL;
+    }
+    qatomic_set(&r->closed, 1);
+    XT_TP_NOTE(XT_TPN_GATE, tid, (uintptr_t)r, 1);
+    return r;
+}
+
+/*
+ * Admission (XtGate.adm): every way into the module's code pushes a level
+ * of its own and pops exactly that level on every way out, each a single
+ * compare-and-swap.  An entry made over a level already admitted inherits
+ * it (a callback of the engine's own work, an exception inside it) and
+ * reads no gate.  Any other entry marks its window (XtGate.checking),
+ * pushes its level, reads the gate, and either goes on, the mark restored,
+ * or, refused, parks for good.  An entry that interrupts another's window
+ * finds the mark, so it reads the gate itself and never inherits, and the
+ * interrupted entry's level stays until it goes on or parks: a thread
+ * ending the process never sees the thread idle in between.
+ */
+XtGate *xt_gate_closed_by;
+
+QEMU_BUILD_BUG_ON(offsetof(XtGate, adm) != 0);
+QEMU_BUILD_BUG_ON(offsetof(XtGate, closed) != 8);
+QEMU_BUILD_BUG_ON(offsetof(XtGate, internal) != 12);
+QEMU_BUILD_BUG_ON(offsetof(XtGate, checking) != 24);
+
+#define ADM_ONE_COUNT (1ull << XT_ADM_COUNT_SHIFT)
+
+static bool adm_cas(XtGate *g, uint64_t old, uint64_t new)
+{
+    return qatomic_cmpxchg(&g->adm, old, new) == old;
+}
+
+/* W's successor N, with SEQ moved; false if SEQ would wrap. */
+static bool adm_next(uint64_t w, uint64_t *n)
+{
+    if ((w & XT_ADM_SEQ_MASK) == XT_ADM_SEQ_MASK) {
+        return false;
+    }
+    *n += 1;
+    return true;
+}
+
+static void adm_poison(XtGate *g);
+
+/*
+ * Testing (gatecheck): why words were poisoned, and how notifications'
+ * second halves found their roots; reported with the process's end.
+ */
+enum {
+    POISON_FULL,        /* COUNT full */
+    POISON_WRAP,        /* SEQ about to wrap */
+    POISON_PAIRING,     /* an exit with no admitted level */
+    POISON_LEAK,        /* a level leaked above an entry in its window */
+    POISON_REJECT,      /* refused with other levels outstanding */
+    POISON_ROOTS,       /* every root taken */
+    POISON_STUB,        /* the stubs' (full, wrap, commit) */
+    POISON_N
+};
+static uint32_t gate_poisons[POISON_N];
+static uint32_t gate_claimed, gate_unclaimed, gate_pushed, gate_args_differ;
+uint32_t xt_gate_read_open;
+
+/* Testing: where the poison counts are, for the test points' controller. */
+void xt_gate_tp_publish(void)
+{
+    xt_tp_publish(XT_TPA_POISONS, gate_poisons);
+    xt_tp_publish(XT_TPA_READ_OPEN, &xt_gate_read_open);
+}
+
+/* G's word poisoned, for good: the thread is never taken as idle again. */
+static void adm_poison_why(XtGate *g, int why)
+{
+    qatomic_inc(&gate_poisons[why]);
+    adm_poison(g);
+}
+
+static void adm_poison(XtGate *g)
+{
+    uint64_t w;
+
+    do {
+        w = qatomic_read(&g->adm);
+    } while (!(w & XT_ADM_POISONED) && !adm_cas(g, w, w | XT_ADM_POISONED));
+}
+
+G_NORETURN void xt_adm_poison_park(XtGate *g)
+{
+    adm_poison_why(g, POISON_STUB);
+    xt_adm_park(g);
+}
+
+G_NORETURN void xt_adm_park(XtGate *g)
+{
+    LARGE_INTEGER forever = { .QuadPart = INT64_MIN };
+
+    for (;;) {
+        NtDelayExecution(FALSE, &forever);
+    }
+}
+
+/*
+ * Whether G's thread may not enter: its own closure, or the process's
+ * end's, which neither the end's owner nor an internal thread meets.
+ */
+static bool adm_closed_for(XtGate *g)
+{
+    XtGate *owner = qatomic_read(&xt_gate_closed_by);
+
+    if (qatomic_read(&g->closed)) {
+        return true;
+    }
+    return owner && owner != g && !qatomic_read(&g->internal);
+}
+
+/*
+ * An entry at LEVEL refused at the gate: its level popped and the word
+ * parked if that was the only level, poisoned (its levels kept) if
+ * anything else is outstanding (an entry it interrupted in its own window,
+ * or a level an interruption left above it), and parked either way.
+ */
+G_NORETURN void xt_adm_reject(XtGate *g, uint32_t level)
+{
+    uint64_t w, n;
+
+    XT_TP(XT_TP_REJECT_ARG, g, level);
+    do {
+        w = qatomic_read(&g->adm);
+        if (XT_ADM_COUNT(w) == 1 && level == 1) {
+            n = (w - ADM_ONE_COUNT) | XT_ADM_PARKED;
+            if (!adm_next(w, &n)) {
+                n = w | XT_ADM_POISONED;
+            }
+        } else {
+            n = w | XT_ADM_POISONED;
+        }
+    } while (!adm_cas(g, w, n));
+    if (n & XT_ADM_POISONED) {
+        qatomic_inc(&gate_poisons[POISON_REJECT]);
+    }
+    xt_adm_park(g);
+}
+
+/*
+ * The newest root that isn't free (the highest push count), or -1.  All
+ * of them are scanned: completing one never hides another.
+ */
+static int root_newest(XtGate *g)
+{
+    int best = -1;
+    uint64_t gen = 0;
+
+    for (int i = 0; i < XT_GATE_ROOTS; i++) {
+        if (qatomic_load_acquire(&g->roots[i].state) != XT_ROOT_FREE &&
+            (best < 0 || g->roots[i].gen > gen)) {
+            best = i;
+            gen = g->roots[i].gen;
+        }
+    }
+    return best;
+}
+
+/*
+ * An entry's level pushed, in one compare-and-swap.  CHECKING has a byte a
+ * level: set, the level is pushed and its gate not yet read; clear, it is
+ * admitted.  An entry over a level already admitted inherits it: it pushes
+ * and clears its own byte at once.  Any other entry sets its byte before the
+ * push (an interruption then sees the window, or, interrupting before the
+ * push, changes the word, so that the push fails and starts again), reads
+ * the gate (with KIND, a notification's second half, first trying to
+ * claim the newest root, if that one is pending and of its kind, in which
+ * case it goes ahead whatever the gate says: it finishes an operation its
+ * first half began), re-reads the word (parked or poisoned meanwhile, or a
+ * level leaked above, it parks), and clears its byte: the one store that
+ * admits it.  Refused at the gate, it parks.  CHECKING is the thread's own,
+ * each byte written by a single store.  The level, with
+ * XT_ADM_ATTEMPT if the gate was read; *CLAIMED the root claimed, or -1.
+ */
+static uint32_t adm_enter(XtGate *g, uint32_t kind, uint64_t addr,
+                          uint64_t len, int *claimed)
+{
+    uint32_t c;
+    uint64_t w, n;
+    bool fresh;
+
+    *claimed = -1;
+    for (;;) {
+        w = qatomic_read(&g->adm);
+        XT_TP(XT_TP_ENTER_READ, g, w);
+        if (w & (XT_ADM_PARKED | XT_ADM_POISONED)) {
+            xt_adm_park(g);
+        }
+        c = XT_ADM_COUNT(w);
+        if (c >= XT_ADM_MAX_LEVELS) {
+            adm_poison_why(g, POISON_FULL);
+            xt_adm_park(g);
+        }
+        n = w + ADM_ONE_COUNT;
+        if (!adm_next(w, &n)) {
+            adm_poison_why(g, POISON_WRAP);
+            xt_adm_park(g);
+        }
+        fresh = !c || qatomic_read(&g->checking[c - 1]);
+        if (fresh) {
+            qatomic_set(&g->checking[c], 1);
+            barrier();
+            XT_TP(XT_TP_ENTER_MARKED, g, c);
+        }
+        if (adm_cas(g, w, n)) {
+            XT_TP(XT_TP_ENTER_CASDONE, g, n);
+            break;
+        }
+    }
+    if (!fresh) {
+        barrier();
+        qatomic_set(&g->checking[c], 0);
+        return c + 1;
+    }
+    /* The level published before the gate is read (part of a pair). */
+    barrier();
+    XT_TP(XT_TP_ENTER_PUSHED, g, c + 1);
+    if (kind) {
+        int i = root_newest(g);
+
+        XT_TP(XT_TP_ROOT_CHOSEN, g, i);
+        if (i >= 0 && g->roots[i].kind == kind &&
+            qatomic_cmpxchg(&g->roots[i].state, XT_ROOT_PENDING,
+                            XT_ROOT_CLAIMED) == XT_ROOT_PENDING) {
+            /*
+             * Still the newest, or an interruption between the choice and
+             * the claim left a newer one: then it is given back.
+             */
+            XT_TP(XT_TP_ROOT_CLAIMED, g, i);
+            if (root_newest(g) == i) {
+                *claimed = i;
+            } else {
+                qatomic_store_release(&g->roots[i].state, XT_ROOT_PENDING);
+            }
+        }
+        if (xt_gate_check) {
+            qatomic_inc(*claimed >= 0 ? &gate_claimed : &gate_unclaimed);
+            if (*claimed >= 0 && (g->roots[*claimed].addr != addr ||
+                                  g->roots[*claimed].len != len)) {
+                qatomic_inc(&gate_args_differ);
+            }
+        }
+    }
+    if (*claimed < 0 && adm_closed_for(g)) {
+        xt_adm_reject(g, c + 1);
+    }
+    barrier();
+    w = qatomic_read(&g->adm);
+    XT_TP(XT_TP_ENTER_REREAD, g, w);
+    if (w & (XT_ADM_PARKED | XT_ADM_POISONED)) {
+        xt_adm_park(g);
+    }
+    if (XT_ADM_COUNT(w) != c + 1) {
+        adm_poison_why(g, POISON_LEAK);
+        xt_adm_park(g);
+    }
+    barrier();
+    XT_TP(XT_TP_ENTER_CLEARADDR, g, c);
+    qatomic_set(&g->checking[c], 0);
+    return (c + 1) | XT_ADM_ATTEMPT;
+}
+
+/*
+ * Whether G's word shows its caller's own level alone and isn't poisoned
+ * or parked: what a thread acting on its own gate without a certifier (its
+ * own end, the exit's owner) checks live before teardown, rather than
+ * trust the level its entry returned (an interruption may have left a
+ * level above it since).
+ */
+bool xt_adm_alone(XtGate *g)
+{
+    uint64_t w = qatomic_load_acquire(&g->adm);
+
+    XT_TP(XT_TP_ALONE_READ, g, w);
+    return XT_ADM_COUNT(w) == 1 &&
+           !(w & (XT_ADM_PARKED | XT_ADM_POISONED)) &&
+           !qatomic_read(&g->checking[0]);
+}
+
+uint32_t xt_adm_enter(XtGate *g)
+{
+    int claimed;
+
+    return adm_enter(g, 0, 0, 0, &claimed);
+}
+
+/*
+ * A notification's second half entering: the root it claimed (its first
+ * half's), or -1, inherited levels claiming nothing.
+ */
+int xt_adm_enter_claim(XtGate *g, uint32_t kind, uint64_t addr, uint64_t len)
+{
+    int claimed;
+
+    adm_enter(g, kind, addr, len, &claimed);
+    return claimed;
+}
+
+/*
+ * The calling thread parks for good where it is, in one transition: if
+ * its current level (one committed level) is all it has, that level goes
+ * and the word is parked; if anything else is outstanding (an outer level
+ * it would hold while parked), the word is poisoned with its levels kept,
+ * so that it is never taken as idle holding that (the second thread ending
+ * the process).
+ */
+G_NORETURN void xt_adm_park_terminal(XtGate *g)
+{
+    uint64_t w, n;
+
+    do {
+        w = qatomic_read(&g->adm);
+        if (XT_ADM_COUNT(w) == 1) {
+            n = (w - ADM_ONE_COUNT) | XT_ADM_PARKED;
+            if (!adm_next(w, &n)) {
+                n = w | XT_ADM_POISONED;
+            }
+        } else {
+            n = w | XT_ADM_POISONED;
+        }
+    } while (!adm_cas(g, w, n));
+    xt_adm_park(g);
+}
+
+/*
+ * A notification's first half, entered as an attempt, leaves its operation
+ * for its second: the fields first, then PENDING with a release.  With
+ * every root taken, the word is poisoned: the thread can't be taken as
+ * idle with an operation nobody would see.
+ */
+void xt_root_push(XtGate *g, uint32_t kind, uint64_t addr, uint64_t len)
+{
+    for (int i = 0; i < XT_GATE_ROOTS; i++) {
+        XtGateRoot *r = &g->roots[i];
+
+        if (qatomic_read(&r->state) == XT_ROOT_FREE) {
+            r->kind = kind;
+            r->addr = addr;
+            r->len = len;
+            r->gen = ++g->root_gen;
+            qatomic_store_release(&r->state, XT_ROOT_PENDING);
+            XT_TP(XT_TP_ROOT_PUSHED, g, i);
+            if (xt_gate_check) {
+                qatomic_inc(&gate_pushed);
+            }
+            return;
+        }
+    }
+    adm_poison_why(g, POISON_ROOTS);
+}
+
+/* Claimed root I released, after the second half's last access. */
+void xt_root_release(XtGate *g, int i)
+{
+    qatomic_store_release(&g->roots[i].state, XT_ROOT_FREE);
+}
+
+/*
+ * The innermost level popped.  None admitted to pop (no level, or the
+ * innermost still in its window) is a pairing error: the word is
+ * poisoned, so the thread is never taken as idle.
+ */
+void xt_adm_exit(XtGate *g)
+{
+    uint64_t w, n;
+
+    do {
+        w = qatomic_read(&g->adm);
+        n = w - ADM_ONE_COUNT;
+        if (!XT_ADM_COUNT(w) || !adm_next(w, &n) ||
+            qatomic_read(&g->checking[XT_ADM_COUNT(w) - 1])) {
+            adm_poison_why(g, POISON_PAIRING);
+            return;
+        }
+    } while (!adm_cas(g, w, n));
+}
+
+/*
+ * Testing (xt_tp_leak): a level pushed with its byte left set, as an entry
+ * stopped for good inside its window leaves it.  The word left, or 0 if
+ * none could be pushed.
+ */
+uint64_t xt_adm_leak_uncommitted(XtGate *g)
+{
+    uint64_t w, n;
+    uint32_t c;
+
+    do {
+        w = qatomic_read(&g->adm);
+        c = XT_ADM_COUNT(w);
+        n = w + ADM_ONE_COUNT;
+        if (c >= XT_ADM_MAX_LEVELS || !adm_next(w, &n)) {
+            return 0;
+        }
+        qatomic_set(&g->checking[c], 1);
+    } while (!adm_cas(g, w, n));
+    return n;
+}
+
+/*
+ * Scans (the report, the reaper) go through these: index 0 is the initial
+ * thread's static gate, I the pool's I - 1.  Only a registered gate is
+ * returned (PUBLISHED, set with a release after its fields, by its
+ * registrar or by a scan that finds it in the registry), and nothing past
+ * the committed part of the pool is read.
+ */
+static uint32_t gate_scan_end(void)
+{
+    return MIN(qatomic_load_acquire(&gate_committed) / sizeof(XtGate),
+               XT_GATE_POOL_MAX);
+}
+
+static XtGate *gate_scan_at(uint32_t i)
+{
+    XtGate *g;
+
+    if (!i) {
+        g = &gate_initial;
+    } else if ((uintptr_t)i * sizeof(XtGate) >
+               qatomic_load_acquire(&gate_committed)) {
+        return NULL;
+    } else {
+        g = &gate_pool[i - 1];
+    }
+    if (qatomic_load_acquire(&g->published)) {
+        return g;
+    }
+    /*
+     * The registry is what makes a gate a thread's: one it holds whose
+     * registrar ended before marking it published is marked here.  Fields
+     * read before that are only a key for the lookup, which decides.
+     */
+    if (i && qatomic_read(&g->tid) &&
+        xt_gate_lookup(qatomic_read(&g->tid), qatomic_read(&g->create_time)) ==
+        g) {
+        qatomic_store_release(&g->published, 1);
+        return g;
+    }
+    return NULL;
+}
+
+/*
+ * Testing (gatecheck): the gates' state, for the process's end's report:
+ * how many there are, how many are poisoned (and why, where it was
+ * counted), parked or still holding a root, and how notifications'
+ * second halves found their roots.
+ */
+void xt_gate_report(char *line, size_t size)
+{
+    uint32_t n = gate_scan_end(), gates = 0, poisoned = 0, parked = 0;
+    uint32_t levels = 0, deepest = 0, roots = 0;
+
+    for (uint32_t i = 0; i <= n; i++) {
+        XtGate *g = gate_scan_at(i);
+        uint64_t w;
+
+        if (!g) {
+            continue;
+        }
+        w = qatomic_read(&g->adm);
+        gates++;
+        poisoned += !!(w & XT_ADM_POISONED);
+        parked += !!(w & XT_ADM_PARKED);
+        levels += XT_ADM_COUNT(w);
+        deepest = MAX(deepest, (uint32_t)XT_ADM_COUNT(w));
+        for (int k = 0; k < XT_GATE_ROOTS; k++) {
+            roots += qatomic_read(&g->roots[k].state) != XT_ROOT_FREE;
+        }
+    }
+    snprintf(line, size, "gatecheck: %u gates, %u poisoned (full %u wrap %u "
+             "pairing %u leak %u reject %u roots %u stub %u), %u parked, "
+             "%u levels outstanding (deepest %u), %u roots live; second "
+             "halves %u claimed, %u unclaimed, %u with other arguments; %u "
+             "roots pushed; %u reads taken from threads ended mid-read\n",
+             gates, poisoned, gate_poisons[POISON_FULL],
+             gate_poisons[POISON_WRAP], gate_poisons[POISON_PAIRING],
+             gate_poisons[POISON_LEAK],
+             gate_poisons[POISON_REJECT],
+             gate_poisons[POISON_ROOTS], gate_poisons[POISON_STUB], parked,
+             levels, deepest, roots, gate_claimed, gate_unclaimed,
+             gate_args_differ, gate_pushed, qatomic_read(&xt_gate_read_open));
+}
+
+/*
+ * Retirement (XtGate.ret): the reaper's, once the gate's thread has ended
+ * (its handle signalled), decided by compare-and-swap so that one retirer
+ * does it.  A quarantined gate is retired with nothing reclaimed: its
+ * thread ended unsafely, maybe holding what its record's teardown would
+ * wait for.
+ */
+#define RET_STATE           0xffu
+#define RET_LIVE            0u
+#define RET_RETIRING        1u
+#define RET_RETIRED         2u
+#define RET_QUARANTINED     0x100u
+
+/*
+ * G's thread ended, or will, unsafely: its record is never reclaimed.
+ * Whether this call quarantined it (it wasn't, and isn't being retired).
+ */
+bool xt_gate_quarantine(XtGate *g)
+{
+    uint32_t r;
+
+    do {
+        r = qatomic_read(&g->ret);
+        if ((r & RET_STATE) != RET_LIVE || (r & RET_QUARANTINED)) {
+            return false;
+        }
+    } while (qatomic_cmpxchg(&g->ret, r, r | RET_QUARANTINED) != r);
+    XT_TP_NOTE(XT_TPN_QUARANTINE, (uintptr_t)g, g->tid, 0);
+    return true;
+}
+
+/*
+ * What the thread of G, whose handle has signalled, left behind: its own
+ * code no longer changes its gate.  OWNED: its word isn't parked and a
+ * level of it was admitted (its checking byte clear) and never withdrawn,
+ * so it was inside the module's work when it ended, unannounced (a kill
+ * from another process; a self end inside a notification, which Windows
+ * doesn't notify), and may have held anything the engine has.  A level
+ * still in its window holds nothing: the admission takes nothing before
+ * its byte's clear.  This is conservative: a death right after the clear,
+ * or just before an exit's pop, counts as OWNED too.  UNFINISHED: no such
+ * level, but a protection's or an allocation's root still PENDING or
+ * CLAIMED: its second half's page-flag work never ran (a read's only
+ * invalidates, which a flush does).  Only published roots are read.
+ */
+XtDeath xt_gate_death(XtGate *g)
+{
+    uint64_t w = qatomic_load_acquire(&g->adm);
+    uint32_t c = MIN(XT_ADM_COUNT(w), XT_ADM_MAX_LEVELS);
+
+    if (!(w & XT_ADM_PARKED)) {
+        for (uint32_t i = 0; i < c; i++) {
+            if (!qatomic_read(&g->checking[i])) {
+                return XT_DEATH_OWNED;
+            }
+        }
+    }
+    for (int i = 0; i < XT_GATE_ROOTS; i++) {
+        uint32_t s = qatomic_load_acquire(&g->roots[i].state);
+
+        if ((s == XT_ROOT_PENDING || s == XT_ROOT_CLAIMED) &&
+            (g->roots[i].kind == XT_MEMOP_PROTECT ||
+             g->roots[i].kind == XT_MEMOP_ALLOC)) {
+            return XT_DEATH_UNFINISHED;
+        }
+    }
+    return XT_DEATH_CLEAN;
+}
+
+/*
+ * The process's end, every other thread certified out of the module: each
+ * gate whose thread has ended judged (xt_gate_death), the deaths counted
+ * and noted (unless certification counted them, quarantining them, or
+ * retirement had quarantined them).  Ended: retired (retirement waited
+ * for its handle first; gates and their words outlive it), or its handle
+ * signalled.  No retirement is under way, which would close a handle: a
+ * retirer works at an admitted level, so it is certified only after it.
+ */
+void xt_gate_find_deaths(uint32_t *owned, uint32_t *unfinished)
+{
+    LARGE_INTEGER zero = { .QuadPart = 0 };
+    uint32_t n = gate_scan_end();
+
+    for (uint32_t i = 0; i <= n; i++) {
+        XtGate *g = gate_scan_at(i);
+        uint32_t r;
+        XtDeath d;
+
+        if (!g) {
+            continue;
+        }
+        r = qatomic_load_acquire(&g->ret);
+        if ((r & RET_QUARANTINED) ||
+            ((r & RET_STATE) != RET_RETIRED &&
+             (!g->thread || NtWaitForSingleObject(g->thread, FALSE, &zero) !=
+                            STATUS_SUCCESS))) {
+            continue;
+        }
+        d = xt_gate_death(g);
+        if (d == XT_DEATH_CLEAN) {
+            continue;
+        }
+        xt_gate_quarantine(g);
+        (*(d == XT_DEATH_OWNED ? owned : unfinished))++;
+        XT_TP_NOTE(XT_TPN_DIED, (uintptr_t)g, d, 1);
+    }
+}
+
+/*
+ * The next gate from *CURSOR whose thread has ended and which this caller
+ * now retires (RETIRING won by compare-and-swap); *QUARANTINED says whether
+ * its record must stay.  NULL past the last.  Retired gates at the start
+ * of the pool are passed over for good.
+ */
+static uint32_t gate_retired_below = 1;
+
+XtGate *xt_gate_retire_next(uint32_t *cursor, bool *quarantined)
+{
+    LARGE_INTEGER zero = { .QuadPart = 0 };
+    uint32_t n = gate_scan_end();
+
+    if (*cursor && *cursor < qatomic_read(&gate_retired_below)) {
+        *cursor = qatomic_read(&gate_retired_below);
+    }
+    for (; *cursor <= n; (*cursor)++) {
+        XtGate *g = gate_scan_at(*cursor);
+        uint32_t r;
+
+        if (!g) {
+            continue;
+        }
+        r = qatomic_load_acquire(&g->ret);
+        if ((r & RET_STATE) == RET_RETIRED) {
+            if (*cursor && *cursor == qatomic_read(&gate_retired_below)) {
+                qatomic_cmpxchg(&gate_retired_below, *cursor, *cursor + 1);
+            }
+            continue;
+        }
+        if ((r & RET_STATE) != RET_LIVE || !g->thread ||
+            NtWaitForSingleObject(g->thread, FALSE, &zero) != STATUS_SUCCESS) {
+            continue;
+        }
+        if (qatomic_cmpxchg(&g->ret, r, (r & ~RET_STATE) | RET_RETIRING) ==
+            r) {
+            *quarantined = r & RET_QUARANTINED;
+            (*cursor)++;
+            XT_TP(XT_TP_RETIRE_CLAIMED, g, r);
+            return g;
+        }
+    }
+    return NULL;
+}
+
+/* G's retirement given up (it couldn't be done now): LIVE again. */
+void xt_gate_retire_abort(XtGate *g)
+{
+    XT_TP_NOTE(XT_TPN_REAP_ABORT, (uintptr_t)g, g->tid, 0);
+    qatomic_store_release(&g->ret, (qatomic_read(&g->ret) & ~RET_STATE) |
+                                   RET_LIVE);
+}
+
+/* G retired: its handle closed, the record and frame handed to the reaper. */
+void xt_gate_mark_retired(XtGate *g)
+{
+    HANDLE h = g->thread;
+
+    g->thread = NULL;
+    if (h) {
+        NtClose(h);
+    }
+    XT_TP_NOTE(XT_TPN_RETIRED, (uintptr_t)g, g->tid,
+               !!(qatomic_read(&g->ret) & RET_QUARANTINED));
+    qatomic_store_release(&g->ret,
+                          (qatomic_read(&g->ret) & ~RET_STATE) | RET_RETIRED);
+}
+
