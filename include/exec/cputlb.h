@@ -176,6 +176,18 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *cpu, vaddr addr,
 void tlb_flush_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap);
 
 /**
+ * tlb_flush_nonglobal_by_mmuidx:
+ * @cpu: CPU whose TLB should be flushed
+ * @idxmap: bitmap of MMU indexes to flush
+ *
+ * Flush the entries of the specified MMU indexes that tlb_fill did not
+ * mark global (CPUTLBEntryFull.global), e.g. on a change of address
+ * space that keeps global translations.  Like tlb_flush_by_mmuidx, this
+ * clears the CPU's jump cache.
+ */
+void tlb_flush_nonglobal_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap);
+
+/**
  * tlb_flush_by_mmuidx_all_cpus_synced:
  * @cpu: Originating CPU of the flush
  * @idxmap: bitmap of MMU indexes to flush
@@ -245,6 +257,10 @@ static inline void tlb_flush_page_by_mmuidx(CPUState *cpu,
 }
 
 static inline void tlb_flush_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap)
+{
+}
+static inline void tlb_flush_nonglobal_by_mmuidx(CPUState *cpu,
+                                                 MMUIdxMap idxmap)
 {
 }
 static inline void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *cpu,
