@@ -128,16 +128,30 @@ void x86_cpu_do_interrupt(CPUState *cs)
     }
 }
 
-void x86_cpu_poll_during_halt(CPUState *cpu)
+bool x86_cpu_poll_during_halt(CPUState *cpu)
 {
     X86CPU *x86_cpu = X86_CPU(cpu);
 
-    if (cpu_test_interrupt(cpu, CPU_INTERRUPT_POLL)) {
+    /*
+     * Clear POLL before polling, as the running path does: a request
+     * raised meanwhile (posted interrupts and timers raise it without the
+     * BQL) stays raised for the next pass instead of being erased.
+     */
+    while (cpu_test_interrupt(cpu, CPU_INTERRUPT_POLL)) {
         bql_lock();
-        apic_poll_irq(x86_cpu->apic_state);
         cpu_reset_interrupt(cpu, CPU_INTERRUPT_POLL);
+        apic_poll_irq(x86_cpu->apic_state);
         bql_unlock();
     }
+
+    /*
+     * POLL means work for the host thread, not an event that ends HLT: a
+     * POLL raised after the loop above keeps the thread awake (the idle
+     * check counts it) and is handled at the next call.
+     */
+    return x86_cpu_pending_interrupt(cpu,
+               qatomic_load_acquire(&cpu->interrupt_request) &
+               ~CPU_INTERRUPT_POLL) != 0;
 }
 
 void x86_cpu_leaving_halt(CPUState *cpu)

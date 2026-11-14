@@ -1107,10 +1107,10 @@ static bool cpu_poll_while_halted(CPUState *cpu)
     const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
 
     if (tcg_ops->poll_during_halt) {
-        tcg_ops->poll_during_halt(cpu);
-    }
-
-    if (!cpu_has_work(cpu)) {
+        if (!tcg_ops->poll_during_halt(cpu)) {
+            return false;
+        }
+    } else if (!cpu_has_work(cpu)) {
         return false;
     }
 
