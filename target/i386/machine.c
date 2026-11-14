@@ -335,6 +335,10 @@ static int cpu_post_load(void *opaque, int version_id)
 #ifndef CONFIG_USER_ONLY
     if (tcg_enabled() && tcg_tsc_counter) {
         x86_tsc_counter_set(env, env->tsc);
+        /* Hyper-V's reference time continues from vCPU 0's TSC. */
+        if (tcg_hyperv && CPU(cpu)->cpu_index == 0) {
+            x86_tsc_counter_rebase(env);
+        }
     }
 #endif
 
@@ -918,6 +922,37 @@ static const VMStateDescription vmstate_msr_hyperv_stimer = {
         VMSTATE_UINT64_ARRAY(env.msr_hv_stimer_config, X86CPU,
                              HV_STIMER_COUNT),
         VMSTATE_UINT64_ARRAY(env.msr_hv_stimer_count, X86CPU, HV_STIMER_COUNT),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+/* TCG's synthetic timers: their next expiries and queued messages. */
+static bool tcg_hv_stimer_needed(void *opaque)
+{
+    X86CPU *cpu = opaque;
+    CPUX86State *env = &cpu->env;
+
+    if (!tcg_enabled() || !hyperv_feat_enabled(cpu, HYPERV_FEAT_STIMER)) {
+        return false;
+    }
+    for (int i = 0; i < HV_STIMER_COUNT; i++) {
+        if (env->hv_stimer_expiry[i] != UINT64_MAX ||
+            env->hv_stimer_msg_sint[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const VMStateDescription vmstate_tcg_hv_stimer = {
+    .name = "cpu/tcg_hv_stimer",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = tcg_hv_stimer_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64_ARRAY(env.hv_stimer_expiry, X86CPU, HV_STIMER_COUNT),
+        VMSTATE_UINT64_ARRAY(env.hv_stimer_msg_exp, X86CPU, HV_STIMER_COUNT),
+        VMSTATE_UINT8_ARRAY(env.hv_stimer_msg_sint, X86CPU, HV_STIMER_COUNT),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -1933,6 +1968,7 @@ const VMStateDescription vmstate_x86_cpu = {
         &vmstate_msr_hyperv_runtime,
         &vmstate_msr_hyperv_synic,
         &vmstate_msr_hyperv_stimer,
+        &vmstate_tcg_hv_stimer,
         &vmstate_msr_hyperv_reenlightenment,
         &vmstate_avx512,
         &vmstate_xss,

@@ -71,6 +71,8 @@ struct TCGState {
     uint32_t haltpoll_us;
     OnOffAuto apictimer;
     OnOffAuto apicpost;
+    bool hyperv;
+    bool hvtimers;
 };
 typedef struct TCGState TCGState;
 
@@ -216,6 +218,28 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #endif
         tcg_tsc_counter = HOST_COUNTER_SUPPORTED && !icount_enabled();
     }
+
+#ifndef CONFIG_USER_ONLY
+    /*
+     * x-hyperv: the reference TSC page and reference time are the TSC
+     * scaled to 100 ns, which needs the TSC at a fixed 1 GHz.
+     */
+    if (s->hyperv) {
+        if (!tcg_tsc_counter) {
+            error_report("x-hyperv needs x-hosttime (and no icount)");
+            return -EINVAL;
+        }
+        tcg_hyperv = true;
+    }
+    /* x-hvtimers: the SynIC and synthetic timers, with x-hyperv */
+    if (s->hvtimers) {
+        if (!s->hyperv) {
+            error_report("x-hvtimers needs x-hyperv");
+            return -EINVAL;
+        }
+        tcg_hvtimers = true;
+    }
+#endif
 
     /*
      * x-pause=hint: only where no other vCPU shares the thread (with
