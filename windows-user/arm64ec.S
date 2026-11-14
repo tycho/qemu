@@ -314,9 +314,9 @@ xt_check_call:
     yield
     ldr     w17, [x16, #TP_RELEASE]
     cbz     w17, .Ltp_spin\@
-    /* FORCE_ZERO: what Windows does to these at a context's application. */
+    /* FORCE_ZERO bit 0: what Windows does to these, applying a context. */
     ldr     w17, [x16, #TP_FORCE_ZERO]
-    cbz     w17, .Ltp_kept\@
+    tbz     w17, #0, .Ltp_kept\@
     mov     x13, xzr
     mov     x14, xzr
     mov     x23, xzr
@@ -327,6 +327,21 @@ xt_check_call:
     str     x28, [x16, #(TP_AFTER + 32)]
     add     x17, x16, #TP_GPR_AFTER
     tp_gprs
+    /*
+     * FORCE_ZERO bit 1: a fault here, a nested entry of the module's
+     * (ResetToConsistentState's) with the full native context; lr kept in
+     * the frame, x16 reloaded.
+     */
+    ldr     w17, [x16, #TP_FORCE_ZERO]
+    tbz     w17, #1, .Ltp_nofault\@
+    add     x17, sp, #64
+    str     x30, [x17]
+    bl      "#xt_tp_fault"
+    add     x17, sp, #64
+    ldr     x30, [x17]
+    adrp    x16, xt_tp_block
+    ldr     x16, [x16, :lo12:xt_tp_block]
+.Ltp_nofault\@:
     /* Done (4). */
     add     x16, x16, #TP_ASM_STATE
     mov     w17, #4
@@ -845,6 +860,21 @@ xt_ec_adm_nogate:
     mov     x0, x8
     add     sp, sp, #32
     ldp     x29, x30, [sp], #16
+    ret
+
+/*
+ * void xt_tp_fault(void) (the test points' fault action): one load that
+ * faults, at xt_tp_fault_pc, which the module's exception paths recognise
+ * and continue past (ResetToConsistentState, or test-tp.c's handler).
+ * It changes x16 alone.
+ */
+    .globl "#xt_tp_fault"
+    .def "#xt_tp_fault"; .scl 2; .type 32; .endef
+"#xt_tp_fault":
+    mov     x16, #8
+    .globl  xt_tp_fault_pc
+xt_tp_fault_pc:
+    ldr     x16, [x16]
     ret
 
     .section .drectve, "yn"

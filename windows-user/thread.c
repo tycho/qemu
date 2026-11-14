@@ -278,6 +278,14 @@ void xt_record_release(void)
     qatomic_dec(&record_users);
 }
 
+#ifdef TARGET_X86_64
+/* Testing: where the count is, for the test points' controller. */
+void xt_record_tp_publish(void)
+{
+    xt_tp_publish(XT_TPA_RECORD_USERS, &record_users);
+}
+#endif
+
 static void wait_record_users(void)
 {
     /* The unlink before the count is read (pairs with the hold). */
@@ -473,6 +481,7 @@ static DWORD thread_by_handle(HANDLE thread, void **teb, HANDLE *own)
     began = xt_adapter_begin();
     xt_record_hold();
     cpu_list_lock();
+    XT_TP(XT_TP_TERM_LISTS, NULL, 0);
     CPU_FOREACH(cs) {
         XtThread *t = cs->opaque;
         HANDLE h;

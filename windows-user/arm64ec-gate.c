@@ -63,6 +63,9 @@ bool xt_gate_init_process(void)
         return false;
     }
     gate_reg = p;
+    xt_tp_publish(XT_TPA_GATE_INITIAL, &gate_initial);
+    xt_tp_publish(XT_TPA_GATE_POOL, gate_pool);
+    xt_tp_publish(XT_TPA_GATE_USED, &gate_used);
     return true;
 }
 
@@ -76,17 +79,20 @@ static XtGate *gate_alloc(void)
     if (i >= XT_GATE_POOL_MAX) {
         return NULL;
     }
+    XT_TP(XT_TP_POOL_RESERVE, NULL, i);
     while ((done = qatomic_load_acquire(&gate_committed)) < end) {
         uintptr_t to = ROUND_UP(end, XT_GATE_COMMIT_BLOCK);
         void *p = (char *)gate_pool + done;
         SIZE_T size = to - done;
 
         /* Committing a range twice is harmless: a racing thread may. */
-        if (xt_ec_alloc_direct(&p, &size, MEM_COMMIT, PAGE_READWRITE) < 0) {
+        if (XT_TP_FAIL(XT_TPF_COMMIT) ||
+            xt_ec_alloc_direct(&p, &size, MEM_COMMIT, PAGE_READWRITE) < 0) {
             return NULL;
         }
         qatomic_cmpxchg(&gate_committed, done, to);
     }
+    XT_TP(XT_TP_POOL_COMMIT, &gate_pool[i], i);
     return &gate_pool[i];
 }
 
@@ -133,7 +139,8 @@ static XtGate *gate_register(XtGate *g)
 {
     uint32_t i = gate_hash(g->tid, g->create_time);
 
-    if (qatomic_fetch_inc(&gate_registered) >= XT_GATE_REG_SLOTS / 4 * 3) {
+    if (qatomic_fetch_inc(&gate_registered) >= XT_GATE_REG_SLOTS / 4 * 3 ||
+        XT_TP_FAIL(XT_TPF_REGISTRY)) {
         return NULL;
     }
     for (uint32_t n = 0; n < XT_GATE_REG_SLOTS; n++) {
@@ -141,8 +148,10 @@ static XtGate *gate_register(XtGate *g)
 
         if (!old) {
             /* The fields filled before: a release, as the reader's acquire. */
+            XT_TP(XT_TP_REG_CAS, g, i);
             old = qatomic_cmpxchg(&gate_reg[i], NULL, g);
             if (!old) {
+                XT_TP(XT_TP_REG_PUBLISHED, g, i);
                 qatomic_store_release(&g->published, 1);
                 return g;
             }
@@ -166,6 +175,9 @@ bool xt_gate_identity(HANDLE h, uint32_t *tid, uint64_t *create_time)
     XtThreadBasicInfo tbi;
     LARGE_INTEGER times[4];
 
+    if (XT_TP_FAIL(XT_TPF_IDENTITY)) {
+        return false;
+    }
     if (NtQueryInformationThread(h, 0 /* ThreadBasicInformation */, &tbi,
                                  sizeof(tbi), NULL) < 0 ||
         NtQueryInformationThread(h, 1 /* ThreadTimes */, times,
@@ -194,11 +206,13 @@ static XtGate *gate_new(HANDLE h, uint32_t tid, uint64_t create_time,
     g->closed = closed;
     g->internal = internal;
     /* The reaper waits on it: a gate without one could never retire. */
-    if (NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
+    if (XT_TP_FAIL(XT_TPF_DUP_GATE) ||
+        NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
                           &g->thread, SYNCHRONIZE, 0, 0) < 0) {
         g->thread = NULL;
         return NULL;
     }
+    XT_TP(XT_TP_GATE_INIT, g, tid);
     return g;
 }
 
@@ -211,7 +225,11 @@ static XtGate *gate_cache(XtGate *g)
     XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
     XtGate *old;
 
+    XT_TP(XT_TP_CACHE_CAS, g, 0);
     old = qatomic_cmpxchg((XtGate **)&area->EmulatorData[XT_EC_GATE], NULL, g);
+    if (!old) {
+        XT_TP_NOTE(XT_TPN_GATE, GetCurrentThreadId(), (uintptr_t)g, 0);
+    }
     return old ? old : g;
 }
 
@@ -324,6 +342,7 @@ XtGate *xt_gate_for(HANDLE h, bool create_closed, NTSTATUS *st)
         return NULL;
     }
     qatomic_set(&r->closed, 1);
+    XT_TP_NOTE(XT_TPN_GATE, tid, (uintptr_t)r, 1);
     return r;
 }
 
@@ -383,6 +402,13 @@ static uint32_t gate_poisons[POISON_N];
 static uint32_t gate_claimed, gate_unclaimed, gate_pushed, gate_args_differ;
 uint32_t xt_gate_read_open;
 
+/* Testing: where the poison counts are, for the test points' controller. */
+void xt_gate_tp_publish(void)
+{
+    xt_tp_publish(XT_TPA_POISONS, gate_poisons);
+    xt_tp_publish(XT_TPA_READ_OPEN, &xt_gate_read_open);
+}
+
 /* G's word poisoned, for good: the thread is never taken as idle again. */
 static void adm_poison_why(XtGate *g, int why)
 {
@@ -438,6 +464,7 @@ G_NORETURN void xt_adm_reject(XtGate *g, uint32_t level)
 {
     uint64_t w, n;
 
+    XT_TP(XT_TP_REJECT_ARG, g, level);
     do {
         w = qatomic_read(&g->adm);
         if (XT_ADM_COUNT(w) == 1 && level == 1) {
@@ -500,6 +527,7 @@ static uint32_t adm_enter(XtGate *g, uint32_t kind, uint64_t addr,
     *claimed = -1;
     for (;;) {
         w = qatomic_read(&g->adm);
+        XT_TP(XT_TP_ENTER_READ, g, w);
         if (w & (XT_ADM_PARKED | XT_ADM_POISONED)) {
             xt_adm_park(g);
         }
@@ -517,8 +545,10 @@ static uint32_t adm_enter(XtGate *g, uint32_t kind, uint64_t addr,
         if (fresh) {
             qatomic_set(&g->checking[c], 1);
             barrier();
+            XT_TP(XT_TP_ENTER_MARKED, g, c);
         }
         if (adm_cas(g, w, n)) {
+            XT_TP(XT_TP_ENTER_CASDONE, g, n);
             break;
         }
     }
@@ -529,9 +559,11 @@ static uint32_t adm_enter(XtGate *g, uint32_t kind, uint64_t addr,
     }
     /* The level published before the gate is read (part of a pair). */
     barrier();
+    XT_TP(XT_TP_ENTER_PUSHED, g, c + 1);
     if (kind) {
         int i = root_newest(g);
 
+        XT_TP(XT_TP_ROOT_CHOSEN, g, i);
         if (i >= 0 && g->roots[i].kind == kind &&
             qatomic_cmpxchg(&g->roots[i].state, XT_ROOT_PENDING,
                             XT_ROOT_CLAIMED) == XT_ROOT_PENDING) {
@@ -539,6 +571,7 @@ static uint32_t adm_enter(XtGate *g, uint32_t kind, uint64_t addr,
              * Still the newest, or an interruption between the choice and
              * the claim left a newer one: then it is given back.
              */
+            XT_TP(XT_TP_ROOT_CLAIMED, g, i);
             if (root_newest(g) == i) {
                 *claimed = i;
             } else {
@@ -558,6 +591,7 @@ static uint32_t adm_enter(XtGate *g, uint32_t kind, uint64_t addr,
     }
     barrier();
     w = qatomic_read(&g->adm);
+    XT_TP(XT_TP_ENTER_REREAD, g, w);
     if (w & (XT_ADM_PARKED | XT_ADM_POISONED)) {
         xt_adm_park(g);
     }
@@ -566,6 +600,7 @@ static uint32_t adm_enter(XtGate *g, uint32_t kind, uint64_t addr,
         xt_adm_park(g);
     }
     barrier();
+    XT_TP(XT_TP_ENTER_CLEARADDR, g, c);
     qatomic_set(&g->checking[c], 0);
     return (c + 1) | XT_ADM_ATTEMPT;
 }
@@ -581,6 +616,7 @@ bool xt_adm_alone(XtGate *g)
 {
     uint64_t w = qatomic_load_acquire(&g->adm);
 
+    XT_TP(XT_TP_ALONE_READ, g, w);
     return XT_ADM_COUNT(w) == 1 &&
            !(w & (XT_ADM_PARKED | XT_ADM_POISONED)) &&
            !qatomic_read(&g->checking[0]);
@@ -648,6 +684,7 @@ void xt_root_push(XtGate *g, uint32_t kind, uint64_t addr, uint64_t len)
             r->len = len;
             r->gen = ++g->root_gen;
             qatomic_store_release(&r->state, XT_ROOT_PENDING);
+            XT_TP(XT_TP_ROOT_PUSHED, g, i);
             if (xt_gate_check) {
                 qatomic_inc(&gate_pushed);
             }
@@ -681,6 +718,28 @@ void xt_adm_exit(XtGate *g)
             return;
         }
     } while (!adm_cas(g, w, n));
+}
+
+/*
+ * Testing (xt_tp_leak): a level pushed with its byte left set, as an entry
+ * stopped for good inside its window leaves it.  The word left, or 0 if
+ * none could be pushed.
+ */
+uint64_t xt_adm_leak_uncommitted(XtGate *g)
+{
+    uint64_t w, n;
+    uint32_t c;
+
+    do {
+        w = qatomic_read(&g->adm);
+        c = XT_ADM_COUNT(w);
+        n = w + ADM_ONE_COUNT;
+        if (c >= XT_ADM_MAX_LEVELS || !adm_next(w, &n)) {
+            return 0;
+        }
+        qatomic_set(&g->checking[c], 1);
+    } while (!adm_cas(g, w, n));
+    return n;
 }
 
 /*
@@ -791,6 +850,7 @@ void xt_gate_quarantine(XtGate *g)
             return;
         }
     } while (qatomic_cmpxchg(&g->ret, r, r | RET_QUARANTINED) != r);
+    XT_TP_NOTE(XT_TPN_QUARANTINE, (uintptr_t)g, g->tid, 0);
 }
 
 /*
@@ -831,6 +891,7 @@ XtGate *xt_gate_retire_next(uint32_t *cursor, bool *quarantined)
             r) {
             *quarantined = r & RET_QUARANTINED;
             (*cursor)++;
+            XT_TP(XT_TP_RETIRE_CLAIMED, g, r);
             return g;
         }
     }
@@ -840,6 +901,7 @@ XtGate *xt_gate_retire_next(uint32_t *cursor, bool *quarantined)
 /* G's retirement given up (it couldn't be done now): LIVE again. */
 void xt_gate_retire_abort(XtGate *g)
 {
+    XT_TP_NOTE(XT_TPN_REAP_ABORT, (uintptr_t)g, g->tid, 0);
     qatomic_store_release(&g->ret, (qatomic_read(&g->ret) & ~RET_STATE) |
                                    RET_LIVE);
 }
@@ -853,6 +915,8 @@ void xt_gate_mark_retired(XtGate *g)
     if (h) {
         NtClose(h);
     }
+    XT_TP_NOTE(XT_TPN_RETIRED, (uintptr_t)g, g->tid,
+               !!(qatomic_read(&g->ret) & RET_QUARANTINED));
     qatomic_store_release(&g->ret,
                           (qatomic_read(&g->ret) & ~RET_STATE) | RET_RETIRED);
 }

@@ -182,18 +182,54 @@ void xt_ec_stub_inject_init(void);
 void xt_ec_stub_inject_report(void);
 
 /*
- * The thread gates' test points (test-tp.c, arm64ec.S's tp_point): a page
- * shared with a controller process, which arms a point, waits for a
- * thread to be held there, acts on it, and releases it.  STATE: 0 idle,
- * 1 armed, 2 held (claimed), 3 published, 4 done.  BEFORE and AFTER hold
- * x13, x14, x23, x24 and x28 (the canary) around the hold, GPR_BEFORE and
- * GPR_AFTER every register but x16-x18 and x28, by number.  FORCE_ZERO
- * has the hold zero x13, x14, x23 and x24 itself; LIVE_LAYOUT says which
- * registers the entries' admission keeps its state in (2: x10-x12, the
- * kind in w15).  The rest is
- * the subject's: its native APC routine and what that routine last
- * acknowledged; its harness's words.
+ * The thread gates' test points (test-tp.c, arm64ec.S's tp_point): a
+ * section shared with a controller process, which arms points, waits for
+ * a thread to be held at one, acts on it, and releases it.
+ *
+ * The stubs' point (arm64ec.S): STATE 0 idle, 1 armed, 2 held (claimed),
+ * 3 published, 4 done.  BEFORE and AFTER hold x13, x14, x23, x24 and x28
+ * (the canary) around the hold, GPR_BEFORE and GPR_AFTER every register
+ * but x16-x18 and x28, by number.  FORCE_ZERO has the hold zero x13, x14,
+ * x23 and x24 itself (bit 0), or makes a fault after the hold, a nested
+ * entry (bit 1); LIVE_LAYOUT says which registers the entries'
+ * admission keeps its state in (2: x10-x12, the kind in w15).  The
+ * subject's native APC routine, and what it last acknowledged; its
+ * harness's words.
+ *
+ * The C points (XT_TP, XtTpId): C_ARMED has a bit a point; a hit on an
+ * armed point looks for an armed slot of it (XtTpSlot) whose filters
+ * match, and the NTH such hit (or, with EVERY, each from the NTH) holds
+ * the thread.  A hit on a slot already holding (a nested hit) counts BUSY
+ * and passes.  The failure sites (XT_TP_FAIL, XtTpFail): F_ARMED a bit a
+ * site, failing at its F_NTH[] hit, or every hit from it with F_EVERY.
+ * The notes (XT_TP_NOTE, XtTpNote): a log the controller reads, even
+ * after the subject has ended.  ADDR[] (XtTpAddr) is where the module's
+ * counters are, in the subject, for the controller's reads.
  */
+#define XT_TP_SIZE 0x20000
+#define XT_TP_SLOTS 8
+#define XT_TP_IDS 128
+#define XT_TP_LOG 2048
+
+typedef struct XtTpSlot {
+    uint32_t point, state;          /* XT_TPS_* */
+    uint32_t nth, every;
+    uint64_t gate_filter, tid_filter;
+    uint64_t hits, busy;
+    /* The hold: its generation, thread, gate, word and argument. */
+    uint64_t gen, tid, gate, word, arg, word_after;
+    /* Released when RELEASE is GEN; CMD_SEQ moves for a command (CMD). */
+    uint64_t release;
+    uint32_t cmd, cmd_seq, cmd_done, expired;
+    uint64_t cmd_arg, cmd_result;
+    uint64_t done;                  /* the last hold's GEN, once it ends */
+} XtTpSlot;
+
+typedef struct XtTpLog {
+    uint32_t kind, tid;
+    uint64_t a, b, c;
+} XtTpLog;
+
 typedef struct XtTpBlock {
     uint32_t magic, version;
     uint32_t asm_point, asm_state;
@@ -208,16 +244,58 @@ typedef struct XtTpBlock {
     uint32_t force_zero, live_layout;
     uint64_t pad[5];
     uint64_t gpr_before[32], gpr_after[32];
+    /* 0x400 */
+    uint64_t c_armed[XT_TP_IDS / 64], f_armed[XT_TP_IDS / 64];
+    uint64_t f_every[XT_TP_IDS / 64];
+    uint64_t log_next, hold_gen;
+    uint64_t pad2[1];
+    uint64_t addr[32];
+    uint32_t f_nth[XT_TP_IDS], f_hits[XT_TP_IDS];
+    XtTpSlot slots[XT_TP_SLOTS];
+    XtTpLog log[XT_TP_LOG];
 } XtTpBlock;
 
+/* XtTpSlot.state */
+enum {
+    XT_TPS_IDLE,
+    XT_TPS_ARMED,
+    XT_TPS_CLAIMED,
+    XT_TPS_HELD,
+    XT_TPS_DONE,
+};
+
+/* XtTpSlot.every: hold at each hit from the Nth, or act at each, unheld. */
+#define XT_TP_EVERY_ACT 2
+
+/* XtTpSlot.cmd: what the held thread does, on its own gate. */
+enum {
+    XT_TPC_POISON = 1,              /* POISONED set, the rest kept */
+    XT_TPC_SEQ,                     /* SEQ moved forward to CMD_ARG */
+    XT_TPC_SEQ_STEP,                /* SEQ moved forward by one */
+    XT_TPC_FAULT,                   /* a fault, a nested entry (xt_tp_fault) */
+};
+
+/* xt_tp_leak's flags. */
+#define XT_TP_LEAK_UNCOMMITTED  1   /* the byte left set */
+#define XT_TP_LEAK_REC          2   /* a record user held */
+#define XT_TP_LEAK_ROOT         4   /* a pending root, kind (FLAGS >> 8) */
+#define XT_TP_LEAK_PAIRED       8   /* no leak: a level entered and left */
+#define XT_TP_LEAK_ROOT_ADDR    0x7e570000ull   /* + kind * 0x1000 */
+
 #define XT_TP_MAGIC 0x50545458u     /* "XTTP" */
+
+NTSTATUS NTAPI NtTerminateThread(HANDLE, NTSTATUS);
+PVOID NTAPI RtlAddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
 
 extern XtTpBlock *xt_tp_block;
 void xt_tp_process_init(void);
 uint64_t xt_tp_jump_asm(uint64_t target, uint64_t arg);
+void xt_tp_fault(void);
+extern const char xt_tp_fault_pc[];
 XTEXPORT uint64_t xt_tp_jump(uint64_t target, uint64_t arg);
 XTEXPORT uint64_t xt_tp_native_add(uint64_t arg);
 XTEXPORT DWORD WINAPI xt_tp_jump_worker(void *arg);
+XTEXPORT uint64_t xt_tp_leak(uint64_t flags);
 
 /*
  * A thread's gate (arm64ec-gate.c): what another thread needs to know
@@ -302,11 +380,13 @@ void xt_adm_exit(XtGate *g);
 G_NORETURN void xt_adm_park(XtGate *g);
 G_NORETURN void xt_adm_poison_park(XtGate *g);
 G_NORETURN void xt_adm_reject(XtGate *g, uint32_t level);
+uint64_t xt_adm_leak_uncommitted(XtGate *g);
 
 NTSTATUS xt_ec_alloc_direct(void **base, SIZE_T *size, ULONG type,
                             ULONG prot);
 bool xt_gate_init_process(void);
 void xt_gate_report(char *line, size_t size);
+void xt_gate_tp_publish(void);
 void xt_gate_quarantine(XtGate *g);
 XtGate *xt_gate_retire_next(uint32_t *cursor, bool *quarantined);
 void xt_gate_mark_retired(XtGate *g);
