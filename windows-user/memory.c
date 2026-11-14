@@ -90,6 +90,7 @@ void xt_mem_forget(int kind, ULONG prot, vaddr start, vaddr len)
     last = MIN(start + len - 1, (vaddr)guest_addr_max) | ~TARGET_PAGE_MASK;
     began = xt_adapter_begin();
     mmap_lock();
+    xt_cache_forget(kind, from, last);
     while (keep && from <= last) {
         XtUnprotect u = { from, last };
         vaddr page;
