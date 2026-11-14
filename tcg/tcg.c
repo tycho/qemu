@@ -294,6 +294,7 @@ bool tcg_retalign;
 bool tcg_tb_flags_canon;
 TCGJumpCacheLayout tcg_jc_layout;
 const void *tcg_xpage_stub;
+bool tcg_repstr;
 __thread TCGContext *tcg_ctx;
 
 TCGContext **tcg_ctxs;
