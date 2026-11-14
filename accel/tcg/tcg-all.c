@@ -104,6 +104,8 @@ static void tcg_accel_instance_init(Object *obj)
 }
 
 bool one_insn_per_tb;
+bool tcg_smc_check;
+bool tcg_smc_call;
 
 #ifndef CONFIG_USER_ONLY
 static void tcg_vm_change_state(void *opaque, bool running, RunState state)

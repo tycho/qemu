@@ -42,6 +42,7 @@
 #include "tcg-accel-ops.h"
 #include "backend-ldst.h"
 #include "internal-common.h"
+#include "qemu/crc32c.h"
 #include "tb-internal.h"
 #include "tcg/startup.h"
 
@@ -367,11 +368,13 @@ static bool pageflags_set_clear(vaddr start, vaddr last,
 
     /*
      * Need to flush if an overlapping executable region
-     * removes exec, adds write, or is a new mapping.
+     * removes exec, adds write, is a new mapping, or loses
+     * PAGE_FIXED_CODE (its TBs may not check their code).
      */
     if ((p_flags & PAGE_EXEC)
         && (!(merge_flags & PAGE_EXEC)
             || (merge_flags & ~p_flags & PAGE_WRITE)
+            || (p_flags & ~merge_flags & PAGE_FIXED_CODE)
             || (clear_flags & PAGE_VALID))) {
         inval_tb = true;
     }
@@ -718,10 +721,94 @@ void tb_lock_page0(tb_page_addr_t address)
     }
 
     if (prot & PAGE_WRITE) {
+        /*
+         * With x-smc=check the page stays writable: the TB checks its
+         * guest bytes at entry instead.
+         */
+        if (tcg_smc_check) {
+            return;
+        }
         pageflags_set_clear(start, last, 0, PAGE_WRITE);
         mprotect(g2h_untagged_vaddr(start), last - start + 1,
                  prot & (PAGE_READ | PAGE_EXEC) ? PROT_READ : PROT_NONE);
     }
+}
+
+/*
+ * x-smc=check: TB has gone stale at its entry.  It goes, and execution
+ * resumes at its start, which the main loop translates again.  Nothing of
+ * the TB has run yet, but a chained entry may not have stored the PC.
+ */
+static void G_NORETURN tb_smc_stale(CPUState *cpu, TranslationBlock *tb)
+{
+    const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
+
+    mmap_lock();
+    tb_phys_invalidate(tb, -1);
+    mmap_unlock();
+    if (tcg_ops->synchronize_from_tb) {
+        tcg_ops->synchronize_from_tb(cpu, tb);
+    } else {
+        tcg_debug_assert(!(tb_cflags(tb) & CF_PCREL));
+        cpu->cc->set_pc(cpu, tb->pc);
+    }
+    cpu_loop_exit_noexc(cpu);
+}
+
+/*
+ * x-smc=check: the entry of a TB whose code may change: the CRC32C of the
+ * guest bytes its translation read, compared with theirs then.  While the
+ * bytes are read, cpu->smc_check_tb names the TB, so that the host fault
+ * of a page gone since is taken as the TB gone stale (tb_smc_check_fault):
+ * translating it again finds the guest's real fetch fault, if any.
+ */
+void HELPER(tb_smc_check)(CPUArchState *env, void *ptr)
+{
+    TranslationBlock *tb = ptr;
+    CPUState *cpu = env_cpu(env);
+    uint32_t crc;
+
+    if (unlikely(tb->smc_reject)) {
+        tb_smc_stale(cpu, tb);
+    }
+    cpu->smc_check_tb = tb;
+    signal_barrier();
+    crc = tb_code_sum(g2h_untagged_vaddr(tb->pc), tb->smc_len);
+    signal_barrier();
+    cpu->smc_check_tb = NULL;
+    if (unlikely(crc != tb->smc_crc)) {
+        tb_smc_stale(cpu, tb);
+    }
+}
+
+/* x-smc=check emitted in the TB: its check failed, or faulted. */
+void HELPER(tb_smc_stale)(CPUArchState *env, void *ptr)
+{
+    tb_smc_stale(env_cpu(env), ptr);
+}
+
+uintptr_t tb_smc_inline_fault(uintptr_t host_pc, uintptr_t host_addr)
+{
+    TranslationBlock *tb;
+
+    if (!tcg_smc_check || tcg_smc_call) {
+        return 0;
+    }
+    tb = tcg_tb_lookup(host_pc);
+    if (!tb || !tb->smc_inline ||
+        host_pc - (uintptr_t)tb->tc.ptr >= tb->smc_check_end ||
+        host_addr - (uintptr_t)g2h_untagged_vaddr(tb->pc) >= tb->smc_len) {
+        return 0;
+    }
+    return (uintptr_t)tb->smc_stale;
+}
+
+void tb_smc_check_fault(CPUState *cpu)
+{
+    TranslationBlock *tb = cpu->smc_check_tb;
+
+    cpu->smc_check_tb = NULL;
+    tb_smc_stale(cpu, tb);
 }
 
 /*
@@ -747,8 +834,11 @@ int page_unprotect(CPUState *cpu, tb_page_addr_t address, uintptr_t pc)
 
     p = pageflags_find(address, address);
 
-    /* If this address was not really writable, nothing to do. */
-    if (!p || !(p->flags & PAGE_WRITE_ORG)) {
+    /*
+     * If this address was not really writable, nothing to do; nor with
+     * x-smc=check, where QEMU never write-protects a page.
+     */
+    if (!p || !(p->flags & PAGE_WRITE_ORG) || tcg_smc_check) {
         mmap_unlock();
         return 0;
     }

@@ -591,6 +591,17 @@ static abi_long mmap_end(abi_ulong start, abi_ulong last,
     if (flags & MAP_ANONYMOUS) {
         page_flags |= PAGE_ANON;
     }
+    /*
+     * A private mapping's contents change through its own pages, which
+     * need PAGE_WRITE, or a protection or mapping change, which reaches
+     * the flags.  Not seen: a write to the file, or to a shared alias of
+     * it, before the page is copied, and writes by another process; write
+     * protection misses those too.  A shared mapping can be written
+     * through another view of it, so its code is checked.
+     */
+    if ((flags & MAP_TYPE) == MAP_PRIVATE) {
+        page_flags |= PAGE_FIXED_CODE;
+    }
     if (passthrough_start > passthrough_last) {
         page_set_flags(start, last, page_flags, PAGE_VALID);
     } else {
