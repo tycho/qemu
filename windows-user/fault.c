@@ -19,6 +19,7 @@
 #include "user/cpu_loop.h"
 #include "user/page-protection.h"
 #include "host/cpuinfo.h"
+#include "tcg/tcg-cache.h"
 #include "xtajit.h"
 
 extern IMAGE_DOS_HEADER __ImageBase;
@@ -240,7 +241,7 @@ static void G_NORETURN zext32_trap(XtNativeContext *ctx, int reg)
  */
 bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx)
 {
-    XtThread *t = xt_self;
+    XtThread *t;
     XtFault *f;
     XtFaultKind kind;
     MMUAccessType access;

@@ -259,6 +259,15 @@ static inline uint32_t tb_cflags(const TranslationBlock *tb)
 bool tcg_cflags_has(CPUState *cpu, uint32_t flags);
 void tcg_cflags_set(CPUState *cpu, uint32_t flags);
 
+#ifdef CONFIG_USER_ONLY
+/* TranslationBlock.pt_state */
+enum {
+    TB_PT_ABSENT,       /* not in page tracking */
+    TB_PT_PENDING,      /* recorded, not yet in the interval tree */
+    TB_PT_IN_TREE,
+};
+#endif
+
 static inline tb_page_addr_t tb_page_addr0(const TranslationBlock *tb)
 {
 #ifdef CONFIG_USER_ONLY

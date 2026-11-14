@@ -199,7 +199,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s);
 void page_init(void);
 void tb_htable_init(void);
 void tb_reset_jump(TranslationBlock *tb, int n);
-TranslationBlock *tb_link_page(TranslationBlock *tb);
+TranslationBlock *tb_link_page(TranslationBlock *tb, bool defer_pages);
 void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
                                uintptr_t host_pc);
 
