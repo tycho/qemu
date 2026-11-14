@@ -329,24 +329,24 @@ XtGate *xt_gate_for(HANDLE h, bool create_closed, NTSTATUS *st)
 
 /*
  * Admission (XtGate.adm): every way into the module's code pushes a level
- * of its own and pops exactly that level on every way out.  An entry made
- * while the innermost level is committed inherits it (a callback of the
- * engine's own work, an exception inside it) and checks no gate.  Any
- * other entry is an attempt: it pushes its level uncommitted, then reads
- * the gate, then commits, or, refused, parks for good.  An entry that
- * interrupts an attempt finds that level uncommitted, so it never
- * inherits it, and the attempt's level stays until the attempt itself
- * commits or parks: a thread ending the process never sees the thread
- * idle in between.
+ * of its own and pops exactly that level on every way out, each a single
+ * compare-and-swap.  An entry made over a level already admitted inherits
+ * it (a callback of the engine's own work, an exception inside it) and
+ * reads no gate.  Any other entry marks its window (XtGate.checking),
+ * pushes its level, reads the gate, and either goes on, the mark restored,
+ * or, refused, parks for good.  An entry that interrupts another's window
+ * finds the mark, so it reads the gate itself and never inherits, and the
+ * interrupted entry's level stays until it goes on or parks: a thread
+ * ending the process never sees the thread idle in between.
  */
 XtGate *xt_gate_closed_by;
 
 QEMU_BUILD_BUG_ON(offsetof(XtGate, adm) != 0);
 QEMU_BUILD_BUG_ON(offsetof(XtGate, closed) != 8);
 QEMU_BUILD_BUG_ON(offsetof(XtGate, internal) != 12);
+QEMU_BUILD_BUG_ON(offsetof(XtGate, checking) != 24);
 
 #define ADM_ONE_COUNT (1ull << XT_ADM_COUNT_SHIFT)
-#define ADM_ONE_UNC (1ull << XT_ADM_UNC_SHIFT)
 
 static bool adm_cas(XtGate *g, uint64_t old, uint64_t new)
 {
@@ -372,8 +372,8 @@ static void adm_poison(XtGate *g);
 enum {
     POISON_FULL,        /* COUNT full */
     POISON_WRAP,        /* SEQ about to wrap */
-    POISON_PAIRING,     /* an exit with no committed level */
-    POISON_COMMIT,      /* an attempt's level no longer the innermost */
+    POISON_PAIRING,     /* an exit with no admitted level */
+    POISON_LEAK,        /* a level leaked above an entry in its window */
     POISON_REJECT,      /* refused with other levels outstanding */
     POISON_ROOTS,       /* every root taken */
     POISON_STUB,        /* the stubs' (full, wrap, commit) */
@@ -429,9 +429,10 @@ static bool adm_closed_for(XtGate *g)
 }
 
 /*
- * An attempt at LEVEL refused: parked if it was the only level, poisoned
- * if anything else is outstanding (an attempt it interrupted, or a level
- * an interruption left above it), and parked either way.
+ * An entry at LEVEL refused at the gate: its level popped and the word
+ * parked if that was the only level, poisoned (its levels kept) if
+ * anything else is outstanding (an entry it interrupted in its own window,
+ * or a level an interruption left above it), and parked either way.
  */
 G_NORETURN void xt_adm_reject(XtGate *g, uint32_t level)
 {
@@ -439,8 +440,8 @@ G_NORETURN void xt_adm_reject(XtGate *g, uint32_t level)
 
     do {
         w = qatomic_read(&g->adm);
-        if (XT_ADM_COUNT(w) == 1 && XT_ADM_UNC(w) == 1 && level == 1) {
-            n = (w - ADM_ONE_COUNT - ADM_ONE_UNC) | XT_ADM_PARKED;
+        if (XT_ADM_COUNT(w) == 1 && level == 1) {
+            n = (w - ADM_ONE_COUNT) | XT_ADM_PARKED;
             if (!adm_next(w, &n)) {
                 n = w | XT_ADM_POISONED;
             }
@@ -452,26 +453,6 @@ G_NORETURN void xt_adm_reject(XtGate *g, uint32_t level)
         qatomic_inc(&gate_poisons[POISON_REJECT]);
     }
     xt_adm_park(g);
-}
-
-/* The attempt at LEVEL commits, if its level is still the innermost. */
-static void adm_commit(XtGate *g, uint32_t level)
-{
-    uint64_t w, n;
-
-    do {
-        w = qatomic_read(&g->adm);
-        n = w - ADM_ONE_UNC;
-        if (w & (XT_ADM_PARKED | XT_ADM_POISONED)) {
-            /* An interruption poisoned it meanwhile: no engine work now. */
-            xt_adm_park(g);
-        }
-        if (XT_ADM_COUNT(w) != level || XT_ADM_UNC(w) != level ||
-            !adm_next(w, &n)) {
-            adm_poison_why(g, POISON_COMMIT);
-            xt_adm_park(g);
-        }
-    } while (!adm_cas(g, w, n));
 }
 
 /*
@@ -494,75 +475,115 @@ static int root_newest(XtGate *g)
 }
 
 /*
- * An entry's level pushed, with the gate checked if it's an attempt; with
- * KIND (a notification's second half), an attempt first tries to claim the
- * newest root, if that one is pending and of its kind, and if it does it
- * commits whatever the gate says: it finishes an operation its first half
- * began.  The level, with XT_ADM_ATTEMPT if it was an attempt; *CLAIMED
- * the root claimed, or -1.
+ * An entry's level pushed, in one compare-and-swap.  CHECKING has a byte a
+ * level: set, the level is pushed and its gate not yet read; clear, it is
+ * admitted.  An entry over a level already admitted inherits it: it pushes
+ * and clears its own byte at once.  Any other entry sets its byte before the
+ * push (an interruption then sees the window, or, interrupting before the
+ * push, changes the word, so that the push fails and starts again), reads
+ * the gate (with KIND, a notification's second half, first trying to
+ * claim the newest root, if that one is pending and of its kind, in which
+ * case it goes ahead whatever the gate says: it finishes an operation its
+ * first half began), re-reads the word (parked or poisoned meanwhile, or a
+ * level leaked above, it parks), and clears its byte: the one store that
+ * admits it.  Refused at the gate, it parks.  CHECKING is the thread's own,
+ * each byte written by a single store.  The level, with
+ * XT_ADM_ATTEMPT if the gate was read; *CLAIMED the root claimed, or -1.
  */
 static uint32_t adm_enter(XtGate *g, uint32_t kind, uint64_t addr,
                           uint64_t len, int *claimed)
 {
+    uint32_t c;
+    uint64_t w, n;
+    bool fresh;
+
     *claimed = -1;
     for (;;) {
-        uint64_t w = qatomic_read(&g->adm), n;
-        uint32_t count = XT_ADM_COUNT(w), unc = XT_ADM_UNC(w);
-
+        w = qatomic_read(&g->adm);
         if (w & (XT_ADM_PARKED | XT_ADM_POISONED)) {
             xt_adm_park(g);
         }
-        if (count == XT_ADM_FIELD_MASK) {
+        c = XT_ADM_COUNT(w);
+        if (c >= XT_ADM_MAX_LEVELS) {
             adm_poison_why(g, POISON_FULL);
             xt_adm_park(g);
         }
         n = w + ADM_ONE_COUNT;
-        if (count == unc) {
-            n += ADM_ONE_UNC;
-        }
         if (!adm_next(w, &n)) {
             adm_poison_why(g, POISON_WRAP);
             xt_adm_park(g);
         }
-        if (!adm_cas(g, w, n)) {
-            continue;
+        fresh = !c || qatomic_read(&g->checking[c - 1]);
+        if (fresh) {
+            qatomic_set(&g->checking[c], 1);
+            barrier();
         }
-        if (count > unc) {
-            return count + 1;
+        if (adm_cas(g, w, n)) {
+            break;
         }
-        /* The level published before the gate is read (part of a pair). */
-        barrier();
-        if (kind) {
-            int i = root_newest(g);
-
-            if (i >= 0 && g->roots[i].kind == kind &&
-                qatomic_cmpxchg(&g->roots[i].state, XT_ROOT_PENDING,
-                                XT_ROOT_CLAIMED) == XT_ROOT_PENDING) {
-                /*
-                 * Still the newest, or an interruption between the choice
-                 * and the claim left a newer one: then it is given back.
-                 */
-                if (root_newest(g) == i) {
-                    *claimed = i;
-                } else {
-                    qatomic_store_release(&g->roots[i].state,
-                                          XT_ROOT_PENDING);
-                }
-            }
-            if (xt_gate_check) {
-                qatomic_inc(*claimed >= 0 ? &gate_claimed : &gate_unclaimed);
-                if (*claimed >= 0 && (g->roots[*claimed].addr != addr ||
-                                      g->roots[*claimed].len != len)) {
-                    qatomic_inc(&gate_args_differ);
-                }
-            }
-        }
-        if (*claimed < 0 && adm_closed_for(g)) {
-            xt_adm_reject(g, count + 1);
-        }
-        adm_commit(g, count + 1);
-        return (count + 1) | XT_ADM_ATTEMPT;
     }
+    if (!fresh) {
+        barrier();
+        qatomic_set(&g->checking[c], 0);
+        return c + 1;
+    }
+    /* The level published before the gate is read (part of a pair). */
+    barrier();
+    if (kind) {
+        int i = root_newest(g);
+
+        if (i >= 0 && g->roots[i].kind == kind &&
+            qatomic_cmpxchg(&g->roots[i].state, XT_ROOT_PENDING,
+                            XT_ROOT_CLAIMED) == XT_ROOT_PENDING) {
+            /*
+             * Still the newest, or an interruption between the choice and
+             * the claim left a newer one: then it is given back.
+             */
+            if (root_newest(g) == i) {
+                *claimed = i;
+            } else {
+                qatomic_store_release(&g->roots[i].state, XT_ROOT_PENDING);
+            }
+        }
+        if (xt_gate_check) {
+            qatomic_inc(*claimed >= 0 ? &gate_claimed : &gate_unclaimed);
+            if (*claimed >= 0 && (g->roots[*claimed].addr != addr ||
+                                  g->roots[*claimed].len != len)) {
+                qatomic_inc(&gate_args_differ);
+            }
+        }
+    }
+    if (*claimed < 0 && adm_closed_for(g)) {
+        xt_adm_reject(g, c + 1);
+    }
+    barrier();
+    w = qatomic_read(&g->adm);
+    if (w & (XT_ADM_PARKED | XT_ADM_POISONED)) {
+        xt_adm_park(g);
+    }
+    if (XT_ADM_COUNT(w) != c + 1) {
+        adm_poison_why(g, POISON_LEAK);
+        xt_adm_park(g);
+    }
+    barrier();
+    qatomic_set(&g->checking[c], 0);
+    return (c + 1) | XT_ADM_ATTEMPT;
+}
+
+/*
+ * Whether G's word shows its caller's own level alone and isn't poisoned
+ * or parked: what a thread acting on its own gate without a certifier (its
+ * own end, the exit's owner) checks live before teardown, rather than
+ * trust the level its entry returned (an interruption may have left a
+ * level above it since).
+ */
+bool xt_adm_alone(XtGate *g)
+{
+    uint64_t w = qatomic_load_acquire(&g->adm);
+
+    return XT_ADM_COUNT(w) == 1 &&
+           !(w & (XT_ADM_PARKED | XT_ADM_POISONED)) &&
+           !qatomic_read(&g->checking[0]);
 }
 
 uint32_t xt_adm_enter(XtGate *g)
@@ -598,7 +619,7 @@ G_NORETURN void xt_adm_park_terminal(XtGate *g)
 
     do {
         w = qatomic_read(&g->adm);
-        if (XT_ADM_COUNT(w) == 1 && XT_ADM_UNC(w) == 0) {
+        if (XT_ADM_COUNT(w) == 1) {
             n = (w - ADM_ONE_COUNT) | XT_ADM_PARKED;
             if (!adm_next(w, &n)) {
                 n = w | XT_ADM_POISONED;
@@ -643,8 +664,9 @@ void xt_root_release(XtGate *g, int i)
 }
 
 /*
- * The innermost level popped.  None committed to pop is a pairing error:
- * the word is poisoned, so the thread is never taken as idle.
+ * The innermost level popped.  None admitted to pop (no level, or the
+ * innermost still in its window) is a pairing error: the word is
+ * poisoned, so the thread is never taken as idle.
  */
 void xt_adm_exit(XtGate *g)
 {
@@ -653,7 +675,8 @@ void xt_adm_exit(XtGate *g)
     do {
         w = qatomic_read(&g->adm);
         n = w - ADM_ONE_COUNT;
-        if (XT_ADM_COUNT(w) <= XT_ADM_UNC(w) || !adm_next(w, &n)) {
+        if (!XT_ADM_COUNT(w) || !adm_next(w, &n) ||
+            qatomic_read(&g->checking[XT_ADM_COUNT(w) - 1])) {
             adm_poison_why(g, POISON_PAIRING);
             return;
         }
@@ -731,13 +754,14 @@ void xt_gate_report(char *line, size_t size)
         }
     }
     snprintf(line, size, "gatecheck: %u gates, %u poisoned (full %u wrap %u "
-             "pairing %u commit %u reject %u roots %u stub %u), %u parked, "
+             "pairing %u leak %u reject %u roots %u stub %u), %u parked, "
              "%u levels outstanding (deepest %u), %u roots live; second "
              "halves %u claimed, %u unclaimed, %u with other arguments; %u "
              "roots pushed; %u reads taken from threads ended mid-read\n",
              gates, poisoned, gate_poisons[POISON_FULL],
              gate_poisons[POISON_WRAP], gate_poisons[POISON_PAIRING],
-             gate_poisons[POISON_COMMIT], gate_poisons[POISON_REJECT],
+             gate_poisons[POISON_LEAK],
+             gate_poisons[POISON_REJECT],
              gate_poisons[POISON_ROOTS], gate_poisons[POISON_STUB], parked,
              levels, deepest, roots, gate_claimed, gate_unclaimed,
              gate_args_differ, gate_pushed, qatomic_read(&xt_gate_read_open));

@@ -190,8 +190,9 @@ void xt_ec_stub_inject_report(void);
  * EmulatorData[XT_EC_GATE] for itself.
  *
  * ADM is the admission word (XT_ADM_*): the levels of the module's code
- * the thread is in, how many of the outermost are attempts still checking
- * the gate, a sequence number every change moves, and two sticky states.
+ * the thread is in, a sequence number every change moves, and two sticky
+ * states.  CHECKING, the thread's own, has a byte a level, set from the
+ * level's push until its entry has read the gate (adm_enter).
  * ROOTS are the operations a notification's first half left for its
  * second.  CLOSED is the thread's own closure, set by a thread ending it;
  * INTERNAL marks one of the engine's internal threads until it parks or
@@ -214,6 +215,7 @@ typedef struct XtGate {
     uint32_t internal;
     uint32_t ret;
     uint32_t published;         /* registered: readable by a scan */
+    uint8_t checking[32];       /* [I]: level I + 1 not yet admitted */
     uint64_t root_gen;
     XtGateRoot roots[XT_GATE_ROOTS];
     uint32_t tid;
@@ -226,18 +228,16 @@ typedef struct XtGate {
  * XtGate.adm, changed only by compare-and-swap, so that a transition an
  * interruption made in between is never written over: SEQ moves on every
  * change (one that would wrap it poisons the word instead), COUNT is the
- * levels outstanding, UNC how many of the outermost are attempts still
- * checking the gate (they lie under every committed level), PARKED and
- * POISONED stick.  arm64ec.S's stubs use the same layout.
+ * levels outstanding, PARKED and POISONED stick.  arm64ec.S's stubs use the
+ * same layout.
  */
 #define XT_ADM_SEQ_MASK     0xffffffffull
 #define XT_ADM_COUNT_SHIFT  32
-#define XT_ADM_UNC_SHIFT    46
 #define XT_ADM_FIELD_MASK   0x3fffull
+#define XT_ADM_MAX_LEVELS   32      /* XtGate.checking's bytes */
 #define XT_ADM_PARKED       (1ull << 60)
 #define XT_ADM_POISONED     (1ull << 61)
 #define XT_ADM_COUNT(w)     (((w) >> XT_ADM_COUNT_SHIFT) & XT_ADM_FIELD_MASK)
-#define XT_ADM_UNC(w)       (((w) >> XT_ADM_UNC_SHIFT) & XT_ADM_FIELD_MASK)
 
 /*
  * The gate every thread's fresh entry checks: NULL while open, the exit
@@ -255,6 +255,7 @@ extern XtGate *xt_gate_closed_by;
 #define XT_ADM_ATTEMPT      0x80000000u
 
 uint32_t xt_adm_enter(XtGate *g);
+bool xt_adm_alone(XtGate *g);
 int xt_adm_enter_claim(XtGate *g, uint32_t kind, uint64_t addr, uint64_t len);
 G_NORETURN void xt_adm_park_terminal(XtGate *g);
 void xt_root_push(XtGate *g, uint32_t kind, uint64_t addr, uint64_t len);

@@ -788,6 +788,7 @@ enum {
     EC_EXIT_HELPER = 1 << 4,        /* an internal thread didn't park */
     EC_EXIT_RCU = 1 << 5,           /* call_rcu's worker not at rest */
     EC_EXIT_FLUSH = 1 << 6,         /* the write-buffer flush failed */
+    EC_EXIT_SELF = 1 << 7,          /* the owner's word: not its level alone */
     EC_EXIT_DONE = 1u << 31,
 };
 
@@ -1408,7 +1409,8 @@ static NTSTATUS ec_thread_term(HANDLE thread, LONG code, XtGate *me,
     return STATUS_SUCCESS;
 
 self:
-    if (nested || qatomic_read(&me->internal)) {
+    /* The live word, not the level returned: a leak may sit above it. */
+    if (nested || qatomic_read(&me->internal) || !xt_adm_alone(me)) {
         xt_gate_quarantine(me);
         ec_unsafe_term_quiet();
     } else if (state == 2) {
@@ -1563,9 +1565,14 @@ static void ec_exit_begin(void)
     }
     ec_exit_phase[1] = get_clock() - t0;
     /*
-     * The rest relies on every other thread being out of the engine: after
-     * a failure none of it runs (a failed thread may hold what it needs).
+     * The rest relies on every other thread being out of the engine, and on
+     * this one holding only this call's level (read live: an interruption
+     * may have left one above it): after a failure none of it runs (a
+     * failed thread may hold what it needs).
      */
+    if (!xt_adm_alone(g)) {
+        ec_exit_outcome |= EC_EXIT_SELF;
+    }
     if (!ec_exit_outcome && qatomic_load_acquire(&engine_state) == 2) {
         xt_enter();
         for (guint i = 0; i < reads->len; i++) {
