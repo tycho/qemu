@@ -41,7 +41,8 @@ NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
                                            SIZE_T, PSIZE_T);
 
 #ifndef XT_SCAFFOLD
-#define XT_SCAFFOLD "smc=check"
+/* The fork's defaults for the module; XTAJIT_SETTINGS overrides them. */
+#define XT_SCAFFOLD "smc=check,cache=files"
 #endif
 
 /*
