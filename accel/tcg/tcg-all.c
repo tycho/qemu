@@ -34,11 +34,13 @@
 #include "host/fpenv.h"
 #include "qapi/error.h"
 #include "qapi/qapi-builtin-type-infos.h"
+#include "qapi/qapi-type-infos-common.h"
 #include "qemu/error-report.h"
 #include "qemu/accel.h"
 #include "qemu/atomic.h"
 #include "qapi/qapi-types-common.h"
 #include "qapi/qapi-builtin-visit.h"
+#include "qapi/qapi-visit-common.h"
 #include "qemu/units.h"
 #include "qemu/target-info.h"
 #ifndef CONFIG_USER_ONLY
@@ -50,6 +52,8 @@
 #include "accel/accel-cpu-ops.h"
 #include "accel/tcg/cpu-ops.h"
 #include "internal-common.h"
+#include "qapi/visitor.h"
+#include "tcg-accel-ops-mttcg.h"
 
 
 struct TCGState {
@@ -63,6 +67,10 @@ struct TCGState {
     bool iofast;
     bool hosttime;
     bool pause_hint;
+    int hostpoll;
+    uint32_t haltpoll_us;
+    OnOffAuto apictimer;
+    OnOffAuto apicpost;
 };
 typedef struct TCGState TCGState;
 
@@ -89,6 +97,8 @@ static void tcg_accel_instance_init(Object *obj)
 #else
     s->splitwx_enabled = 0;
 #endif
+    s->apictimer = ON_OFF_AUTO_OFF;
+    s->apicpost = ON_OFF_AUTO_OFF;
 }
 
 bool one_insn_per_tb;
@@ -269,6 +279,85 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #endif
 
     return 0;
+}
+
+static const char * const tcg_hostpoll_names[] = {
+    [QEMU_HOST_POLL_POLL] = "poll",
+    [QEMU_HOST_POLL_KQUEUE] = "kqueue",
+    [QEMU_HOST_POLL_SPIN] = "spin",
+};
+
+static char *tcg_get_hostpoll(Object *obj, Error **errp)
+{
+    return g_strdup(tcg_hostpoll_names[TCG_STATE(obj)->hostpoll]);
+}
+
+static void tcg_set_hostpoll(Object *obj, const char *value, Error **errp)
+{
+    for (int i = 0; i < ARRAY_SIZE(tcg_hostpoll_names); i++) {
+        if (!strcmp(value, tcg_hostpoll_names[i])) {
+            if (i != QEMU_HOST_POLL_POLL && !QEMU_HOST_POLL_KQUEUE_SUPPORTED) {
+                error_setg(errp, "x-hostpoll: '%s' needs kqueue timers in "
+                           "nanoseconds, which this host lacks", value);
+                return;
+            }
+            TCG_STATE(obj)->hostpoll = i;
+            return;
+        }
+    }
+    error_setg(errp, "Invalid 'x-hostpoll' value: %s (poll, kqueue, spin)",
+               value);
+}
+
+static void tcg_get_haltpoll(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    uint32_t value = TCG_STATE(obj)->haltpoll_us;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void tcg_set_haltpoll(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value > 10000) {
+        error_setg(errp, "x-haltpoll: at most 10000 microseconds");
+        return;
+    }
+    TCG_STATE(obj)->haltpoll_us = value;
+}
+
+static void tcg_get_apicpost(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    OnOffAuto value = TCG_STATE(obj)->apicpost;
+
+    visit_type_OnOffAuto(v, name, &value, errp);
+}
+
+static void tcg_set_apicpost(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    visit_type_OnOffAuto(v, name, &TCG_STATE(obj)->apicpost, errp);
+}
+
+static void tcg_get_apictimer(Object *obj, Visitor *v, const char *name,
+                              void *opaque, Error **errp)
+{
+    OnOffAuto value = TCG_STATE(obj)->apictimer;
+
+    visit_type_OnOffAuto(v, name, &value, errp);
+}
+
+static void tcg_set_apictimer(Object *obj, Visitor *v, const char *name,
+                              void *opaque, Error **errp)
+{
+    visit_type_OnOffAuto(v, name, &TCG_STATE(obj)->apictimer, errp);
 }
 
 bool tcg_prologue_deferred;
