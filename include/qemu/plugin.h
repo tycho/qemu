@@ -181,6 +181,9 @@ void qemu_plugin_vcpu_mem_cb(CPUState *cpu, uint64_t vaddr,
 
 void qemu_plugin_flush_cb(void);
 
+/* Whether any plugin is loaded. */
+bool qemu_plugins_loaded(void);
+
 void qemu_plugin_atexit_cb(void);
 
 void qemu_plugin_add_dyn_cb_arr(GArray *arr);
@@ -247,6 +250,11 @@ static inline void qemu_plugin_opt_parse(const char *optstr,
 static inline int qemu_plugin_load_list(QemuPluginList *head, Error **errp)
 {
     return 0;
+}
+
+static inline bool qemu_plugins_loaded(void)
+{
+    return false;
 }
 
 static inline void qemu_plugin_vcpu_init_hook(CPUState *cpu)

@@ -73,6 +73,10 @@ QEMU_RET_ARG_NONNULL static inline TCGv_i64 TCGV128_HIGH(TCGv_i128 t)
 bool tcg_target_has_memory_bswap(MemOp memop);
 
 QEMU_RET_NONNULL TCGTemp *tcg_temp_new_internal(TCGType type, TCGTempKind kind);
+TCGTemp *tcg_alias_global(TCGContext *s, TCGTemp *base, intptr_t off,
+                          TCGType type);
+TCGTemp *tcg_alias_element(TCGContext *s, TCGTemp *base, intptr_t off,
+                           MemOp size, unsigned *idx);
 
 static inline TCGTemp *tcg_temp_new_ebb(TCGType type)
 {

@@ -38,6 +38,34 @@ static inline uintptr_t host_signal_pc(host_sigcontext *uc)
     return uc->uc_mcontext.pc;
 }
 
+/*
+ * The registers at the signal, indexed by TCGReg (X0-X30, SP, V0-V31),
+ * as two 64-bit halves each.
+ */
+#define HOST_SIGNAL_TCG_REGS 64
+
+static inline void host_signal_tcg_regs(host_sigcontext *uc,
+                                        uint64_t (*regs)[2])
+{
+    struct _aarch64_ctx *hdr;
+
+    memset(regs, 0, sizeof(uint64_t[HOST_SIGNAL_TCG_REGS][2]));
+    for (int i = 0; i < 31; i++) {
+        regs[i][0] = uc->uc_mcontext.regs[i];
+    }
+    regs[31][0] = uc->uc_mcontext.sp;
+    for (hdr = first_ctx(uc); hdr->magic; hdr = next_ctx(hdr)) {
+        if (hdr->magic == FPSIMD_MAGIC) {
+            struct fpsimd_context *fp = (struct fpsimd_context *)hdr;
+
+            for (int i = 0; i < 32; i++) {
+                memcpy(regs[32 + i], &fp->vregs[i], 16);
+            }
+            break;
+        }
+    }
+}
+
 static inline void host_signal_set_pc(host_sigcontext *uc, uintptr_t pc)
 {
     uc->uc_mcontext.pc = pc;
