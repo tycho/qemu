@@ -13,6 +13,8 @@ extern EGLDisplay qemu_egl_display;
 extern EGLConfig qemu_egl_config;
 extern DisplayGLMode qemu_egl_mode;
 extern bool qemu_egl_angle_d3d;
+/* ANGLE's device: its ID3D11Device on Windows, its MTLDevice on macOS */
+extern void *qemu_egl_angle_native_device;
 
 typedef struct egl_fb {
     int width;
@@ -20,6 +22,7 @@ typedef struct egl_fb {
     int x;
     int y;
     GLuint texture;
+    GLenum texture_target; /* 0 for GL_TEXTURE_2D */
     GLuint framebuffer;
     bool delete_texture;
     QemuDmaBuf *dmabuf;
@@ -31,7 +34,11 @@ void egl_fb_destroy(egl_fb *fb);
 void egl_fb_setup_default(egl_fb *fb, int width, int height, int x, int y);
 void egl_fb_setup_for_tex(egl_fb *fb, int width, int height,
                           GLuint texture, bool delete);
+void egl_fb_setup_for_tex_target(egl_fb *fb, int width, int height,
+                                 GLuint texture, GLenum target, bool delete);
 void egl_fb_setup_new_tex(egl_fb *fb, int width, int height);
+void egl_fb_setup_new_tex_target(egl_fb *fb, int width, int height,
+                                 GLenum target);
 void egl_fb_blit(egl_fb *dst, egl_fb *src, bool flip);
 void egl_fb_read(DisplaySurface *dst, egl_fb *src);
 void egl_fb_read_rect(DisplaySurface *dst, egl_fb *src, int x, int y, int w, int h);
@@ -60,8 +67,13 @@ int egl_create_fence(EGLSyncKHR sync);
 #endif
 
 EGLSurface qemu_egl_init_surface_x11(EGLContext ectx, EGLNativeWindowType win);
+EGLSurface qemu_egl_init_buffer_surface(EGLContext ectx, EGLenum buftype,
+                                        EGLClientBuffer buffer,
+                                        const EGLint *attrib_list);
+bool qemu_egl_destroy_surface(EGLSurface surface);
 
-#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32)
+#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32) || \
+    defined(CONFIG_DARWIN)
 EGLDisplay qemu_egl_get_display(EGLNativeDisplayType native,
                                 EGLenum platform);
 #endif
@@ -75,6 +87,10 @@ int qemu_egl_init_dpy_mesa(EGLNativeDisplayType dpy, DisplayGLMode mode);
 
 #ifdef WIN32
 int qemu_egl_init_dpy_win32(EGLNativeDisplayType dpy, DisplayGLMode mode);
+#endif
+
+#ifdef CONFIG_DARWIN
+int qemu_egl_init_dpy_cocoa(DisplayGLMode mode);
 #endif
 
 EGLContext qemu_egl_init_ctx(void);

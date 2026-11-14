@@ -22,6 +22,7 @@
 
 #include "ui/egl-helpers.h"
 
+#define VIRGL_RENDERER_UNSTABLE_APIS
 #include <virglrenderer.h>
 
 /*
@@ -41,13 +42,29 @@
      VIRGL_VERSION_MICRO >= (micro))
 #endif
 
+/*
+ * On macOS a blob is a Metal or render-server allocation that the renderer
+ * cannot map at a fixed address (it fails with EINVAL); map it as a
+ * subregion instead.
+ */
 #define VIRGL_HAS_MAP_FIXED \
-    (VIRGL_CHECK_VERSION(1, 3, 0) && !IS_ENABLED(CONFIG_WIN32))
+    (VIRGL_CHECK_VERSION(1, 3, 0) && !IS_ENABLED(CONFIG_WIN32) && \
+     !IS_ENABLED(CONFIG_DARWIN))
 
 struct virtio_gpu_virgl_resource {
     struct virtio_gpu_simple_resource base;
     MemoryRegion *mr;
     void *map_fixed;
+    /*
+     * A RESOURCE_UNREF that arrived while the blob mapping was still being
+     * torn down; completed (virgl unref and response) once the MR finalizes.
+     */
+    struct virtio_gpu_ctrl_command *unref_cmd;
+    /*
+     * A command for this resource is suspended at the cmdq head, holding
+     * renderer_blocked, until its in-flight unmap finalizes.
+     */
+    bool map_blocked;
 };
 
 static struct virtio_gpu_virgl_resource *
@@ -82,7 +99,10 @@ struct virtio_gpu_virgl_hostmem_region {
     Object parent_obj;
     MemoryRegion mr;
     struct VirtIOGPU *g;
+    struct virtio_gpu_virgl_resource *res;
     enum virtio_gpu_virgl_hostmem_region_mapping_state mapping_state;
+    /* On VirtIOGPUGL.unmap_done_list while in VIRTIO_GPU_MR_UNMAP_COMPLETED */
+    QTAILQ_ENTRY(virtio_gpu_virgl_hostmem_region) done_next;
 };
 
 #define TYPE_VIRTIO_GPU_VIRGL_HOSTMEM_REGION "virtio-gpu-virgl-hostmem-region"
@@ -96,12 +116,21 @@ to_hostmem_region(MemoryRegion *mr)
     return container_of(mr, struct virtio_gpu_virgl_hostmem_region, mr);
 }
 
+static void virtio_gpu_virgl_finish_unmap(VirtIOGPU *g,
+                                          struct virtio_gpu_virgl_resource *res);
+
 static void virtio_gpu_virgl_resume_cmdq_bh(void *opaque)
 {
     VirtIOGPU *g = opaque;
+    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+    struct virtio_gpu_virgl_hostmem_region *vmr;
 
     if (!virtio_gpu_virgl_update_render_state(g)) {
         return;
+    }
+
+    while ((vmr = QTAILQ_FIRST(&gl->unmap_done_list)) != NULL) {
+        virtio_gpu_virgl_finish_unmap(g, vmr->res);
     }
 
     virtio_gpu_process_cmdq(g);
@@ -109,14 +138,20 @@ static void virtio_gpu_virgl_resume_cmdq_bh(void *opaque)
 
 /*
  * MR could outlive the resource if MR's reference is held outside of
- * virtio-gpu. In order to prevent unmapping resource while MR is alive,
- * and thus, making the data pointer invalid, we will block virtio-gpu
- * command processing until MR is fully unreferenced and freed.
+ * virtio-gpu (a flat view still under an RCU reader), so the virgl mapping
+ * stays alive until the MR is fully unreferenced and freed; only then is
+ * the resource unmapped.  That grace period is on the order of 100 ms, and
+ * blocking the whole control queue for it turns a burst of unmaps into
+ * multi-second round trips for every other command, past a WDDM guest's
+ * GPU-scheduler timeout.  The queue therefore keeps flowing: UNMAP_BLOB is
+ * answered once the subregion is gone (the guest cannot reach the pages
+ * any more), and only work that needs the virgl unmap to have happened
+ * (an UNREF of the resource, a re-MAP, a create reusing its id) waits for
+ * it.
  */
 static void virtio_gpu_virgl_hostmem_region_finalize(Object *obj)
 {
     struct virtio_gpu_virgl_hostmem_region *vmr = VIRTIO_GPU_VIRGL_HOSTMEM_REGION(obj);
-    VirtIOGPUBase *b;
     VirtIOGPUGL *gl;
 
     if (!vmr->g) {
@@ -125,15 +160,13 @@ static void virtio_gpu_virgl_hostmem_region_finalize(Object *obj)
 
     vmr->mapping_state = VIRTIO_GPU_MR_UNMAP_COMPLETED;
 
-    b = VIRTIO_GPU_BASE(vmr->g);
-    b->renderer_blocked--;
-
     /*
      * memory_region_unref() is executed from RCU thread context, while
      * virglrenderer works only on the main-loop thread that's holding GL
      * context.
      */
     gl = VIRTIO_GPU_GL(vmr->g);
+    QTAILQ_INSERT_TAIL(&gl->unmap_done_list, vmr, done_next);
     qemu_bh_schedule(gl->cmdq_resume_bh);
 }
 
@@ -219,6 +252,7 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
     object_initialize_child(OBJECT(g), name, vmr,
                             TYPE_VIRTIO_GPU_VIRGL_HOSTMEM_REGION);
     vmr->g = g;
+    vmr->res = res;
     vmr->mapping_state = VIRTIO_GPU_MR_MAPPED;
 
     mr = &vmr->mr;
@@ -232,17 +266,58 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
     return 0;
 }
 
+/*
+ * Drop the virgl mapping of a blob whose MemoryRegion has finalized, and
+ * release a command blocked on that.
+ */
+static int
+virtio_gpu_virgl_unmap_completed(VirtIOGPU *g,
+                                 struct virtio_gpu_virgl_resource *res)
+{
+    struct virtio_gpu_virgl_hostmem_region *vmr = to_hostmem_region(res->mr);
+    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+    int ret;
+
+    QTAILQ_REMOVE(&gl->unmap_done_list, vmr, done_next);
+    res->mr = NULL;
+    g_free(vmr);
+
+    if (res->map_blocked) {
+        res->map_blocked = false;
+        VIRTIO_GPU_BASE(g)->renderer_blocked--;
+    }
+
+    ret = virgl_renderer_resource_unmap(res->base.resource_id);
+    if (ret) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: failed to unmap virgl resource: %s\n",
+                      __func__, strerror(-ret));
+    }
+    return ret;
+}
+
+/*
+ * Unmap a blob in 2 steps:
+ *
+ * 1. Detach the subregion: the guest loses access immediately, and the
+ *    MR goes away asynchronously once its last (RCU) reference drops.
+ * 2. virtio_gpu_virgl_hostmem_region_finalize() queues the region for the
+ *    main loop, which drops the virgl mapping and completes any UNREF
+ *    deferred behind it (virtio_gpu_virgl_finish_unmap()).
+ *
+ * Sets *in_flight while step 2 is pending (res->mr stays set until then).
+ */
 static int
 virtio_gpu_virgl_unmap_resource_blob(VirtIOGPU *g,
                                      struct virtio_gpu_virgl_resource *res,
-                                     bool *cmd_suspended)
+                                     bool *in_flight)
 {
     struct virtio_gpu_virgl_hostmem_region *vmr;
     VirtIOGPUBase *b = VIRTIO_GPU_BASE(g);
     MemoryRegion *mr = res->mr;
+#if VIRGL_HAS_MAP_FIXED
     int ret;
 
-#if VIRGL_HAS_MAP_FIXED
     if (res->map_fixed) {
         if (mmap(res->map_fixed, res->base.blob_size, PROT_READ | PROT_WRITE,
                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
@@ -266,33 +341,12 @@ virtio_gpu_virgl_unmap_resource_blob(VirtIOGPU *g,
     trace_virtio_gpu_cmd_res_unmap_blob(res->base.resource_id, mr,
                                         vmr->mapping_state);
 
-    /*
-     * Perform async unmapping in 3 steps:
-     *
-     * 1. Begin async unmapping with memory_region_del_subregion()
-     *    and suspend/block cmd processing.
-     * 2. Wait for res->mr to be freed and cmd processing resumed
-     *    asynchronously by virtio_gpu_virgl_hostmem_region_finalize().
-     * 3. Finish the unmapping with final virgl_renderer_resource_unmap().
-     */
     switch (vmr->mapping_state) {
     case VIRTIO_GPU_MR_UNMAP_COMPLETED:
-        res->mr = NULL;
-        g_free(vmr);
-
-        ret = virgl_renderer_resource_unmap(res->base.resource_id);
-        if (ret) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "%s: failed to unmap virgl resource: %s\n",
-                          __func__, strerror(-ret));
-            return ret;
-        }
-        break;
+        /* Finalized, but the resume BH has not run yet: finish here. */
+        return virtio_gpu_virgl_unmap_completed(g, res);
 
     case VIRTIO_GPU_MR_MAPPED:
-        /* render will be unblocked once MR is freed */
-        b->renderer_blocked++;
-
         vmr->mapping_state = VIRTIO_GPU_MR_UNMAP_STARTED;
 
         /* memory region owns self res->mr object and frees it by itself */
@@ -301,13 +355,51 @@ virtio_gpu_virgl_unmap_resource_blob(VirtIOGPU *g,
 
         /* Fallthrough */
     case VIRTIO_GPU_MR_UNMAP_STARTED:
-        *cmd_suspended = true;
+        *in_flight = true;
         break;
     }
 
     return 0;
 }
+
+/*
+ * Park a command at the cmdq head until the in-flight unmap of @res
+ * finalizes: a re-MAP, whose virgl map must follow the virgl unmap, or a
+ * create reusing the id of a resource whose UNREF waits for its unmap.
+ */
+static void
+virtio_gpu_virgl_wait_for_unmap(VirtIOGPU *g,
+                                struct virtio_gpu_virgl_resource *res,
+                                bool *cmd_suspended)
+{
+    if (!res->map_blocked) {
+        res->map_blocked = true;
+        VIRTIO_GPU_BASE(g)->renderer_blocked++;
+    }
+    *cmd_suspended = true;
+}
 #endif
+
+/*
+ * A guest may reuse a resource id as soon as it has queued the UNREF, but
+ * the UNREF of a mapped blob completes only when its MemoryRegion
+ * finalizes.  Park a create of that id at the cmdq head, as a re-MAP is
+ * parked; the unmap completion releases the block, completes the unref and
+ * resumes the queue.  Returns true if the create was parked.
+ */
+static bool
+virtio_gpu_virgl_create_waits_for_unref(VirtIOGPU *g,
+                                        struct virtio_gpu_virgl_resource *res,
+                                        bool *cmd_suspended)
+{
+#if VIRGL_VERSION_MAJOR >= 1
+    if (res->unref_cmd) {
+        virtio_gpu_virgl_wait_for_unmap(g, res, cmd_suspended);
+        return true;
+    }
+#endif
+    return false;
+}
 
 static struct virtio_gpu_virgl_resource *
 virtio_gpu_virgl_resource_new(uint32_t resource_id, uint32_t width,
@@ -339,7 +431,8 @@ virtio_gpu_virgl_resource_new_blob(uint32_t resource_id, uint64_t blob_size)
 #endif
 
 static void virgl_cmd_create_resource_2d(VirtIOGPU *g,
-                                         struct virtio_gpu_ctrl_command *cmd)
+                                         struct virtio_gpu_ctrl_command *cmd,
+                                         bool *cmd_suspended)
 {
     struct virtio_gpu_resource_create_2d c2d;
     struct virgl_renderer_resource_create_args args;
@@ -358,6 +451,9 @@ static void virgl_cmd_create_resource_2d(VirtIOGPU *g,
 
     res = virtio_gpu_virgl_find_resource(g, c2d.resource_id);
     if (res) {
+        if (virtio_gpu_virgl_create_waits_for_unref(g, res, cmd_suspended)) {
+            return;
+        }
         qemu_log_mask(LOG_GUEST_ERROR, "%s: resource already exists %d\n",
                       __func__, c2d.resource_id);
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
@@ -383,7 +479,8 @@ static void virgl_cmd_create_resource_2d(VirtIOGPU *g,
 }
 
 static void virgl_cmd_create_resource_3d(VirtIOGPU *g,
-                                         struct virtio_gpu_ctrl_command *cmd)
+                                         struct virtio_gpu_ctrl_command *cmd,
+                                         bool *cmd_suspended)
 {
     struct virtio_gpu_resource_create_3d c3d;
     struct virgl_renderer_resource_create_args args;
@@ -402,6 +499,9 @@ static void virgl_cmd_create_resource_3d(VirtIOGPU *g,
 
     res = virtio_gpu_virgl_find_resource(g, c3d.resource_id);
     if (res) {
+        if (virtio_gpu_virgl_create_waits_for_unref(g, res, cmd_suspended)) {
+            return;
+        }
         qemu_log_mask(LOG_GUEST_ERROR, "%s: resource already exists %d\n",
                       __func__, c3d.resource_id);
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
@@ -426,21 +526,25 @@ static void virgl_cmd_create_resource_3d(VirtIOGPU *g,
     virgl_renderer_resource_create(&args, NULL, 0);
 }
 
+/*
+ * Unref @res, unless its blob mapping is still being torn down: then
+ * *in_flight is set and the unref has to be repeated once it is gone.
+ */
 static int
 virtio_gpu_virgl_resource_unref(VirtIOGPU *g,
                                 struct virtio_gpu_virgl_resource *res,
-                                bool *suspended)
+                                bool *in_flight)
 {
     struct iovec *res_iovs = NULL;
     int num_iovs = 0;
 #if VIRGL_VERSION_MAJOR >= 1
     int ret;
 
-    ret = virtio_gpu_virgl_unmap_resource_blob(g, res, suspended);
+    ret = virtio_gpu_virgl_unmap_resource_blob(g, res, in_flight);
     if (ret) {
         return ret;
     }
-    if (*suspended) {
+    if (*in_flight) {
         return 0;
     }
 #endif
@@ -464,11 +568,11 @@ virtio_gpu_virgl_resource_unref(VirtIOGPU *g,
 }
 
 static void virgl_cmd_resource_unref(VirtIOGPU *g,
-                                     struct virtio_gpu_ctrl_command *cmd,
-                                     bool *cmd_suspended)
+                                     struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_resource_unref unref;
     struct virtio_gpu_virgl_resource *res;
+    bool in_flight = false;
 
     VIRTIO_GPU_FILL_CMD(unref);
     trace_virtio_gpu_cmd_res_unref(unref.resource_id);
@@ -481,19 +585,77 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
         return;
     }
 
-    virtio_gpu_virgl_resource_unref(g, res, cmd_suspended);
+    if (res->unref_cmd) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: resource %d already being unref'd\n",
+                      __func__, unref.resource_id);
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+        return;
+    }
+
+    if (virtio_gpu_virgl_resource_unref(g, res, &in_flight)) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+        return;
+    }
+    if (in_flight) {
+        /*
+         * The mapping is still being torn down: the virgl unref must wait
+         * for it, and so must this command's completion, but not the
+         * commands behind it.  virtio_gpu_virgl_finish_unmap() completes
+         * the unref and answers the command.
+         */
+        res->unref_cmd = cmd;
+        cmd->deferred = true;
+    }
 }
+
+#if VIRGL_VERSION_MAJOR >= 1
+/*
+ * Finish the unmap of a blob whose MemoryRegion has finalized, and complete
+ * a RESOURCE_UNREF deferred behind it.  Main-loop only (virglrenderer runs
+ * on the thread holding the GL context).
+ */
+static void virtio_gpu_virgl_finish_unmap(VirtIOGPU *g,
+                                          struct virtio_gpu_virgl_resource *res)
+{
+    struct virtio_gpu_ctrl_command *cmd = res->unref_cmd;
+    bool in_flight = false;
+
+    virtio_gpu_virgl_unmap_completed(g, res);
+    if (!cmd) {
+        return;
+    }
+
+    res->unref_cmd = NULL;
+    if (virtio_gpu_virgl_resource_unref(g, res, &in_flight)) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+    }
+    virtio_gpu_ctrl_response_nodata(g, cmd, cmd->error ? cmd->error :
+                                    VIRTIO_GPU_RESP_OK_NODATA);
+    g_free(cmd);
+}
+#endif
 
 void virtio_gpu_virgl_resource_destroy(VirtIOGPU *g,
                                        struct virtio_gpu_simple_resource *base,
                                        Error **errp)
 {
     struct virtio_gpu_virgl_resource *res;
-    bool suspended = false;
+    bool in_flight = false;
 
     res = container_of(base, struct virtio_gpu_virgl_resource, base);
 
-    if (virtio_gpu_virgl_resource_unref(g, res, &suspended)) {
+    /*
+     * Reset drops queued commands without a response (see the cmdq flush
+     * in virtio_gpu_reset()); a deferred UNREF is no different.
+     */
+    g_clear_pointer(&res->unref_cmd, g_free);
+    if (res->map_blocked) {
+        res->map_blocked = false;
+        VIRTIO_GPU_BASE(g)->renderer_blocked--;
+    }
+
+    if (virtio_gpu_virgl_resource_unref(g, res, &in_flight)) {
         error_setg(errp, "failed to destroy virgl resource");
     }
 }
@@ -571,7 +733,7 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
 {
     struct virtio_gpu_set_scanout ss;
     struct virgl_renderer_resource_info info;
-    void *d3d_tex2d = NULL;
+    ScanoutTextureNative native = NO_NATIVE_TEXTURE;
     int ret;
 
     VIRTIO_GPU_FILL_CMD(ss);
@@ -596,7 +758,29 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
     memset(&ext, 0, sizeof(ext));
     ret = virgl_renderer_resource_get_info_ext(ss.resource_id, &ext);
     info = ext.base;
-    d3d_tex2d = ext.d3d_tex2d;
+    if (ext.d3d_tex2d) {
+        native = (ScanoutTextureNative) {
+            .type = SCANOUT_TEXTURE_NATIVE_TYPE_D3D,
+            .handle = ext.d3d_tex2d,
+        };
+    }
+#if VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION >= 1
+    /* the renderer's own texture, when it shares textures natively */
+    if (ext.version >= 1) {
+        switch (ext.native_type) {
+#ifdef CONFIG_METAL
+        case VIRGL_NATIVE_HANDLE_METAL_TEXTURE:
+            native = (ScanoutTextureNative) {
+                .type = SCANOUT_TEXTURE_NATIVE_TYPE_METAL,
+                .handle = ext.native_handle,
+            };
+            break;
+#endif
+        default:
+            break;
+        }
+    }
+#endif
 #else
     memset(&info, 0, sizeof(info));
     ret = virgl_renderer_resource_get_info(ss.resource_id, &info);
@@ -625,7 +809,7 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
         info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
         info.width, info.height,
         ss.r.x, ss.r.y, ss.r.width, ss.r.height,
-        d3d_tex2d);
+        native, NULL);
     g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
 }
 
@@ -849,10 +1033,12 @@ static void virgl_cmd_get_capset(VirtIOGPU *g,
 
 #if VIRGL_VERSION_MAJOR >= 1
 static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
-                                           struct virtio_gpu_ctrl_command *cmd)
+                                           struct virtio_gpu_ctrl_command *cmd,
+                                           bool *cmd_suspended)
 {
     struct virgl_renderer_resource_create_blob_args virgl_args = { 0 };
     g_autofree struct virtio_gpu_virgl_resource *res = NULL;
+    struct virtio_gpu_virgl_resource *old;
     struct virtio_gpu_resource_create_blob cblob;
     struct virgl_renderer_resource_info info;
     int ret;
@@ -873,7 +1059,11 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
         return;
     }
 
-    if (virtio_gpu_virgl_find_resource(g, cblob.resource_id)) {
+    old = virtio_gpu_virgl_find_resource(g, cblob.resource_id);
+    if (old) {
+        if (virtio_gpu_virgl_create_waits_for_unref(g, old, cmd_suspended)) {
+            return;
+        }
         qemu_log_mask(LOG_GUEST_ERROR, "%s: resource already exists %d\n",
                       __func__, cblob.resource_id);
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
@@ -929,7 +1119,8 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
 }
 
 static void virgl_cmd_resource_map_blob(VirtIOGPU *g,
-                                        struct virtio_gpu_ctrl_command *cmd)
+                                        struct virtio_gpu_ctrl_command *cmd,
+                                        bool *cmd_suspended)
 {
     struct virtio_gpu_resource_map_blob mblob;
     struct virtio_gpu_virgl_resource *res;
@@ -957,6 +1148,31 @@ static void virgl_cmd_resource_map_blob(VirtIOGPU *g,
         return;
     }
 
+    if (res->unref_cmd) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource %d is being unref'd\n",
+                      __func__, mblob.resource_id);
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+        return;
+    }
+
+    if (res->mr &&
+        to_hostmem_region(res->mr)->mapping_state != VIRTIO_GPU_MR_MAPPED) {
+        bool in_flight = false;
+
+        /*
+         * Re-mapping a blob whose previous mapping is still being torn
+         * down: the virgl map must follow the virgl unmap.
+         */
+        if (virtio_gpu_virgl_unmap_resource_blob(g, res, &in_flight)) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            return;
+        }
+        if (in_flight) {
+            virtio_gpu_virgl_wait_for_unmap(g, res, cmd_suspended);
+            return;
+        }
+    }
+
     ret = virtio_gpu_virgl_map_resource_blob(g, res, mblob.offset);
     if (ret) {
         cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
@@ -970,12 +1186,11 @@ static void virgl_cmd_resource_map_blob(VirtIOGPU *g,
 }
 
 static void virgl_cmd_resource_unmap_blob(VirtIOGPU *g,
-                                          struct virtio_gpu_ctrl_command *cmd,
-                                          bool *cmd_suspended)
+                                          struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_resource_unmap_blob ublob;
     struct virtio_gpu_virgl_resource *res;
-    int ret;
+    bool in_flight = false;
 
     VIRTIO_GPU_FILL_CMD(ublob);
     virtio_gpu_unmap_blob_bswap(&ublob);
@@ -988,12 +1203,77 @@ static void virgl_cmd_resource_unmap_blob(VirtIOGPU *g,
         return;
     }
 
-    ret = virtio_gpu_virgl_unmap_resource_blob(g, res, cmd_suspended);
-    if (ret) {
-        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+    if (res->unref_cmd) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource %d is being unref'd\n",
+                      __func__, ublob.resource_id);
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
         return;
     }
+
+    /*
+     * The subregion is gone before this returns, so the guest cannot reach
+     * the pages any more: answer now.  Dropping the virgl mapping waits for
+     * the MR to finalize, but nothing the guest can do depends on it except
+     * an UNREF or a re-MAP of this resource, which each wait on their own.
+     */
+    if (virtio_gpu_virgl_unmap_resource_blob(g, res, &in_flight)) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+    }
 }
+
+#if defined(HAVE_VIRGL_RENDERER_NATIVE_SCANOUT)
+static void virgl_scanout_native_blob_cleanup(ScanoutTextureNative *native)
+{
+    assert(native->type == SCANOUT_TEXTURE_NATIVE_TYPE_METAL);
+    virgl_renderer_release_handle_for_scanout(VIRGL_NATIVE_HANDLE_METAL_TEXTURE,
+                                              native->handle);
+}
+
+/*
+ * Without dmabufs (macOS), a blob scanout is shown through a texture the
+ * renderer creates for it, from the layout the guest gives.
+ */
+static bool virgl_scanout_native_blob(VirtIOGPU *g,
+                                      struct virtio_gpu_set_scanout_blob *ss)
+{
+    struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[ss->scanout_id];
+    enum virgl_renderer_native_handle_type type;
+    virgl_renderer_native_handle handle;
+
+    type = virgl_renderer_create_handle_for_scanout(ss->resource_id,
+                                                    ss->width,
+                                                    ss->height,
+                                                    ss->format,
+                                                    ss->padding,
+                                                    ss->strides[0],
+                                                    ss->offsets[0],
+                                                    &handle);
+#ifdef CONFIG_METAL
+    if (type == VIRGL_NATIVE_HANDLE_METAL_TEXTURE) {
+        ScanoutTextureNative native = {
+            .type = SCANOUT_TEXTURE_NATIVE_TYPE_METAL,
+            .handle = handle,
+        };
+
+        qemu_console_resize(scanout->con, ss->r.width, ss->r.height);
+        qemu_console_gl_scanout_texture(scanout->con, 0, false,
+                                        ss->width, ss->height,
+                                        ss->r.x, ss->r.y,
+                                        ss->r.width, ss->r.height,
+                                        native,
+                                        virgl_scanout_native_blob_cleanup);
+        scanout->resource_id = ss->resource_id;
+        return true;
+    }
+#endif
+
+    /* don't leak memory if handle type is unknown */
+    if (type != VIRGL_NATIVE_HANDLE_NONE) {
+        virgl_renderer_release_handle_for_scanout(type, handle);
+    }
+    return false;
+}
+#endif
 
 static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
                                        struct virtio_gpu_ctrl_command *cmd)
@@ -1025,6 +1305,12 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
                                          &cmd->error)) {
         return;
     }
+
+#if defined(HAVE_VIRGL_RENDERER_NATIVE_SCANOUT)
+    if (virgl_scanout_native_blob(g, &ss)) {
+        return;
+    }
+#endif
 
     res = virtio_gpu_virgl_find_resource(g, ss.resource_id);
     if (!res) {
@@ -1074,10 +1360,10 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
         virgl_cmd_context_destroy(g, cmd);
         break;
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_2D:
-        virgl_cmd_create_resource_2d(g, cmd);
+        virgl_cmd_create_resource_2d(g, cmd, &cmd_suspended);
         break;
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D:
-        virgl_cmd_create_resource_3d(g, cmd);
+        virgl_cmd_create_resource_3d(g, cmd, &cmd_suspended);
         break;
     case VIRTIO_GPU_CMD_SUBMIT_3D:
         virgl_cmd_submit_3d(g, cmd);
@@ -1107,7 +1393,7 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
         virgl_renderer_force_ctx_0();
         break;
     case VIRTIO_GPU_CMD_RESOURCE_UNREF:
-        virgl_cmd_resource_unref(g, cmd, &cmd_suspended);
+        virgl_cmd_resource_unref(g, cmd);
         break;
     case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:
         /* TODO add security */
@@ -1131,13 +1417,13 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
         break;
 #if VIRGL_VERSION_MAJOR >= 1
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
-        virgl_cmd_resource_create_blob(g, cmd);
+        virgl_cmd_resource_create_blob(g, cmd, &cmd_suspended);
         break;
     case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
-        virgl_cmd_resource_map_blob(g, cmd);
+        virgl_cmd_resource_map_blob(g, cmd, &cmd_suspended);
         break;
     case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB:
-        virgl_cmd_resource_unmap_blob(g, cmd, &cmd_suspended);
+        virgl_cmd_resource_unmap_blob(g, cmd);
         break;
     case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
         virgl_cmd_set_scanout_blob(g, cmd);
@@ -1149,7 +1435,9 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
         break;
     }
 
-    if (cmd_suspended || cmd->finished) {
+    cmd->suspended = cmd_suspended;
+
+    if (cmd_suspended || cmd->finished || cmd->deferred) {
         return;
     }
     if (cmd->error) {
@@ -1172,9 +1460,21 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
                                                   cmd->cmd_hdr.ring_idx,
                                                   cmd->cmd_hdr.fence_id);
         if (ret) {
+            /*
+             * The renderer context is gone (e.g. its render-server
+             * worker died mid-teardown): this fence can never retire
+             * through the timeline.  Complete it now: the cmd is not
+             * yet on fenceq, so responding here both signals the fence
+             * to the guest and keeps it off the queue.  Leaving it
+             * pending wedges the guest's GPU scheduler (VIDEO_TDR_FAILURE
+             * bugcheck on Windows).
+             */
             qemu_log_mask(LOG_GUEST_ERROR,
-                          "%s: virgl_renderer_context_create_fence error: %s",
-                          __func__, strerror(-ret));
+                          "%s: virgl_renderer_context_create_fence error: %s,"
+                          " retiring fence %" PRIu64 " immediately\n",
+                          __func__, strerror(-ret),
+                          (uint64_t)cmd->cmd_hdr.fence_id);
+            virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
         }
         return;
     }
@@ -1262,7 +1562,6 @@ void virtio_gpu_virgl_reset_async_fences(VirtIOGPU *g)
 static void virtio_gpu_virgl_async_fence_bh(void *opaque)
 {
     QSLIST_HEAD(, virtio_gpu_virgl_context_fence) async_fenceq;
-    struct virtio_gpu_ctrl_command *cmd, *tmp;
     struct virtio_gpu_virgl_context_fence *f;
     VirtIOGPU *g = opaque;
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
@@ -1278,33 +1577,23 @@ static void virtio_gpu_virgl_async_fence_bh(void *opaque)
 
         QSLIST_REMOVE_HEAD(&async_fenceq, next);
 
-        QTAILQ_FOREACH_SAFE(cmd, &g->fenceq, next, tmp) {
-            /*
-             * the guest can end up emitting fences out of order
-             * so we should check all fenced cmds not just the first one.
-             */
-            if (cmd->cmd_hdr.fence_id > f->fence_id) {
-                continue;
-            }
-            if (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) {
-                if (cmd->cmd_hdr.ring_idx != f->ring_idx) {
-                    continue;
-                }
-                if (cmd->cmd_hdr.ctx_id != f->ctx_id) {
-                    continue;
-                }
-            }
-            virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
-            QTAILQ_REMOVE(&g->fenceq, cmd, next);
-            g_free(cmd);
+        /*
+         * Delegate to the same completion logic the synchronous callbacks
+         * use: virgl_write_fence() completes only global (non-ring) fenced
+         * cmds and virgl_write_context_fence() only ring fences matching
+         * ctx/ring, each with per-cmd inflight accounting.  Upstream's BH
+         * matched more loosely (a context fence could complete a global
+         * fenced cmd with a numerically smaller id from an unrelated id
+         * space); global and per-context fence ids are separate counters
+         * here, so keep the strict matching.
+         */
+        if (f->ring_idx == UINT32_MAX) {
+            virgl_write_fence(g, (uint32_t)f->fence_id);
+        } else {
+            virgl_write_context_fence(g, f->ctx_id, f->ring_idx, f->fence_id);
         }
 
-        trace_virtio_gpu_fence_resp(f->fence_id);
         g_free(f);
-        g->inflight--;
-        if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
-            trace_virtio_gpu_dec_inflight_fences(g->inflight);
-        }
     }
 }
 
@@ -1421,7 +1710,39 @@ static void virtio_gpu_fence_poll(void *opaque)
     virgl_renderer_poll();
     virtio_gpu_process_cmdq(g);
     if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq)) {
-        timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+        /*
+         * Without async fencing, virgl_renderer_poll() is the only place a
+         * retired renderer fence is discovered, so this period is a hard
+         * floor under every guest operation that blocks on a fence -- keep
+         * it at the millisecond-timer granularity.
+         *
+         * With async fencing, ring (venus/neptune context) fences retire
+         * through the proxy sync thread and async_fence_bh; the poll's job
+         * shrinks to discovering vrend/global fences, which still retire
+         * only from virgl_renderer_poll() (vrend's async path is EGL-only
+         * and disabled here).  While only ring fences are pending, relax to
+         * a slow tick -- it still runs process_cmdq and catches any global
+         * fence that appears; virgl_renderer_poll() skips proxy contexts
+         * under ASYNC_FENCE_CB, so it cannot rescue a missed ring-fence
+         * wake (the sync thread's poll on the worker socket covers worker
+         * death instead).  Any pending global fence keeps the 1 ms rate.
+         */
+        uint64_t period_ms = 1;
+        if (gl->async_fence_enabled) {
+            struct virtio_gpu_ctrl_command *cmd;
+            bool poll_needed = !QTAILQ_EMPTY(&g->cmdq);
+            QTAILQ_FOREACH(cmd, &g->fenceq, next) {
+                if (!(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX)) {
+                    poll_needed = true;
+                    break;
+                }
+            }
+            if (!poll_needed) {
+                period_ms = 100;
+            }
+        }
+        timer_mod(gl->fence_poll,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + period_ms);
     }
 }
 
@@ -1486,7 +1807,12 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
 #endif
     }
 #endif
-#ifdef VIRGL_RENDERER_D3D11_SHARE_TEXTURE
+#if defined(VIRGL_RENDERER_NATIVE_SHARE_TEXTURE)
+    /* ANGLE's D3D11 or Metal device: share the renderer's textures */
+    if (qemu_egl_angle_native_device) {
+        flags |= VIRGL_RENDERER_NATIVE_SHARE_TEXTURE;
+    }
+#elif defined(VIRGL_RENDERER_D3D11_SHARE_TEXTURE)
     if (qemu_egl_angle_d3d) {
         flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
     }
@@ -1515,6 +1841,33 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
         }
     }
 #endif
+#ifdef VIRGL_RENDERER_NEPTUNE
+    if (virtio_gpu_neptune_enabled(g->parent_obj.conf)) {
+        flags |= VIRGL_RENDERER_NEPTUNE;
+        flags |= VIRGL_RENDERER_RENDER_SERVER;
+    }
+#endif
+
+#if VIRGL_CHECK_VERSION(1, 1, 2)
+    if (flags & VIRGL_RENDERER_RENDER_SERVER) {
+        /*
+         * Async fencing needs no EGL on the render-server path: the proxy
+         * retires fences on its own sync thread, fed by an eventfd/pipe the
+         * render worker writes per retire.  Upstream's qemu_egl_display gate
+         * above exists for vrend, whose async path does need EGL.  Without
+         * this, the only retire discovery for venus/neptune fences is the
+         * fence_poll timer below -- a 1 ms floor under every guest fence
+         * wait.
+         */
+        virtio_gpu_3d_cbs.write_fence         = virgl_write_async_fence;
+        virtio_gpu_3d_cbs.write_context_fence = virgl_write_async_context_fence;
+        flags |= VIRGL_RENDERER_ASYNC_FENCE_CB;
+        flags |= VIRGL_RENDERER_THREAD_SYNC;
+        gl->async_fence_enabled = true;
+        fprintf(stderr, "virtio-gpu: async fence delivery enabled "
+                "(render-server proxy)\n");
+    }
+#endif
 
     ret = virgl_renderer_init(g, flags, &virtio_gpu_3d_cbs);
     if (ret != 0) {
@@ -1533,6 +1886,7 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
     }
 
 #if VIRGL_VERSION_MAJOR >= 1
+    QTAILQ_INIT(&gl->unmap_done_list);
     gl->cmdq_resume_bh = virtio_bh_io_new_guarded(DEVICE(g),
                                                   virtio_gpu_virgl_resume_cmdq_bh,
                                                   g);
@@ -1614,6 +1968,17 @@ GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g)
             virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_DRM);
         }
     }
+
+#ifdef VIRGL_RENDERER_NEPTUNE
+    if (virtio_gpu_neptune_enabled(g->parent_obj.conf)) {
+        virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_NEPTUNE,
+                                   &capset_max_ver,
+                                   &capset_max_size);
+        if (capset_max_size) {
+            virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_NEPTUNE);
+        }
+    }
+#endif
 
     return capset_ids;
 }
