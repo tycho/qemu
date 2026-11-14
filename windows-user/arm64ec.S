@@ -105,7 +105,7 @@ xt_check_call:
 .elseif \which == 3
     tbnz    w17, #31, xt_ec_inj_call
 .else
-    tbnz    w17, #31, 1f
+    tbnz    w17, #31, xt_ec_inj_begin
 .endif
     b       xt_cap_entry
 1:
@@ -150,6 +150,7 @@ xt_check_call:
 #define G_INTERNAL      0x0c
 #define G_CHECKING      0x18
 
+#define TEB_TID         0x48
 #define TEB_PEB         0x60
 #define TEB_CPU_AREA    0x1788
 #define PEB_EC_BITMAP   0x368
@@ -201,6 +202,142 @@ xt_check_call:
 .endm
 
 /*
+ * The thread gates' test points (test-tp.c), in the inject copies only:
+ * point ID of a route (TP_JUMP, TP_RET, TP_CALL; 1-6 the admission's
+ * windows, 7 after the entry's kind).  When the control block arms ID
+ * (for its thread, at its NTH pass), the thread is held at the point:
+ * x13, x14, x23 and x24 recorded (and every register but x16-x18 and
+ * x28, at its number's place in GPR_BEFORE), x28 set to the block's
+ * canary, the hit published, a spin until the controller releases it, and
+ * the same recorded again.  What the controller does meanwhile (an APC,
+ * a context edit, a suspension) and what the registers show is its test.
+ * Nothing here uses sp as a base (an entry's sp may be 8 off 16) or sets
+ * flags, and only x16, x17 (saved and restored) and x28 (dead in the
+ * stubs) change; the frame below sp keeps an interruption's pushes off the
+ * save.  No C is called: a call would change what is measured.
+ */
+#define TP_JUMP         0x10
+#define TP_RET          0x20
+#define TP_CALL         0x30
+#define TP_BYPASS       0x40
+#define TP_BEGIN        0x50
+
+#define TP_ASM_POINT    0x08
+#define TP_ASM_STATE    0x0c
+#define TP_CANARY       0x10
+#define TP_TID_FILTER   0x18
+#define TP_HITS         0x20
+#define TP_NTH          0x28
+#define TP_TID          0x30
+#define TP_SPIN_PC      0x38
+#define TP_ORIG_SP      0x40
+#define TP_X16          0x48
+#define TP_X17          0x50
+#define TP_BEFORE       0x58
+#define TP_AFTER        0x80
+#define TP_RELEASE      0xa8
+#define TP_FORCE_ZERO   0x1d0
+#define TP_GPR_BEFORE   0x200
+#define TP_GPR_AFTER    0x300
+
+.macro tp_gprs
+    stp     x0, x1, [x17, #0]
+    stp     x2, x3, [x17, #16]
+    stp     x4, x5, [x17, #32]
+    stp     x6, x7, [x17, #48]
+    stp     x8, x9, [x17, #64]
+    stp     x10, x11, [x17, #80]
+    stp     x12, x13, [x17, #96]
+    stp     x14, x15, [x17, #112]
+    stp     x19, x20, [x17, #152]
+    stp     x21, x22, [x17, #168]
+    stp     x23, x24, [x17, #184]
+    stp     x25, x26, [x17, #200]
+    str     x27, [x17, #216]
+    stp     x29, x30, [x17, #232]
+.endm
+
+.macro tp_point id
+    sub     sp, sp, #96
+    add     x28, sp, #96
+    stp     x16, x17, [x28, #-16]
+    adrp    x16, xt_tp_block
+    ldr     x16, [x16, :lo12:xt_tp_block]
+    cbz     x16, .Ltp_out\@
+    ldr     w17, [x16, #TP_ASM_POINT]
+    sub     w17, w17, #(\id)
+    cbnz    w17, .Ltp_out\@
+    ldr     x17, [x16, #TP_TID_FILTER]
+    cbz     x17, .Ltp_count\@
+    ldr     x28, [x18, #TEB_TID]
+    sub     x17, x17, x28
+    cbnz    x17, .Ltp_out\@
+.Ltp_count\@:
+    add     x16, x16, #TP_HITS
+    mov     x17, #1
+    ldadd   x17, x17, [x16]
+    sub     x16, x16, #TP_HITS
+    add     x17, x17, #1
+    ldr     w28, [x16, #TP_NTH]
+    sub     x17, x17, x28
+    cbnz    x17, .Ltp_out\@
+    /* Armed (1) to held (2): this hit's alone. */
+    add     x16, x16, #TP_ASM_STATE
+    mov     w17, #1
+    mov     w28, #2
+    cas     w17, w28, [x16]
+    sub     x16, x16, #TP_ASM_STATE
+    sub     w17, w17, #1
+    cbnz    w17, .Ltp_out\@
+    ldr     x17, [x18, #TEB_TID]
+    str     x17, [x16, #TP_TID]
+    adr     x17, .Ltp_spin\@
+    str     x17, [x16, #TP_SPIN_PC]
+    add     x28, sp, #96
+    str     x28, [x16, #TP_ORIG_SP]
+    ldr     x17, [x28, #-16]
+    str     x17, [x16, #TP_X16]
+    ldr     x17, [x28, #-8]
+    str     x17, [x16, #TP_X17]
+    stp     x13, x14, [x16, #TP_BEFORE]
+    stp     x23, x24, [x16, #(TP_BEFORE + 16)]
+    add     x17, x16, #TP_GPR_BEFORE
+    tp_gprs
+    ldr     x28, [x16, #TP_CANARY]
+    str     x28, [x16, #(TP_BEFORE + 32)]
+    /* Published (3), then held until released. */
+    add     x16, x16, #TP_ASM_STATE
+    mov     w17, #3
+    stlr    w17, [x16]
+    sub     x16, x16, #TP_ASM_STATE
+.Ltp_spin\@:
+    yield
+    ldr     w17, [x16, #TP_RELEASE]
+    cbz     w17, .Ltp_spin\@
+    /* FORCE_ZERO: what Windows does to these at a context's application. */
+    ldr     w17, [x16, #TP_FORCE_ZERO]
+    cbz     w17, .Ltp_kept\@
+    mov     x13, xzr
+    mov     x14, xzr
+    mov     x23, xzr
+    mov     x24, xzr
+.Ltp_kept\@:
+    stp     x13, x14, [x16, #TP_AFTER]
+    stp     x23, x24, [x16, #(TP_AFTER + 16)]
+    str     x28, [x16, #(TP_AFTER + 32)]
+    add     x17, x16, #TP_GPR_AFTER
+    tp_gprs
+    /* Done (4). */
+    add     x16, x16, #TP_ASM_STATE
+    mov     w17, #4
+    stlr    w17, [x16]
+.Ltp_out\@:
+    add     x28, sp, #96
+    ldp     x16, x17, [x28, #-16]
+    mov     sp, x28
+.endm
+
+/*
  * An entry's admission (arm64ec-gate.c's adm_enter): the level pushed by
  * one compare-and-swap; over a level already admitted (its byte in
  * CHECKING clear) it inherits, else its own byte is set before the push,
@@ -212,9 +349,10 @@ xt_check_call:
  * push is relaxed: the owner's flush of every processor's writes is the
  * pair's other half.  A refusal, a parked or poisoned word, 32 levels, or a
  * SEQ that would wrap, goes to C, which never returns; x11 then holds the
- * COUNT the level was pushed over.
+ * COUNT the level was pushed over.  With TP (the inject copies), the
+ * harness's test points TP + 1 to TP + 6 in its windows.
  */
-.macro adm_enter
+.macro adm_enter tp=0
     ldr     x16, [x18, #TEB_CPU_AREA]
     ldr     x16, [x16, #AREA_GATE]
     cbz     x16, xt_ec_adm_nogate
@@ -227,6 +365,9 @@ xt_check_call:
     ubfx    x11, x17, #32, #14
     lsr     x12, x11, #5
     cbnz    x12, xt_ec_adm_poison_entry
+.if \tp
+    tp_point (\tp + 1)
+.endif
     /*
      * w10 1 if it reads the gate (no level, or the innermost one's byte
      * set), 0 if it inherits; its own byte set before the push if 1.
@@ -239,16 +380,25 @@ xt_check_call:
 .Ladm_mark\@:
     strb    w10, [x12, #G_CHECKING]
 .Ladm_push\@:
+.if \tp
+    tp_point (\tp + 2)
+.endif
     /* COUNT+1, SEQ+1. */
     movz    x12, #1, lsl #32
     add     x12, x17, x12
     add     x12, x12, #1
     mov     x11, x17
     cas     x11, x12, [x16]
+.if \tp
+    tp_point (\tp + 3)
+.endif
     sub     x11, x11, x17
     cbnz    x11, .Ladm_try\@
     ubfx    x11, x17, #32, #14
     cbz     w10, .Ladm_admit\@
+.if \tp
+    tp_point (\tp + 4)
+.endif
     ldr     w17, [x16, #G_CLOSED]
     cbnz    w17, xt_ec_adm_reject_entry
     adrp    x17, xt_gate_closed_by
@@ -266,8 +416,14 @@ xt_check_call:
     sub     x12, x12, x11
     sub     x12, x12, #1
     cbnz    x12, xt_ec_adm_poison_entry
+.if \tp
+    tp_point (\tp + 5)
+.endif
 .Ladm_admit\@:
     add     x12, x16, x11
+.if \tp
+    tp_point (\tp + 6)
+.endif
     strb    wzr, [x12, #G_CHECKING]
 .endm
 
@@ -277,14 +433,19 @@ xt_check_call:
  * (none, or the innermost's byte still set: a pairing error), or a SEQ that
  * would wrap, the word is poisoned instead.  x16, x17, and RA, RB, RC
  * (x14, x23, x24 by default: protected where InSimulation is set; the
- * bypass, outside simulation, passes x10-x12) only.
+ * bypass, outside simulation, passes x10-x12) only.  With TP (the
+ * inject copy of the bypass), the harness's test points TP + 1 after the
+ * word's read and TP + 3 after the compare-and-swap.
  */
-.macro adm_exit ra=14, rb=23, rc=24
+.macro adm_exit ra=14, rb=23, rc=24, tp=0
     ldr     x16, [x18, #TEB_CPU_AREA]
     ldr     x16, [x16, #AREA_GATE]
     cbz     x16, .Ladm_out\@
 .Ladm_pop\@:
     ldr     x17, [x16, #G_ADM]
+.if \tp
+    tp_point (\tp + 1)
+.endif
     ubfx    x\ra, x17, #32, #14
     cbz     x\ra, .Ladm_bad\@
     add     x\rc, x16, x\ra
@@ -297,6 +458,9 @@ xt_check_call:
     add     x\rc, x\rc, #1
     mov     x\rb, x17
     casl    x\rb, x\rc, [x16]
+.if \tp
+    tp_point (\tp + 3)
+.endif
     sub     x\rb, x\rb, x17
     cbnz    x\rb, .Ladm_pop\@
     b       .Ladm_out\@
@@ -422,15 +586,17 @@ ExitToX64:
  * cap_check.
  */
 xt_ec_inj_jump:
-    adm_enter
+    adm_enter TP_JUMP
     str     lr, [sp, #-8]!
     mov     w15, #1
+    tp_point (TP_JUMP + 7)
     b       2f
 
 xt_ec_inj_ret:
-    adm_enter
+    adm_enter TP_RET
     mov     x9, lr
     mov     w15, #2
+    tp_point (TP_RET + 7)
 2:
     ldr     x16, [x18, #TEB_PEB]
     ldr     x16, [x16, #PEB_EC_BITMAP]
@@ -438,21 +604,19 @@ xt_ec_inj_ret:
     ldr     x16, [x16, x17, lsl #3]
     lsr     x17, x9, #12
     lsr     x16, x16, x17
-    tbnz    x16, #0, xt_ec_bypass_dispatch
+    tbnz    x16, #0, xt_ec_bypass_dispatch_inj
     b       3f
 
 xt_ec_inj_call:
-    adm_enter
+    adm_enter TP_CALL
     str     lr, [sp, #-8]!
     mov     w15, #1
+    tp_point (TP_CALL + 7)
 3:
     entry_tail 1
 
-    .globl BeginSimulation
-BeginSimulation:
-    cap_check 4
-    adm_enter
-    /* The registers the dispatcher keeps, for xt_ec_begin. */
+/* The registers the dispatcher keeps, for xt_ec_begin, which never returns. */
+.macro begin_tail
     ldr     x17, [x18, #TEB_CPU_AREA]
     ldr     x16, [x17, #AREA_FRAME]
     stp     x19, x20, [x16, #F_X(19)]
@@ -463,6 +627,18 @@ BeginSimulation:
     mov     sp, x16
     bl      "#xt_ec_begin"
     brk     #0xf000
+.endm
+
+    .globl BeginSimulation
+BeginSimulation:
+    cap_check 4
+    adm_enter
+    begin_tail
+
+/* Its inject copy, with the harness's test points. */
+xt_ec_inj_begin:
+    adm_enter TP_BEGIN
+    begin_tail
 
 /*
  * void xt_ec_exit_native_env(env, target, ymm): leave the engine for
@@ -564,6 +740,11 @@ xt_ec_bypass_dispatch:
     adm_exit 10, 11, 12
     b       xt_ec_exit_withdrawn
 
+/* Its inject copy, for the inject entries' bypass. */
+xt_ec_bypass_dispatch_inj:
+    adm_exit 10, 11, 12, TP_BYPASS
+    b       xt_ec_exit_withdrawn
+
     .globl xt_ec_exit_suspend_point
 xt_ec_exit_suspend_point:
     brk     #0xcafe
@@ -640,6 +821,31 @@ xt_ec_adm_nogate:
 "#xt_ec_jump_set_stack":
     mov     sp, x1
     br      x0
+
+
+/*
+ * uint64_t xt_tp_jump_asm(target, arg) (test-tp.c's xt_tp_jump): TARGET
+ * entered through DispatchJump, as an adjustor thunk enters a possibly
+ * x64 function, with ARG in RCX and the return right after a "blr x16"
+ * (a return into an exit thunk, to the dispatch).  x64 code keeps what
+ * the AArch64 convention needs kept but x23, x24 and x28, which ARM64EC
+ * code doesn't use; 32 bytes of home space under the return address.
+ */
+    .globl "#xt_tp_jump_asm"
+    .def "#xt_tp_jump_asm"; .scl 2; .type 32; .endef
+"#xt_tp_jump_asm":
+    stp     x29, x30, [sp, #-16]!
+    mov     x29, sp
+    sub     sp, sp, #32
+    mov     x9, x0
+    mov     x0, x1
+    adrp    x16, DispatchJump
+    add     x16, x16, :lo12:DispatchJump
+    blr     x16
+    mov     x0, x8
+    add     sp, sp, #32
+    ldp     x29, x30, [sp], #16
+    ret
 
     .section .drectve, "yn"
     .ascii " -export:DispatchJump,DATA"

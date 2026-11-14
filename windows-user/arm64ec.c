@@ -598,6 +598,7 @@ static NTSTATUS ec_process_init(void)
     if (!init_syscalls()) {
         return STATUS_NOT_SUPPORTED;
     }
+    xt_tp_process_init();
     if (!xt_gate_init_process() || !xt_gate_register_initial()) {
         return STATUS_NO_MEMORY;
     }

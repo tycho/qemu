@@ -22,7 +22,7 @@ windows_user_ss.add(when: 'TARGET_X86_64',
                     if_true: files('arm64ec.c', 'arm64ec-gate.c', 'arm64ec.S',
                                    'context-amd64.c',
                                    'runtime/emutls.c', 'runtime/setjmp-ec.S',
-                                   'test-ec.c', 'test-ec.S'),
+                                   'test-ec.c', 'test-ec.S', 'test-tp.c'),
                     if_false: files('context-wow64.c', 'test.c', 'wow64.c'))
 
 # rpmalloc, with its own configuration and its own code's warnings.

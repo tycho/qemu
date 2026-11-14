@@ -182,6 +182,44 @@ void xt_ec_stub_inject_init(void);
 void xt_ec_stub_inject_report(void);
 
 /*
+ * The thread gates' test points (test-tp.c, arm64ec.S's tp_point): a page
+ * shared with a controller process, which arms a point, waits for a
+ * thread to be held there, acts on it, and releases it.  STATE: 0 idle,
+ * 1 armed, 2 held (claimed), 3 published, 4 done.  BEFORE and AFTER hold
+ * x13, x14, x23, x24 and x28 (the canary) around the hold, GPR_BEFORE and
+ * GPR_AFTER every register but x16-x18 and x28, by number.  FORCE_ZERO
+ * has the hold zero x13, x14, x23 and x24 itself; LIVE_LAYOUT says which
+ * registers the entries' admission keeps its state in (2: x10-x12, the
+ * kind in w15).  The rest is
+ * the subject's: its native APC routine and what that routine last
+ * acknowledged; its harness's words.
+ */
+typedef struct XtTpBlock {
+    uint32_t magic, version;
+    uint32_t asm_point, asm_state;
+    uint64_t canary, tid_filter, hits;
+    uint32_t nth, gen;
+    uint64_t tid, spin_pc, orig_sp, x16, x17;
+    uint64_t before[5], after[5];
+    uint32_t release, ready;
+    uint64_t apc_routine, module_base;
+    uint64_t ack, ack_tid;
+    uint64_t harness[32];
+    uint32_t force_zero, live_layout;
+    uint64_t pad[5];
+    uint64_t gpr_before[32], gpr_after[32];
+} XtTpBlock;
+
+#define XT_TP_MAGIC 0x50545458u     /* "XTTP" */
+
+extern XtTpBlock *xt_tp_block;
+void xt_tp_process_init(void);
+uint64_t xt_tp_jump_asm(uint64_t target, uint64_t arg);
+XTEXPORT uint64_t xt_tp_jump(uint64_t target, uint64_t arg);
+XTEXPORT uint64_t xt_tp_native_add(uint64_t arg);
+XTEXPORT DWORD WINAPI xt_tp_jump_worker(void *arg);
+
+/*
  * A thread's gate (arm64ec-gate.c): what another thread needs to know
  * before it may take the thread as holding nothing of the engine's, kept
  * for the process's life so that a pointer to it never dangles.  Each
