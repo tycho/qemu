@@ -340,6 +340,8 @@ typedef enum XtTpId {
     XT_TP_INTERNAL_BODY,
     XT_TP_INTERNAL_END,
     XT_TP_ENGINE_STARTING = 56,     /* the engine's bring-up, state 1 */
+    XT_TP_ENGINE_ELECTED,           /* its starter's handle out, state 0 */
+    XT_TP_ENGINE_WAIT,              /* a waiter, the state it read */
 } XtTpId;
 
 /* The failure sites. */
@@ -358,6 +360,7 @@ typedef enum XtTpFail {
     XT_TPF_OPEN,                    /* ec_open_thread */
     XT_TPF_CONTINUE,                /* ec_continue_level's continuation */
     XT_TPF_TERMACCESS,              /* ThreadTerm's access check passes */
+    XT_TPF_DUP_STARTER,             /* the bring-up's handle (ec_engine_up) */
 } XtTpFail;
 
 /* The notes: KIND, the thread, and A, B, C. */

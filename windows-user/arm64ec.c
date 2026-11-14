@@ -539,34 +539,92 @@ static int process_init(void)
     return 0;
 }
 
-static int engine_state;    /* 0 none, 1 starting, 2 ready, -1 failed */
+/*
+ * 0 none, 1 starting, 2 ready; -1 failed, -2 the bring-up's thread ended
+ * before it was done (ec_engine_up).
+ */
+static int engine_state;
 static void ec_tp_publish(void);
 
 /*
- * The engine, once per process, and the calling thread's record, once
- * per thread: at a thread's first entry, when the loader has set up the
- * module's TLS.  Another thread's first entry waits for the bring-up.
- * The record is found through the CPU area, without the module's TLS:
- * EmulatorData[0] is the thread's record from here until its own end
- * takes it, or, once another thread has ended it, the reaper.
+ * The bring-up's thread, by a handle that can be waited on: the first
+ * entrant to swap its own in from NULL brings the engine up, alone.
+ */
+static HANDLE engine_starter;
+
+/*
+ * The engine brought up, once per process, at a thread's first entry
+ * (when the loader has set up the module's TLS): 2, or the failed state.
+ * A thread that finds none yet offers to bring it up, by publishing its
+ * own handle; every other first entry waits for the one that did.  A
+ * waiter that finds the bring-up's thread ended (it is killed, or ends
+ * itself, with no notification of the module's) fails the bring-up,
+ * which can't be finished from another thread: a waiter never waits
+ * forever.  A thread that can't make a handle waits for another's, if
+ * there is one.
+ */
+static int ec_engine_up(void)
+{
+    LARGE_INTEGER zero = { .QuadPart = 0 };
+    HANDLE me = NULL;
+    int s, unwatched = 0;
+
+    if (!qatomic_load_acquire(&engine_starter)) {
+        if (!XT_TP_FAIL(XT_TPF_DUP_STARTER) &&
+            NtDuplicateObject(GetCurrentProcess(), GetCurrentThread(),
+                              GetCurrentProcess(), &me, SYNCHRONIZE, 0,
+                              0) >= 0 &&
+            qatomic_cmpxchg(&engine_starter, NULL, me) == NULL) {
+            XT_TP(XT_TP_ENGINE_ELECTED, xt_gate_self(), 0);
+            qatomic_store_release(&engine_state, 1);
+            XT_TP(XT_TP_ENGINE_STARTING, xt_gate_self(), 1);
+            s = process_init() < 0 ? -1 : 2;
+            qatomic_store_release(&engine_state, s);
+            return s;
+        }
+        if (me) {
+            NtClose(me);
+        }
+    }
+    while ((s = qatomic_load_acquire(&engine_state)) == 0 || s == 1) {
+        HANDLE h = qatomic_load_acquire(&engine_starter);
+
+        XT_TP(XT_TP_ENGINE_WAIT, NULL, s);
+        if (!h) {
+            /*
+             * No starter yet, and this thread can't be one: another's may
+             * be on its way (a moment), else nothing will bring it up.
+             */
+            if (++unwatched > 1000) {
+                return -1;
+            }
+            NtYieldExecution();
+            continue;
+        }
+        if (NtWaitForSingleObject(h, FALSE, &zero) == STATUS_SUCCESS) {
+            /* The bring-up's thread is gone; a failed swap reads again. */
+            qatomic_cmpxchg(&engine_state, s, -2);
+            continue;
+        }
+        NtYieldExecution();
+    }
+    return s;
+}
+
+/*
+ * The engine, once per process (ec_engine_up), and the calling thread's
+ * record, once per thread.  The record is found through the CPU area,
+ * without the module's TLS: EmulatorData[0] is the thread's record from
+ * here until its own end takes it, or, once another thread has ended it,
+ * the reaper.  NULL if the engine couldn't be brought up.
  */
 static XtThread *enter_engine(void)
 {
     XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
     XtThread *t;
 
-    if (qatomic_read(&engine_state) != 2) {
-        if (qatomic_cmpxchg(&engine_state, 0, 1) == 0) {
-            XT_TP(XT_TP_ENGINE_STARTING, xt_gate_self(), 1);
-            qatomic_store_release(&engine_state,
-                                  process_init() < 0 ? -1 : 2);
-        }
-        while (qatomic_load_acquire(&engine_state) == 1) {
-            NtYieldExecution();
-        }
-        if (qatomic_read(&engine_state) < 0) {
-            return NULL;
-        }
+    if (qatomic_load_acquire(&engine_state) != 2 && ec_engine_up() != 2) {
+        return NULL;
     }
     t = area->EmulatorData[0];
     if (!t) {
@@ -1662,7 +1720,8 @@ static void ec_process_term(HANDLE h, BOOL after, NTSTATUS status)
             fputs(line, stderr);
             xt_log_text(line);
         }
-        if (qatomic_load_acquire(&engine_state)) {
+        /* A failed bring-up (state below 0) has no engine to keep. */
+        if (qatomic_load_acquire(&engine_state) > 0) {
             ec_exit_begin();
         }
     }
@@ -2238,8 +2297,12 @@ static __attribute__((noinline)) XtThread *ec_thread_first(void)
     XtThread *t = enter_engine();
 
     if (!t) {
+        int s = qatomic_read(&engine_state);
+
+        /* The log's status only once process_init failed opening it. */
         NtTerminateProcess(GetCurrentProcess(),
-                           !xt_log_handle() && xt_log_status < 0 ?
+                           s == -2 ? STATUS_THREAD_IS_TERMINATING :
+                           s == -1 && !xt_log_handle() && xt_log_status < 0 ?
                            xt_log_status : STATUS_NOT_SUPPORTED);
     }
     return t;
