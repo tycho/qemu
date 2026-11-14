@@ -200,17 +200,6 @@ unsigned __attribute__((constructor)) cpuinfo_init(void)
 #endif
 #ifdef _WIN32
     {
-        /*
-         * KUSER_SHARED_DATA.ProcessorFeatures, which IsProcessorFeaturePresent
-         * reads, read directly: code loaded before kernel32 can't import it.
-         */
-        const volatile uint8_t *pf = (const volatile uint8_t *)0x7ffe0274;
-
-        info |= pf[PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE] ? CPUINFO_CRC32 : 0;
-    }
-#endif
-#ifdef _WIN32
-    {
         HANDLE key = win32_cpu_key();
 
         if (key) {

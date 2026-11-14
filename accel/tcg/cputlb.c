@@ -54,7 +54,6 @@
 #include "qemu/plugin-memory.h"
 #endif
 #include "tcg/tcg-ldst.h"
-#include "tcg/startup.h"
 #include "backend-ldst.h"
 
 
@@ -303,6 +302,19 @@ static inline size_t tlb_wmap_bit(CPUTLBDescFast *fast, uintptr_t host)
  * conflict misses.  With tcg_tlb_grow, keep it in the 15-35% range, where
  * conflicts (victim-TLB hits) are rarer still.
  */
+static inline size_t tlb_grow_rate(void)
+{
+    return tcg_tlb_grow ? 35 : 70;
+}
+
+static inline size_t tlb_shrink_rate(void)
+{
+    return tcg_tlb_grow ? 15 : 30;
+}
+
+static void tlb_mmu_realloc_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
+                                   size_t new_size, int64_t now);
+
 static bool tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
                                   int64_t now)
 {
@@ -350,6 +362,7 @@ static bool tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
         return false;
     }
     tlb_mmu_realloc_locked(desc, fast, new_size, now);
+    return true;
 }
 
 /*
@@ -388,7 +401,6 @@ static void tlb_mmu_realloc_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
         fast->table = g_try_new(CPUTLBEntry, new_size);
         desc->fulltlb = tlb_fulltlb_alloc(new_size, true);
     }
-    return true;
 }
 
 static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)

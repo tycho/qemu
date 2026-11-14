@@ -22,8 +22,10 @@
 TCGTBCPUState cpu_exec_tb_state(CPUState *cpu);
 
 /*
- * The TB for @s if the jump cache holds it, else NULL.  It never looks
- * further, translates or faults.
+ * The TB for @s if the jump cache holds it, else NULL; NULL too when the
+ * loop samples the next TB it runs (a region sample deferred from a
+ * requested exit), which only the loop does.  It never looks further,
+ * translates or faults.
  */
 TranslationBlock *cpu_exec_tb_cached(CPUState *cpu, TCGTBCPUState s);
 
@@ -48,7 +50,8 @@ TranslationBlock *cpu_exec_tb_done(CPUState *cpu, uintptr_t ret,
 
 /*
  * Link exit @tb_exit of @last_tb (cpu_exec_tb_done()'s) to @tb, as the
- * loop does before running @tb.
+ * loop does before running @tb: with its dead slot's link where @tb
+ * writes those exits first.
  */
 void cpu_exec_tb_link(TranslationBlock *last_tb, int tb_exit,
                       TranslationBlock *tb);

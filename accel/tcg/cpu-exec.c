@@ -55,8 +55,6 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "tcg/startup.h"
-#include "qemu/plugin.h"
-#include "tcg/startup.h"
 #if !defined(CONFIG_USER_ONLY)
 #include "accel/tcg/iommu.h"
 #endif
@@ -207,9 +205,9 @@ static bool tb_lookup_cmp(const void *p, const void *d)
 }
 
 /*
- * The TB for state @s.  With x-tblookup, @stale, if non-NULL, is the TB
- * of a jump-cache entry for s.pc under an older salt, the answer if it
- * still matches.
+ * The TB for state @s, whose first page is @stale's if @stale is
+ * non-NULL: with x-tblookup, a jump-cache entry for s.pc under an older
+ * salt, which is the answer if it still matches.
  */
 static TranslationBlock *tb_htable_lookup_stale(CPUState *cpu,
                                                 TCGTBCPUState s,
@@ -272,6 +270,21 @@ static inline bool tb_jmp_cache_ctx_match(CPUJumpCache *jc, TCGTBCPUState s)
 }
 
 /*
+ * Whether @tb, read from a jump-cache entry whose key is at @key, is the
+ * TB for state @s.
+ */
+static inline bool tb_jmp_cache_hit(CPUJumpCache *jc, const vaddr *key,
+                                    TranslationBlock *tb,
+                                    const TCGTBCPUState *s)
+{
+    return tb &&
+           tb_jmp_cache_key_match(jc, *key, s->pc) &&
+           tb->cs_base == s->cs_base &&
+           tb->flags == s->flags &&
+           tb_cflags(tb) == s->cflags;
+}
+
+/*
  * tcg_jcgen: whether the jump-cache entry for @tb at @pc may outlive a
  * flush of non-global translations: its code is on one page, which the
  * TLB holds as global.
@@ -312,21 +325,6 @@ static bool tb_jmp_cache_global(CPUState *cpu, TranslationBlock *tb, vaddr pc)
 bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
 bool tcg_cpu_bound;
 
-/*
- * Whether @tb, read from a jump-cache entry whose key is at @key, is the
- * TB for state @s.
- */
-static inline bool tb_jmp_cache_hit(CPUJumpCache *jc, const vaddr *key,
-                                    TranslationBlock *tb,
-                                    const TCGTBCPUState *s)
-{
-    return tb &&
-           *key == s->pc &&
-           tb->cs_base == s->cs_base &&
-           tb->flags == s->flags &&
-           tb_cflags(tb) == s->cflags;
-}
-
 static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     TranslationBlock *tb;
@@ -350,7 +348,35 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
         return NULL;
     }
 
-    tb = tb_htable_lookup(cpu, s);
+    /*
+     * tcg_jc_ctx: entries are made only for the TB state of the current
+     * salt; in another state, move the salt on first.  The generated
+     * lookup runs in the state its TB was made for (the front end sends a
+     * TB that changes it to the helper), which is then the cache's.
+     */
+    if (tcg_jc_ctx && !tb_jmp_cache_ctx_match(jc, s)) {
+        /* A one-off state (a TB of a single insn, say) isn't cached. */
+        if (s.cflags & CF_COUNT_MASK) {
+            return tb_htable_lookup(cpu, s);
+        }
+        tcg_flush_jmp_cache(cpu);
+        jc->ctx_cs_base = s.cs_base;
+        jc->ctx_flags = s.flags;
+        jc->ctx_cflags = s.cflags;
+    }
+
+    /*
+     * With x-tblookup, an entry for this pc made under an older salt (a
+     * flush of the non-global translations since, a CR3 write) holds the
+     * TB that was right then; it is again if it matches the current
+     * state and pages, as the hash table's would.
+     */
+    if (tcg_ijmp_inline && tb && tcg_jcgen &&
+        !((jc->array[hash].pc ^ s.pc) & (jc->salt_step - 1))) {
+        tb = tb_htable_lookup_stale(cpu, s, tb);
+    } else {
+        tb = tb_htable_lookup(cpu, s);
+    }
     if (tb == NULL) {
         return NULL;
     }
@@ -378,6 +404,9 @@ TranslationBlock *cpu_exec_tb_cached(CPUState *cpu, TCGTBCPUState s)
     uint32_t hash = tb_jmp_cache_hash_func(s.pc);
     TranslationBlock *tb = qatomic_read(&jc->array[hash].tb);
 
+    if (unlikely(jc->region_sample_next)) {
+        return NULL;
+    }
     return tb_jmp_cache_hit(jc, &jc->array[hash].pc, tb, &s) ? tb : NULL;
 }
 #endif
@@ -1184,12 +1213,16 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     qemu_spin_unlock(&tb_next->jmp_lock);
 }
 
-/* Link @last_tb's exit *@tb_exit to @tb. */
+/* Link @last_tb's exit *@tb_exit to @tb, and its dead slot's too. */
 static inline QEMU_ALWAYS_INLINE
 void tb_link(TranslationBlock *last_tb, const int *tb_exit,
              TranslationBlock *tb)
 {
     tb_add_jump(last_tb, *tb_exit, tb);
+    /* Its goto_tb_dead too, if tb writes them first. */
+    if (last_tb->jmp[*tb_exit].dead && tb->chain_dead_in) {
+        tb_add_jump(last_tb, last_tb->jmp[*tb_exit].dead - 1, tb);
+    }
 }
 
 #ifdef CONFIG_USER_ONLY
@@ -1468,7 +1501,7 @@ void cpu_loop_tb_after(CPUState *cpu, TranslationBlock *tb,
             if (tb) {
                 region_sample(cpu, tb);
             } else if (tcg_edge_sys) {
-                region_sample_next = true;
+                cpu->tb_jmp_cache->region_sample_next = true;
             }
         }
         return;
@@ -1630,8 +1663,8 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 tb_link(last_tb, &tb_exit, tb);
             }
 
-            if (unlikely(region_sample_next)) {
-                region_sample_next = false;
+            if (unlikely(cpu->tb_jmp_cache->region_sample_next)) {
+                cpu->tb_jmp_cache->region_sample_next = false;
                 region_sample(cpu, tb);
             }
             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
@@ -1735,6 +1768,9 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
             tcg_prologue_init();
             tcg_prologue_deferred = false;
         }
+        /* Once the front end has said where the return stack lives. */
+        tcg_retstack_env = tcg_sysret && tcg_retstack && tcg_retsp_off &&
+                           tcg_retep_off && tcg_jc_layout.valid;
 #endif
         tcg_target_initialized = true;
     }

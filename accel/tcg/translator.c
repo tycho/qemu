@@ -36,6 +36,11 @@
 #include "tb-internal.h"
 #include "tb-hash.h"
 #include "tcg/tcg-temp-internal.h"
+#include "tcg/tcg-internal.h"
+#ifdef CONFIG_USER_ONLY
+#include "exec/page-protection.h"
+#include "user/page-protection.h"
+#endif
 
 #ifndef CONFIG_USER_ONLY
 static void set_can_do_io(DisasContextBase *db, bool val)
@@ -545,6 +550,26 @@ static bool region_page_has_breakpoint(CPUState *cpu, vaddr page)
     return false;
 }
 
+#ifdef CONFIG_USER_ONLY
+/*
+ * x-smc=check: whether code on PAGE needs no check at TB entry (fixed and
+ * not writable).  TBs of several blocks are made only from such pages: a
+ * checked TB's CRC covers the bytes between its blocks too, and data
+ * stored there would fail its check at every entry.
+ */
+static bool smc_page_unchecked(vaddr page)
+{
+    return !tcg_smc_check ||
+           (page_get_flags(page) & (PAGE_FIXED_CODE | PAGE_WRITE)) ==
+           PAGE_FIXED_CODE;
+}
+#else
+static bool smc_page_unchecked(vaddr page)
+{
+    return true;
+}
+#endif
+
 static bool region_page_ok(const DisasContextBase *db, vaddr pc)
 {
     vaddr first = db->pc_first & TARGET_PAGE_MASK;
@@ -556,7 +581,8 @@ static bool region_page_ok(const DisasContextBase *db, vaddr pc)
     if ((pc & TARGET_PAGE_MASK) == first) {
         return true;
     }
-    if ((pc & TARGET_PAGE_MASK) != first + TARGET_PAGE_SIZE) {
+    if ((pc & TARGET_PAGE_MASK) != first + TARGET_PAGE_SIZE ||
+        !smc_page_unchecked(first + TARGET_PAGE_SIZE)) {
         return false;
     }
     if (r && region_page_has_breakpoint(r->cpu, first + TARGET_PAGE_SIZE)) {
@@ -1244,6 +1270,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     TCGOp *icount_start_insn;
     TCGOp *loop_op = NULL;
     bool plugin_enabled;
+    bool is_head, unit = false;
 #ifdef CONFIG_USER_ONLY
     TCGOp *smc_mark;
     bool smc_split;
@@ -1344,7 +1371,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         loop_op = tcg_last_op();
         db->region_capable = (tcg_superblock || tcg_units) && ops->block_start
                              && tb_page_addr0(tb) != -1
-                             && !(cflags & CF_COUNT_MASK);
+                             && !(cflags & CF_COUNT_MASK)
+                             && smc_page_unchecked(db->pc_first);
         if (db->region_capable && tcg_superblock) {
             translator_region_sampler_start();
         }
@@ -1406,6 +1434,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
  next_block:
     while (!(db->region && db->region->stubbing)) {
+        vaddr insn_pc = db->pc_next;
+
         *max_insns = ++db->num_insns;
         ops->insn_start(db, cpu);
         db->insn_start = tcg_last_op();
@@ -1576,7 +1606,11 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
 #ifdef CONFIG_USER_ONLY
     if (tcg_smc_check && smc_needs_check(db, tb)) {
-        smc_gen_check(db, tb, smc_mark);
+        /*
+         * A TB that loops back to its start (tcg_region) checks at its
+         * loop label, so on every iteration as at its entry.
+         */
+        smc_gen_check(db, tb, db->loop_label ? loop_op : smc_mark);
     }
 #endif
 

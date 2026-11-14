@@ -214,7 +214,7 @@ void tb_lazysync_unwind(uintptr_t host_pc, const uint64_t (*regs)[2],
     }
     tb_unwind_check(tb, TCG_CACHE_UNWIND_LAZYSYNC);
     off = host_pc - (uintptr_t)tb->tc.ptr;
-    p = tb->tc.ptr + tb->tc.size;
+    p = tb->tc.search;
     for (int i = 0; i < tb->icount * (INSN_START_WORDS + 1); ++i) {
         decode_sleb128(&p);
     }

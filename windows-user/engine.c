@@ -630,9 +630,6 @@ void xt_invalidate(vaddr start, vaddr len)
 }
 
 CPUState *xt_spare_cpu;
-bool xt_diag;
-bool xt_rcu_stress;
-int xt_rcu_inj_step;
 static int applied, rejected;
 /* The first setting refused, and why. */
 static char *first_rejected;
@@ -717,6 +714,16 @@ static void set_settings(Object *accel, const char *settings)
                 }
             } else if (!strcmp(kv[i], "cachetrace")) {
                 tcg_cache_trace = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cachedump")) {
+                cache_dump = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cacheinjpromote")) {
+                tcg_cache_inj_promote = true;
+                applied++;
+            } else if (!strcmp(kv[i], "cacheselftest")) {
+                cache_selftest = true;
+                applied++;
 #ifdef TARGET_X86_64
             } else if (!strcmp(kv[i], "rcustress")) {
                 /* Testing: grace periods back to back (arm64ec.c). */
@@ -752,12 +759,21 @@ static void set_settings(Object *accel, const char *settings)
                 applied++;
             } else if (!strcmp(kv[i], "zext32report")) {
                 tcg_zext32_report = true;
+                applied++;
             } else {
                 reject(kv[i], NULL);
             }
             continue;
         }
         /* The translation cache's settings with a value (testing). */
+#ifdef TARGET_X86_64
+        if (!strncmp(kv[i], "rcuinj=", 7)) {
+            /* Testing: registration interrupted (arm64ec.c). */
+            xt_rcu_inj_step = atoi(eq + 1);
+            applied++;
+            continue;
+        }
+#endif
         if (!strncmp(kv[i], "cacheflush=", 11)) {
             tcg_cache_flush_every = atoi(eq + 1);
             applied++;
@@ -781,14 +797,6 @@ static void set_settings(Object *accel, const char *settings)
             continue;
         }
         /* QEMU's own accelerator properties go as they are, the rest as x-. */
-#ifdef TARGET_X86_64
-        if (!strncmp(kv[i], "rcuinj=", 7)) {
-            /* Testing: registration interrupted (arm64ec.c). */
-            xt_rcu_inj_step = atoi(eq + 1);
-            applied++;
-            continue;
-        }
-#endif
         name = g_strndup(kv[i], eq - kv[i]);
         if (strcmp(name, "one-insn-per-tb") && strcmp(name, "tb-size") &&
             strcmp(name, "split-wx")) {
@@ -863,6 +871,10 @@ static void G_NORETURN cache_terminate(void)
 
 bool xt_fault_context_partial;
 bool xt_native_harness;
+bool xt_diag;
+bool xt_rcu_stress;
+bool xt_exit_strict, xt_exit_report, xt_lock_check, xt_gate_check;
+int xt_rcu_inj_step;
 
 /*
  * A setting asked for that the module doesn't know or can't do: the
@@ -1000,7 +1012,6 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
                                                 reason);
 
         xt_log_text(line);
-bool xt_exit_strict, xt_exit_report, xt_lock_check, xt_gate_check;
         NtTerminateProcess(GetCurrentProcess(), STATUS_NOT_SUPPORTED);
     }
     tcg_prologue_init();
