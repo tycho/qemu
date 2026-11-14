@@ -24,6 +24,9 @@
 #include "xtajit.h"
 #include "arm64ec.h"
 #include "run.h"
+#include "qemu/timer.h"
+#include "accel/tcg/internal-common.h"
+#include "exec/tb-flush.h"
 
 /* The layouts arm64ec.S's offsets (F_*, C_*, TEB_CPU_AREA, AREA_*) assume. */
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, entry) != 0x04);
@@ -62,8 +65,6 @@ QEMU_BUILD_BUG_ON(offsetof(CPUX86State, xmm_regs) != 0x3d0);
 QEMU_BUILD_BUG_ON(sizeof(ZMMReg) != 64);
 
 NTSTATUS NTAPI NtContinue(PCONTEXT, BOOLEAN);
-NTSTATUS NTAPI NtTerminateThread(HANDLE, NTSTATUS);
-PVOID NTAPI RtlAddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
 PVOID NTAPI RtlImageDirectoryEntryToData(PVOID, BOOLEAN, USHORT, PULONG);
 NTSTATUS NTAPI RtlQueryEnvironmentVariable(PVOID, PCWSTR, SIZE_T, PWSTR,
                                            SIZE_T, PSIZE_T);
@@ -87,6 +88,7 @@ extern IMAGE_DOS_HEADER __ImageBase;
 NTSTATUS xt_syscall(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                     uint64_t a4, uint64_t a5, uint64_t nr);
 
+static int64_t nr_flush_buffers = -1;
 static int64_t nr_continue = -1, nr_raise = -1, nr_alloc = -1,
                nr_protect = -1;
 
@@ -173,10 +175,25 @@ NTSTATUS xt_continue_native(XtNativeContext *ctx)
     return xt_syscall((uintptr_t)ctx, FALSE, 0, 0, 0, 0, nr_continue);
 }
 
-static NTSTATUS alloc_direct(void **base, SIZE_T *size, ULONG type, ULONG prot)
+NTSTATUS xt_ec_alloc_direct(void **base, SIZE_T *size, ULONG type,
+                            ULONG prot)
 {
     return xt_syscall((uintptr_t)GetCurrentProcess(), (uintptr_t)base, 0,
                       (uintptr_t)size, type, prot, nr_alloc);
+}
+
+/*
+ * Every processor running a thread of the process made to see this one's
+ * writes, and to have its own seen (FlushProcessWriteBuffers): the
+ * process's end's half of the barrier pair whose other half, a thread's
+ * entry, costs it nothing (arm64ec-gate.c).
+ */
+static NTSTATUS ec_flush_write_buffers(void)
+{
+    if (nr_flush_buffers < 0) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    return xt_syscall(0, 0, 0, 0, 0, 0, nr_flush_buffers);
 }
 
 /* Whether ProcessInit has found the system calls the module makes itself. */
@@ -194,7 +211,8 @@ void *xt_alloc_direct(size_t len)
     void *p = NULL;
     SIZE_T size = len;
 
-    if (alloc_direct(&p, &size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) < 0) {
+    if (xt_ec_alloc_direct(&p, &size, MEM_RESERVE | MEM_COMMIT,
+                           PAGE_READWRITE) < 0) {
         return NULL;
     }
     return p;
@@ -249,6 +267,7 @@ static bool init_syscalls(void)
     nr_raise = find_syscall_nr(md, "NtRaiseException");
     nr_alloc = find_syscall_nr(md, "NtAllocateVirtualMemory");
     nr_protect = find_syscall_nr(md, "NtProtectVirtualMemory");
+    nr_flush_buffers = find_syscall_nr(md, "NtFlushProcessWriteBuffers");
     ki_exception_dispatcher = ntdll_native(md, "KiUserExceptionDispatcher");
     cross_process_work = (void (*)(void))
         ntdll_native(md, "ProcessPendingCrossProcessEmulatorWork");
@@ -262,8 +281,9 @@ static bool init_syscalls(void)
         xt_ntdll_lut_size = MAX(xt_ntdll_lut_size, r[i].Source + 1);
     }
     size = xt_ntdll_lut_size * sizeof(uint32_t);
-    if (alloc_direct((void **)&xt_ntdll_lut, &size, MEM_COMMIT | MEM_RESERVE,
-                     PAGE_READWRITE) < 0) {
+    if (xt_ec_alloc_direct((void **)&xt_ntdll_lut, &size,
+                           MEM_COMMIT | MEM_RESERVE,
+                           PAGE_READWRITE) < 0) {
         return false;
     }
     for (ULONG i = 0; i < md->RedirectionMetadataCount; i++) {
@@ -412,7 +432,13 @@ static unsigned __stdcall reader_retirer(void *arg)
     LARGE_INTEGER tick = { .QuadPart = -20 * 10000 };   /* 20 ms */
 
     for (;;) {
-        XtReaderNode *n = qatomic_xchg(&readers, NULL), *keep = NULL;
+        XtReaderNode *n, *keep = NULL;
+
+        /* The process's end: here it holds nothing. */
+        if (xt_internal_stopping()) {
+            xt_internal_park();
+        }
+        n = qatomic_xchg(&readers, NULL);
 
         while (n) {
             XtReaderNode *next = n->next;
@@ -436,7 +462,7 @@ static unsigned __stdcall reader_retirer(void *arg)
             readers_push(keep);
             keep = next;
         }
-        NtDelayExecution(FALSE, &tick);
+        NtDelayExecution(TRUE, &tick);
     }
     return 0;
 }
@@ -454,20 +480,32 @@ static unsigned __stdcall rcu_stress(void *arg)
     LARGE_INTEGER ms = { .QuadPart = -10000 };
 
     for (;;) {
+        if (xt_internal_stopping()) {
+            xt_internal_park();
+        }
         synchronize_rcu();
         qatomic_inc(&rcu_stress_done);
-        NtDelayExecution(FALSE, &ms);
+        NtDelayExecution(TRUE, &ms);
     }
     return 0;
 }
 
+/*
+ * The watchdog sleeps in slices, so that the process's end, which may wait
+ * longer than 5 s for a thread to stop, disarms it first.
+ */
 static unsigned __stdcall rcu_stress_watchdog(void *arg)
 {
-    LARGE_INTEGER s = { .QuadPart = -5 * 1000 * 10000 };    /* 5 s */
+    LARGE_INTEGER slice = { .QuadPart = -10 * 10000 };      /* 10 ms */
     uint64_t seen = 0;
 
     for (;;) {
-        NtDelayExecution(FALSE, &s);
+        for (int i = 0; i < 500; i++) {
+            if (xt_internal_stopping()) {
+                xt_internal_park();
+            }
+            NtDelayExecution(TRUE, &slice);
+        }
         if (qatomic_read(&rcu_stress_done) == seen) {
             fputs("rcustress: no grace period completed in 5 s\n", stderr);
             xt_log_text("rcustress: no grace period completed in 5 s\n");
@@ -503,32 +541,92 @@ static int process_init(void)
     return 0;
 }
 
-static int engine_state;    /* 0 none, 1 starting, 2 ready, -1 failed */
+/*
+ * 0 none, 1 starting, 2 ready; -1 failed, -2 the bring-up's thread ended
+ * before it was done (ec_engine_up).
+ */
+static int engine_state;
+static void ec_tp_publish(void);
 
 /*
- * The engine, once per process, and the calling thread's record, once
- * per thread: at a thread's first entry, when the loader has set up the
- * module's TLS.  Another thread's first entry waits for the bring-up.
- * The record is found through the CPU area, without the module's TLS:
- * EmulatorData[0] is the thread's record from here until ThreadTerm
- * takes it.
+ * The bring-up's thread, by a handle that can be waited on: the first
+ * entrant to swap its own in from NULL brings the engine up, alone.
+ */
+static HANDLE engine_starter;
+
+/*
+ * The engine brought up, once per process, at a thread's first entry
+ * (when the loader has set up the module's TLS): 2, or the failed state.
+ * A thread that finds none yet offers to bring it up, by publishing its
+ * own handle; every other first entry waits for the one that did.  A
+ * waiter that finds the bring-up's thread ended (it is killed, or ends
+ * itself, with no notification of the module's) fails the bring-up,
+ * which can't be finished from another thread: a waiter never waits
+ * forever.  A thread that can't make a handle waits for another's, if
+ * there is one.
+ */
+static int ec_engine_up(void)
+{
+    LARGE_INTEGER zero = { .QuadPart = 0 };
+    HANDLE me = NULL;
+    int s, unwatched = 0;
+
+    if (!qatomic_load_acquire(&engine_starter)) {
+        if (!XT_TP_FAIL(XT_TPF_DUP_STARTER) &&
+            NtDuplicateObject(GetCurrentProcess(), GetCurrentThread(),
+                              GetCurrentProcess(), &me, SYNCHRONIZE, 0,
+                              0) >= 0 &&
+            qatomic_cmpxchg(&engine_starter, NULL, me) == NULL) {
+            XT_TP(XT_TP_ENGINE_ELECTED, xt_gate_self(), 0);
+            qatomic_store_release(&engine_state, 1);
+            XT_TP(XT_TP_ENGINE_STARTING, xt_gate_self(), 1);
+            s = process_init() < 0 ? -1 : 2;
+            qatomic_store_release(&engine_state, s);
+            return s;
+        }
+        if (me) {
+            NtClose(me);
+        }
+    }
+    while ((s = qatomic_load_acquire(&engine_state)) == 0 || s == 1) {
+        HANDLE h = qatomic_load_acquire(&engine_starter);
+
+        XT_TP(XT_TP_ENGINE_WAIT, NULL, s);
+        if (!h) {
+            /*
+             * No starter yet, and this thread can't be one: another's may
+             * be on its way (a moment), else nothing will bring it up.
+             */
+            if (++unwatched > 1000) {
+                return -1;
+            }
+            NtYieldExecution();
+            continue;
+        }
+        if (NtWaitForSingleObject(h, FALSE, &zero) == STATUS_SUCCESS) {
+            /* The bring-up's thread is gone; a failed swap reads again. */
+            qatomic_cmpxchg(&engine_state, s, -2);
+            continue;
+        }
+        NtYieldExecution();
+    }
+    return s;
+}
+
+/*
+ * The engine, once per process (ec_engine_up), and the calling thread's
+ * record, once per thread.  The record is found through the CPU area,
+ * without the module's TLS: EmulatorData[0] is the thread's record from
+ * here until its own end takes it, or, once another thread has ended it,
+ * the reaper.  NULL if the engine couldn't be brought up.
  */
 static XtThread *enter_engine(void)
 {
     XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
     XtThread *t;
 
-    if (qatomic_read(&engine_state) != 2) {
-        if (qatomic_cmpxchg(&engine_state, 0, 1) == 0) {
-            qatomic_store_release(&engine_state,
-                                  process_init() < 0 ? -1 : 2);
-        }
-        while (qatomic_load_acquire(&engine_state) == 1) {
-            NtYieldExecution();
-        }
-        if (qatomic_read(&engine_state) < 0) {
-            return NULL;
-        }
+    if (qatomic_load_acquire(&engine_state) != 2 && ec_engine_up() != 2) {
+        return NULL;
     }
     t = area->EmulatorData[0];
     if (!t) {
@@ -536,6 +634,8 @@ static XtThread *enter_engine(void)
         t->cpu->opaque = t;
         t->ec_doorbell = area->SuspendDoorbell;
         area->EmulatorData[0] = t;
+        /* For the reaper, once the thread has ended (ec_reap_gates). */
+        qatomic_store_release(&xt_gate_self()->rec, t);
         ec_register(t);
         /* From here the entries store the registers into the CPU state. */
         qatomic_set(&((XtEcFrame *)area->EmulatorData[1])->env, t->env);
@@ -552,19 +652,24 @@ static XtThread *enter_engine(void)
  */
 static uint32_t reached;
 
-XTEXPORT NTSTATUS ProcessInit(void)
+static NTSTATUS ec_process_init(void)
 {
     reached |= 0x40;
     if (!init_syscalls()) {
         return STATUS_NOT_SUPPORTED;
     }
+    xt_tp_process_init();
+    if (!xt_gate_init_process() || !xt_gate_register_initial()) {
+        return STATUS_NO_MEMORY;
+    }
+    ec_tp_publish();
     xt_emutls_init();
-    {
+{
         void *p = NULL;
         SIZE_T size = 0x1000;
         ULONG old;
 
-        if (alloc_direct(&p, &size, MEM_RESERVE | MEM_COMMIT,
+        if (xt_ec_alloc_direct(&p, &size, MEM_RESERVE | MEM_COMMIT,
                          PAGE_READWRITE) < 0) {
             return STATUS_NO_MEMORY;
         }
@@ -578,18 +683,6 @@ XTEXPORT NTSTATUS ProcessInit(void)
     return STATUS_SUCCESS;
 }
 
-XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
-{
-    xt_ec_stub_inject_report();
-    if (xt_rcu_stress) {
-        char line[64];
-
-        snprintf(line, sizeof(line), "rcustress: %llu grace periods\n",
-                 (unsigned long long)qatomic_read(&rcu_stress_done));
-        fputs(line, stderr);
-        xt_log_text(line);
-    }
-}
 
 #define XT_EMULATOR_STACK (256 * 1024)
 #define XT_EC_THREAD_PAGE 0x1000
@@ -599,7 +692,7 @@ XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
  * doorbell word Windows sets to ask a simulating thread to stop
  * (SuspendDoorbell), and the native registers of an entry or exit.
  */
-XTEXPORT NTSTATUS ThreadInit(void)
+static NTSTATUS ec_thread_init(void)
 {
     XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
     PVOID mem = NULL;
@@ -607,8 +700,11 @@ XTEXPORT NTSTATUS ThreadInit(void)
     uintptr_t stack;
 
     reached |= 0x100;
-    if (!area || alloc_direct(&mem, &size, MEM_RESERVE | MEM_COMMIT,
-                              PAGE_READWRITE) < 0) {
+    if (!area) {
+        return STATUS_NO_MEMORY;
+    }
+    if (xt_ec_alloc_direct(&mem, &size, MEM_RESERVE | MEM_COMMIT,
+                           PAGE_READWRITE) < 0) {
         return STATUS_NO_MEMORY;
     }
     stack = (uintptr_t)mem + XT_EC_THREAD_PAGE;
@@ -617,136 +713,1114 @@ XTEXPORT NTSTATUS ThreadInit(void)
     area->EmulatorStackBase = stack + XT_EMULATOR_STACK;
     area->EmulatorData[0] = NULL;
     area->EmulatorData[1] = mem;
+    qatomic_store_release(&xt_gate_self()->frame, mem);
     return STATUS_SUCCESS;
 }
 
 NTSTATUS NTAPI NtSuspendThread(HANDLE, PULONG);
 NTSTATUS NTAPI NtResumeThread(HANDLE, PULONG);
-NTSTATUS NTAPI NtGetContextThread(HANDLE, PCONTEXT);
 NTSTATUS NTAPI NtDuplicateObject(HANDLE, HANDLE, HANDLE, PHANDLE,
                                  ACCESS_MASK, ULONG, ULONG);
 
 static void ec_unregister(XtThread *t);
 
 /*
- * Another thread out of the engine for Windows to end, through H: it is
- * suspended and its context read, which waits for it to answer the
- * doorbell or to leave an adapter scope (InSyscallCallback), as FEX's
- * module does.  0 with it suspended there; else the status of the step
- * that failed, the suspension undone.
+ * How long a thread still inside the module is waited for, let go to
+ * finish, before its stop fails (ec_term_other, ec_freeze).
  */
-static NTSTATUS ec_stop_for_term(HANDLE h)
-{
-    CONTEXT c = { .ContextFlags = CONTEXT_CONTROL };
-    NTSTATUS st;
+#define EC_STOP_ACTIVE_MS 200
 
-    st = NtSuspendThread(h, NULL);
-    if (st < 0) {
-        return st;
-    }
-    st = NtGetContextThread(h, &c);
-    if (st < 0) {
-        NtResumeThread(h, NULL);
-    }
-    return st < 0 ? st : 0;
+NTSTATUS NTAPI NtGetNextThread(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG,
+                               PHANDLE);
+NTSTATUS NTAPI NtCompareObjects(HANDLE, HANDLE);
+
+/*
+ * Whether the thread behind H is already ending: Windows then neither
+ * suspends it nor gives its context, and its CPU area is gone.  It holds
+ * nothing of the engine's, as long as whatever ended it stopped it first
+ * (ThreadTerm), or it ended itself; a termination that didn't is counted
+ * there (ec_unsafe_term).
+ */
+static bool ec_thread_ending(HANDLE h)
+{
+    ULONG ended = 0;
+
+    return NtQueryInformationThread(h, 20 /* ThreadIsTerminated */, &ended,
+                                    sizeof(ended), NULL) >= 0 && ended;
 }
 
 /*
- * A thread's end, by itself or by another thread (THREAD), before Windows
- * terminates it.  Another thread is found, whatever THREAD allows
- * (TerminateThread needs THREAD_TERMINATE alone), through its record's
- * own handle (xt_terminated_thread), and stopped through that where it
- * holds nothing of the engine's: suspended and its context read
- * (ec_stop_for_term).  It stays suspended for Windows to end.  Then the
- * record leaves the watcher's list and goes: the thread's own at once,
- * another's once its handle is signalled (xt_reap), as the emulator stack
- * and its page; the handles the reaper waits on are made first, and
- * without them the record stays.  A thread that can't be stopped so is
- * left as it is, with its record (the failure is an event): with all
- * access to it, that takes a thread already ending.  A thread Windows
- * won't end, or that the engine has no record of, is left alone.
+ * Whether the thread behind H (which must allow SYNCHRONIZE) has ended, by
+ * its handle's signal, within TIMEOUT_MS: "ending" is set before its
+ * termination runs, and only the signal says its code has stopped.
  */
-XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
+static bool ec_thread_dead(HANDLE h, uint32_t timeout_ms)
 {
-    XtCpuArea *area;
-    XtThread *t;
-    HANDLE h, own = NULL, stack_ref = NULL, rec_ref = NULL;
-    void *teb = NULL;
-    DWORD tid;
-    bool self;
+    LARGE_INTEGER t = { .QuadPart = -(int64_t)timeout_ms * 10000 };
 
-    if (qatomic_load_acquire(&engine_state) != 2) {
-        return STATUS_SUCCESS;
-    }
-    xt_enter();
-    tid = xt_terminated_thread(thread, &teb, &own);
-    if (!tid) {
-        return STATUS_SUCCESS;
-    }
-    xt_reap();
-    self = teb == NtCurrentTeb();
-    if (self) {
-        h = GetCurrentThread();
-    } else {
-        NTSTATUS st = ec_stop_for_term(own);
+    return NtWaitForSingleObject(h, FALSE, &t) == STATUS_SUCCESS;
+}
 
+/*
+ * Terminations Windows went ahead with although the thread wasn't stopped
+ * outside the engine (the stop failed, or the thread couldn't be found):
+ * such a thread may have died holding anything, so the process's end
+ * counts them (ProcessTerm).  Counted before ThreadTerm returns, so before
+ * Windows can act; a termination Windows then refuses is counted all the
+ * same.
+ */
+static uint32_t ec_unsafe_terms;
+
+static void ec_unsafe_term(DWORD tid, NTSTATUS st)
+{
+    qatomic_inc(&ec_unsafe_terms);
+    XT_TP_NOTE(XT_TPN_UNSAFE, tid, (uint32_t)st, 0);
+    xt_gevent(XT_EV_THREAD_TERM, tid, 4 | (uint64_t)(uint32_t)st << 32);
+}
+
+/*
+ * THREAD, if it is another thread of this process, opened with what a
+ * stop needs; else NULL.  Found by its id where THREAD can be queried,
+ * else as the same object among the process's threads (TerminateThread
+ * needs THREAD_TERMINATE alone).  *FOUND_NOT says whether NULL means
+ * "not one of ours" rather than "couldn't tell".
+ */
+static HANDLE ec_open_thread(HANDLE thread, bool *found_not)
+{
+    const ACCESS_MASK want = THREAD_SUSPEND_RESUME |
+                             THREAD_QUERY_INFORMATION | SYNCHRONIZE;
+    HANDLE h = NULL, next;
+
+    *found_not = false;
+    if (XT_TP_FAIL(XT_TPF_OPEN)) {
+        return NULL;
+    }
+    for (;;) {
+        NTSTATUS st = NtGetNextThread(GetCurrentProcess(), h, want, 0, 0,
+                                      &next);
+
+        if (h) {
+            NtClose(h);
+        }
         if (st < 0) {
-            xt_gevent(XT_EV_THREAD_TERM, tid, 4 | (uint64_t)(uint32_t)st << 32);
-            goto out;
+            /* The end of the list: not a thread of this process. */
+            *found_not = st == STATUS_NO_MORE_ENTRIES;
+            return NULL;
         }
-        h = own;
-    }
-    /* Its TEB is read only once it is stopped: it may have ended. */
-    area = xt_cpu_area(teb);
-    if (!area || !qatomic_read(&area->EmulatorData[0])) {
-        if (!self) {
-            NtResumeThread(h, NULL);
+        h = next;
+        if (NtCompareObjects(thread, h) == 0) {
+            return h;
         }
-        goto out;
     }
-    if (NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
-                          &stack_ref, 0, 0, DUPLICATE_SAME_ACCESS) < 0 ||
-        (!self &&
-         NtDuplicateObject(GetCurrentProcess(), h, GetCurrentProcess(),
-                           &rec_ref, 0, 0, DUPLICATE_SAME_ACCESS) < 0)) {
-        /* Stopped, and the record stays with it. */
+}
+
+static bool watcher_stop, watcher_fast;
+static uint32_t lock_misses;      /* lockcheck's (xt_lock_checked) */
+static void *lock_miss_caller;
+static void ec_ring_doorbells(void);
+
+/*
+ * The process's end, at Windows' first call (NULL, before), on the exiting
+ * thread: every other thread of the process is certified out of the
+ * engine, for good, so that what runs after Windows has ended them (DLL
+ * detach code, on this thread) waits for none of them.
+ *
+ * - One thread owns it, the first to swap its gate into xt_gate_closed_by,
+ *   which closes the gate to every other thread (arm64ec-gate.c); every
+ *   processor's writes are flushed next.  Another thread ending the
+ *   process the same way at once parks at the gate.
+ * - The engine's internal threads (the registry, runtime.c) are asked to
+ *   park: the module's helpers at the top of their loops, rcustress's
+ *   watchdog before it could misread a long stop as a stall.
+ * - The freeze: every other thread, found with NtGetNextThread, is asked
+ *   to suspend and its doorbell rung, to bring it out of the engine
+ *   sooner, and certified from its gate (ec_certify), with no context
+ *   read; those still inside the module are let go to finish, for up to
+ *   EC_STOP_ACTIVE_MS.  A read one is in is taken over.  Passes repeat
+ *   until one finds no thread it hasn't certified.  A slot of the
+ *   registry still being created is waited for first, so that an internal
+ *   thread is never mistaken for another.  A budget (EC_FREEZE_MS) is
+ *   checked after each pass.
+ * - Then the doorbell watcher and the region sampler park, and every
+ *   registered thread must be parked, or be call_rcu's worker.
+ * - Every translation goes: a native thread may have written code with
+ *   its flush's notification never made.
+ * - Then call_rcu's work is drained and its worker left at rest
+ *   (rcu_worker_resting).  These last steps run only if all went well.
+ *
+ * A failure is counted and logged, and the exit goes on (unless the
+ * setting keyword exitstrict makes it fatal): the detach code runs as it
+ * would have.  A termination ThreadTerm let through uncertified
+ * (ec_unsafe_terms) is one.  After the freeze nothing here writes to the
+ * standard streams, whose reader may be a stopped thread; the outcome is
+ * printed at the last call with the keyword exitreport.
+ */
+#define EC_FREEZE_MS 30000
+#define EC_PARK_MS 1000
+
+enum {
+    EC_EXIT_STOP = 1 << 0,          /* a thread not stopped so */
+    EC_EXIT_UNSAFE = 1 << 1,        /* ThreadTerm let one through */
+    EC_EXIT_BUDGET = 1 << 2,        /* the freeze ran out of time */
+    EC_EXIT_CREATING = 1 << 3,      /* an internal thread's creation hung */
+    EC_EXIT_HELPER = 1 << 4,        /* an internal thread didn't park */
+    EC_EXIT_RCU = 1 << 5,           /* call_rcu's worker not at rest */
+    EC_EXIT_FLUSH = 1 << 6,         /* the write-buffer flush failed */
+    EC_EXIT_SELF = 1 << 7,          /* the owner's word: not its level alone */
+    EC_EXIT_DIED = 1 << 8,          /* a thread died inside, or mid-operation */
+    EC_EXIT_DONE = 1u << 31,
+};
+
+static uint32_t ec_exit_outcome;
+static uint32_t ec_exit_frozen, ec_exit_passes, ec_exit_refrozen;
+static int64_t ec_exit_ns, ec_exit_phase[4];
+static NTSTATUS ec_exit_first_fail;
+static int ec_exit_first_why;
+
+typedef struct EcFrozen {
+    HANDLE h;
+    DWORD tid;
+    bool suspended;         /* by the freeze, and not undone */
+} EcFrozen;
+
+typedef struct EcRead {
+    vaddr addr, len;
+} EcRead;
+
+static DWORD ec_thread_id(HANDLE h)
+{
+    XtThreadBasicInfo tbi;
+
+    if (NtQueryInformationThread(h, 0, &tbi, sizeof(tbi), NULL) < 0) {
+        return 0;
+    }
+    return (DWORD)(uintptr_t)tbi.ClientId.UniqueThread;
+}
+
+/* Whether TID is a registered internal thread's (one not yet ended). */
+static bool ec_is_internal(DWORD tid)
+{
+    int n;
+    const XtInternal *r = xt_internal_threads(&n);
+
+    for (int i = 0; i < n; i++) {
+        if (qatomic_load_acquire(&r[i].state) != XT_INTERNAL_FREE &&
+            qatomic_read(&r[i].tid) == tid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Until DEADLINE: no slot of the registry still being created. */
+static bool ec_wait_creations(int64_t deadline)
+{
+    int n;
+    const XtInternal *r = xt_internal_threads(&n);
+
+    for (int i = 0; i < n; i++) {
+        while (qatomic_load_acquire(&r[i].state) == XT_INTERNAL_CREATING) {
+            if (get_clock() > deadline) {
+                return false;
+            }
+            NtYieldExecution();
+        }
+    }
+    return true;
+}
+
+static bool ec_is_frozen(GArray *frozen, DWORD tid)
+{
+    for (guint i = 0; i < frozen->len; i++) {
+        if (g_array_index(frozen, EcFrozen, i).tid == tid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A thread the freeze couldn't stop (TID, 0 if unknown), with ST and WHY. */
+static void ec_freeze_failed(DWORD tid, NTSTATUS st, int why)
+{
+    ec_exit_outcome |= EC_EXIT_STOP;
+    if (!ec_exit_first_fail) {
+        ec_exit_first_fail = st;
+        ec_exit_first_why = why;
+    }
+    xt_gevent(XT_EV_THREAD_TERM, tid, 8 | (uint64_t)(uint32_t)st << 32);
+}
+
+/*
+ * A certificate (ec_certify): the thread has no level in the module and
+ * no operation outstanding that isn't handed over, and the gate keeps it
+ * out from here on.  Or it can't be had yet (active), or ever (failed).
+ */
+static uint32_t ec_died_owned, ec_died_unfinished;
+
+typedef enum EcCert {
+    EC_CERT_ACTIVE,
+    EC_CERT_FAILED,
+    EC_CERT_IDLE,
+    EC_CERT_PARKED,
+    EC_CERT_TAKEN,          /* idle or parked, a read taken over */
+    EC_CERT_NEW,            /* no gate yet: its first call meets the gate */
+    EC_CERT_ENDING,         /* Windows says it is ending */
+} EcCert;
+
+static uint32_t ec_certs[EC_CERT_ENDING + 1];
+
+/*
+ * G's certificate, from a snapshot: its admission word, every root, the
+ * word again.  The word's sequence number moves on every change and never
+ * recurs, so equal words mean the thread made no admission change in
+ * between; each root stands on its own: free, or taken (its range, for a
+ * read pending since its first half, is the taker's, added to READS, or
+ * left on its root for the reaper without READS).  Called with the gate
+ * closed and every processor's writes flushed.  A word that keeps changing
+ * between the reads is taken as active, so that the call is bounded.
+ */
+static EcCert ec_certify(XtGate *g, GArray *reads)
+{
+    /* A thread changing its word all the while is still active. */
+    for (int tries = 0; tries < 64; tries++) {
+        uint64_t w1 = qatomic_load_acquire(&g->adm), w2;
+        uint32_t state[XT_GATE_ROOTS];
+        bool taken = false;
+
+        for (int i = 0; i < XT_GATE_ROOTS; i++) {
+            state[i] = qatomic_load_acquire(&g->roots[i].state);
+        }
+        XT_TP(XT_TP_FREEZE_CERT, g, tries);
+        w2 = qatomic_load_acquire(&g->adm);
+        if (w1 != w2) {
+            continue;
+        }
+        if (w1 & XT_ADM_POISONED) {
+            return EC_CERT_FAILED;
+        }
+        if (XT_ADM_COUNT(w1) && !(w1 & XT_ADM_PARKED)) {
+            return EC_CERT_ACTIVE;
+        }
+        for (int i = 0; i < XT_GATE_ROOTS; i++) {
+            XtGateRoot *r = &g->roots[i];
+
+            if (state[i] == XT_ROOT_FREE || state[i] == XT_ROOT_TAKEN) {
+                continue;
+            }
+            if (state[i] == XT_ROOT_PENDING && r->kind == XT_MEMOP_READ &&
+                qatomic_cmpxchg(&r->state, XT_ROOT_PENDING,
+                                XT_ROOT_TAKEN) == XT_ROOT_PENDING) {
+                XT_TP(XT_TP_ROOT_TAKEN, g, i);
+                if (reads) {
+                    EcRead rd = { r->addr, r->len };
+
+                    g_array_append_val(reads, rd);
+                } else {
+                    /* Left on its root, for the reaper once it has ended. */
+                    qatomic_inc(&xt_gate_read_open);
+                }
+                taken = true;
+                continue;
+            }
+            /* Another operation owed: a parked thread never finishes it. */
+            return w1 & XT_ADM_PARKED ? EC_CERT_FAILED : EC_CERT_ACTIVE;
+        }
+        if (taken) {
+            return EC_CERT_TAKEN;
+        }
+        return w1 & XT_ADM_PARKED ? EC_CERT_PARKED : EC_CERT_IDLE;
+    }
+    return EC_CERT_ACTIVE;
+}
+
+/*
+ * The thread behind H's certificate: through its gate, found by its
+ * identity; none registered yet is a thread whose first call will meet the
+ * gate.  An identity that can't be read is a failure, unless Windows says
+ * the thread is ending.
+ */
+/*
+ * The certificate of an ending thread (H, its gate G or NULL): none until
+ * its handle has signalled; then, from its gate, a failure if it died
+ * inside the module or with an operation unfinished (xt_gate_death),
+ * quarantined and counted, else ENDING.
+ */
+static EcCert ec_cert_ended(HANDLE h, XtGate *g)
+{
+    XtDeath d;
+
+    if (!ec_thread_dead(h, 0)) {
+        return EC_CERT_ACTIVE;
+    }
+    d = g ? xt_gate_death(g) : XT_DEATH_CLEAN;
+    if (d == XT_DEATH_CLEAN) {
+        return EC_CERT_ENDING;
+    }
+    /* Counted once: the freeze may meet it again in a later pass. */
+    if (xt_gate_quarantine(g)) {
+        qatomic_inc(d == XT_DEATH_OWNED ? &ec_died_owned
+                                        : &ec_died_unfinished);
+        XT_TP_NOTE(XT_TPN_DIED, (uintptr_t)g, d, 0);
+    }
+    return EC_CERT_FAILED;
+}
+
+static EcCert ec_certify_thread(HANDLE h, GArray *reads)
+{
+    NTSTATUS st;
+    XtGate *g = xt_gate_for(h, false, &st);
+
+    if (ec_thread_ending(h)) {
+        return st < 0 ? EC_CERT_FAILED : ec_cert_ended(h, g);
+    }
+    if (st < 0) {
+        return EC_CERT_FAILED;
+    }
+    return g ? ec_certify(g, reads) : EC_CERT_NEW;
+}
+
+static void ec_freeze(DWORD me, GArray *frozen, GArray *reads)
+{
+    const ACCESS_MASK want = THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION |
+                             SYNCHRONIZE;
+    int64_t deadline = get_clock() + (int64_t)EC_FREEZE_MS * SCALE_MS;
+    GArray *pending = g_array_sized_new(FALSE, FALSE, sizeof(EcFrozen), 32);
+
+    for (;;) {
+        HANDLE h = NULL, next;
+        bool fresh = false;
+        NTSTATUS st;
+        int64_t until;
+
+        ec_exit_passes++;
+        if (!ec_wait_creations(deadline)) {
+            ec_exit_outcome |= EC_EXIT_CREATING;
+            return;
+        }
+        /*
+         * Every new thread asked to suspend, and the doorbells rung at
+         * once: a thread in the engine leaves it at its next consistent
+         * point (leave_suspend, which pops its level), one in the module's
+         * other code finishes, and native code stays still.  None of that
+         * is the certificate; it gets threads to one sooner.
+         */
+        while ((st = NtGetNextThread(GetCurrentProcess(), h, want, 0, 0,
+                                     &next)) >= 0) {
+            EcFrozen f = { NULL, 0, false };
+
+            if (h) {
+                NtClose(h);
+            }
+            h = next;
+            f.tid = ec_thread_id(h);
+            if (!f.tid) {
+                /* Passed over only once ended: the gates' walk judges it. */
+                if (!ec_thread_dead(h, EC_STOP_ACTIVE_MS)) {
+                    ec_freeze_failed(0, STATUS_INVALID_HANDLE, 0x400);
+                }
+                continue;
+            }
+            if (f.tid == me || ec_is_internal(f.tid) ||
+                ec_is_frozen(frozen, f.tid) ||
+                ec_is_frozen(pending, f.tid)) {
+                continue;
+            }
+            /* Only a thread that is ending may be passed over. */
+            st = NtDuplicateObject(GetCurrentProcess(), h,
+                                   GetCurrentProcess(), &f.h, 0, 0,
+                                   DUPLICATE_SAME_ACCESS);
+            if (st < 0) {
+                if (!ec_thread_dead(h, EC_STOP_ACTIVE_MS)) {
+                    ec_freeze_failed(f.tid, st, 0x100);
+                }
+                continue;
+            }
+            if (XT_TP_FAIL(XT_TPF_SUSPEND_FREEZE) ||
+                NtSuspendThread(f.h, NULL) < 0) {
+                f.suspended = false;
+            } else {
+                f.suspended = true;
+            }
+            g_array_append_val(pending, f);
+        }
+        if (st != STATUS_NO_MORE_ENTRIES) {
+            /* The list ended early: a thread after it was never seen. */
+            ec_freeze_failed(0, st, 0x200);
+        }
+        if (h) {
+            NtClose(h);
+            h = NULL;
+        }
+        ec_ring_doorbells();
+        /*
+         * Each certified from its gate, no context read; those still
+         * active are let go together, their suspensions undone, to finish
+         * what they are in, and certified as they do, until
+         * EC_STOP_ACTIVE_MS has gone by.
+         */
+        until = get_clock() + (int64_t)EC_STOP_ACTIVE_MS * SCALE_MS;
+        for (bool released = false;;) {
+            bool active = false;
+
+            for (guint i = 0; i < pending->len; i++) {
+                EcFrozen *f = &g_array_index(pending, EcFrozen, i);
+                EcCert c;
+
+                if (!f->h) {
+                    continue;
+                }
+                c = ec_certify_thread(f->h, reads);
+                if (c == EC_CERT_ACTIVE) {
+                    active = true;
+                    continue;
+                }
+                qatomic_inc(&ec_certs[c]);
+                if (c == EC_CERT_FAILED) {
+                    ec_freeze_failed(f->tid, STATUS_UNSUCCESSFUL, 0x800);
+                    NtClose(f->h);
+                } else {
+                    g_array_append_val(frozen, *f);
+                    ec_exit_frozen++;
+                    fresh = true;
+                }
+                f->h = NULL;
+            }
+            if (!active) {
+                break;
+            }
+            if (get_clock() > until) {
+                for (guint i = 0; i < pending->len; i++) {
+                    EcFrozen *f = &g_array_index(pending, EcFrozen, i);
+
+                    if (f->h) {
+                        qatomic_inc(&ec_certs[EC_CERT_ACTIVE]);
+                        ec_freeze_failed(f->tid, STATUS_TIMEOUT, 0x1000);
+                        NtClose(f->h);
+                        f->h = NULL;
+                    }
+                }
+                break;
+            }
+            if (!released) {
+                for (guint i = 0; i < pending->len; i++) {
+                    EcFrozen *f = &g_array_index(pending, EcFrozen, i);
+
+                    if (f->h && f->suspended) {
+                        NtResumeThread(f->h, NULL);
+                        f->suspended = false;
+                    }
+                }
+                released = true;
+            }
+            /* Not a timed wait: Windows' timer would make it 15.6 ms. */
+            NtYieldExecution();
+        }
+        g_array_set_size(pending, 0);
+        if (get_clock() > deadline) {
+            ec_exit_outcome |= EC_EXIT_BUDGET;
+            return;
+        }
+        if (!fresh) {
+            /*
+             * A pass that found no thread it hadn't certified: every
+             * certificate holds while the gate is closed, as a thread let
+             * run again meets the gate at its next way in.
+             */
+            return;
+        }
+    }
+}
+
+/*
+ * Set for good when a thread was ended unsafely and its gate couldn't be
+ * found to quarantine it: the reaper then reclaims nothing more, as it
+ * can't tell which record that thread may have left in use.
+ */
+static bool ec_reap_held;
+
+/*
+ * Gates whose threads have ended, retired (arm64ec-gate.c): the thread's
+ * record unlinked and handed to the reaper with its TLS block, its frame
+ * and emulator stack likewise, a read taken from it invalidated.  Only
+ * once its handle has signalled: the thread runs nothing more, and a read
+ * it was blocked in has completed or been cancelled with it, though one
+ * Windows doesn't tie to the thread (overlapped, a completion port's) may
+ * still write later.  A quarantined gate keeps its record and frame: its
+ * thread ended unsafely.  On a thread at its only level in the module.
+ */
+static void ec_reap_gates(void)
+{
+    uint32_t cursor = 0;
+    bool quarantined;
+    XtGate *g;
+
+    if (qatomic_read(&ec_reap_held)) {
+        return;
+    }
+    while ((g = xt_gate_retire_next(&cursor, &quarantined))) {
+        HANDLE hr = NULL, hf = NULL;
+        XtThread *t;
+        XtEcFrame *f;
+
+        XT_TP(XT_TP_REAP_PASS, g, quarantined);
+
+        /*
+         * Read after this gate's thread was seen ended: a terminator that
+         * couldn't find its target's gate set the hold before Windows ended
+         * that target, so a pass already running sees it here.
+         */
+        if (qatomic_load_acquire(&ec_reap_held)) {
+            xt_gate_retire_abort(g);
+            return;
+        }
+
+        /* The handles the reaper waits on, before anything is taken. */
+        if (!quarantined &&
+            (XT_TP_FAIL(XT_TPF_DUP_REAP1) ||
+             NtDuplicateObject(GetCurrentProcess(), g->thread,
+                               GetCurrentProcess(), &hr, 0, 0,
+                               DUPLICATE_SAME_ACCESS) < 0 ||
+             XT_TP_FAIL(XT_TPF_DUP_REAP2) ||
+             NtDuplicateObject(GetCurrentProcess(), g->thread,
+                               GetCurrentProcess(), &hf, 0, 0,
+                               DUPLICATE_SAME_ACCESS) < 0)) {
+            if (hr) {
+                NtClose(hr);
+            }
+            xt_gate_retire_abort(g);
+            continue;
+        }
+        for (int i = 0; i < XT_GATE_ROOTS; i++) {
+            XtGateRoot *r = &g->roots[i];
+
+            if (qatomic_load_acquire(&r->state) == XT_ROOT_TAKEN) {
+                xt_invalidate(r->addr, r->len);
+                XT_TP_NOTE(XT_TPN_INVALIDATE, r->addr, r->len, (uintptr_t)g);
+                XT_TP(XT_TP_RETIRE_INVALIDATED, g, i);
+                qatomic_store_release(&r->state, XT_ROOT_FREE);
+            }
+        }
+        t = quarantined ? NULL : qatomic_xchg((XtThread **)&g->rec, NULL);
+        f = quarantined ? NULL : qatomic_xchg((XtEcFrame **)&g->frame, NULL);
+        if (t) {
+            if (f) {
+                qatomic_set(&f->env, NULL);
+            }
+            ec_unregister(t);
+            xt_thread_retire(t, hr);
+            hr = NULL;
+        }
+        if (f) {
+            xt_reap_later(hf, f);
+            hf = NULL;
+        }
+        if (hr) {
+            NtClose(hr);
+        }
+        if (hf) {
+            NtClose(hf);
+        }
+        xt_gate_mark_retired(g);
+    }
+}
+
+/*
+ * The calling thread's own end, at its only level: its record goes now,
+ * its frame and emulator stack once the thread has ended (the reaper), and
+ * its thread-affine cleanup runs here.
+ */
+static void ec_term_self(XtGate *g)
+{
+    XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+    HANDLE stack_ref = NULL;
+    XtEcFrame *f;
+    XtThread *t;
+    bool began;
+
+    began = xt_adapter_begin();
+    if (!area || !qatomic_read(&area->EmulatorData[0]) ||
+        XT_TP_FAIL(XT_TPF_DUP_SELF) ||
+        NtDuplicateObject(GetCurrentProcess(), GetCurrentThread(),
+                          GetCurrentProcess(), &stack_ref, 0, 0,
+                          DUPLICATE_SAME_ACCESS) < 0) {
         goto out;
     }
     t = qatomic_xchg(&area->EmulatorData[0], NULL);
+    qatomic_set((XtThread **)&g->rec, NULL);
     if (!t) {
-        /* Its own end, or another termination, took it first. */
-        if (!self) {
-            NtResumeThread(h, NULL);
-        }
         goto out;
     }
-    /*
-     * Before the CPU state goes: the thread is this one, or stopped, so no
-     * entry is storing into it.
-     */
-    qatomic_set(&((XtEcFrame *)area->EmulatorData[1])->env, NULL);
+    f = area->EmulatorData[1];
+    qatomic_set((XtEcFrame **)&g->frame, NULL);
+    /* Before the CPU state goes: no entry of this thread's is storing. */
+    qatomic_set(&f->env, NULL);
     ec_unregister(t);
-    xt_reap_later(stack_ref, area->EmulatorData[1]);
+    xt_reap_later(stack_ref, f);
     stack_ref = NULL;
-    if (self) {
-        xt_thread_free(t);
-        xt_crt_thread_fini();
-    } else {
-        xt_thread_retire(t, rec_ref);
-        rec_ref = NULL;
-    }
+    xt_thread_free(t);
+    xt_crt_thread_fini();
 out:
     if (stack_ref) {
         NtClose(stack_ref);
     }
-    if (rec_ref) {
-        NtClose(rec_ref);
+    xt_adapter_end(began);
+}
+
+/* An unsafe termination counted, where logging it could take a lock. */
+static void ec_unsafe_term_quiet(void)
+{
+    qatomic_inc(&ec_unsafe_terms);
+    XT_TP_NOTE(XT_TPN_UNSAFE, 0, 0, 1);
+}
+
+/*
+ * Another thread's end, through OWN (TID): its gate closed, found by its
+ * identity (one made closed if it has none yet, which it adopts at its
+ * first call), every processor's writes flushed, so that from here its
+ * entries park.  Then, at the caller's own level (admitted), it is
+ * suspended and the doorbells rung, to bring it out of the engine sooner.
+ * If the caller's level is its only one, it is popped (*POPPED) before the
+ * wait: the caller holds nothing while it waits, and anyone may certify
+ * it meanwhile, so two threads ending each other don't wait on each other.
+ * The thread is certified from its gate as the process's end does (a read
+ * it is in is taken, its range left on its root for the reaper), let go
+ * to finish while it is still inside the module, for up to
+ * EC_STOP_ACTIVE_MS.  Certified, it is let run again (its closure keeps it
+ * out of the engine) and Windows ends it; its record goes with the reaper
+ * once it has.  Not certified, or one of the engine's internal threads
+ * (whose work no level counts), it is quarantined and counted; Windows ends
+ * it all the same.  A thread whose gate can't be found holds the reaper
+ * for good.
+ */
+static void ec_term_other(HANDLE own, DWORD tid, XtGate *me, uint32_t level,
+                          bool *popped)
+{
+    int64_t until;
+    bool suspended, released = false;
+    NTSTATUS st;
+    XtGate *g = xt_gate_for(own, true, &st);
+    EcCert c;
+
+    if (!g) {
+        if (st < 0 && !ec_thread_dead(own, 0)) {
+            qatomic_store_release(&ec_reap_held, true);
+            XT_TP_NOTE(XT_TPN_REAP_HELD, tid, 0, 0);
+            ec_unsafe_term(tid, st);
+        }
+        return;
     }
-    if (own) {
-        /* A suspension outlives the handle: Windows ends the thread. */
+    XT_TP(XT_TP_TERM_CLOSED, g, tid);
+    if (qatomic_read(&g->internal) || ec_is_internal(tid)) {
+        /* Its creator registers it before it runs: startup included. */
+        xt_gate_quarantine(g);
+        ec_unsafe_term(tid, STATUS_UNSUCCESSFUL);
+        return;
+    }
+    if (XT_TP_FAIL(XT_TPF_FLUSH_TERM) || ec_flush_write_buffers() < 0) {
+        xt_gate_quarantine(g);
+        ec_unsafe_term(tid, STATUS_UNSUCCESSFUL);
+        return;
+    }
+    suspended = !XT_TP_FAIL(XT_TPF_SUSPEND_TERM) &&
+                NtSuspendThread(own, NULL) >= 0;
+    XT_TP(XT_TP_TERM_SUSPENDED, g, suspended);
+    if (qatomic_load_acquire(&engine_state) == 2) {
+        ec_ring_doorbells();
+    }
+    if ((level & ~XT_ADM_ATTEMPT) == 1) {
+        xt_adm_exit(me);
+        *popped = true;
+    }
+    until = get_clock() + (int64_t)EC_STOP_ACTIVE_MS * SCALE_MS;
+    for (;;) {
+        c = ec_thread_ending(own) ? ec_cert_ended(own, g) : ec_certify(g, NULL);
+        XT_TP(XT_TP_TERM_CERT, g, c);
+        if (c != EC_CERT_ACTIVE || get_clock() > until) {
+            break;
+        }
+        if (suspended && !released) {
+            NtResumeThread(own, NULL);
+            released = true;
+        }
+        NtYieldExecution();
+    }
+    if (suspended && !released) {
+        NtResumeThread(own, NULL);
+    }
+    if (c == EC_CERT_ACTIVE || c == EC_CERT_FAILED) {
+        xt_gate_quarantine(g);
+        if (*popped) {
+            ec_unsafe_term_quiet();
+        } else {
+            ec_unsafe_term(tid, STATUS_UNSUCCESSFUL);
+        }
+    }
+}
+
+/* Gates of threads already ended retired, and the reaper's other work. */
+static void ec_reap_all(void)
+{
+    bool began;
+
+    xt_enter();
+    began = xt_adapter_begin();
+    xt_reap();
+    ec_reap_gates();
+    xt_adapter_end(began);
+}
+
+/*
+ * A thread's end, by itself or by another thread (THREAD), before Windows
+ * terminates it, at the caller's LEVEL on its gate ME.  Windows calls
+ * this before it checks THREAD's access, and ends nothing through a real
+ * handle without THREAD_TERMINATE: such a call changes nothing here.
+ *
+ * - The caller's own end (NULL, its pseudo-handle, or a handle to the same
+ *   object as its gate's), told apart without the record lists: nested
+ *   inside the engine's own work (an outer level), or on an internal
+ *   thread, it is quarantined and counted, as it would end holding what
+ *   that work holds and the lists' upkeep could wait on it; at its only
+ *   level, the reaper's work, then ec_term_self.
+ * - Another thread is found through its record's own handle
+ *   (xt_terminated_thread) at the caller's only level, else among the
+ *   process's threads (ec_open_thread), which takes no lock of the
+ *   engine's, and ended as ec_term_other has it, before the engine is up
+ *   too: a thread can enter it before Windows ends it.  One that can't be
+ *   found holds the reaper.
+ */
+static NTSTATUS ec_thread_term(HANDLE thread, LONG code, XtGate *me,
+                               uint32_t level, bool *popped)
+{
+    PUBLIC_OBJECT_BASIC_INFORMATION obi;
+    bool nested = (level & ~XT_ADM_ATTEMPT) > 1;
+    int state = qatomic_load_acquire(&engine_state);
+    bool not_ours = false;
+    HANDLE own = NULL;
+    void *teb = NULL;
+    DWORD tid = 0;
+
+    XT_TP_NOTE(XT_TPN_THREAD_TERM, (uintptr_t)thread, level, 0);
+    if (thread && thread != GetCurrentThread() &&
+        (NtQueryObject(thread, ObjectBasicInformation, &obi, sizeof(obi),
+                       NULL) < 0 ||
+         !(obi.GrantedAccess & THREAD_TERMINATE)) &&
+        !XT_TP_FAIL(XT_TPF_TERMACCESS)) {
+        return STATUS_SUCCESS;
+    }
+    if (!thread || thread == GetCurrentThread() ||
+        (me->thread && NtCompareObjects(thread, me->thread) == 0)) {
+        goto self;
+    }
+    if (state == 2 && !nested) {
+        ec_reap_all();
+        tid = xt_terminated_thread(thread, &teb, &own);
+    }
+    if (!own) {
+        own = ec_open_thread(thread, &not_ours);
+        if (!own) {
+            if (!not_ours) {
+                qatomic_store_release(&ec_reap_held, true);
+                XT_TP_NOTE(XT_TPN_REAP_HELD, 0, 0, 0);
+                ec_unsafe_term(0, STATUS_UNSUCCESSFUL);
+            }
+            return STATUS_SUCCESS;
+        }
+        tid = ec_thread_id(own);
+    }
+    if (tid == GetCurrentThreadId()) {
         NtClose(own);
+        goto self;
+    }
+    ec_term_other(own, tid, me, level, popped);
+    /* A suspension, if any is left, outlives the handle. */
+    NtClose(own);
+    return STATUS_SUCCESS;
+
+self:
+    XT_TP(XT_TP_TERM_SELF, me, level);
+    /* The live word, not the level returned: a leak may sit above it. */
+    if (nested || qatomic_read(&me->internal) || !xt_adm_alone(me)) {
+        xt_gate_quarantine(me);
+        ec_unsafe_term_quiet();
+    } else if (state == 2) {
+        ec_reap_all();
+        ec_term_self(me);
     }
     return STATUS_SUCCESS;
+}
+
+/* Until EC_PARK_MS: every registered thread parked, or call_rcu's worker. */
+static bool ec_wait_parked(void)
+{
+    int64_t deadline = get_clock() + (int64_t)EC_PARK_MS * SCALE_MS;
+    int n;
+    const XtInternal *r = xt_internal_threads(&n);
+
+    for (int i = 0; i < n; i++) {
+        for (;;) {
+            uint32_t state = qatomic_load_acquire(&r[i].state);
+            DWORD tid = qatomic_read(&r[i].tid);
+            int rcu_tid, sampler_tid;
+            bool sampler_parked = translator_region_sampler_parked(
+                &sampler_tid);
+
+            rcu_worker_resting(&rcu_tid);
+            if (state == XT_INTERNAL_FREE || state == XT_INTERNAL_PARKED ||
+                (tid && tid == (DWORD)rcu_tid) ||
+                (tid && tid == (DWORD)sampler_tid && sampler_parked)) {
+                break;
+            }
+            if (get_clock() > deadline) {
+                return false;
+            }
+            NtYieldExecution();
+        }
+    }
+    return true;
+}
+
+/* Until EC_PARK_MS: call_rcu's worker waiting, with nothing counted. */
+static bool ec_wait_rcu_rest(void)
+{
+    int64_t deadline = get_clock() + (int64_t)EC_PARK_MS * SCALE_MS;
+    int tid;
+
+    while (!rcu_worker_resting(&tid)) {
+        if (get_clock() > deadline) {
+            return false;
+        }
+        NtYieldExecution();
+    }
+    return true;
+}
+
+/*
+ * Every translation goes, as one flush: on this thread's CPU, exclusively
+ * of the others, which are stopped outside the engine.  The flush walks
+ * every CPU, so it is only for an end whose steps all went well: after a
+ * failure (a thread ended without a stop may have left its CPU behind), or
+ * on a thread with no CPU (one that never ran x64 code ends the process),
+ * they are dropped range by range instead, which costs more.
+ */
+static void ec_exit_flush(void)
+{
+    XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+    XtThread *t = area ? area->EmulatorData[0] : NULL;
+    CPUState *prev = current_cpu;
+
+    if (!t || ec_exit_outcome) {
+        xt_invalidate(0, (vaddr)guest_addr_max + 1);
+        return;
+    }
+    current_cpu = t->cpu;
+    start_exclusive();
+    tb_flush__exclusive_or_serial();
+    end_exclusive();
+    current_cpu = prev;
+}
+
+/*
+ * NS in milliseconds, its whole part and tenths, rounded half up: the
+ * exit's report formats integers only, which neither allocates nor locks
+ * (a float's conversion does both), as a thread that died inside the
+ * module may hold either.
+ */
+static uint64_t ec_ms_whole(int64_t ns)
+{
+    return (uint64_t)(ns + 50000) / 1000000;
+}
+
+static uint32_t ec_ms_tenth(int64_t ns)
+{
+    return (uint32_t)((uint64_t)(ns + 50000) / 100000 % 10);
+}
+
+static void ec_exit_line(char *line, size_t size)
+{
+    int n = snprintf(line, size, "exit: outcome 0x%x, %u threads stopped "
+                     "(%u again), %u passes, %u unsafe terminations, "
+                     "%llu.%u ms (freeze %llu.%u, parks %llu.%u, flush "
+                     "%llu.%u), first stop failure 0x%lx why 0x%x; "
+                     "certified idle %u parked %u taken %u new %u ending %u, "
+                     "failed %u, still active %u; died inside %u, "
+                     "mid-operation %u\n",
+                     ec_exit_outcome & ~EC_EXIT_DONE, ec_exit_frozen,
+                     ec_exit_refrozen, ec_exit_passes,
+                     qatomic_read(&ec_unsafe_terms),
+                     (unsigned long long)ec_ms_whole(ec_exit_ns),
+                     ec_ms_tenth(ec_exit_ns),
+                     (unsigned long long)ec_ms_whole(ec_exit_phase[0]),
+                     ec_ms_tenth(ec_exit_phase[0]),
+                     (unsigned long long)ec_ms_whole(ec_exit_phase[1]),
+                     ec_ms_tenth(ec_exit_phase[1]),
+                     (unsigned long long)ec_ms_whole(ec_exit_phase[2]),
+                     ec_ms_tenth(ec_exit_phase[2]),
+                     (unsigned long)ec_exit_first_fail, ec_exit_first_why,
+                     ec_certs[EC_CERT_IDLE], ec_certs[EC_CERT_PARKED],
+                     ec_certs[EC_CERT_TAKEN], ec_certs[EC_CERT_NEW],
+                     ec_certs[EC_CERT_ENDING], ec_certs[EC_CERT_FAILED],
+                     ec_certs[EC_CERT_ACTIVE], qatomic_read(&ec_died_owned),
+                     qatomic_read(&ec_died_unfinished));
+
+    if (xt_lock_check && n > 0 && (size_t)n < size) {
+        n += snprintf(line + n, size - n, "lockcheck: %u acquisitions "
+                      "outside protection, the first from %p (module %p)\n",
+                      qatomic_read(&lock_misses),
+                      qatomic_read(&lock_miss_caller), &__ImageBase);
+    }
+    if (xt_gate_check && n > 0 && (size_t)n < size) {
+        xt_gate_report(line + n, size - n);
+    }
+}
+
+/* Testing: where the counts are, for the test points' controller. */
+static void ec_tp_publish(void)
+{
+    xt_gate_tp_publish();
+    xt_record_tp_publish();
+    xt_tp_publish(XT_TPA_UNSAFE, &ec_unsafe_terms);
+    xt_tp_publish(XT_TPA_REAP_HELD, &ec_reap_held);
+    xt_tp_publish(XT_TPA_CERTS, ec_certs);
+    xt_tp_publish(XT_TPA_EXIT_OUTCOME, &ec_exit_outcome);
+    xt_tp_publish(XT_TPA_ENGINE_STATE, &engine_state);
+}
+
+static void ec_exit_begin(void)
+{
+    DWORD me = GetCurrentThreadId();
+    XtGate *g = xt_gate_self();
+    XtGate *owner = qatomic_cmpxchg(&xt_gate_closed_by, NULL, g);
+    GArray *frozen, *reads;
+    int64_t t0 = get_clock();
+    char line[1024];
+    bool began;
+
+    if (owner == g) {
+        return;
+    }
+    if (owner) {
+        /*
+         * Another thread is ending the process and has closed the gate:
+         * this thread parks for good in one terminal transition, parked
+         * if this call's level is all it has (certified with the rest),
+         * poisoned if it holds an outer level (a failed stop).
+         */
+        xt_adm_park_terminal(g);
+    }
+    /*
+     * The gate closed (the swap above, which also elected this thread),
+     * then every processor's writes flushed: from here a thread's entry
+     * either sees the gate closed, or its level is visible to ec_freeze.
+     */
+    XT_TP(XT_TP_EXIT_ELECTED, g, 0);
+    if (XT_TP_FAIL(XT_TPF_FLUSH_PROCESS) || ec_flush_write_buffers() < 0) {
+        ec_exit_outcome |= EC_EXIT_FLUSH;
+    }
+    began = xt_adapter_begin();
+    frozen = g_array_sized_new(FALSE, FALSE, sizeof(EcFrozen), 32);
+    reads = g_array_sized_new(FALSE, FALSE, sizeof(EcRead), 8);
+    xt_internal_stop();
+    qatomic_set(&watcher_fast, true);
+    xt_internal_alert();
+    ec_freeze(me, frozen, reads);
+    ec_exit_phase[0] = get_clock() - t0;
+    if (qatomic_read(&ec_unsafe_terms)) {
+        ec_exit_outcome |= EC_EXIT_UNSAFE;
+    }
+    qatomic_set(&watcher_stop, true);
+    translator_region_sampler_park();
+    xt_internal_alert();
+    if (!ec_wait_parked()) {
+        ec_exit_outcome |= EC_EXIT_HELPER;
+    }
+    ec_exit_phase[1] = get_clock() - t0;
+    /*
+     * The rest relies on every other thread being out of the engine, and on
+     * this one holding only this call's level (read live: an interruption
+     * may have left one above it): after a failure none of it runs (a
+     * failed thread may hold what it needs).
+     */
+    XT_TP(XT_TP_EXIT_SELF, g, 0);
+    if (!xt_adm_alone(g)) {
+        ec_exit_outcome |= EC_EXIT_SELF;
+    }
+    /*
+     * Threads that died unannounced, which the freeze may not list: only
+     * with every other thread certified out (the outcome still 0), when
+     * no gate is being retired and no gate's handle closed.
+     */
+    if (!ec_exit_outcome) {
+        uint32_t owned = 0, unfinished = 0;
+
+        xt_gate_find_deaths(&owned, &unfinished);
+        qatomic_add(&ec_died_owned, owned);
+        qatomic_add(&ec_died_unfinished, unfinished);
+    }
+    if (qatomic_read(&ec_died_owned) || qatomic_read(&ec_died_unfinished)) {
+        ec_exit_outcome |= EC_EXIT_DIED;
+    }
+    if (!ec_exit_outcome && qatomic_load_acquire(&engine_state) == 2) {
+        xt_enter();
+        for (guint i = 0; i < reads->len; i++) {
+            EcRead *r = &g_array_index(reads, EcRead, i);
+
+            xt_invalidate(r->addr, r->len);
+            XT_TP_NOTE(XT_TPN_INVALIDATE, r->addr, r->len, 0);
+        }
+        /* A flush's notification may be what a stopped thread missed. */
+        ec_exit_flush();
+    }
+    ec_exit_phase[2] = get_clock() - t0;
+    if (!ec_exit_outcome) {
+        drain_call_rcu();
+        if (!ec_wait_rcu_rest()) {
+            ec_exit_outcome |= EC_EXIT_RCU;
+        }
+    }
+    ec_exit_ns = get_clock() - t0;
+    XT_TP_NOTE(XT_TPN_EXIT, ec_exit_outcome, ec_exit_frozen,
+               qatomic_read(&ec_unsafe_terms));
+    ec_exit_line(line, sizeof(line));
+    xt_log_text(line);
+    qatomic_store_release(&ec_exit_outcome, ec_exit_outcome | EC_EXIT_DONE);
+    if ((ec_exit_outcome & ~EC_EXIT_DONE) && xt_exit_strict) {
+        NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
+    }
+    xt_adapter_end(began);
+}
+
+/*
+ * Windows' calls at the process's end, on the exiting thread: (NULL,
+ * before), with the other threads still running; (NULL, after), once it
+ * has ended them; then (the process, before).  What writes to the
+ * standard streams runs before the first call's freeze (ec_exit_begin),
+ * or, for testing (exitreport), at the last, the other threads gone.
+ */
+static void ec_process_term(HANDLE h, BOOL after, NTSTATUS status)
+{
+    if (!h && !after) {
+        xt_ec_stub_inject_report();
+        if (xt_rcu_stress) {
+            char line[64];
+
+            snprintf(line, sizeof(line), "rcustress: %llu grace periods\n",
+                     (unsigned long long)qatomic_read(&rcu_stress_done));
+            fputs(line, stderr);
+            xt_log_text(line);
+        }
+        /* A failed bring-up (state below 0) has no engine to keep. */
+        if (qatomic_load_acquire(&engine_state) > 0) {
+            ec_exit_begin();
+        }
+    }
+    if (h && !after && xt_exit_report &&
+        (qatomic_load_acquire(&ec_exit_outcome) & EC_EXIT_DONE) &&
+        qatomic_read(&xt_gate_closed_by) == xt_gate_self()) {
+        char line[1024];
+
+        ec_exit_line(line, sizeof(line));
+        fputs(line, stderr);
+    }
 }
 
 /*
@@ -776,19 +1850,59 @@ static bool note_ready(void)
  *   page gets its write permission back and the store is retried.
  * Anything else goes on to the dispatch.
  */
+/*
+ * A continuation of this exception that leaves its level: popped first (an
+ * outer level, the engine's own work it interrupted, stays), and a
+ * continuation that fails ends the process rather than go on with the
+ * level gone.
+ */
+static G_NORETURN void ec_continue_level(XtGate *g, ARM64_NT_CONTEXT *native)
+{
+    if (g) {
+        xt_adm_exit(g);
+    }
+    if (!XT_TP_FAIL(XT_TPF_CONTINUE)) {
+        xt_continue_native(native);
+    }
+    NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
+    __builtin_unreachable();
+}
+
 XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
                                          ARM64_NT_CONTEXT *native)
 {
     XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
-    XtThread *t = area ? area->EmulatorData[0] : NULL;
+    uint32_t level;
+    XtThread *t;
+    XtGate *g;
 
-    /* The engine's start-up probe of crossing accesses (xt_cross_probe). */
-    if (xt_cross_probe_take(er->ExceptionCode, &native->Pc)) {
-        xt_continue_native(native);
+    /*
+     * The exit stub's trap at a rung doorbell (arm64ec.S), redirected to
+     * its resume point, where the suspension completes: the stub has
+     * popped its level already, and this touches only the thread's own
+     * frame and doorbell.
+     */
+    if (native->Pc == (uintptr_t)xt_ec_exit_suspend_point) {
+        ((XtEcFrame *)area->EmulatorData[1])->inj_armed = 1;
+        qatomic_set(area->SuspendDoorbell, 0);
+        native->Pc = (uintptr_t)xt_ec_exit_resume_point;
+        ec_continue_level(NULL, native);
     }
-    if (xt_ec_probe_rtcs(er, guest, native)) {
-        xt_continue_native(native);
+    /* The start-up probes (xt_cross_probe), before any gate can close. */
+    if (xt_cross_probe_take(er->ExceptionCode, &native->Pc) ||
+        xt_ec_probe_rtcs(er, guest, native)) {
+        ec_continue_level(NULL, native);
     }
+    g = xt_gate_self();
+    level = xt_adm_enter(g);
+    /* Testing: the test points' fault action, a nested entry, continued. */
+    if (unlikely(xt_tp_block) && native->Pc == (uintptr_t)xt_tp_fault_pc) {
+        XT_TP_NOTE(XT_TPN_FAULT, 1, level, qatomic_read(&g->adm));
+        XT_TP(XT_TP_FAULT_NESTED, g, level);
+        native->Pc += 4;
+        ec_continue_level(g, native);
+    }
+    t = area ? area->EmulatorData[0] : NULL;
     /* The module's int3, past the debugger: at the int3 for the dispatch. */
     if (t && t->int3_rip && er->ExceptionCode == STATUS_BREAKPOINT &&
         native->Pc == t->int3_rip) {
@@ -797,12 +1911,6 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
             guest->Rip--;
         }
         t->int3_rip = 0;
-    }
-    if (native->Pc == (uintptr_t)xt_ec_exit_suspend_point) {
-        ((XtEcFrame *)area->EmulatorData[1])->inj_armed = 1;
-        qatomic_set(area->SuspendDoorbell, 0);
-        native->Pc = (uintptr_t)xt_ec_exit_resume_point;
-        xt_continue_native(native);
     }
     /*
      * Generated code's return stack push or pop ran into its ring's guard
@@ -819,7 +1927,7 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
 
         if (top) {
             native->X[tcg_retstack_reg] = top;
-            xt_continue_native(native);
+            ec_continue_level(g, native);
         }
     }
     if (t && t == xt_self && t->state != XT_WINDOWS) {
@@ -830,7 +1938,7 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
         handled = xt_fault_redirect(er, native);
         area->InSyscallCallback = prev;
         if (handled) {
-            xt_continue_native(native);
+            ec_continue_level(g, native);
         }
         /* An exception in the engine it doesn't recover: logged. */
         xt_event(t, XT_EV_FAULT, (uint64_t)t->fault.busy << 32 | t->active,
@@ -841,9 +1949,32 @@ XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
                er->NumberParameters >= 2 && er->ExceptionInformation[0] == 1 &&
                note_ready() &&
                xt_unprotect_for_native(er->ExceptionInformation[1])) {
-        xt_continue_native(native);
+        ec_continue_level(g, native);
     }
+    xt_adm_exit(g);
     return STATUS_SUCCESS;
+}
+
+/*
+ * Testing (lockcheck): the mmap lock taken where a stop of this thread
+ * would not wait for its release: outside simulation (InSimulation, or the
+ * emulator stack, which BeginSimulation's C runs on before it sets the
+ * flag), outside an adapter scope, and not on one of the engine's own
+ * threads.  The process's end relies on there being none.
+ */
+void xt_lock_checked(void *caller)
+{
+    XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+    uintptr_t sp = (uintptr_t)__builtin_frame_address(0);
+
+    if (xt_internal_self || !area || area->InSimulation ||
+        area->InSyscallCallback ||
+        (sp >= area->EmulatorStackLimit && sp < area->EmulatorStackBase)) {
+        return;
+    }
+    if (qatomic_fetch_inc(&lock_misses) == 0) {
+        qatomic_set(&lock_miss_caller, caller);
+    }
 }
 
 /*
@@ -868,32 +1999,33 @@ void xt_adapter_end(bool began)
     }
 }
 
-XTEXPORT void NotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type, ULONG prot,
-                                BOOL after, NTSTATUS status)
+static void ec_notify_memory_alloc(void *addr, SIZE_T len, ULONG type,
+                                   ULONG prot, BOOL after, NTSTATUS status)
 {
     if (note_ready()) {
         xt_note_alloc(addr, len, type, prot, after, status);
     }
 }
 
-XTEXPORT void NotifyMemoryFree(void *addr, SIZE_T len, ULONG type, BOOL after,
-                               NTSTATUS status)
+static void ec_notify_memory_free(void *addr, SIZE_T len, ULONG type,
+                                  BOOL after, NTSTATUS status)
 {
     if (note_ready()) {
         xt_note_free(addr, len, type, after, status);
     }
 }
 
-XTEXPORT void NotifyMemoryProtect(void *addr, SIZE_T len, ULONG prot,
-                                  BOOL after, NTSTATUS status)
+static void ec_notify_memory_protect(void *addr, SIZE_T len, ULONG prot,
+                                     BOOL after, NTSTATUS status)
 {
     if (note_ready()) {
         xt_note_protect(addr, len, prot, after, status);
     }
 }
 
-XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
-                                         SIZE_T len, ULONG type, ULONG prot)
+static NTSTATUS ec_notify_map_view_of_section(void *unk1, void *addr,
+                                              void *unk2, SIZE_T len,
+                                              ULONG type, ULONG prot)
 {
     if (note_ready()) {
         xt_note_map(addr, len, prot);
@@ -901,36 +2033,37 @@ XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
     return STATUS_SUCCESS;
 }
 
-XTEXPORT void NotifyUnmapViewOfSection(void *addr, BOOL after, NTSTATUS status)
+static void ec_notify_unmap_view_of_section(void *addr, BOOL after,
+                                            NTSTATUS status)
 {
     if (note_ready()) {
         xt_note_unmap(addr, after);
     }
 }
 
-XTEXPORT void FlushInstructionCacheHeavy(const void *addr, SIZE_T len)
+static void ec_flush_instruction_cache_heavy(const void *addr, SIZE_T len)
 {
     if (note_ready()) {
         xt_note_flush(addr, len);
     }
 }
 
-XTEXPORT void BTCpu64FlushInstructionCache(const void *addr, SIZE_T len)
+static void ec_btcpu64_flush_instruction_cache(const void *addr, SIZE_T len)
 {
     if (note_ready()) {
         xt_note_flush(addr, len);
     }
 }
 
-XTEXPORT void BTCpu64NotifyMemoryDirty(void *addr, SIZE_T len)
+static void ec_btcpu64_notify_memory_dirty(void *addr, SIZE_T len)
 {
     if (note_ready()) {
         xt_note_flush(addr, len);
     }
 }
 
-XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
-                                    BOOL after, NTSTATUS status)
+static void ec_btcpu64_notify_read_file(HANDLE h, void *addr, SIZE_T len,
+                                        BOOL after, NTSTATUS status)
 {
     if (note_ready()) {
         xt_note_read_file(addr, len, after, status);
@@ -943,12 +2076,12 @@ XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
  * until the first entry makes a CPU.  The processor information needs
  * that CPU.
  */
-XTEXPORT BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT feature)
+static BOOLEAN ec_btcpu64_is_processor_feature_present(UINT feature)
 {
     return xt_feature_present(feature);
 }
 
-XTEXPORT void UpdateProcessorInformation(void *info)
+static void ec_update_processor_information(void *info)
 {
     if (qatomic_load_acquire(&engine_state) == 2) {
         xt_processor_info(info, PROCESSOR_ARCHITECTURE_AMD64);
@@ -969,26 +2102,53 @@ NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
 static XtThread *ec_threads[XT_EC_MAX_THREADS];
 static int ec_nthreads;
 
+/*
+ * The watcher's round: each engine thread whose doorbell Windows rang is
+ * asked to stop.  Also the process's end's, right after it has asked
+ * Windows to suspend every thread, so as not to wait for the watcher's
+ * next tick.
+ */
+static void ec_ring_doorbells(void)
+{
+    int n = MIN(qatomic_read(&ec_nthreads), XT_EC_MAX_THREADS);
+
+    xt_record_hold();
+    for (int i = 0; i < n; i++) {
+        XtThread *t = qatomic_read(&ec_threads[i]);
+
+        if (t && qatomic_read(&t->state) == XT_ENGINE &&
+            qatomic_read(t->ec_doorbell) &&
+            !qatomic_read(&t->suspend_req)) {
+            qatomic_set(&t->suspend_req, 1);
+            cpu_exit(t->cpu);
+        }
+    }
+    xt_record_release();
+}
+
 static unsigned __stdcall doorbell_watcher(void *arg)
 {
     LARGE_INTEGER tick = { .QuadPart = -10000 };
 
     for (;;) {
-        int n = MIN(qatomic_read(&ec_nthreads), XT_EC_MAX_THREADS);
-
-        NtDelayExecution(FALSE, &tick);
-        xt_record_hold();
-        for (int i = 0; i < n; i++) {
-            XtThread *t = qatomic_read(&ec_threads[i]);
-
-            if (t && qatomic_read(&t->state) == XT_ENGINE &&
-                qatomic_read(t->ec_doorbell) &&
-                !qatomic_read(&t->suspend_req)) {
-                qatomic_set(&t->suspend_req, 1);
-                cpu_exit(t->cpu);
-            }
+        /*
+         * The process's end needs it to stop the other threads, so it
+         * stops on its own request, last; here it holds nothing.
+         */
+        if (qatomic_read(&watcher_stop)) {
+            xt_internal_park();
         }
-        xt_record_release();
+        /*
+         * While the process's end stops threads, Windows rings their
+         * doorbells as it waits for them: looked at without the timer's
+         * 15.6 ms granularity.
+         */
+        if (qatomic_read(&watcher_fast)) {
+            NtYieldExecution();
+        } else {
+            NtDelayExecution(TRUE, &tick);
+        }
+        ec_ring_doorbells();
     }
     return 0;
 }
@@ -1127,6 +2287,8 @@ static G_NORETURN void leave_syscall(XtThread *t)
     }
     k.rec.ExceptionCode = STATUS_EMULATION_SYSCALL;
     xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
+    /* K is ntdll's from here: the engine's last access is behind. */
+    xt_adm_exit(xt_gate_self());
     xt_ec_jump_set_stack(ki_exception_dispatcher, (uintptr_t)&k);
 }
 
@@ -1177,6 +2339,7 @@ static G_NORETURN void leave_exception(XtThread *t, XtExit *x)
     t->int3_rip = x->vector == EXCP03_INT3 ? t->env->eip : 0;
     leave(t, &n, true);
     xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
+    xt_adm_exit(xt_gate_self());
     xt_syscall((uintptr_t)r, (uintptr_t)&n, first, 0, 0, 0, nr_raise);
     NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
     __builtin_unreachable();
@@ -1196,6 +2359,7 @@ static G_NORETURN void leave_suspend(XtThread *t, XtEcFrame *f)
     f->inj_armed = 1;
     t->ec_suspended = true;
     xt_cpu_area(NtCurrentTeb())->InSimulation = 0;
+    xt_adm_exit(xt_gate_self());
     xt_ec_continue_kept(&n, nr_continue);
     NtTerminateProcess(GetCurrentProcess(), STATUS_ASSERTION_FAILURE);
     __builtin_unreachable();
@@ -1240,8 +2404,12 @@ static __attribute__((noinline)) XtThread *ec_thread_first(void)
     XtThread *t = enter_engine();
 
     if (!t) {
+        int s = qatomic_read(&engine_state);
+
+        /* The log's status only once process_init failed opening it. */
         NtTerminateProcess(GetCurrentProcess(),
-                           !xt_log_handle() && xt_log_status < 0 ?
+                           s == -2 ? STATUS_THREAD_IS_TERMINATING :
+                           s == -1 && !xt_log_handle() && xt_log_status < 0 ?
                            xt_log_status : STATUS_NOT_SUPPORTED);
     }
     return t;
@@ -1698,7 +2866,7 @@ static void from_ec_view(const ARM64EC_NT_CONTEXT *ec, ARM64_NT_CONTEXT *n)
     n->Cpsr = (f & 0x80 ? 1u << 31 : 0) | (f & 0x40 ? 1u << 30 : 0) |
               (f & 0x01 ? 1u << 29 : 0) | (f & 0x800 ? 1u << 28 : 0);
     memcpy(n->V, ec->V, sizeof(ec->V));
-    {
+{
         uint64_t fpcr, fpsr;
 
         asm volatile("mrs %0, fpcr" : "=r"(fpcr));
@@ -1915,4 +3083,208 @@ XTEXPORT void xt_ec_test_syscalls(int64_t nr[4], uint32_t *lut_size)
 XTEXPORT uint32_t xt_ec_test_reached(void)
 {
     return reached;
+}
+
+/*
+ * A notification's halves (arm64ec-gate.c): the first, entered as an
+ * attempt (not as a callback of the engine's own work), leaves its
+ * operation on the gate for the second, which claims it as it enters, and
+ * releases it once its work is done.
+ */
+static uint32_t ec_half_enter(XtGate *g, BOOL after, uint32_t kind,
+                              const void *addr, SIZE_T len, int *claimed)
+{
+    if (after) {
+        *claimed = xt_adm_enter_claim(g, kind, (uintptr_t)addr, len);
+        return 0;
+    }
+    *claimed = -1;
+    return xt_adm_enter(g);
+}
+
+static void ec_half_exit(XtGate *g, uint32_t level, int claimed,
+                         uint32_t kind, const void *addr, SIZE_T len)
+{
+    if (level & XT_ADM_ATTEMPT) {
+        xt_root_push(g, kind, (uintptr_t)addr, len);
+    }
+    if (claimed >= 0) {
+        xt_root_release(g, claimed);
+    }
+    xt_adm_exit(g);
+    if (level & XT_ADM_ATTEMPT) {
+        XT_TP(XT_TP_HALF_EXITED, g, kind);
+    }
+}
+
+/*
+ * Windows' calls into the module: each runs inside a level of its own on
+ * the thread's admission word (arm64ec-gate.c), entered before anything
+ * else and left on its way out, so that a thread inside one is never
+ * taken as idle, and one entered once the process's end has closed the
+ * gate parks before it does anything.
+ */
+
+XTEXPORT NTSTATUS ProcessInit(void)
+{
+    XtGate *g = xt_gate_self();
+    NTSTATUS r;
+
+    xt_adm_enter(g);
+    r = ec_process_init();
+    xt_adm_exit(g);
+    return r;
+}
+
+XTEXPORT NTSTATUS ThreadInit(void)
+{
+    XtGate *g = xt_gate_self();
+    NTSTATUS r;
+
+    xt_adm_enter(g);
+    r = ec_thread_init();
+    xt_adm_exit(g);
+    return r;
+}
+
+XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
+{
+    XtGate *g = xt_gate_self();
+    uint32_t level = xt_adm_enter(g);
+    bool popped = false;
+    NTSTATUS r;
+
+    /* Its level popped already if it waited for another thread outside. */
+    r = ec_thread_term(thread, code, g, level, &popped);
+    if (!popped) {
+        xt_adm_exit(g);
+    }
+    return r;
+}
+
+XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_process_term(h, after, status);
+    xt_adm_exit(g);
+}
+
+XTEXPORT void NotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type, ULONG prot,
+                                BOOL after, NTSTATUS status)
+{
+    XtGate *g = xt_gate_self();
+    uint32_t level;
+    int claimed;
+
+    level = ec_half_enter(g, after, XT_MEMOP_ALLOC, addr, len, &claimed);
+    ec_notify_memory_alloc(addr, len, type, prot, after, status);
+    ec_half_exit(g, level, claimed, XT_MEMOP_ALLOC, addr, len);
+}
+
+XTEXPORT void NotifyMemoryFree(void *addr, SIZE_T len, ULONG type, BOOL after,
+                               NTSTATUS status)
+{
+    XtGate *g = xt_gate_self();
+    uint32_t level;
+    int claimed;
+
+    level = ec_half_enter(g, after, XT_MEMOP_FREE, addr, len, &claimed);
+    ec_notify_memory_free(addr, len, type, after, status);
+    ec_half_exit(g, level, claimed, XT_MEMOP_FREE, addr, len);
+}
+
+XTEXPORT void NotifyMemoryProtect(void *addr, SIZE_T len, ULONG prot,
+                                  BOOL after, NTSTATUS status)
+{
+    XtGate *g = xt_gate_self();
+    uint32_t level;
+    int claimed;
+
+    level = ec_half_enter(g, after, XT_MEMOP_PROTECT, addr, len, &claimed);
+    ec_notify_memory_protect(addr, len, prot, after, status);
+    ec_half_exit(g, level, claimed, XT_MEMOP_PROTECT, addr, len);
+}
+
+XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
+                                         SIZE_T len, ULONG type, ULONG prot)
+{
+    XtGate *g = xt_gate_self();
+    NTSTATUS r;
+
+    xt_adm_enter(g);
+    r = ec_notify_map_view_of_section(unk1, addr, unk2, len, type, prot);
+    xt_adm_exit(g);
+    return r;
+}
+
+XTEXPORT void NotifyUnmapViewOfSection(void *addr, BOOL after, NTSTATUS status)
+{
+    XtGate *g = xt_gate_self();
+    uint32_t level;
+    int claimed;
+
+    level = ec_half_enter(g, after, XT_MEMOP_UNMAP, addr, 0, &claimed);
+    ec_notify_unmap_view_of_section(addr, after, status);
+    ec_half_exit(g, level, claimed, XT_MEMOP_UNMAP, addr, 0);
+}
+
+XTEXPORT void FlushInstructionCacheHeavy(const void *addr, SIZE_T len)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_flush_instruction_cache_heavy(addr, len);
+    xt_adm_exit(g);
+}
+
+XTEXPORT void BTCpu64FlushInstructionCache(const void *addr, SIZE_T len)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_btcpu64_flush_instruction_cache(addr, len);
+    xt_adm_exit(g);
+}
+
+XTEXPORT void BTCpu64NotifyMemoryDirty(void *addr, SIZE_T len)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_btcpu64_notify_memory_dirty(addr, len);
+    xt_adm_exit(g);
+}
+
+XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
+                                    BOOL after, NTSTATUS status)
+{
+    XtGate *g = xt_gate_self();
+    uint32_t level;
+    int claimed;
+
+    level = ec_half_enter(g, after, XT_MEMOP_READ, addr, len, &claimed);
+    ec_btcpu64_notify_read_file(h, addr, len, after, status);
+    ec_half_exit(g, level, claimed, XT_MEMOP_READ, addr, len);
+}
+
+XTEXPORT BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT feature)
+{
+    XtGate *g = xt_gate_self();
+    BOOLEAN r;
+
+    xt_adm_enter(g);
+    r = ec_btcpu64_is_processor_feature_present(feature);
+    xt_adm_exit(g);
+    return r;
+}
+
+XTEXPORT void UpdateProcessorInformation(void *info)
+{
+    XtGate *g = xt_gate_self();
+
+    xt_adm_enter(g);
+    ec_update_processor_information(info);
+    xt_adm_exit(g);
 }
