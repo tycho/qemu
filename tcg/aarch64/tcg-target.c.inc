@@ -6622,12 +6622,23 @@ static void tcg_target_init(TCGContext *s)
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X20);
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X21);
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X22);
+#ifndef __arm64ec__
+    /*
+     * ARM64EC code doesn't use x23, x24 or x28, so a helper leaves them
+     * alone, but Windows may lose them while it runs: a context captured
+     * asynchronously (an exception, an APC, a suspension) goes through the
+     * x64 context, which has no place for them.  No value lives in them
+     * across a call.
+     */
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X23);
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X24);
+#endif
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X25);
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X26);
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X27);
+#ifndef __arm64ec__
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X28);
+#endif
     tcg_regset_reset_reg(tcg_target_call_clobber_regs, TCG_REG_X29);
 
     /* The guest access slow paths save the vector registers themselves. */
@@ -6830,6 +6841,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
             tcg_out_movi(s, TCG_TYPE_PTR, TCG_REG_GUEST_BASE, guest_base);
         }
         tcg_regset_set_reg(s->reserved_regs, TCG_REG_GUEST_BASE);
+#endif
     }
 
     tcg_out_mov(s, TCG_TYPE_PTR, TCG_AREG0, tcg_target_call_iarg_regs[0]);

@@ -1,0 +1,856 @@
+/*
+ * xtajit: QEMU's user-mode engine as a CPU module of Windows on Arm: the
+ * 32-bit x86 one of the WOW64 layer (i386), or the x64 one of ARM64EC
+ * processes (x86_64).
+ *
+ * Copyright (c) 2026 Steven Noonan
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+#ifndef WINDOWS_USER_XTAJIT_H
+#define WINDOWS_USER_XTAJIT_H
+
+#include <winternl.h>
+#include "runtime/runtime.h"
+#include "qemu/rcu.h"
+#include "exec/cpu-common.h"
+#include "exec/mmu-access-type.h"
+#include "user/guest-host.h"
+#include "cpu.h"
+
+/*
+ * A thread's full native context, for fault recovery: CONTEXT on AArch64.
+ * In ARM64EC code CONTEXT is the AMD64 context; the native one is
+ * ARM64_NT_CONTEXT.
+ */
+#ifdef __arm64ec__
+typedef ARM64_NT_CONTEXT XtNativeContext;
+#else
+typedef CONTEXT XtNativeContext;
+#endif
+
+/* The guest context Windows keeps for a thread: x86's WOW64 one, or x64's. */
+#ifdef TARGET_X86_64
+typedef CONTEXT XtGuestContext;
+#else
+typedef WOW64_CONTEXT XtGuestContext;
+#endif
+
+/*
+ * Who owns a thread's guest state.  Windows owns it outside simulation:
+ * the WOW64 context in the thread's CPU area is authoritative, and another
+ * thread may read, change or suspend it.  The engine owns it from the
+ * import to the export, and CPUX86State is authoritative.
+ *
+ *   WINDOWS -> ACQUIRING   set WOW64 TLS slot 2 bit 0, then import
+ *   ACQUIRING -> ENGINE    import done; RCU reader registered
+ *   ENGINE -> PUBLISHING   the exit's architectural effect is complete
+ *   PUBLISHING -> WINDOWS  export, unregister, clear bit 0, then notify
+ */
+typedef enum XtState {
+    XT_WINDOWS,
+    XT_ACQUIRING,
+    XT_ENGINE,
+    XT_PUBLISHING,
+} XtState;
+
+/*
+ * What the engine is doing while it owns the thread, and so which
+ * recovery a host fault gets (xt_fault_redirect).
+ */
+typedef enum XtActive {
+    XT_ACT_NONE,
+    XT_ACT_EXEC,        /* in cpu_exec: its jmp_env is the recovery target */
+    XT_ACT_ATOMIC,      /* in cpu_exec_step_atomic: likewise */
+    XT_ACT_ADAPTER,     /* a guarded adapter access (xt_guest_read) */
+    XT_ACT_FAULT,       /* the fault continuation is running */
+} XtActive;
+
+/* Event kinds of the per-thread ring. */
+typedef enum XtEv {
+    XT_EV_NONE,
+    XT_EV_THREAD_INIT,      /* a = cpu index, b = TEB */
+    XT_EV_ACTIVATE,         /* a = activation id */
+    XT_EV_ACQUIRE,          /* a = eip, b = esp after the import */
+    XT_EV_EXIT,             /* a = trapnr, b = eip */
+    XT_EV_PUBLISH,          /* a = exit kind, b = eip */
+    XT_EV_NOTIFY,           /* Wow64NotifyUnsimulateComplete returned */
+    XT_EV_SYSCALL,          /* a = number, b = status */
+    XT_EV_RAISE,            /* a = info[0] << 32 | code, b = info[1] << 32 | address */
+    XT_EV_FAULT,            /* a = kind << 56 | host pc offset, b = addr */
+    XT_EV_RESUME,           /* a = kind, b = addr: continuation entered */
+    XT_EV_RETRY,            /* a = addr: flags refreshed, access retried */
+    XT_EV_SMC,              /* a = page_unprotect result, b = addr */
+    XT_EV_SUSPEND_SEEN,     /* a suspension request ended the run */
+    XT_EV_ATOMIC,           /* cpu_exec_step_atomic, b = eip */
+    XT_EV_INT81,
+    XT_EV_CHECK,            /* a = failed invariants, b = where */
+    XT_EV_INJECT,           /* a = injection point, b = suspended there */
+    XT_EV_THREAD_TERM,
+    XT_EV_PLACE,            /* a = what (string), b = address */
+    XT_EV_MEMNOTE,          /* a = kind << 56 | prot << 32 | length, b = address */
+    XT_EV_REFRESH,          /* a = old flags << 16 | new flags, b = address */
+    XT_EV_REAP,             /* a = records freed, b = TLS blocks freed */
+    XT_EV__MAX,
+} XtEv;
+
+typedef struct XtEvent {
+    uint64_t seq;           /* process-wide order */
+    uint64_t cnt;           /* CNTVCT_EL0 */
+    uint16_t kind;
+    uint8_t state;
+    uint8_t active;
+    uint32_t activation;
+    uint64_t a, b;
+} XtEvent;
+
+#define XT_RING 1024
+
+/* The fault being continued: filled by the handler, read by the continuation. */
+typedef enum XtFaultKind {
+    XT_FK_GEN = 1,      /* generated code: host pc + GETPC_ADJ */
+    XT_FK_HELPER,       /* a helper: helper_retaddr */
+    XT_FK_FETCH,        /* instruction fetch through cpu_ld*_code_mmu */
+    XT_FK_TRANSLATE,    /* the translator reading guest code */
+    XT_FK_SMC,          /* a TB's entry check reading its guest code */
+    XT_FK_ADAPTER,      /* xt_guest_read */
+} XtFaultKind;
+
+typedef struct XtFault {
+    int busy;
+    XtFaultKind kind;
+    uint32_t code;          /* the native exception code */
+    bool is_write;
+    MMUAccessType access;
+    vaddr addr;
+    uintptr_t host_pc;      /* for cpu_restore_state, 0 for none */
+    XtNativeContext ctx;    /* the native context, for a retry */
+} XtFault;
+
+/* What a guest #PF carries to Wow64RaiseException besides CR2. */
+typedef struct XtGuestFault {
+    uint32_t code;          /* native code, or 0 for ACCESS_VIOLATION */
+} XtGuestFault;
+
+/* Why xt_run returned: the exits Windows has to see. */
+typedef enum XtExitKind {
+    XT_EXIT_SYSCALL,
+    XT_EXIT_EXCEPTION,
+    XT_EXIT_SUSPEND,
+    XT_EXIT_STOP,           /* the harness asked to stop (int3 in tests) */
+    XT_EXIT_NATIVE,         /* a transfer to native code at target */
+} XtExitKind;
+
+/*
+ * cpu_exec's exit for a transfer to native code (ARM64EC code): above
+ * EXCP_INTERRUPT, so that cpu_exec returns it as it is rather than as an
+ * x86 interrupt vector.
+ */
+#define XT_EXCP_NATIVE 0x10100
+/* xt_run_core's for a suspension request, seen before a run */
+#define XT_EXCP_SUSPEND 0x10101
+
+typedef struct XtExit {
+    XtExitKind kind;
+    int trapnr;
+    uint32_t nr;            /* system call number */
+    vaddr args;             /* guest address of the arguments */
+    vaddr target;           /* XT_EXIT_NATIVE's */
+    int vector;             /* a software interrupt's, else -1 */
+    EXCEPTION_RECORD rec;
+} XtExit;
+
+typedef struct XtThread {
+    /*
+     * A round trip's fields (an entry from native code into x64 code, and
+     * its exit) first, together.  The allocator places the record and the
+     * CPU state at the same offset in a page (blocks this large start
+     * after its page header), so these share page offsets only with the
+     * CPU state's QOM header (checked in thread.c), which a round trip
+     * doesn't touch: a core may take a load as dependent on an earlier
+     * store whose address matches its own in the low 12 bits.
+     */
+    CPUState *cpu;
+    CPUX86State *env;
+    /* The x64 module's: the thread's reader, once registered (its TLS's) */
+    struct rcu_reader_data *rcu_reader;
+    void *teb;
+    XtState state;
+    XtActive active;
+    uint32_t activation;
+    int suspend_req;        /* set by another thread (cpu_exit after) */
+    int terminating;        /* another thread is terminating this one */
+    XtGuestFault gfault;
+    bool wow64;             /* under wow64.dll: slot 2, the CPU area */
+    bool rcu_registered;
+    bool after_suspend;     /* the last exit was a suspension */
+    bool bp_skip;           /* run one instruction past breakpoints */
+    bool ec_seen;           /* (ec_foreign_pc): EC_SEEN_PC is EC code */
+    bool ec_suspended;      /* left through a suspension's continuation */
+    vaddr bp_hit;           /* the last breakpoint reported, else 0 */
+    vaddr native_target;    /* set with XT_EXCP_NATIVE */
+    vaddr ec_seen_pc;       /* tb_lookup's last classification */
+    ULONG *ec_doorbell;     /* the x64 module's SuspendDoorbell word */
+
+    void *heap;             /* its allocator heap, given back with it */
+    DWORD tid;
+    HANDLE handle;          /* the thread, with all access: who it is */
+    bool stop_at_int3;      /* the native harness: int3 ends a run */
+    uint64_t int3_rip;      /* a raised int3's RIP, past it, until dispatch */
+    vaddr bp[4];            /* DR0-DR3 as execute breakpoints, where bp_on */
+    bool bp_on[4];
+    uint32_t suspensions;   /* suspension exits taken */
+    XtFault fault;
+    /*
+     * EFLAGS the packed context can't carry, kept at each exit that
+     * re-enters through a context (a system call, an exception, a
+     * suspension) for the re-entry at its RSP; nested activations push
+     * their own, deeper (xt_ec_aux_*).
+     */
+    struct {
+        vaddr rsp;
+        uint32_t eflags;
+    } aux[8];
+    int naux;
+    sigjmp_buf adapter_jmp;
+    uint32_t violations;
+    uint64_t counts[XT_EV__MAX];
+    unsigned ring_pos;
+    unsigned logged;        /* events written to the log so far */
+    XtEvent ring[XT_RING];
+} XtThread;
+
+extern __thread XtThread *xt_self;
+extern uintptr_t xt_bop;            /* the system-call stub (int 0x2e) */
+extern uint32_t xt_inject_point;    /* XTAJIT_INJECT: see xt_inject */
+
+/* engine.c */
+extern CPUState *xt_spare_cpu;      /* made at init, for the first thread */
+int xt_engine_init(const char *settings, int *applied, int *rejected);
+/*
+ * Diagnostics at every transition between Windows and the engine: the
+ * state machine's invariant checks (xt_check) and the routine events
+ * (acquire, exit) in the thread's event ring.  On with the setting
+ * keyword "diag", a log (XTAJIT_LOG), or a test harness; fault and
+ * suspension events are recorded regardless.
+ */
+extern bool xt_diag;
+/* Testing (keyword rcustress): grace periods back to back. */
+extern bool xt_rcu_stress;
+/* Testing (keywords exitstrict, exitreport): the process's end. */
+extern bool xt_exit_strict, xt_exit_report;
+/*
+ * Testing (keyword lockcheck): each outer acquisition of the mmap lock
+ * checked to be where a stop of the thread would wait for its release
+ * (arm64ec.c); the misses counted, the first one's caller kept.
+ */
+extern bool xt_lock_check, xt_gate_check;
+void xt_lock_checked(void *caller);
+/* Testing (keyword rcuinj=N): registrations interrupted at step N. */
+extern int xt_rcu_inj_step;
+CPUState *xt_cpu_new(void);
+void xt_cpu_free(CPUState *cs);
+extern const char *xt_cpu_model;   /* -cpu syntax; set before init */
+/* The x64 module's CPU model (XTAJIT_CPU), decided once. */
+typedef enum XtCpuModel {
+    XT_CPU_SSE,
+    XT_CPU_AVX2,
+    XT_CPU_MAX,
+} XtCpuModel;
+XtCpuModel xt_cpu_x64_model(void);
+/* Whether the model has AVX: the AVX2 and max models. */
+bool xt_cpu_avx(void);
+void *xt_alloc_low(size_t len);
+bool xt_mem_refresh(vaddr addr, MMUAccessType access, bool *changed);
+bool xt_mem_stale_write(vaddr addr);
+void xt_invalidate(vaddr start, vaddr len);
+
+/*
+ * The engine's internal threads (runtime.c), registered: their slots, in
+ * XT_INTERNAL_* states; a stop request for all of them, which each meets
+ * by parking for good where it holds nothing (xt_internal_park); and the
+ * calling thread's mark.
+ */
+typedef struct XtInternal {
+    uint32_t state;
+    DWORD tid;
+    HANDLE h;                   /* the registry's own, to alert it */
+} XtInternal;
+
+enum {
+    XT_INTERNAL_FREE,
+    XT_INTERNAL_CREATING,       /* claimed, being created: to wait for */
+    XT_INTERNAL_STARTING,       /* created, its routine not yet running */
+    XT_INTERNAL_RUNNING,
+    XT_INTERNAL_PARKED,
+};
+
+const XtInternal *xt_internal_threads(int *n);
+void xt_internal_stop(void);
+void xt_internal_alert(void);
+bool xt_internal_stopping(void);
+G_NORETURN void xt_internal_park(void);
+extern __thread bool xt_internal_self;
+
+/*
+ * The thread gates' test points (test-tp.c; the block in arm64ec.h):
+ * dormant, a load and a branch, unless a controller process mapped its
+ * block at process init.
+ */
+#ifdef TARGET_X86_64
+/* The C points. */
+typedef enum XtTpId {
+    /*
+     * adm_enter: after the word's read, the byte's mark, the cas, the
+     * push (before the gate's read), the re-read, before the byte's
+     * clear.
+     */
+    XT_TP_ENTER_READ = 1,
+    XT_TP_ENTER_MARKED,
+    XT_TP_ENTER_CASDONE,
+    XT_TP_ENTER_PUSHED,
+    XT_TP_ENTER_REREAD,
+    XT_TP_ENTER_CLEARADDR,
+    XT_TP_ALONE_READ = 8,           /* xt_adm_alone, its word loaded */
+    XT_TP_REJECT_ARG,               /* xt_adm_reject, with its level */
+    XT_TP_ROOT_PUSHED = 10,         /* a root PENDING */
+    XT_TP_ROOT_CHOSEN,              /* the newest chosen, not claimed */
+    XT_TP_ROOT_CLAIMED,
+    XT_TP_ROOT_TAKEN,               /* PENDING to TAKEN, nothing else */
+    XT_TP_HALF_EXITED,              /* a first half done, its root left */
+    XT_TP_FAULT_NESTED,             /* the fault action's nested entry */
+    XT_TP_POOL_RESERVE = 16,        /* an index, its memory not committed */
+    XT_TP_POOL_COMMIT,
+    XT_TP_GATE_INIT,                /* the fields filled */
+    XT_TP_REG_CAS,                  /* before the registry's cas */
+    XT_TP_REG_PUBLISHED,            /* registered, not yet PUBLISHED */
+    XT_TP_CACHE_CAS,                /* before the CPU area's cas */
+    XT_TP_TERM_CLOSED = 24,         /* ec_term_other, the target's gate */
+    XT_TP_TERM_SUSPENDED,
+    XT_TP_TERM_CERT,                /* between certification tries */
+    XT_TP_TERM_SELF,                /* the self path, before its check */
+    XT_TP_TERM_LISTS,               /* inside the record lists' lock */
+    XT_TP_EXIT_ELECTED = 32,
+    XT_TP_FREEZE_CERT,              /* ec_certify, between the words: its try */
+    XT_TP_EXIT_SELF,                /* the owner's, before its check */
+    XT_TP_REAP_PASS = 40,           /* a gate taken for retirement */
+    XT_TP_RETIRE_CLAIMED,           /* RETIRING won */
+    XT_TP_RETIRE_INVALIDATED,       /* a root's range invalidated */
+    XT_TP_INTERNAL_START = 48,      /* before its gate */
+    XT_TP_INTERNAL_BODY,
+    XT_TP_INTERNAL_END,
+    XT_TP_ENGINE_STARTING = 56,     /* the engine's bring-up, state 1 */
+    XT_TP_ENGINE_ELECTED,           /* its starter's handle out, state 0 */
+    XT_TP_ENGINE_WAIT,              /* a waiter, the state it read */
+} XtTpId;
+
+/* The failure sites. */
+typedef enum XtTpFail {
+    XT_TPF_IDENTITY = 1,            /* xt_gate_identity */
+    XT_TPF_DUP_GATE,                /* gate_new's handle */
+    XT_TPF_DUP_REAP1,               /* the reaper's two handles */
+    XT_TPF_DUP_REAP2,
+    XT_TPF_DUP_SELF,                /* ec_term_self's */
+    XT_TPF_SUSPEND_TERM,            /* ec_term_other's suspension */
+    XT_TPF_SUSPEND_FREEZE,
+    XT_TPF_FLUSH_TERM,              /* the write buffers' flush */
+    XT_TPF_FLUSH_PROCESS,
+    XT_TPF_COMMIT,                  /* the pool's commit */
+    XT_TPF_REGISTRY,                /* the registry full */
+    XT_TPF_OPEN,                    /* ec_open_thread */
+    XT_TPF_CONTINUE,                /* ec_continue_level's continuation */
+    XT_TPF_TERMACCESS,              /* ThreadTerm's access check passes */
+    XT_TPF_DUP_STARTER,             /* the bring-up's handle (ec_engine_up) */
+} XtTpFail;
+
+/* The notes: KIND, the thread, and A, B, C. */
+typedef enum XtTpNote {
+    XT_TPN_GATE = 1,                /* a gate: tid, gate, 1 if made closed */
+    XT_TPN_INVALIDATE,              /* addr, len, gate (0: the exit's) */
+    XT_TPN_EXIT,                    /* the process's end: outcome */
+    XT_TPN_THREAD_TERM,             /* handle, level, own end */
+    XT_TPN_QUARANTINE,              /* gate */
+    XT_TPN_UNSAFE,                  /* tid, status */
+    XT_TPN_RETIRED,                 /* gate, quarantined */
+    XT_TPN_REAP_HELD,
+    XT_TPN_REAP_ABORT,              /* gate */
+    XT_TPN_ACT,                     /* an unheld act: point, arg, word */
+    XT_TPN_FAULT,                   /* the fault action: 1 nested, 2 handler */
+    XT_TPN_DIED,                    /* a death found: gate, XtDeath */
+} XtTpNote;
+
+/* XtTpBlock.addr[] (arm64ec.h): the module's counters, in the subject. */
+typedef enum XtTpAddr {
+    XT_TPA_POISONS,                 /* uint32_t[7], arm64ec-gate.c */
+    XT_TPA_UNSAFE,                  /* uint32_t */
+    XT_TPA_REAP_HELD,               /* bool */
+    XT_TPA_READ_OPEN,               /* uint32_t */
+    XT_TPA_CERTS,                   /* uint32_t[7] */
+    XT_TPA_EXIT_OUTCOME,            /* uint32_t */
+    XT_TPA_GATE_INITIAL,            /* XtGate */
+    XT_TPA_GATE_POOL,               /* XtGate *, the pool */
+    XT_TPA_GATE_USED,               /* uint32_t */
+    XT_TPA_ENGINE_STATE,            /* int */
+    XT_TPA_RECORD_USERS,            /* int */
+    XT_TPA_APC_END,                 /* a native APC routine ending its thread */
+} XtTpAddr;
+
+extern struct XtTpBlock *xt_tp_block;
+void xt_tp_hit(unsigned id, void *gate, uint64_t arg);
+bool xt_tp_fail(unsigned id);
+void xt_tp_note(unsigned kind, uint64_t a, uint64_t b, uint64_t c);
+void xt_tp_publish(unsigned i, const void *p);
+void xt_record_tp_publish(void);
+#define XT_TP(id, gate, arg) \
+    do { \
+        if (unlikely(xt_tp_block)) { \
+            xt_tp_hit(id, gate, arg); \
+        } \
+    } while (0)
+#define XT_TP_FAIL(id) (unlikely(xt_tp_block) && xt_tp_fail(id))
+#define XT_TP_NOTE(kind, a, b, c) \
+    do { \
+        if (unlikely(xt_tp_block)) { \
+            xt_tp_note(kind, a, b, c); \
+        } \
+    } while (0)
+#else
+#define XT_TP(id, gate, arg) do { } while (0)
+#define XT_TP_FAIL(id) false
+#define XT_TP_NOTE(kind, a, b, c) do { } while (0)
+#endif
+
+/* thread.c */
+void *xt_alloc_high(size_t len);
+bool xt_tls_ready(void);
+void xt_tls_attach(void);
+void xt_emutls_init(void);
+bool xt_syscalls_ready(void);
+void *xt_alloc_direct(size_t len);
+#ifdef TARGET_X86_64
+/* An internal thread's gate (arm64ec-gate.c), first thing in its start. */
+void xt_gate_install_internal(void);
+void xt_gate_end_internal(void);
+#endif
+size_t xt_emutls_roots(void);
+
+/* The emulated TLS's test hooks (xt_emutls_test). */
+enum {
+    XT_EMUTLS_FAIL, XT_EMUTLS_STALL, XT_EMUTLS_STALLED, XT_EMUTLS_RELEASE,
+    XT_EMUTLS_MADE, XT_EMUTLS_FREED, XT_EMUTLS_ROOTS,
+};
+/* Failures: the root's storage, a further chunk, its handle, the slot. */
+enum {
+    XT_EMUTLS_FAIL_ALLOC = 1, XT_EMUTLS_FAIL_CHUNK, XT_EMUTLS_FAIL_DUP,
+    XT_EMUTLS_FAIL_SLOT, XT_EMUTLS_FAIL_STICKY = 0x100,
+};
+/*
+ * Stalls: in a root's construction after its storage, after it is in the
+ * thread's slot, after its handle, between its link and its publication;
+ * in a sweep, once it is the sweeper, and between unlinking a root and
+ * freeing it.
+ */
+enum {
+    XT_EMUTLS_STEP_STORAGE = 1, XT_EMUTLS_STEP_CELL, XT_EMUTLS_STEP_HANDLE,
+    XT_EMUTLS_STEP_LINK, XT_EMUTLS_STEP_SWEEP, XT_EMUTLS_STEP_UNLINK,
+};
+long xt_emutls_test(int what, long arg);
+void xt_emutls_reap(void);
+#define XT_EMUTLS_READER_INTENT ((void *)1)
+void *xt_emutls_reader_intent(void);
+void xt_emutls_reader_set(void *reader);
+/* The x64 module: this thread's RCU reader, registered for its life. */
+void xt_rcu_ensure(void);
+void *xt_emutls_reader_get(void);
+void *xt_emutls_reader_ended(void *root);
+void xt_emutls_reader_retired(void *root);
+void xt_enter(void);
+void xt_placement(const char *what, const void *p);
+XtThread *xt_thread_new(bool wow64);
+void xt_thread_free(XtThread *t);
+void xt_event(XtThread *t, XtEv kind, uint64_t a, uint64_t b);
+void xt_gevent(XtEv kind, uint64_t a, uint64_t b);
+uint32_t xt_check(XtThread *t, XtState expect, int where);
+void xt_acquire(XtThread *t, const XtGuestContext *c);
+void xt_dump(XtThread *t, void *handle);
+void xt_log_flush(XtThread *t);
+void xt_log_open(void);
+void xt_log_text(const char *s);
+bool xt_guest_read(XtThread *t, vaddr addr, void *buf, size_t len);
+void xt_record_hold(void);
+void xt_record_release(void);
+void xt_thread_retire(XtThread *t, void *thread_handle);
+DWORD xt_terminated_thread(HANDLE thread, void **teb, HANDLE *own);
+void xt_reap_later(void *thread_handle, void *alloc);
+void xt_park(XtThread *t);
+int xt_reap(void);
+void xt_log_native(EXCEPTION_RECORD *er, XtNativeContext *ctx);
+extern NTSTATUS xt_log_status;      /* the event log's opening */
+
+/* context-wow64.c, context-amd64.c: the guest context and CPUX86State */
+void xt_import(XtThread *t, const XtGuestContext *c);
+void xt_export(XtThread *t, XtGuestContext *c);
+#ifdef __arm64ec__
+/*
+ * The guest's EFLAGS.  Between cpu_exec's exit and its next entry,
+ * x86_cpu_exec_exit (or an import) has left them complete in env->eflags;
+ * only inside cpu_exec are they computed from the lazy condition codes.
+ */
+static inline uint32_t xt_ec_eflags(CPUX86State *env)
+{
+    return env_archcpu(env)->eflags_in_tcg ? cpu_compute_eflags(env)
+                                           : env->eflags;
+}
+
+void xt_ec_pack(XtThread *t, ARM64_NT_CONTEXT *n);
+void xt_ec_import_entry(XtThread *t, uint64_t pc, uint32_t nzcv);
+void xt_ec_import_engine(XtThread *t, uint64_t pc, uint32_t nzcv);
+
+/* Segment R holds SEL, with the base load_seg gives it (GS's the TEB). */
+static inline bool xt_ec_seg_loaded(XtThread *t, X86Seg r, int sel)
+{
+    const SegmentCache *s = &t->env->segs[r];
+
+    return s->selector == sel &&
+           s->base == (r == R_GS ? (uintptr_t)t->teb : 0);
+}
+
+/* The selectors an entry from native code loads (xt_ec_import_entry). */
+static inline bool xt_ec_segs_loaded(XtThread *t)
+{
+    return xt_ec_seg_loaded(t, R_CS, 0x33) && xt_ec_seg_loaded(t, R_SS, 0x2b) &&
+           xt_ec_seg_loaded(t, R_DS, 0x2b) && xt_ec_seg_loaded(t, R_ES, 0x2b) &&
+           xt_ec_seg_loaded(t, R_FS, 0x53) && xt_ec_seg_loaded(t, R_GS, 0x2b);
+}
+void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n, uint64_t pc,
+                       uint32_t nzcv);
+/* Whether the guest has YMM state: its XCR0 enables the AVX component. */
+static inline bool xt_ec_ymm(XtThread *t)
+{
+    return t->env->xcr0 & XSTATE_YMM_MASK;
+}
+void xt_ec_import_ymm(XtThread *t, const CONTEXT *c);
+#endif
+
+/* memory.c: Windows' memory notifications, the processor's identity */
+typedef struct XtUnprotect {
+    vaddr start, last;
+    vaddr found;
+} XtUnprotect;
+int xt_find_protected(void *opaque, vaddr start, vaddr end, int flags);
+void xt_mem_forget(int kind, ULONG prot, vaddr start, vaddr len);
+void xt_note_flush(const void *addr, SIZE_T len);
+void xt_note_alloc(void *addr, SIZE_T len, ULONG type, ULONG prot, BOOL after,
+                   NTSTATUS status);
+void xt_note_protect(void *addr, SIZE_T len, ULONG prot, BOOL after,
+                     NTSTATUS status);
+void xt_note_free(void *addr, SIZE_T len, ULONG type, BOOL after,
+                  NTSTATUS status);
+void xt_note_map(void *addr, SIZE_T len, ULONG prot);
+void xt_note_unmap(void *addr, BOOL after);
+void xt_note_read_file(void *addr, SIZE_T len, BOOL after, NTSTATUS status);
+bool xt_unprotect_for_native(vaddr addr);
+bool xt_guard_restore(vaddr addr);
+BOOLEAN xt_feature_present(UINT feature);
+bool xt_cpu_check(CPUState *cs, char *reason, size_t len);
+void xt_processor_info(void *info, USHORT arch);
+/*
+ * wow64.c, arm64ec.c: a scope of the engine's own work outside
+ * simulation, during which a suspension must wait.
+ */
+bool xt_adapter_begin(void);
+void xt_adapter_end(bool began);
+
+/* runtime.c: the guest's protection of pages QEMU write-protected */
+ULONG xt_guest_prot(uintptr_t page);
+void xt_guest_prot_forget(uintptr_t start, uintptr_t last);
+
+
+/* Points where XTAJIT_INJECT waits for a suspension request. */
+enum {
+    XT_INJ_ACQUIRE = 1,
+    XT_INJ_EXECUTE,
+    XT_INJ_TRANSLATE,
+    XT_INJ_HELPER,
+    XT_INJ_ATOMIC,
+    XT_INJ_FLUSH,
+    XT_INJ_PUBLISH,
+    XT_INJ_CALLBACK,
+};
+void xt_inject_wait(XtThread *t, int point);
+
+/*
+ * The transitions between Windows and the engine, inline in both
+ * modules' entries and exits; their slow parts are out of line
+ * (thread.c).
+ */
+
+/* XTAJIT_INJECT: see xt_inject_wait. */
+static inline void xt_inject(XtThread *t, int point)
+{
+    if (unlikely(xt_inject_point == point)) {
+        xt_inject_wait(t, point);
+    }
+}
+
+/*
+ * A thread another one is terminating stops here, where it holds nothing
+ * of the engine's and slot 2 bit 0 is clear, until Windows ends it.
+ */
+static inline void xt_park_if_terminating(XtThread *t)
+{
+    if (t && unlikely(qatomic_read(&t->terminating))) {
+        xt_park(t);
+    }
+}
+
+/* WOW64's TLS slots, in the 64-bit TEB's TlsSlots (TEB + 0x1480). */
+#define TEB_TLS_SLOTS 0x1480
+#define WOW64_TLS_CPURESERVED_FLAGS 2   /* bit 0: running guest code */
+#define XT_TLS_THREAD 16                /* ours; unused by wow64.dll */
+
+static inline void **xt_tls_slots(void *teb)
+{
+    return (void **)((char *)teb + TEB_TLS_SLOTS);
+}
+
+static inline void xt_set_slot2(XtThread *t, bool running)
+{
+    uint64_t *f;
+
+    if (!t->wow64) {
+        return;
+    }
+    f = (uint64_t *)&xt_tls_slots(t->teb)[WOW64_TLS_CPURESERVED_FLAGS];
+    if (running) {
+        qatomic_or(f, 1);
+    } else {
+        qatomic_and(f, ~(uint64_t)1);
+    }
+}
+
+/*
+ * WINDOWS -> ACQUIRING -> ENGINE.  Slot 2 bit 0 is set before the import,
+ * so a suspension from here on takes the cooperative path and waits for
+ * this thread's next notification.  The WOW64 module registers the RCU
+ * reader here, for as long as the engine owns the thread; the x64 module
+ * registers it once, for the thread's life (xt_rcu_ensure).
+ * xt_acquire_begin and xt_acquire_end are the two
+ * halves, for a caller that imports the state itself in between.
+ */
+static inline void xt_acquire_begin(XtThread *t)
+{
+    xt_park_if_terminating(t);
+    if (unlikely(xt_diag)) {
+        xt_check(t, XT_WINDOWS, 1);
+    }
+    t->state = XT_ACQUIRING;
+    xt_set_slot2(t, true);
+#ifdef TARGET_X86_64
+    if (unlikely(!t->rcu_registered)) {
+        xt_rcu_ensure();
+        t->rcu_reader = get_ptr_rcu_reader();
+        t->rcu_registered = true;
+    }
+#else
+    rcu_register_thread();
+    t->rcu_registered = true;
+#endif
+    xt_inject(t, XT_INJ_ACQUIRE);
+}
+
+static inline void xt_acquire_end(XtThread *t)
+{
+    t->state = XT_ENGINE;
+    if (unlikely(xt_diag)) {
+        xt_event(t, XT_EV_ACQUIRE, t->env->eip, t->env->regs[R_ESP]);
+        xt_check(t, XT_ENGINE, 2);
+    }
+}
+
+/*
+ * ENGINE -> PUBLISHING -> WINDOWS: the exit's architectural effect is
+ * complete; export (into C, unless it is NULL: a caller that takes the
+ * state from the CPU itself), then end the RCU reader (the WOW64 module;
+ * the x64 module's stays registered, outside any read section), then
+ * clear bit 0.
+ * The caller notifies (Wow64NotifyUnsimulateComplete) after.
+ */
+static inline void xt_publish(XtThread *t, XtGuestContext *c)
+{
+    if (unlikely(xt_diag)) {
+        xt_check(t, XT_ENGINE, 3);
+    }
+    t->state = XT_PUBLISHING;
+    if (c) {
+        xt_export(t, c);
+    }
+    xt_inject(t, XT_INJ_PUBLISH);
+#ifndef TARGET_X86_64
+    rcu_unregister_thread();
+    t->rcu_registered = false;
+#endif
+    t->state = XT_WINDOWS;
+    xt_set_slot2(t, false);
+    if (unlikely(xt_diag)) {
+        xt_check(t, XT_WINDOWS, 4);
+    }
+}
+
+extern HANDLE xt_log_file;
+
+static inline void *xt_log_handle(void)
+{
+    return xt_log_file;
+}
+
+/* exec.c: xt_run_core (run.h) with every exit in X */
+void xt_run(XtThread *t, XtExit *x);
+
+/* fault.c */
+bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx);
+uint32_t xt_fault_count(void);
+/* Resume at CTX, all of it (wow64.c, arm64ec.c); returns only on failure. */
+NTSTATUS xt_continue_native(XtNativeContext *ctx);
+
+/* Status codes winnt.h leaves to ntstatus.h. */
+#ifndef STATUS_WX86_SINGLE_STEP
+#define STATUS_WX86_SINGLE_STEP ((NTSTATUS)0x4000001E)
+#endif
+#ifndef STATUS_SUCCESS
+#define STATUS_SUCCESS ((NTSTATUS)0)
+#endif
+#ifndef STATUS_ENTRYPOINT_NOT_FOUND
+#define STATUS_ENTRYPOINT_NOT_FOUND ((NTSTATUS)0xC0000139)
+#endif
+#ifndef STATUS_ASSERTION_FAILURE
+#define STATUS_ASSERTION_FAILURE ((NTSTATUS)0xC0000420)
+#endif
+#ifndef STATUS_NOT_SUPPORTED
+#define STATUS_NOT_SUPPORTED ((NTSTATUS)0xC00000BB)
+#endif
+#ifndef STATUS_STACK_BUFFER_OVERRUN
+#define STATUS_STACK_BUFFER_OVERRUN ((NTSTATUS)0xC0000409)
+#endif
+
+typedef struct XtThreadBasicInfo {
+    NTSTATUS ExitStatus;
+    void *TebBaseAddress;
+    CLIENT_ID ClientId;
+    ULONG_PTR AffinityMask;
+    LONG Priority;
+    LONG BasePriority;
+} XtThreadBasicInfo;
+
+#define XTEXPORT __declspec(dllexport)
+
+#ifndef TARGET_X86_64
+/* wow64.c: the module's interface to wow64.dll */
+int xt_process_init(bool wow64);
+int xt_settings_applied(int *rejected);
+XTEXPORT NTSTATUS WINAPI BTCpuProcessInit(void);
+XTEXPORT void WINAPI BTCpuProcessTerm(HANDLE h, BOOL after, ULONG status);
+XTEXPORT NTSTATUS WINAPI BTCpuThreadInit(void);
+XTEXPORT void WINAPI BTCpuThreadTerm(HANDLE thread, LONG code);
+XTEXPORT void *WINAPI BTCpuGetBopCode(void);
+XTEXPORT void WINAPI BTCpuSimulate(void);
+XTEXPORT NTSTATUS WINAPI BTCpuSuspendLocalThread(HANDLE thread, void *info,
+                                        void *unk1, ULONG request);
+XTEXPORT NTSTATUS WINAPI BTCpuResetToConsistentState(EXCEPTION_POINTERS *p);
+XTEXPORT void WINAPI BTCpuFlushInstructionCache2(const void *addr, SIZE_T len);
+XTEXPORT void WINAPI BTCpuFlushInstructionCacheHeavy(const void *addr, SIZE_T len);
+XTEXPORT void WINAPI BTCpuNotifyMemoryDirty(void *addr, SIZE_T len);
+XTEXPORT void WINAPI BTCpuNotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type,
+                                   ULONG prot, BOOL after, ULONG status);
+XTEXPORT void WINAPI BTCpuNotifyMemoryProtect(void *addr, SIZE_T len, ULONG prot,
+                                     BOOL after, ULONG status);
+XTEXPORT void WINAPI BTCpuNotifyMemoryFree(void *addr, SIZE_T len, ULONG type,
+                                  BOOL after, ULONG status);
+XTEXPORT NTSTATUS WINAPI BTCpuNotifyMapViewOfSection(void *unk1, void *addr,
+                                            void *unk2, SIZE_T len,
+                                            ULONG type, ULONG prot);
+XTEXPORT void WINAPI BTCpuNotifyUnmapViewOfSection(void *addr, BOOL after,
+                                          ULONG status);
+XTEXPORT void WINAPI BTCpuNotifyReadFile(HANDLE h, void *addr, SIZE_T len, BOOL after,
+                                NTSTATUS status);
+XTEXPORT BOOLEAN WINAPI BTCpuIsProcessorFeaturePresent(UINT feature);
+XTEXPORT void BTCpuUpdateProcessorInformation(void *info);
+
+/* test.c: the native harness's entry points */
+typedef struct XtTestExit XtTestExit;
+typedef struct XtTestState XtTestState;
+XTEXPORT int xt_test_init(int *rejected);
+XTEXPORT void *xt_test_thread(void);
+#ifndef STATUS_THREAD_IS_TERMINATING
+#define STATUS_THREAD_IS_TERMINATING ((NTSTATUS)0xC000004B)
+#endif
+#ifndef STATUS_NO_MORE_ENTRIES
+#define STATUS_NO_MORE_ENTRIES ((NTSTATUS)0x8000001A)
+#endif
+#ifndef STATUS_UNSUCCESSFUL
+#define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001)
+#endif
+XTEXPORT int xt_test_run(WOW64_CONTEXT *ctx, XtTestExit *out);
+XTEXPORT void xt_test_roundtrip(const WOW64_CONTEXT *in, WOW64_CONTEXT *out);
+XTEXPORT void xt_test_invalidate(void *addr, size_t len);
+XTEXPORT void xt_test_forget(void *addr, size_t len);
+XTEXPORT int xt_test_page_flags(void *addr);
+XTEXPORT void xt_test_state(XtTestState *s);
+XTEXPORT void xt_test_dump(void *handle);
+XTEXPORT int xt_test_suspend(DWORD tid);
+XTEXPORT int xt_test_flush(DWORD tid);
+XTEXPORT int xt_test_guest_read(uint32_t addr, void *buf, uint32_t len);
+XTEXPORT uintptr_t xt_test_bop(void);
+#else
+/* arm64ec.c: the module's interface to ntdll in an ARM64EC process */
+XTEXPORT NTSTATUS ProcessInit(void);
+XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status);
+XTEXPORT NTSTATUS ThreadInit(void);
+XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code);
+XTEXPORT NTSTATUS ResetToConsistentState(EXCEPTION_RECORD *er, CONTEXT *guest,
+                                         ARM64_NT_CONTEXT *native);
+XTEXPORT void NotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type, ULONG prot,
+                                BOOL after, NTSTATUS status);
+XTEXPORT void NotifyMemoryFree(void *addr, SIZE_T len, ULONG type, BOOL after,
+                               NTSTATUS status);
+XTEXPORT void NotifyMemoryProtect(void *addr, SIZE_T len, ULONG prot,
+                                  BOOL after, NTSTATUS status);
+XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
+                                         SIZE_T len, ULONG type, ULONG prot);
+XTEXPORT void NotifyUnmapViewOfSection(void *addr, BOOL after, NTSTATUS status);
+XTEXPORT void FlushInstructionCacheHeavy(const void *addr, SIZE_T len);
+XTEXPORT void BTCpu64FlushInstructionCache(const void *addr, SIZE_T len);
+XTEXPORT void BTCpu64NotifyMemoryDirty(void *addr, SIZE_T len);
+XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
+                                    BOOL after, NTSTATUS status);
+XTEXPORT BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT feature);
+XTEXPORT void UpdateProcessorInformation(void *info);
+
+/* arm64ec.c: the ARM64EC test harness's entry points */
+typedef struct XtEcTestExit XtEcTestExit;
+XTEXPORT int xt_ec_test_init(int *rejected);
+XTEXPORT void *xt_ec_test_thread(void);
+XTEXPORT int xt_ec_test_run(CONTEXT *ctx, XtEcTestExit *out);
+XTEXPORT void *xt_ec_test_code_buffer(void);
+XTEXPORT void xt_ec_test_invalidate(void *addr, size_t len);
+XTEXPORT void xt_ec_test_load(void *dst, const void *src, size_t len);
+XTEXPORT int xt_ec_test_tls(int reap);
+XTEXPORT long xt_ec_test_tls_hook(int what, long arg);
+XTEXPORT long xt_ec_test_tls_cost(int tls, long n);
+XTEXPORT void xt_ec_test_counts(uint32_t *faults, uint32_t *flushes);
+XTEXPORT void xt_ec_test_syscalls(int64_t nr[4], uint32_t *lut_size);
+XTEXPORT uint32_t xt_ec_test_reached(void);
+
+/* test-ec.c: the capture probe */
+typedef struct XtCapRun XtCapRun;
+typedef struct XtCapEvent XtCapEvent;
+bool xt_ec_probe_rtcs(EXCEPTION_RECORD *er, CONTEXT *guest,
+                      ARM64_NT_CONTEXT *native);
+void xt_ec_probe_process_init(void);
+XTEXPORT void *xt_ec_cap_prepare(int where);
+XTEXPORT void xt_ec_cap_arm(XtCapRun *r, int clear_sim);
+XTEXPORT uint32_t xt_ec_cap_events(XtCapEvent *out, uint32_t max);
+XTEXPORT void xt_ec_cap_entry(int mode, uint64_t rec[6]);
+#endif /* !TARGET_X86_64 */
+
+#endif

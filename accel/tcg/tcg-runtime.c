@@ -32,6 +32,13 @@
 #include "exec/helper-info.c.inc"
 #undef  HELPER_H
 
+#ifdef __arm64ec__
+void *HELPER(memset)(void *ptr, int32_t c, void *len)
+{
+    return memset(ptr, c, (uintptr_t)len);
+}
+#endif
+
 uint64_t HELPER(muluh_i64)(uint64_t arg1, uint64_t arg2)
 {
     uint64_t l, h;
