@@ -38,6 +38,7 @@ DEF(brcond, 0, 2, 2, TCG_OPF_BB_END | TCG_OPF_COND_BRANCH | TCG_OPF_INT)
 
 DEF(mb, 0, 0, 1, TCG_OPF_NOT_PRESENT)
 DEF(host_counter, 1, 0, 1, TCG_OPF_INT)
+DEF(spin_hint, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 
 DEF(mov, 1, 1, 0, TCG_OPF_INT | TCG_OPF_NOT_PRESENT)
 

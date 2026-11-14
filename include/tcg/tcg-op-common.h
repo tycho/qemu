@@ -62,6 +62,7 @@ QEMU_ARG_NONNULL void gen_set_label(TCGLabel *l);
 QEMU_ARG_NONNULL void tcg_gen_br(TCGLabel *l);
 void tcg_gen_mb(TCGBar);
 void tcg_gen_host_counter_i64(TCGv_i64 ret, bool ordered);
+void tcg_gen_spin_hint(void);
 
 /**
  * tcg_gen_exit_tb() - output exit_tb TCG operation

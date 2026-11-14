@@ -1472,6 +1472,12 @@ static const TCGOutOpHostCounter outop_host_counter = {
 };
 #endif
 
+#ifndef TCG_TARGET_HAS_SPIN_HINT
+static void tcg_out_spin_hint(TCGContext *s)
+{
+}
+#endif
+
 #ifndef CONFIG_TCG_INTERPRETER
 /* Validate CPUTLBDescFast placement. */
 QEMU_BUILD_BUG_ON((int)(offsetof(CPUNegativeOffsetState, tlb.f[0]) -
@@ -3067,6 +3073,7 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_call:
     case INDEX_op_br:
     case INDEX_op_mb:
+    case INDEX_op_spin_hint:
     case INDEX_op_insn_start:
     case INDEX_op_exit_tb:
     case INDEX_op_goto_tb:
