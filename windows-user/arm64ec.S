@@ -68,13 +68,18 @@ xt_check_call:
  * KiUserEmulationDispatcher's BeginSimulation).  While the capture probe
  * sets xt_cap_entry_mode, xt_cap_entry (test-ec.S) takes them instead.
  * x16 and x17 are free at each; x9 holds the target where there is one.
- * x13 carries the entry's kind to the frame, and x14, x23 and x24 are
- * scratch: ARM64EC code never uses them, so native code reached by the
- * bypass below can't depend on them.  The x64 registers go into the CPU
- * state when the frame names it (XtEcFrame.env), else into the frame;
- * NZCV is read before any instruction that sets flags, and the guest's
- * sp after the return address's push.  The MMX places and v16-v31 are
- * not taken: the engine keeps the x87 state and the YMM upper halves.
+ * Until InSimulation is set, the entry works in registers an x64 context
+ * keeps: Windows applies one to a thread outside simulation on its own
+ * stack (a special APC, SetThreadContext) and zeroes those it has no x64
+ * place for (x13, x14, x23, x24, x28).  x10-x12 are the admission's
+ * scratch and w15 carries the entry's kind to the frame: the places of
+ * MM4-MM7's mantissas, which no entry takes (the engine keeps the x87
+ * state) and which are no argument of any entry, so native code reached
+ * by the bypass below can't depend on them either.  The x64 registers go
+ * into the CPU state when the frame names it (XtEcFrame.env), else into
+ * the frame; NZCV is read before any instruction that sets flags, and the
+ * guest's sp after the return address's push.  The MMX places and v16-v31
+ * are not taken: the engine keeps the x87 state and the YMM upper halves.
  */
 /* MMn's mantissa (ST(n) from the stack top in w0, the x87 registers at x1). */
 .macro mm_load i, r
@@ -143,6 +148,7 @@ xt_check_call:
 #define G_ADM           0x00
 #define G_CLOSED        0x08
 #define G_INTERNAL      0x0c
+#define G_CHECKING      0x18
 
 #define TEB_PEB         0x60
 #define TEB_CPU_AREA    0x1788
@@ -195,15 +201,18 @@ xt_check_call:
 .endm
 
 /*
- * An entry's admission (arm64ec-gate.c's xt_adm_enter): its level pushed
- * on the thread's admission word by compare-and-swap, inherited if the
- * innermost level is committed, else an attempt that reads the gate and
- * then commits, or parks for good.  Before the entry writes anything of
- * the engine's, and in the scratch registers (x14, x16, x17, x23, x24)
- * with no instruction that sets flags, so NZCV is still the guest's when
- * entry_tail reads it.  A refusal, a parked or poisoned word, a COUNT
- * full, or a SEQ that would wrap, goes to C, which never returns.  x14
- * keeps the COUNT the level was pushed over, for the commit's check.
+ * An entry's admission (arm64ec-gate.c's adm_enter): the level pushed by
+ * one compare-and-swap; over a level already admitted (its byte in
+ * CHECKING clear) it inherits, else its own byte is set before the push,
+ * the gate read after it, the word re-read (parked or poisoned meanwhile,
+ * or a level leaked above, it parks), and the byte cleared last: the store
+ * that admits it.  Before the entry writes anything of the engine's, in
+ * x10-x12, x16 and x17, with no instruction that sets flags, so NZCV is
+ * still the guest's when entry_tail reads it.  The
+ * push is relaxed: the owner's flush of every processor's writes is the
+ * pair's other half.  A refusal, a parked or poisoned word, 32 levels, or a
+ * SEQ that would wrap, goes to C, which never returns; x11 then holds the
+ * COUNT the level was pushed over.
  */
 .macro adm_enter
     ldr     x16, [x18, #TEB_CPU_AREA]
@@ -213,102 +222,90 @@ xt_check_call:
     ldr     x17, [x16, #G_ADM]
     tbnz    x17, #60, xt_ec_adm_park_entry
     tbnz    x17, #61, xt_ec_adm_park_entry
-    mvn     w24, w17
-    cbz     w24, xt_ec_adm_poison_entry
-    ubfx    x14, x17, #32, #14
-    mov     x24, #0x3fff
-    sub     x24, x14, x24
-    cbz     x24, xt_ec_adm_poison_entry
-    ubfx    x23, x17, #46, #14
-    sub     x24, x14, x23
-    cbz     x24, .Ladm_attempt\@
-    /* Inherited: COUNT+1, SEQ+1. */
-    movz    x24, #1, lsl #32
-    add     x24, x17, x24
-    add     x24, x24, #1
-    mov     x23, x17
-    casal   x23, x24, [x16]
-    sub     x23, x23, x17
-    cbnz    x23, .Ladm_try\@
-    b       .Ladm_done\@
-.Ladm_attempt\@:
-    /* An attempt: COUNT+1, UNC+1, SEQ+1, then the gate. */
-    movz    x24, #0x4001, lsl #32
-    add     x24, x17, x24
-    add     x24, x24, #1
-    mov     x23, x17
-    casal   x23, x24, [x16]
-    sub     x23, x23, x17
-    cbnz    x23, .Ladm_try\@
+    mvn     w12, w17
+    cbz     w12, xt_ec_adm_poison_entry
+    ubfx    x11, x17, #32, #14
+    lsr     x12, x11, #5
+    cbnz    x12, xt_ec_adm_poison_entry
+    /*
+     * w10 1 if it reads the gate (no level, or the innermost one's byte
+     * set), 0 if it inherits; its own byte set before the push if 1.
+     */
+    add     x12, x16, x11
+    mov     w10, #1
+    cbz     x11, .Ladm_mark\@
+    ldrb    w10, [x12, #(G_CHECKING - 1)]
+    cbz     w10, .Ladm_push\@
+.Ladm_mark\@:
+    strb    w10, [x12, #G_CHECKING]
+.Ladm_push\@:
+    /* COUNT+1, SEQ+1. */
+    movz    x12, #1, lsl #32
+    add     x12, x17, x12
+    add     x12, x12, #1
+    mov     x11, x17
+    cas     x11, x12, [x16]
+    sub     x11, x11, x17
+    cbnz    x11, .Ladm_try\@
+    ubfx    x11, x17, #32, #14
+    cbz     w10, .Ladm_admit\@
     ldr     w17, [x16, #G_CLOSED]
     cbnz    w17, xt_ec_adm_reject_entry
     adrp    x17, xt_gate_closed_by
     ldr     x17, [x17, :lo12:xt_gate_closed_by]
-    cbz     x17, .Ladm_commit\@
+    cbz     x17, .Ladm_reread\@
     sub     x17, x17, x16
-    cbz     x17, .Ladm_commit\@
+    cbz     x17, .Ladm_reread\@
     ldr     w17, [x16, #G_INTERNAL]
     cbz     w17, xt_ec_adm_reject_entry
-.Ladm_commit\@:
-    /*
-     * Not parked or poisoned by an interruption meanwhile, COUNT and UNC
-     * still this level (x14 + 1): UNC-1, SEQ+1.
-     */
+.Ladm_reread\@:
     ldr     x17, [x16, #G_ADM]
     tbnz    x17, #60, xt_ec_adm_park_entry
     tbnz    x17, #61, xt_ec_adm_park_entry
-    ubfx    x23, x17, #32, #14
-    sub     x23, x23, x14
-    sub     x23, x23, #1
-    cbnz    x23, xt_ec_adm_poison_entry
-    ubfx    x23, x17, #46, #14
-    sub     x23, x23, x14
-    sub     x23, x23, #1
-    cbnz    x23, xt_ec_adm_poison_entry
-    mvn     w24, w17
-    cbz     w24, xt_ec_adm_poison_entry
-    movz    x24, #0x4000, lsl #32
-    sub     x24, x17, x24
-    add     x24, x24, #1
-    mov     x23, x17
-    casal   x23, x24, [x16]
-    sub     x23, x23, x17
-    cbnz    x23, .Ladm_commit\@
-.Ladm_done\@:
+    ubfx    x12, x17, #32, #14
+    sub     x12, x12, x11
+    sub     x12, x12, #1
+    cbnz    x12, xt_ec_adm_poison_entry
+.Ladm_admit\@:
+    add     x12, x16, x11
+    strb    wzr, [x12, #G_CHECKING]
 .endm
 
 /*
- * An exit's withdrawal (xt_adm_exit): the innermost level popped, after
- * the engine's last access.  With no committed level to pop (a pairing
- * error), or a SEQ that would wrap, the word is poisoned instead.  x14,
- * x16, x17, x23 and x24 only.
+ * An exit's withdrawal (xt_adm_exit): the innermost level popped, with
+ * release, after the engine's last access.  With no admitted level to pop
+ * (none, or the innermost's byte still set: a pairing error), or a SEQ that
+ * would wrap, the word is poisoned instead.  x16, x17, and RA, RB, RC
+ * (x14, x23, x24 by default: protected where InSimulation is set; the
+ * bypass, outside simulation, passes x10-x12) only.
  */
-.macro adm_exit
+.macro adm_exit ra=14, rb=23, rc=24
     ldr     x16, [x18, #TEB_CPU_AREA]
     ldr     x16, [x16, #AREA_GATE]
     cbz     x16, .Ladm_out\@
 .Ladm_pop\@:
     ldr     x17, [x16, #G_ADM]
-    ubfx    x14, x17, #32, #14
-    ubfx    x23, x17, #46, #14
-    sub     x24, x14, x23
-    cbz     x24, .Ladm_bad\@
-    mvn     w24, w17
-    cbz     w24, .Ladm_bad\@
-    movz    x23, #1, lsl #32
-    sub     x24, x17, x23
-    add     x24, x24, #1
-    mov     x23, x17
-    casal   x23, x24, [x16]
-    sub     x23, x23, x17
-    cbnz    x23, .Ladm_pop\@
+    ubfx    x\ra, x17, #32, #14
+    cbz     x\ra, .Ladm_bad\@
+    add     x\rc, x16, x\ra
+    ldrb    w\rc, [x\rc, #(G_CHECKING - 1)]
+    cbnz    w\rc, .Ladm_bad\@
+    mvn     w\rc, w17
+    cbz     w\rc, .Ladm_bad\@
+    movz    x\rb, #1, lsl #32
+    sub     x\rc, x17, x\rb
+    add     x\rc, x\rc, #1
+    mov     x\rb, x17
+    casl    x\rb, x\rc, [x16]
+    sub     x\rb, x\rb, x17
+    cbnz    x\rb, .Ladm_pop\@
     b       .Ladm_out\@
 .Ladm_bad\@:
-    orr     x24, x17, #0x2000000000000000
-    mov     x23, x17
-    casal   x23, x24, [x16]
-    sub     x23, x23, x17
-    cbnz    x23, .Ladm_pop\@
+    orr     x\rc, x17, #0x2000000000000000
+    mov     x\rb, x17
+    casl    x\rb, x\rc, [x16]
+    sub     x\rb, x\rb, x17
+    cbnz    x\rb, .Ladm_pop\@
 .Ladm_out\@:
 .endm
 
@@ -327,7 +324,7 @@ xt_check_call:
 .endif
     ldr     x16, [x17, #AREA_FRAME]
     ldr     x14, [x16, #F_ENV]
-    str     w13, [x16, #F_ENTRY]
+    str     w15, [x16, #F_ENTRY]
     str     w24, [x16, #F_NZCV]
     stp     x9, x30, [x16, #F_PCLR]
     cbz     x14, 7f
@@ -391,7 +388,7 @@ DispatchJump:
     cap_check 1
     adm_enter
     str     lr, [sp, #-8]!      /* the x64 return address */
-    mov     w13, #1             /* XT_EC_ENTRY_CALL */
+    mov     w15, #1             /* XT_EC_ENTRY_CALL */
     b       2f
 
     .globl RetToEntryThunk
@@ -399,7 +396,7 @@ RetToEntryThunk:
     cap_check 2
     adm_enter
     mov     x9, lr
-    mov     w13, #2             /* XT_EC_ENTRY_RETURN */
+    mov     w15, #2             /* XT_EC_ENTRY_RETURN */
 2:
     /* Native code (the EC bitmap) is reached without the engine. */
     ldr     x16, [x18, #TEB_PEB]
@@ -408,7 +405,7 @@ RetToEntryThunk:
     ldr     x16, [x16, x17, lsl #3]
     lsr     x17, x9, #12
     lsr     x16, x16, x17
-    tbnz    x16, #0, xt_ec_exit_dispatch
+    tbnz    x16, #0, xt_ec_bypass_dispatch
     b       3f
 
     .globl ExitToX64
@@ -416,7 +413,7 @@ ExitToX64:
     cap_check 3
     adm_enter
     str     lr, [sp, #-8]!      /* the x64 return address */
-    mov     w13, #1             /* XT_EC_ENTRY_CALL */
+    mov     w15, #1             /* XT_EC_ENTRY_CALL */
 3:
     entry_tail 0
 
@@ -427,13 +424,13 @@ ExitToX64:
 xt_ec_inj_jump:
     adm_enter
     str     lr, [sp, #-8]!
-    mov     w13, #1
+    mov     w15, #1
     b       2f
 
 xt_ec_inj_ret:
     adm_enter
     mov     x9, lr
-    mov     w13, #2
+    mov     w15, #2
 2:
     ldr     x16, [x18, #TEB_PEB]
     ldr     x16, [x16, #PEB_EC_BITMAP]
@@ -441,13 +438,13 @@ xt_ec_inj_ret:
     ldr     x16, [x16, x17, lsl #3]
     lsr     x17, x9, #12
     lsr     x16, x16, x17
-    tbnz    x16, #0, xt_ec_exit_dispatch
+    tbnz    x16, #0, xt_ec_bypass_dispatch
     b       3f
 
 xt_ec_inj_call:
     adm_enter
     str     lr, [sp, #-8]!
-    mov     w13, #1
+    mov     w15, #1
 3:
     entry_tail 1
 
@@ -528,6 +525,7 @@ BeginSimulation:
     .globl xt_ec_exit_dispatch
 xt_ec_exit_dispatch:
     adm_exit
+xt_ec_exit_withdrawn:
     ldr     x17, [x18, #TEB_CPU_AREA]
     strb    wzr, [x17]
     ldr     x17, [x17, #AREA_DOORBELL]
@@ -537,14 +535,14 @@ xt_ec_exit_dispatch:
 4:
     .globl xt_ec_exit_resume_point
 xt_ec_exit_resume_point:
+    ldursw  x16, [x9, #-4]
+    mov     w17, #0x0200
+    movk    w17, #0xd63f, lsl #16       /* blr x16 */
+    cmp     w16, w17
     mov     x17, x9
-    mov     w16, #0x0200
-    movk    w16, #0xd63f, lsl #16       /* blr x16 */
-    ldursw  x23, [x17, #-4]
-    cmp     w23, w16
     b.eq    6f
-    and     x23, x23, #-4
-    add     x17, x17, x23
+    and     x16, x16, #-4
+    add     x17, x9, x16
     /* An entry thunk finds the stack arguments at x4 + 0x20. */
     mov     x4, sp
     tbz     x4, #3, 5f
@@ -556,6 +554,15 @@ xt_ec_exit_resume_point:
     adrp    lr, xt_x64_ret
     ldr     lr, [lr, :lo12:xt_x64_ret]
     br      x17
+
+/*
+ * The bypass's withdrawal: native code reached from an entry, outside
+ * simulation, so in registers an x64 context keeps (x10-x12, dead at the
+ * entry); then the dispatch, after the engine exit's withdrawal.
+ */
+xt_ec_bypass_dispatch:
+    adm_exit 10, 11, 12
+    b       xt_ec_exit_withdrawn
 
     .globl xt_ec_exit_suspend_point
 xt_ec_exit_suspend_point:
@@ -569,7 +576,7 @@ xt_ec_exit_suspend_point:
  */
 xt_ec_adm_reject_entry:
     mov     x0, x16
-    add     x1, x14, #1
+    add     x1, x11, #1
     mov     x17, sp
     and     x17, x17, #0xfffffffffffffff0
     mov     sp, x17
