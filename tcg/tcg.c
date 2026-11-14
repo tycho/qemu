@@ -277,6 +277,9 @@ bool tcg_vecglobal;
 bool tcg_ymmglobal;
 bool tcg_vregs_all;
 bool tcg_region;
+unsigned tcg_superblock;
+unsigned tcg_units;
+bool tcg_region_entry;
 bool tcg_tbpack;
 bool tcg_tblayout;
 bool tcg_bti = true;
@@ -5171,7 +5174,64 @@ static void la_find_globals(TCGContext *s)
     unsigned long *seen = tcg_malloc(size);
     TCGOp *op;
 
-    memset(seen, 0, size);
+/*
+ * Units (tcg_units): a conditional jump between two blocks of a unit is a
+ * brcond to a label holding a br to the taken block's region label, then
+ * a br to the other block's.  Move each such two-op stub, reached only by
+ * branches, to the end of the TB: the br before it then reaches its label
+ * by falling through, so the not-taken side runs no branch, and the taken
+ * side runs the stub as it would in place (the allocator puts the
+ * region's homes in place in the stub, on that side alone).
+ */
+static void region_stub_pass(TCGContext *s)
+{
+    TCGOp *last = QTAILQ_LAST(&s->ops);
+    TCGOp *op, *next;
+
+    QTAILQ_FOREACH_SAFE(op, &s->ops, link, next) {
+        bool end = op == last;
+
+        if (op->opc == INDEX_op_set_label) {
+            TCGOp *prev = QTAILQ_PREV(op, link);
+            TCGLabel *l = arg_label(op->args[0]);
+            TCGOp *br = QTAILQ_NEXT(op, link);
+
+            if (!l->region && !l->loop && prev && !op_falls_through(prev)
+                && br && br->opc == INDEX_op_br && br != last
+                && arg_label(br->args[0])->region) {
+                next = QTAILQ_NEXT(br, link);
+                QTAILQ_REMOVE(&s->ops, op, link);
+                QTAILQ_REMOVE(&s->ops, br, link);
+                QTAILQ_INSERT_TAIL(&s->ops, op, link);
+                QTAILQ_INSERT_TAIL(&s->ops, br, link);
+            }
+        }
+        if (end) {
+            break;
+        }
+    }
+}
+
+/*
+ * Whether the code after @op, followed through fall-through, reaches a
+ * back edge to an XLBL_LOOP label before leaving the TB.
+ */
+static bool xblk_reaches_loop(const TCGOp *op)
+{
+    for (op = QTAILQ_NEXT(op, link); op; op = QTAILQ_NEXT(op, link)) {
+        switch (op->opc) {
+        case INDEX_op_br:
+            return arg_label(op->args[0])->xkind == XLBL_LOOP;
+        case INDEX_op_exit_tb:
+        case INDEX_op_goto_tb:
+        case INDEX_op_goto_ptr:
+            return false;
+        default:
+            break;
+        }
+    }
+    return false;
+}
 
     QTAILQ_FOREACH(op, &s->ops, link) {
         const TCGOpDef *def = &tcg_op_defs[op->opc];
@@ -5762,7 +5822,7 @@ liveness_pass_1(TCGContext *s)
                     TCGRegSet set = op->output_pref[0]
                                     & tcg_target_available_regs[in->type];
 
-                    if (s->xblk_pass == 2 && set) {
+                    if ((s->xblk_pass == 2 || s->xblk_region) && set) {
                         /* In a loop, compute the value where it will go. */
                         *la_temp_pref(in) = set;
                     } else {
@@ -5777,7 +5837,7 @@ liveness_pass_1(TCGContext *s)
                  * In a loop, as for mov, compute the value where it goes;
                  * a copy that leaves its input live doesn't constrain it.
                  */
-                if (s->xblk_pass == 2) {
+                if (s->xblk_pass == 2 || s->xblk_region) {
                     TCGTemp *in = arg_temp(op->args[1]);
                     TCGRegSet set = op->output_pref[0]
                                     & tcg_target_available_regs[in->type];
@@ -6768,6 +6828,13 @@ static void xblk_obligations(TCGContext *s, const uint8_t *state)
                 temp_dead(s, ts);
             }
             break;
+        case TEMP_CONST:
+            /* A region's labels end constants' registers too. */
+            if (s->xblk_region && (state[i] & TS_DEAD)
+                && ts->val_type == TEMP_VAL_REG) {
+                temp_dead(s, ts);
+            }
+            break;
         default:
             break;
         }
@@ -6889,6 +6956,116 @@ static void xblk_loop_back(TCGContext *s, TCGLabel *l)
     }
 }
 
+/* Whether region label @l needs home @ts in its register. */
+static bool xblk_region_live(TCGContext *s, TCGLabel *l, TCGTemp *ts)
+{
+    return !(l->live_in[temp_idx(ts)] & TS_DEAD);
+}
+
+/*
+ * Before a branch into the region, or at a region label reached by
+ * fall-through: each home the label needs in its own register, as
+ * xblk_loop_back does for a loop's globals; a home the label needs only in
+ * memory is stored.  Liveness has already put every other global in
+ * memory.
+ */
+static void xblk_region_place(TCGContext *s, TCGLabel *l)
+{
+    TCGRegSet targets = 0;
+
+    for (int i = 0; i < s->nb_region_homes; i++) {
+        TCGTemp *ts = s->region_home[i];
+
+        if (!xblk_region_live(s, l, ts)) {
+            /* Dead after the label, or only needed in memory. */
+            if ((l->live_in[temp_idx(ts)] & TS_MEM)
+                && (ts->val_type == TEMP_VAL_REG
+                    || ts->val_type == TEMP_VAL_CONST)
+                && !ts->mem_coherent) {
+                temp_sync(s, ts, s->reserved_regs, 0, -1);
+            }
+            continue;
+        }
+        tcg_regset_set_reg(targets, s->xblk_home[temp_idx(ts)]);
+    }
+    for (int i = 0; i < s->nb_region_homes; i++) {
+        TCGTemp *ts = s->region_home[i];
+        TCGReg home = s->xblk_home[temp_idx(ts)];
+
+        if (xblk_region_live(s, l, ts)
+            && ts->val_type == TEMP_VAL_REG && ts->reg != home
+            && tcg_regset_test_reg(targets, ts->reg)) {
+            TCGReg r = tcg_reg_alloc(s, tcg_target_available_regs[ts->type],
+                                     s->reserved_regs | targets, 0, false);
+
+            if (tcg_out_mov(s, ts->type, r, ts->reg)) {
+                set_temp_val_reg(s, ts, r);
+            } else {
+                temp_sync(s, ts, s->reserved_regs, 0, -1);
+            }
+        }
+    }
+    for (int i = 0; i < s->nb_region_homes; i++) {
+        TCGTemp *ts = s->region_home[i];
+        TCGReg home = s->xblk_home[temp_idx(ts)];
+        TCGRegSet want = 0;
+
+        if (!xblk_region_live(s, l, ts)
+            || (ts->val_type == TEMP_VAL_REG && ts->reg == home)) {
+            continue;
+        }
+        if (s->reg_to_temp[home]) {
+            tcg_reg_free(s, home, s->reserved_regs | targets);
+        }
+        if (ts->val_type == TEMP_VAL_REG
+            && tcg_out_mov(s, ts->type, home, ts->reg)) {
+            set_temp_val_reg(s, ts, home);
+            continue;
+        }
+        if (ts->val_type == TEMP_VAL_REG) {
+            temp_sync(s, ts, s->reserved_regs, 0, -1);
+        }
+        tcg_regset_set_reg(want, home);
+        temp_load(s, ts, want, s->reserved_regs, 0);
+    }
+}
+
+/* The registers of the homes region label @l needs. */
+static TCGRegSet xblk_region_regs(TCGContext *s, TCGLabel *l)
+{
+    TCGRegSet set = 0;
+
+    for (int i = 0; i < s->nb_region_homes; i++) {
+        TCGTemp *ts = s->region_home[i];
+
+        if (xblk_region_live(s, l, ts)) {
+            tcg_regset_set_reg(set, s->xblk_home[temp_idx(ts)]);
+        }
+    }
+    return set;
+}
+
+/*
+ * After region label @l: the state every branch into the region leaves.
+ * The homes the label needs in their registers, perhaps newer than memory;
+ * everything else in memory, temps dead.  Then the stores the code after
+ * the label needs.
+ */
+static void xblk_region_canon(TCGContext *s, TCGLabel *l)
+{
+    xblk_forget(s);
+    for (int i = 0; i < s->nb_region_homes; i++) {
+        TCGTemp *ts = s->region_home[i];
+
+        if (!xblk_region_live(s, l, ts)) {
+            continue;
+        }
+        set_temp_val_reg(s, ts, s->xblk_home[temp_idx(ts)]);
+        ts->mem_coherent = 0;
+    }
+    xblk_obligations(s, l->live_in);
+}
+
 /*
  * At a conditional branch, we assume all temporaries are dead unless
  * explicitly live-across-conditional-branch; all globals and local
@@ -6902,6 +7079,10 @@ static void tcg_reg_alloc_cbranch(TCGContext *s, const TCGOp *op,
     assert_carry_dead(s);
     if (l && l->xkind == XLBL_INHERIT && l->xbranch == op && l->ft_state) {
         l->snap = xblk_snap(s);
+        return;
+    }
+    if (l && l->xkind == XLBL_REGION) {
+        /* Homes are in place (tcg_reg_alloc_op); the rest is in memory. */
         return;
     }
     s->boundary_check = s->boundary_in;
@@ -7252,6 +7433,19 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
 
     i_allocated_regs = s->reserved_regs;
     o_allocated_regs = s->reserved_regs;
+
+    /*
+     * A conditional branch into the region: homes in place first, and the
+     * branch's inputs kept out of their registers.
+     */
+    if (s->xblk_region && (def->flags & TCG_OPF_COND_BRANCH)) {
+        TCGLabel *l = op_branch_label(op);
+
+        if (l && l->xkind == XLBL_REGION) {
+            xblk_region_place(s, l);
+            i_allocated_regs |= xblk_region_regs(s, l);
+        }
+    }
 
     switch (op->opc) {
     case INDEX_op_brcond:

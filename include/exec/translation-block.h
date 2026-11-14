@@ -99,12 +99,27 @@ struct TranslationBlock {
      * leave its TB (do_tb_phys_invalidate).
      */
     bool loops;
+    /*
+     * System mode (tcg_edge_sys): an I/O access in the TB's last insn
+     * needn't end a TB of its own: every exit checks the exit request,
+     * or the TB has no edge checks (its successors check on entry).
+     */
+    bool edge_end;
 
     /* size of target code for this block (1 <= size <= TARGET_PAGE_SIZE) */
     uint16_t size;
     uint16_t icount;
+    /*
+     * Installed from a translation artifact (tcg-cache.h), its unwind
+     * data not yet checked: both readers of tc.search check it first
+     * (tb_unwind_check).  Set before the TB is published; cleared once.
+     */
+    uint8_t unwind_unchecked;
 
     struct tb_tc tc;
+    /* Installed from an artifact: the unwind data's bytes, and its bound. */
+    uint32_t search_len;
+    uint32_t code_len;
 
     /*
      * Track tb_page_addr_t intervals that intersect this TB.
@@ -116,6 +131,27 @@ struct TranslationBlock {
      */
 #ifdef CONFIG_USER_ONLY
     IntervalTreeNode itree;
+    /*
+     * x-smc=check: whether the TB checks its guest bytes at entry; the
+     * bytes its translation read, from its start (smc_len), and their
+     * CRC32C then; smc_reject if they changed while it was translated.
+     * smc_inline: the check is emitted in the TB, ending smc_check_end
+     * bytes from tc.ptr; a fault of its reads resumes at smc_stale, its
+     * path that discards the TB.
+     */
+    bool smc_check;
+    bool smc_reject;
+    bool smc_inline;
+    /*
+     * Page tracking's state (TB_PT_*), and while pending, the TB's index
+     * in the pending list (accel/tcg/tb-maint.c).
+     */
+    uint8_t pt_state;
+    uint16_t smc_len;
+    uint16_t smc_check_end;
+    uint32_t smc_crc;
+    uint32_t pt_index;
+    const void *smc_stale;
 #else
     uintptr_t page_next[2];
     tb_page_addr_t page_addr[2];
@@ -128,25 +164,23 @@ struct TranslationBlock {
      * the code of this one. This can be done either by emitting direct or
      * indirect native jump instructions. These jumps are reset so that the TB
      * just continues its execution. The TB can be linked to another one by
-     * setting one of the jump targets (or patching the jump instruction). Only
-     * two of such jumps are supported.
+     * setting one of the jump targets (or patching the jump instruction).
+     * Jumps are numbered 0 to TB_JMP_SLOTS - 1, except TB_EXIT_REQUESTED.
      */
+#define TB_JMP_SLOTS 8
 #define TB_JMP_OFFSET_INVALID UINT32_MAX /* indicates no jump generated */
-    uint32_t jmp_reset_offset[2]; /* offset of original jump target */
-    /*
-     * For a goto_tb slot, 1 + the slot of its tcg_gen_goto_tb_dead(), or 0;
-     * and whether this TB writes the chain-dead globals before it reads
-     * them, so that jumps to it may skip storing them.
-     */
-    uint8_t jmp_dead[2];
-    bool chain_dead_in;
     /*
      * The goto_tb slots that leave by a host call (tcg_gen_call_tb), and
      * TB_JMP_RET_LANDING if host returns may enter the TB
      * (tcg_gen_push_ret).
      */
     uint16_t jmp_call;
-#define TB_JMP_RET_LANDING 0x100
+#define TB_JMP_RET_LANDING (1u << TB_JMP_SLOTS)
+    /*
+     * Whether this TB writes the chain-dead globals before it reads
+     * them, so that jumps to it may skip storing them (TBJmpSlot.dead).
+     */
+    bool chain_dead_in;
     /*
      * The goto_tb slots whose unlinked path is out of line, at the TB's
      * end (tcg_goto_tb_cold): a slot is one direct branch, to the TB it
@@ -160,36 +194,51 @@ struct TranslationBlock {
      */
     uint8_t jmp_far;
     /*
-     * For a goto_tb slot that is the first insn at a label which one
-     * conditional branch reaches: 1 + that branch's offset, else 0.
-     * Linking the slot points the branch at the same TB when it can reach
-     * it, so that the taken path doesn't take a second branch.
+     * The number of slots in jmp[]: one past the highest slot the
+     * translation issued, or none (tcg_tb_trim_slots).
      */
-    uint32_t jmp_cond[2];
-    uint32_t jmp_insn_offset[2];  /* offset of direct jump insn */
-    uintptr_t jmp_target_addr[2]; /* target address */
+    uint8_t nb_slots;
 
     /*
      * Each TB has a NULL-terminated list (jmp_list_head) of incoming jumps.
-     * Each TB can have two outgoing jumps, and therefore can participate
-     * in two lists. The list entries are kept in jmp_list_next[2]. The least
-     * significant bit (LSB) of the pointers in these lists is used to encode
-     * which of the two list entries is to be used in the pointed TB.
+     * Each TB can have several outgoing jumps, and therefore can participate
+     * in several lists. The list entries are kept in jmp[].list_next. The
+     * low bits of the pointers in these lists (TB_JMP_TAG_MASK) encode
+     * which of the list entries is to be used in the pointed TB.
      *
      * List traversals are protected by jmp_lock. The destination TB of each
-     * outgoing jump is kept in jmp_dest[] so that the appropriate jmp_lock
+     * outgoing jump is kept in jmp[].dest so that the appropriate jmp_lock
      * can be acquired from any origin TB.
      *
-     * jmp_dest[] are tagged pointers as well. The LSB is set when the TB is
-     * being invalidated, so that no further outgoing jumps from it can be set.
+     * jmp[].dest are tagged pointers as well. The LSB is set when the TB is
+     * being invalidated, so that no further outgoing jumps from it can be
+     * set.
      *
      * jmp_lock also protects the CF_INVALID cflag; a jump must not be chained
      * to a destination TB that has CF_INVALID set.
      */
     uintptr_t jmp_list_head;
-    uintptr_t jmp_list_next[2];
-    uintptr_t jmp_dest[2];
+
+    /* The goto_tb slots, nb_slots of them (tb_struct_size). */
+    struct TBJmpSlot {
+        uint32_t reset_offset;  /* offset of original target */
+        uint32_t insn_offset;   /* offset of direct jump insn */
+        /*
+         * For a slot that is the first insn at a label which one
+         * conditional branch reaches: 1 + that branch's offset, else 0.
+         * Linking the slot points the branch at the same TB when it can
+         * reach it, so that the taken path doesn't take a second branch.
+         */
+        uint32_t cond;
+        /* 1 + the slot of its tcg_gen_goto_tb_dead(), or 0. */
+        uint8_t dead;
+        uintptr_t target_addr;  /* target address */
+        uintptr_t list_next;
+        uintptr_t dest;
+    } jmp[];
 };
+
+#define TB_JMP_TAG_MASK ((uintptr_t)TB_JMP_SLOTS - 1)
 
 /* The alignment given to TranslationBlock during allocation. */
 #define CODE_GEN_ALIGN  16
