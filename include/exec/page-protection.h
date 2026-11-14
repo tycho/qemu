@@ -38,5 +38,13 @@
 /* Target-specific bits that will be used via page_get_flags().  */
 #define PAGE_TARGET_1  0x0200
 #define PAGE_TARGET_2  0x0400
+/*
+ * The page's contents change only through a mapping or protection change
+ * that reaches the page flags: its code needs no check against
+ * self-modification (x-smc=check).  Set by the OS layer that fills the
+ * flags: linux-user for private mappings, the Windows modules for image
+ * pages.
+ */
+#define PAGE_FIXED_CODE 0x0800
 
 #endif

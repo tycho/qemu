@@ -443,6 +443,26 @@ struct TCGContext {
      */
     TCGOp *emit_before_op;
 
+    /*
+     * x-smc=check: the guest bytes the translator read, at their offsets
+     * from the TB's start, up to smc_len, in a buffer of smc_buf_size
+     * (smc_have: which were read); smc_torn_at, the first offset where a
+     * byte read twice differed (UINT32_MAX: none).  In user mode one
+     * context serves every thread, under the mmap lock.
+     */
+    uint32_t smc_torn_at;
+    uint32_t smc_len;
+    uint32_t smc_buf_size;
+    uint8_t *smc_buf;
+    uint8_t *smc_have;
+    /*
+     * x-smc=check emitted in the TB: the label of its path discarding the
+     * TB, or NULL.  insn0_off: the size of the code before the first guest
+     * insn's, set by tcg_gen_code.
+     */
+    TCGLabel *smc_stale;
+    uint16_t insn0_off;
+
     /* Tells which temporary holds a given register.
        It does not take into account fixed registers */
     TCGTemp *reg_to_temp[TCG_TARGET_NB_REGS];

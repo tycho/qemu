@@ -258,6 +258,13 @@ void translator_fake_ld(DisasContextBase *db, const void *data, size_t len);
  * All bytes must have been read during translation.
  * Return true on success or false on failure.
  */
+/*
+ * translator_smc_check: whether self-modifying code is detected by a check
+ * of each TB's guest bytes at its entry (x-smc=check), in which case the
+ * TB must end where x86 serializes instruction fetch (CPUID).
+ */
+bool translator_smc_check(void);
+
 bool translator_st(const DisasContextBase *db, void *dest,
                    vaddr addr, size_t len);
 
