@@ -948,6 +948,80 @@ static void tcg_set_pcid(Object *obj, bool value, Error **errp)
     tcg_pcid = value;
 }
 
+static bool tcg_get_lean(Object *obj, Error **errp)
+{
+    return tcg_lean;
+}
+
+static void tcg_set_lean(Object *obj, bool value, Error **errp)
+{
+    tcg_lean = value;
+}
+
+static bool tcg_get_alignfold(Object *obj, Error **errp)
+{
+    return tcg_alignfold;
+}
+
+static void tcg_set_alignfold(Object *obj, bool value, Error **errp)
+{
+    tcg_alignfold = value;
+}
+
+static char *tcg_get_zext32(Object *obj, Error **errp)
+{
+    switch (tcg_zext32) {
+    case TCG_ZEXT32_ON:
+        return g_strdup("on");
+    case TCG_ZEXT32_CHECK:
+        /*
+         * The development switches change the code: say so (a
+         * description, not a value the setter takes).
+         */
+        return g_strdup_printf("check%s%s", tcg_zext32_poison ? ",poison" : "",
+                               tcg_zext32_nofix ? ",nofix" : "");
+    default:
+        return g_strdup("off");
+    }
+}
+
+static void tcg_set_zext32(Object *obj, const char *value, Error **errp)
+{
+    TCGZext32Mode mode;
+
+    if (!strcmp(value, "off")) {
+        tcg_zext32 = TCG_ZEXT32_OFF;
+        return;
+    } else if (!strcmp(value, "on")) {
+        mode = TCG_ZEXT32_ON;
+    } else if (!strcmp(value, "check")) {
+        mode = TCG_ZEXT32_CHECK;
+    } else {
+        error_setg(errp, "x-zext32 must be off, on or check");
+        return;
+    }
+    if (!tcg_can_zext32()) {
+        error_setg(errp, "x-zext32=%s: only in user mode on an aarch64 host",
+                   value);
+        return;
+    }
+    tcg_zext32 = mode;
+#ifndef _WIN32
+    if (mode == TCG_ZEXT32_CHECK) {
+        /* XTCG_ZEXT32=poison, nofix, report: check's own tests. */
+        const char *dev = getenv("XTCG_ZEXT32");
+        g_auto(GStrv) words = g_strsplit(dev ? dev : "", ",", 0);
+
+        tcg_zext32_poison = g_strv_contains((const char *const *)words,
+                                            "poison");
+        tcg_zext32_nofix = g_strv_contains((const char *const *)words,
+                                           "nofix");
+        tcg_zext32_report = g_strv_contains((const char *const *)words,
+                                            "report");
+    }
+#endif
+}
+
 static void tcg_accel_class_init(ObjectClass *oc, const void *data)
 {
     AccelClass *ac = ACCEL_CLASS(oc);
@@ -1222,6 +1296,26 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "x-pcid", tcg_get_pcid, tcg_set_pcid);
     object_class_property_set_description(oc, "x-pcid",
         "x86: offer process-context identifiers (CPUID PCID and INVPCID)");
+
+    object_class_property_add_bool(oc, "x-lean", tcg_get_lean, tcg_set_lean);
+    object_class_property_set_description(oc, "x-lean",
+        "Leaner code for common guest patterns where the host allows: "
+        "guest accesses use the host's addressing modes (qemu-user), "
+        "32-bit operations and shifted-operand adds");
+
+    object_class_property_add_bool(oc, "x-alignfold", tcg_get_alignfold,
+                                   tcg_set_alignfold);
+    object_class_property_set_description(oc, "x-alignfold",
+        "Drop guest alignment checks implied by an earlier check on the "
+        "same address registers");
+
+    object_class_property_add_str(oc, "x-zext32", tcg_get_zext32,
+                                  tcg_set_zext32);
+    object_class_property_set_description(oc, "x-zext32",
+        "User mode, aarch64 hosts, no guest base: a 32-bit guest address "
+        "register is the host address, since 32-bit values are kept "
+        "zero-extended: off, on or check (on, and trap before an access "
+        "whose register isn't zero-extended)");
 }
 
 static const TypeInfo tcg_accel_type = {
