@@ -309,6 +309,27 @@ bool tcg_iolazy;
 bool tcg_mmio_lockless;
 bool tcg_exit_irq_only;
 
+unsigned tcg_tlb_grow;
+
+static void tcg_get_tlb_grow(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    uint32_t value = tcg_tlb_grow;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void tcg_set_tlb_grow(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    tcg_tlb_grow = value;
+}
+
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
