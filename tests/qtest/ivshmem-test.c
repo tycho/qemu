@@ -321,7 +321,7 @@ static void test_ivshmem_server(void)
     g_assert_cmpint(ret, ==, 0);
 
     thread.server = &server;
-    g_unix_open_pipe(thread.pipe, FD_CLOEXEC, &err);
+    g_unix_open_pipe(thread.pipe, QEMU_G_UNIX_PIPE_CLOEXEC, &err);
     g_assert_no_error(err);
     thread.thread = g_thread_new("ivshmem-server", server_thread, &thread);
     g_assert(thread.thread != NULL);
