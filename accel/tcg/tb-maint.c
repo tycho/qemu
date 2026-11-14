@@ -936,6 +936,20 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
     qatomic_set(&tb->cflags, tb->cflags | CF_INVALID);
     qemu_spin_unlock(&tb->jmp_lock);
 
+    /*
+     * A vCPU may be running a loop inside this TB, which unlinking its
+     * jumps would not end: make every vCPU leave its current TB.
+     */
+    if (tb->loops) {
+        CPUState *cpu;
+
+        WITH_RCU_READ_LOCK_GUARD() {
+            CPU_FOREACH(cpu) {
+                cpu_exit(cpu);
+            }
+        }
+    }
+
     /* remove the TB from the hash list */
     phys_pc = tb_page_addr0(tb);
     h = tb_hash_func(phys_pc, (orig_cflags & CF_PCREL ? 0 : tb->pc),
