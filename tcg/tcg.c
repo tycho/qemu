@@ -3186,6 +3186,8 @@ void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs)
             case INDEX_op_movcond:
             case INDEX_op_cmp_vec:
             case INDEX_op_cmpsel_vec:
+            case INDEX_op_fcmp_vec:
+            case INDEX_op_fcmps_vec:
                 if (op->args[k] < ARRAY_SIZE(cond_name)
                     && cond_name[op->args[k]]) {
                     col += ne_fprintf(f, ",%s", cond_name[op->args[k++]]);
@@ -4439,10 +4441,12 @@ liveness_pass_1(TCGContext *s)
             /*
              * Test if the operation can be removed because all
              * its outputs are dead. We assume that nb_oargs == 0
-             * implies side effects.
+             * implies side effects.  An operation that may raise
+             * floating-point exception flags stays for those.
              */
             def = &tcg_op_defs[opc];
-            if (!(def->flags & TCG_OPF_SIDE_EFFECTS) && def->nb_oargs != 0) {
+            if (!(def->flags & (TCG_OPF_SIDE_EFFECTS | TCG_OPF_FP_STATUS)) &&
+                def->nb_oargs != 0) {
                 for (int i = def->nb_oargs - 1; i >= 0; i--) {
                     if (arg_temp(op->args[i])->state != TS_DEAD) {
                         goto do_not_remove;

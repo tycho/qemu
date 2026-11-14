@@ -70,6 +70,7 @@
 #define TCG_TARGET_HAS_insert_vec       1
 #define TCG_TARGET_HAS_movz_vec         1
 #define TCG_TARGET_HAS_tst_vec          1
+#define TCG_TARGET_HAS_fp_vec           1
 #define TCG_TARGET_HAS_concat_vec       1
 #define TCG_TARGET_HAS_qemu_ldst_vec    1
 #define TCG_TARGET_HAS_perm_vec         1
