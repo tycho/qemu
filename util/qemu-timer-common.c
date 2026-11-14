@@ -50,6 +50,19 @@ static void __attribute__((constructor)) init_get_clock(void)
 
 int use_rt_clock;
 
+#if QEMU_CLOCK_RAW_SUPPORTED
+bool clock_raw;
+int64_t clock_raw_offset;
+
+void qemu_clock_use_raw(void)
+{
+    if (use_rt_clock && !clock_raw) {
+        clock_raw_offset = get_clock() - get_clock_raw();
+        qatomic_store_release(&clock_raw, true);
+    }
+}
+#endif
+
 static void __attribute__((constructor)) init_get_clock(void)
 {
     struct timespec ts;
