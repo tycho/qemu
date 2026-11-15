@@ -1601,7 +1601,14 @@ self:
             ec_reap_all();
             ec_term_self(me);
         }
-        *own_end = true;
+        if (unlikely(xt_term_hold_us)) {
+            int64_t until = get_clock() + (int64_t)xt_term_hold_us * SCALE_US;
+
+            while (get_clock() < until) {
+                /* Spinning: no kernel entry inside ntdll's callback. */
+            }
+        }
+        *own_end = !xt_term_noanswer;
     }
     return STATUS_SUCCESS;
 }
