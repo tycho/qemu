@@ -125,6 +125,8 @@ xt_check_call:
 #define F_X(n)      (0x30 + 0x08 + 8 * (n))
 #define F_SP        (0x30 + 0x100)
 #define F_V         (0x30 + 0x110)
+#define F_RESUME    0x3c0
+#define F_RESUME_GO 0x3c8
 #define C_X(n)      (0x08 + 8 * (n))
 #define C_SP        0x100
 #define C_PC        0x108
@@ -554,11 +556,30 @@ xt_check_call:
 .if \inj
     inj_point 3, 0, 1
 .endif
+    /*
+     * Below a TB's frame left for native code (x-ecinline), which the
+     * entry then resumes or discards; else from the stack's base.
+     */
+    ldr     x0, [x16, #F_RESUME]
+    cbnz    x0, 9f
     ldr     x0, [x17, #AREA_STACK_BASE]
+9:
     mov     sp, x0
     mov     x0, x16
     bl      "#xt_ec_enter"
-    brk     #0xf000
+    /*
+     * Returned: a resume (x-ecinline), by a jump, so that the host's
+     * return predictor holds what it held when the TB left:
+     * tcg_ec_resume_entry(env, code, the frame's sp).
+     */
+    ldr     x17, [x18, #TEB_CPU_AREA]
+    ldr     x16, [x17, #AREA_FRAME]
+    mov     x1, x0
+    ldr     x0, [x16, #F_ENV]
+    ldr     x2, [x16, #F_RESUME_GO]
+    adrp    x16, tcg_ec_resume_entry
+    ldr     x16, [x16, :lo12:tcg_ec_resume_entry]
+    br      x16
 
 .endm
 
