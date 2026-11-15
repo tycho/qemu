@@ -1173,6 +1173,15 @@ void cpu_exec_start(CPUState *cpu);
  */
 void cpu_exec_end(CPUState *cpu);
 
+/*
+ * The parts of cpu_exec_start and cpu_exec_end that run only with an
+ * exclusive section pending (pending_cpus nonzero after cpu->running's
+ * write and the barrier), for callers that do the rest themselves.
+ */
+extern int pending_cpus;
+void cpu_exec_start_finish(CPUState *cpu);
+void cpu_exec_end_finish(CPUState *cpu);
+
 /**
  * start_exclusive:
  *
