@@ -420,6 +420,11 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 #else
     tcg_jc_ctx = tcg_jcgen && tcg_ijmp_inline;
 #endif
+#ifdef CONFIG_USER_ONLY
+    if (tcg_partrans) {
+        max_threads = tcg_partrans;
+    }
+#endif
     page_init();
     tb_htable_init();
     tcg_init(s->tb_size * MiB, s->splitwx_enabled, max_threads);
@@ -1017,6 +1022,56 @@ static void tcg_set_ecinline(Object *obj, bool value, Error **errp)
     tcg_ecinline = value;
 }
 
+#if defined(CONFIG_USER_ONLY) && defined(_WIN32)
+static unsigned partrans_host_cpus(void)
+{
+    SYSTEM_INFO si;
+
+    GetSystemInfo(&si);
+    return si.dwNumberOfProcessors;
+}
+#endif
+
+static char *tcg_get_partrans(Object *obj, Error **errp)
+{
+#ifdef CONFIG_USER_ONLY
+    if (tcg_partrans) {
+        return g_strdup_printf("%u", tcg_partrans);
+    }
+#endif
+    return g_strdup("off");
+}
+
+/*
+ * x-partrans: "off", "on" (a translation context per host CPU, up to 8),
+ * or a number of contexts, 2 to 64.
+ */
+static void tcg_set_partrans(Object *obj, const char *value, Error **errp)
+{
+#if defined(CONFIG_USER_ONLY) && defined(_WIN32)
+    unsigned n;
+
+    if (!strcmp(value, "off")) {
+        n = 0;
+    } else if (!strcmp(value, "on")) {
+        n = MIN(partrans_host_cpus(), 8);
+        n = n < 2 ? 0 : n;
+    } else if (qemu_strtoui(value, NULL, 10, &n) || n < 2 || n > 64) {
+        error_setg(errp, "x-partrans: off, on, or 2 to 64 contexts");
+        return;
+    }
+    if (tcg_machine_inited && n != tcg_partrans) {
+        error_setg(errp, "x-partrans: cannot be changed at run time");
+        return;
+    }
+    tcg_partrans = n;
+#else
+    if (strcmp(value, "off")) {
+        error_setg(errp, "x-partrans: the Windows modules only");
+    }
+#endif
+}
+
 static bool tcg_get_sysret(Object *obj, Error **errp)
 {
     return tcg_sysret;
@@ -1609,6 +1664,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "In the x64 Windows module: leave for native code from generated "
         "code with its frame kept, and resume that frame when the call "
         "returns before anything else enters the engine");
+
+    object_class_property_add_str(oc, "x-partrans", tcg_get_partrans,
+                                  tcg_set_partrans);
+    object_class_property_set_description(oc, "x-partrans",
+        "In the Windows modules: translate in parallel, with off, on (a "
+        "context per host CPU, up to 8) or 2 to 64 translation contexts");
 
     object_class_property_add_bool(oc, "x-sysret", tcg_get_sysret,
                                    tcg_set_sysret);

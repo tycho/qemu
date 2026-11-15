@@ -16,6 +16,7 @@
 #include "tcg/startup.h"
 #include "tcg/helper-tcg.h"
 #include "exec/mmap-lock.h"
+#include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/helper-retaddr.h"
 #include "xtajit.h"
 
@@ -609,7 +610,7 @@ uint32_t xt_check(XtThread *t, XtState expect, int where)
     if (slot2_running(t) != (expect != XT_WINDOWS)) {
         bad |= XT_BAD_SLOT2;
     }
-    if (have_mmap_lock()) {
+    if (have_mmap_lock() || tb_gen_active()) {
         bad |= XT_BAD_MMAP_LOCK;
     }
     if (helper_retaddr) {

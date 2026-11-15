@@ -27,12 +27,14 @@ NTSTATUS NTAPI NtFreeVirtualMemory(HANDLE, PVOID *, PSIZE_T, ULONG);
 #define MEMORY_MAPPED_FILENAME_INFORMATION 2
 
 /*
- * The catalogue, under mmap_lock: the regions queried so far (Windows'
+ * The catalogue, under cat_lock: the regions queried so far (Windows'
  * runs of pages with one protection), each with the image its allocation
  * is, or none; and the images, one per allocation base.  An image's
  * identity hashes its file's path, upper-cased, and its PE header's
  * TimeDateStamp, SizeOfImage and CheckSum.  The memory notifications
- * drop what they reach (xt_cache_forget).
+ * drop what they reach (xt_cache_forget).  Translations query it, in
+ * parallel with x-partrans; Windows' queries and the identity's reads run
+ * outside the lock.
  */
 typedef struct XtImage {
     uintptr_t base;
@@ -51,6 +53,7 @@ static XtImage **images;
 static size_t n_images, max_images;
 static unsigned image_gen;
 static int last_region = -1;
+static QemuSpin cat_lock;
 
 int xt_cache_inj;
 static unsigned inj_count;
@@ -121,32 +124,57 @@ static bool image_identity(uintptr_t base, uint64_t *id)
     return true;
 }
 
-static XtImage *image_at(uintptr_t base)
+/* The image based at BASE, if known.  Under cat_lock. */
+static XtImage *image_find(uintptr_t base)
 {
-    XtImage *img;
-    uint64_t id;
-    int64_t t0 = get_clock();
-
     for (size_t i = 0; i < n_images; i++) {
         if (images[i]->base == base) {
             return images[i];
         }
     }
-    xt_cache_stats.identities++;
+    return NULL;
+}
+
+/*
+ * The image at BASE, identified now if it isn't known, as its generation
+ * (0: it can't be).  Called without cat_lock.
+ */
+static unsigned image_at(uintptr_t base)
+{
+    XtImage *img;
+    unsigned gen;
+    uint64_t id;
+    int64_t t0;
+
+    qemu_spin_lock(&cat_lock);
+    img = image_find(base);
+    gen = img ? img->gen : 0;
+    qemu_spin_unlock(&cat_lock);
+    if (gen) {
+        return gen;
+    }
+    t0 = get_clock();
+    qatomic_inc(&xt_cache_stats.identities);
     if (!image_identity(base, &id)) {
-        xt_cache_stats.identity_fail++;
-        xt_cache_stats.query_ns += get_clock() - t0;
-        return NULL;
+        qatomic_inc(&xt_cache_stats.identity_fail);
+        qatomic_add(&xt_cache_stats.query_ns, get_clock() - t0);
+        return 0;
     }
-    img = g_new(XtImage, 1);
-    *img = (XtImage){ .base = base, .id = id, .gen = ++image_gen };
-    if (n_images == max_images) {
-        max_images = max_images ? max_images * 2 : 64;
-        images = g_renew(XtImage *, images, max_images);
+    qemu_spin_lock(&cat_lock);
+    img = image_find(base);
+    if (!img) {
+        img = g_new(XtImage, 1);
+        *img = (XtImage){ .base = base, .id = id, .gen = ++image_gen };
+        if (n_images == max_images) {
+            max_images = max_images ? max_images * 2 : 64;
+            images = g_renew(XtImage *, images, max_images);
+        }
+        images[n_images++] = img;
     }
-    images[n_images++] = img;
-    xt_cache_stats.query_ns += get_clock() - t0;
-    return img;
+    gen = img->gen;
+    qemu_spin_unlock(&cat_lock);
+    qatomic_add(&xt_cache_stats.query_ns, get_clock() - t0);
+    return gen;
 }
 
 /* The index of the region holding ADDR, or -1. */
@@ -226,6 +254,7 @@ static bool page_image(vaddr page, TCGCacheImage *out)
     int want = PAGE_VALID | PAGE_EXEC | PAGE_FIXED_CODE;
     MEMORY_BASIC_INFORMATION mbi;
     XtImage *img = NULL;
+    unsigned gen = 0;
     int i;
 
     if ((page_get_flags(page) & (want | PAGE_WRITE | PAGE_WRITE_ORG))
@@ -237,32 +266,43 @@ static bool page_image(vaddr page, TCGCacheImage *out)
         return false;
     }
 #endif
+    qemu_spin_lock(&cat_lock);
     i = region_find(page);
     if (i < 0) {
         int64_t t0 = get_clock();
 
-        xt_cache_stats.queries++;
+        qemu_spin_unlock(&cat_lock);
+        qatomic_inc(&xt_cache_stats.queries);
         if (NtQueryVirtualMemory(GetCurrentProcess(), (void *)(uintptr_t)page,
                                  0, &mbi, sizeof(mbi), NULL) < 0) {
-            xt_cache_stats.query_ns += get_clock() - t0;
+            qatomic_add(&xt_cache_stats.query_ns, get_clock() - t0);
             return false;
         }
-        xt_cache_stats.query_ns += get_clock() - t0;
+        qatomic_add(&xt_cache_stats.query_ns, get_clock() - t0);
         if (mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE &&
             !xt_is_own_image(mbi.AllocationBase)) {
-            img = image_at((uintptr_t)mbi.AllocationBase);
+            gen = image_at((uintptr_t)mbi.AllocationBase);
+        }
+        qemu_spin_lock(&cat_lock);
+        if (gen) {
+            img = image_find((uintptr_t)mbi.AllocationBase);
+            /* An image a notification dropped meanwhile isn't added back. */
+            if (!img || img->gen != gen) {
+                qemu_spin_unlock(&cat_lock);
+                return false;
+            }
         }
         i = region_add((uintptr_t)mbi.BaseAddress,
                        (uintptr_t)mbi.BaseAddress + mbi.RegionSize - 1, img);
         last_region = i;
     }
     img = regions[i].img;
-    if (!img) {
-        return false;
+    if (img) {
+        out->id = img->id;
+        out->base = img->base;
     }
-    out->id = img->id;
-    out->base = img->base;
-    return true;
+    qemu_spin_unlock(&cat_lock);
+    return img != NULL;
 }
 
 /* A guarded routine's fault: a guard page's guard goes back. */
@@ -270,10 +310,10 @@ void xt_cache_fault(int64_t code)
 {
     vaddr addr = code & (TCG_CACHE_GFAULT_GUARD - 1);
 
-    xt_cache_stats.faults++;
+    qatomic_inc(&xt_cache_stats.faults);
     if (code & TCG_CACHE_GFAULT_GUARD) {
         if (xt_guard_restore(addr)) {
-            xt_cache_stats.guard_back++;
+            qatomic_inc(&xt_cache_stats.guard_back);
         } else {
             tcg_cache_stats.guard_lost++;
         }
@@ -370,11 +410,14 @@ void xt_cache_init(void)
  */
 void xt_cache_forget(int kind, vaddr start, vaddr last)
 {
+    qemu_spin_lock(&cat_lock);
     if (!n_regions && !n_images) {
+        qemu_spin_unlock(&cat_lock);
         return;
     }
     regions_drop(start, last, NULL);
     if (kind != 3 && kind != 5) {
+        qemu_spin_unlock(&cat_lock);
         return;
     }
     for (size_t i = 0; i < n_images;) {
@@ -389,6 +432,7 @@ void xt_cache_forget(int kind, vaddr start, vaddr last)
             i++;
         }
     }
+    qemu_spin_unlock(&cat_lock);
 }
 
 void xt_cache_print_stats(void)

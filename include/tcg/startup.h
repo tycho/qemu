@@ -285,7 +285,8 @@ extern bool tcg_region_entry;
  * @max_threads: number of vcpu threads in system mode
  *
  * Allocate and initialize TCG resources, especially the JIT buffer.
- * In user-only mode, @max_threads is unused.
+ * In user-only mode, @max_threads is the number of translation contexts
+ * (x-partrans), 1 by default.
  */
 void tcg_init(size_t tb_size, int splitwx, unsigned max_threads);
 
@@ -297,6 +298,25 @@ void tcg_init(size_t tb_size, int splitwx, unsigned max_threads);
  * function before initiating translation.
  */
 void tcg_register_thread(void);
+
+#ifdef CONFIG_USER_ONLY
+/*
+ * x-partrans: the number of translation contexts in user mode, or 0 for
+ * the one shared context.
+ */
+extern unsigned tcg_partrans;
+
+/**
+ * tcg_ctx_borrow: Take a translation context for one translation
+ *
+ * With x-partrans, a context no other thread is using, waiting for one if
+ * all are; otherwise the one shared context.  It becomes tcg_ctx until the
+ * caller gives it back with tcg_ctx_return, which makes tcg_ctx the shared
+ * context again.
+ */
+struct TCGContext *tcg_ctx_borrow(void);
+void tcg_ctx_return(struct TCGContext *s);
+#endif
 
 /**
  * tcg_prologue_init(): Generate the code for the TCG prologue

@@ -31,6 +31,7 @@
 #include "tcg/startup.h"
 #include "exec/helper-gen-common.h"
 #include "internal-common.h"
+#include "exec/mmap-lock.h"
 #include "qemu/crc32c.h"
 #include "disas/disas.h"
 #include "tb-internal.h"
@@ -1730,7 +1731,9 @@ static bool translator_ld_1(CPUArchState *env, DisasContextBase *db,
                 tb_unlock_page1(page0, old_page1);
             }
             tb_set_page_addr1(tb, new_page1);
+            mmap_lock();
             tb_lock_page1(page0, new_page1);
+            mmap_unlock();
         }
         host = db->host_addr[1];
     }
