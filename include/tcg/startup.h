@@ -199,6 +199,11 @@ extern bool tcg_pin_vec;
 extern bool tcg_pin_cc;
 extern bool tcg_pin_pc;
 /*
+ * tcg_pinned_reg: the host register (the backend's TCGReg) that holds the
+ * global at env offset @offset across TBs, or -1 if it isn't pinned.
+ */
+int tcg_pinned_reg(intptr_t offset);
+/*
  * tcg_edge_sys: with tcg_region, in system mode as in user mode, TBs check
  * the exit request on the exits that may close a cycle instead of at
  * their entry; a TB with I/O checks on every exit.  Not with icount.
@@ -486,6 +491,15 @@ extern bool tcg_retalign;
  *   to CODE: by a return if its bit 0 is set (a return stack landing,
  *   tcg_retstack_take_landing, whose host call is owed), else by a jump,
  *   or out through the epilogue if it is zero.
+ * - with tcg_ecfast, if the front end has tcg_ec_callout_fast_fn: the
+ *   call-out entry jumps there first, the state stored and still in the
+ *   pinned registers, env in its register, with x0 (the host's first
+ *   argument register) the rest of the entry, where it goes on if it
+ *   doesn't leave.
+ * - tcg_ec_resume_fast_entry(env, landing, sp), jumped to by a front end
+ *   that has put the pinned globals in their registers itself
+ *   (tcg_pinned_reg): back on the frame at SP, with the rest of the TB
+ *   boundary's state loaded from env, then to LANDING by a return.
  */
 typedef struct TCGEcCallout {
     uintptr_t target, arg;
@@ -502,12 +516,24 @@ extern TCGEcCallout (*tcg_ec_callout_fn)(uintptr_t sp, void *env);
 extern const void *tcg_ec_leave_fn;
 extern const void *tcg_ec_callout_entry;
 extern const void *tcg_ec_resume_entry;
+extern const void *tcg_ec_resume_fast_entry;
+extern const void *tcg_ec_callout_fast_fn;
 /*
  * tcg_retalign: pop the top entry if its key is @key, and return its
  * landing if a return may take it (pushed in this invocation of generated
  * code, its host call owed), else 0.
  */
 uintptr_t tcg_retstack_take_landing(CPUState *cpu, uint64_t key);
+/*
+ * tcg_retalign: the top entry's landing, as tcg_retstack_take_landing
+ * would return it, without popping the entry: its key in *KEY, the env
+ * slot that holds the return stack's top in *SLOT, the top once the
+ * entry is popped in *NEXT, and the ring's bounds in *LO and *HI.  0 if
+ * a return may take none.
+ */
+uintptr_t tcg_retstack_peek_landing(CPUState *cpu, uint64_t *key,
+                                    uint64_t ***slot, uint64_t **next,
+                                    uint64_t **lo, uint64_t **hi);
 bool tcg_retstack_pop_key(CPUState *cpu, uint64_t key);
 bool tcg_retstack_push_key(CPUState *cpu, uint64_t key);
 /*

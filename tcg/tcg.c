@@ -371,6 +371,8 @@ TCGEcCallout (*tcg_ec_callout_fn)(uintptr_t sp, void *env);
 const void *tcg_ec_leave_fn;
 const void *tcg_ec_callout_entry;
 const void *tcg_ec_resume_entry;
+const void *tcg_ec_resume_fast_entry;
+const void *tcg_ec_callout_fast_fn;
 bool tcg_tb_flags_canon;
 bool tcg_addr32;
 bool tcg_tsc_counter;
@@ -1513,6 +1515,24 @@ bool tcg_temp_pin(TCGTemp *ts)
     tcg_regset_set_reg(s->reserved_regs, ts->reg);
     s->pinned[s->nb_pinned++] = ts;
     return true;
+}
+
+/*
+ * The host register that holds the global at env offset @offset across
+ * TBs (tcg_temp_pin), or -1 if it isn't pinned.
+ */
+int tcg_pinned_reg(intptr_t offset)
+{
+    const TCGContext *s = &tcg_init_ctx;
+
+    for (int i = 0; i < s->nb_pinned; i++) {
+        const TCGTemp *ts = s->pinned[i];
+
+        if (ts->mem_base->reg == TCG_AREG0 && ts->mem_offset == offset) {
+            return ts->reg;
+        }
+    }
+    return -1;
 }
 
 /* Store every pinned global to its env slot. */
