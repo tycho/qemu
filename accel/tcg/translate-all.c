@@ -790,6 +790,65 @@ static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
 }
 
 /*
+ * Testing (cachetrace): an install from @img's store or files, with a line
+ * saying it was installed or why not; an installed TB joins the trace's
+ * set, for its links, unlinks and invalidation.
+ */
+static TranslationBlock *tb_cache_install_traced(CPUState *cpu,
+                                                 TCGTBCPUState s,
+                                                 tb_page_addr_t phys_pc,
+                                                 const void *art, size_t len,
+                                                 const TCGCacheImage *img)
+{
+    static const char *const forms[] = {
+        "none", "b26", "bcond19", "tbz14", "ldrlit19", "adr21", "adrp",
+        "adrp+add", "adrp+ldr", "raw-adrp", "movw", "pool64", "rel32",
+    };
+    TCGCacheStats b;
+    TranslationBlock *tb;
+    const TCGCacheStats *a = &tcg_cache_stats;
+    const char *why = "other";
+    char line[200];
+
+    if (!tcg_cache_trace) {
+        return tb_cache_install(cpu, s, phys_pc, art, len, img);
+    }
+    b = tcg_cache_stats;
+    tb = tb_cache_install(cpu, s, phys_pc, art, len, img);
+    if (a->inst_dup != b.inst_dup) {
+        why = "dup";
+    } else if (tb) {
+        why = "ok";
+        tcg_cache_trace_installed(tb, img->id, s.pc - img->base);
+    } else if (a->inst_fail_reloc != b.inst_fail_reloc) {
+        why = tcg_cache_fail_form < ARRAY_SIZE(forms)
+              ? forms[tcg_cache_fail_form] : "reloc";
+    } else if (a->inst_fail_kpc != b.inst_fail_kpc) {
+        why = "key-pc";
+    } else if (a->inst_fail_key != b.inst_fail_key) {
+        why = "key";
+    } else if (a->inst_fail_bytes != b.inst_fail_bytes) {
+        why = "bytes";
+    } else if (a->inst_fail_reserve != b.inst_fail_reserve) {
+        why = "reserve";
+    } else if (a->inst_fail_promoted != b.inst_fail_promoted) {
+        why = "promoted";
+    } else if (a->miss_inel != b.miss_inel) {
+        why = "inel";
+    } else if (a->miss_region != b.miss_region) {
+        why = "region";
+    } else if (a->miss_fault != b.miss_fault) {
+        why = "fault";
+    } else if (a->miss_struct != b.miss_struct) {
+        why = "struct";
+    }
+    snprintf(line, sizeof(line), "inst %016" PRIx64 " %" PRIx64 " %" PRIx64
+             " %s\n", img->id, (uint64_t)s.pc - img->base, img->base, why);
+    tcg_cache_out(line);
+    return tb;
+}
+
+/*
  * Testing (XTCG_CACHE_TEST_DUP=n): every nth install installs its
  * artifact again right after, which must find @first and give back the
  * second TB from the region array and page tracking.
@@ -847,8 +906,8 @@ static bool tb_cache_use(const TCGCacheEnv *env, void *opaque)
         return false;
     }
 
-    u->tb = tb_cache_install(u->cpu, u->s, u->phys_pc, env + 1,
-                             env->len - sizeof(*env), u->img);
+    u->tb = tb_cache_install_traced(u->cpu, u->s, u->phys_pc, env + 1,
+                                    env->len - sizeof(*env), u->img);
     if (!u->tb) {
         tcg_cache_stats.file_fail++;
         tcg_cache_stats.file_fail_ns += TCG_CACHE_CLOCK() - t0;
@@ -962,7 +1021,7 @@ static TranslationBlock *tb_cache_lookup(CPUState *cpu, TCGTBCPUState s,
             tcg_cache_stats.miss_fault++;
             continue;
         }
-        tb = tb_cache_install(cpu, s, phys_pc, buf, c[i].len, img);
+        tb = tb_cache_install_traced(cpu, s, phys_pc, buf, c[i].len, img);
         if (tb) {
             tcg_cache_stats.hits++;
             tcg_cache_stats.hit_ns += TCG_CACHE_CLOCK() - t0;

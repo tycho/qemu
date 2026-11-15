@@ -56,6 +56,88 @@ static void tcg_cache_out_stderr(const char *line)
 
 void (*tcg_cache_out)(const char *line) = tcg_cache_out_stderr;
 TCGCacheStats tcg_cache_stats;
+int tcg_cache_test_reloc_fail;
+
+/*
+ * Testing (cachetrace): the TBs installed from artifacts, by address, with
+ * their key, so that their links, unlinks and invalidations can be told
+ * apart from translated TBs' (tcg_cache_trace_event).
+ */
+typedef struct TraceKey {
+    uint64_t id, rva;
+} TraceKey;
+
+static GHashTable *trace_installed;
+static QemuSpin trace_lock;
+
+void tcg_cache_trace_installed(const TranslationBlock *tb, uint64_t id,
+                               uint64_t rva)
+{
+    TraceKey *k = g_new(TraceKey, 1);
+
+    k->id = id;
+    k->rva = rva;
+    qemu_spin_lock(&trace_lock);
+    if (!trace_installed) {
+        trace_installed = g_hash_table_new_full(NULL, NULL, NULL, g_free);
+    }
+    g_hash_table_insert(trace_installed, (gpointer)tb, k);
+    qemu_spin_unlock(&trace_lock);
+}
+
+static bool trace_key(const TranslationBlock *tb, TraceKey *out, bool drop)
+{
+    TraceKey *k;
+
+    qemu_spin_lock(&trace_lock);
+    k = trace_installed ? g_hash_table_lookup(trace_installed, tb) : NULL;
+    if (k) {
+        *out = *k;
+        if (drop) {
+            g_hash_table_remove(trace_installed, tb);
+        }
+    }
+    qemu_spin_unlock(&trace_lock);
+    return k != NULL;
+}
+
+/*
+ * A line for @what (link, unlink, inval) done to the installed TB @tb, its
+ * slot @n and, for a link, the TB @dest (installed: its key; else its pc).
+ * An invalidated TB leaves the set; a flush empties it.
+ */
+void tcg_cache_trace_event(const char *what, const TranslationBlock *tb,
+                           int n, const TranslationBlock *dest)
+{
+    char line[160];
+    TraceKey k, d;
+
+    if (!strcmp(what, "flush")) {
+        qemu_spin_lock(&trace_lock);
+        if (trace_installed) {
+            g_hash_table_remove_all(trace_installed);
+        }
+        qemu_spin_unlock(&trace_lock);
+        tcg_cache_out("flush\n");
+        return;
+    }
+    if (!trace_key(tb, &k, !strcmp(what, "inval"))) {
+        return;
+    }
+    if (dest && trace_key(dest, &d, false)) {
+        snprintf(line, sizeof(line), "%s %016" PRIx64 " %" PRIx64
+                 " %d -> %016" PRIx64 " %" PRIx64 "\n", what, k.id, k.rva,
+                 n, d.id, d.rva);
+    } else if (dest) {
+        snprintf(line, sizeof(line), "%s %016" PRIx64 " %" PRIx64
+                 " %d -> pc %" PRIx64 "\n", what, k.id, k.rva, n,
+                 (uint64_t)dest->pc);
+    } else {
+        snprintf(line, sizeof(line), "%s %016" PRIx64 " %" PRIx64 " %d\n",
+                 what, k.id, k.rva, n);
+    }
+    tcg_cache_out(line);
+}
 
 const char *const tcg_cache_x_names[TCG_CACHE_X_MAX] = {
     [TCG_CACHE_X_NONE] = "none",
@@ -108,6 +190,14 @@ static void tcg_cache_init(void)
     }
     m = getenv("XTCG_CACHE_VALIDATE");
     tcg_cache_validate_always = m && !strcmp(m, "always");
+    /*
+     * Testing (XTCG_CACHE_TEST_RELOCFAIL=FORM, TCG_CAPF_*'s number): every
+     * relocation of that form fails to apply, as if out of reach.
+     */
+    m = getenv("XTCG_CACHE_TEST_RELOCFAIL");
+    if (m && atoi(m) > 0) {
+        tcg_cache_test_reloc_fail = atoi(m);
+    }
     m = getenv("XTCG_CACHE_TEST_UNWIND_DAMAGE");
     if (m && atoi(m) > 0 && atoi(m) < TCG_CACHE_DAMAGE_MAX) {
         tcg_cache_test_unwind_damage = atoi(m);
@@ -1224,7 +1314,8 @@ TranslationBlock *tcg_cache_place(TCGContext *s, const TCGCacheArtView *v,
             tcg_cache_fail_form = rel->form;
             return NULL;
         }
-        if (!tcg_cache_apply(rw, rx, rel->form, rel->aux, val)) {
+        if (unlikely(tcg_cache_test_reloc_fail == rel->form) ||
+            !tcg_cache_apply(rw, rx, rel->form, rel->aux, val)) {
             tcg_cache_fail_kind = rel->kind;
             tcg_cache_fail_form = rel->form;
             if (tcg_cache_debug) {
