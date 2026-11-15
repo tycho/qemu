@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xtcg-stats.h"
 #include "tcg/tcg-cache.h"
 #include "qemu/timer.h"
 #include "qemu/cacheflush.h"
@@ -1111,6 +1112,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 #endif
 
     assert_memory_lock();
+    xtcg_stat_inc(XS_TB_GEN);
     qemu_thread_jit_write();
     TCG_HOST_FP_SUSPEND_GUARD(cpu);
     translator_region_start();

@@ -22,6 +22,7 @@
 #include "qemu.h"
 #include "user-internals.h"
 #include "qemu/plugin.h"
+#include "qemu/xtcg-stats.h"
 #include "tcg/tcg-cache.h"
 #include "exec/mmap-lock.h"
 #include "accel/tcg/tb-context.h"
@@ -78,6 +79,7 @@ void preexit_cleanup(CPUArchState *env, int code)
         gdb_exit(code);
         qemu_plugin_user_exit();
         perf_exit();
+        xtcg_stats_dump();
         if (tcg_cache_mode && getenv("XTCG_CACHE_STATS")) {
             tcg_cache_print_stats();
             fprintf(stderr, "xtcg-cache: flushes completed %u\n",
