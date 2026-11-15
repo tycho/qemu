@@ -17,6 +17,7 @@
 #include "tcg/tcg-cache.h"
 #include "tcg/startup.h"
 #include "tcg/host-fpenv.h"
+#include "host/fpenv.h"
 #include "accel/tcg/dispatch.h"
 #include "exec/mmap-lock.h"
 #include "accel/tcg/cpu-loop.h"
@@ -1379,6 +1380,8 @@ static void ec_reap_gates(void)
     }
 }
 
+static void ec_frame_normalize(XtThread *t, XtEcFrame *f, uint64_t fpsr);
+
 /*
  * The calling thread's own end, at its only level: its record goes now,
  * its frame and emulator stack once the thread has ended (the reaper), and
@@ -1406,6 +1409,10 @@ static void ec_term_self(XtGate *g)
         goto out;
     }
     f = area->EmulatorData[1];
+    /* A kept frame of x-ecfast's gives back the host FP state first. */
+    if (f->resume_sp) {
+        ec_frame_normalize(t, f, host_fp_status_read());
+    }
     qatomic_set((XtEcFrame **)&g->frame, NULL);
     /* Before the CPU state goes: no entry of this thread's is storing. */
     qatomic_set(&f->env, NULL);
@@ -2656,7 +2663,7 @@ static inline QEMU_ALWAYS_INLINE bool ec_dispatch_ready(XtThread *t,
     return likely(f->saved_to_env && t->rcu_reader &&
                   !qatomic_read(&t->terminating) &&
                   !qatomic_read(&t->suspend_req) &&
-                  !(xt_ec_eflags(env) & RF_MASK) &&
+                  !(env->eflags & RF_MASK) &&
                   (!t->bp_hit || t->bp_hit != f->pc) &&
                   !cpu_single_stepping(cs) &&
                   QTAILQ_EMPTY(&cs->breakpoints) &&
@@ -2673,16 +2680,30 @@ static inline QEMU_ALWAYS_INLINE void ec_dispatch_flags_out(CPUX86State *env)
     env_archcpu(env)->eflags_in_tcg = false;
 }
 
-/* The end of the activation: cpu_exec's, then xt_run_exec's. */
+/*
+ * The end of the activation: cpu_exec's, then xt_run_exec's.  With
+ * KEEP_LAZY (x-ecfast's departure), the flags stay lazy and the host FP
+ * state held.
+ */
+static inline QEMU_ALWAYS_INLINE void ec_dispatch_end_how(XtThread *t,
+                                                          CPUState *cs,
+                                                          CPUX86State *env,
+                                                          bool keep_lazy)
+{
+    if (!keep_lazy) {
+        ec_dispatch_flags_out(env);
+        x86_host_fp_exit(env);
+    }
+    rcu_read_unlock_reader(t->rcu_reader);
+    cpu_exec_end(cs);
+    t->active = XT_ACT_NONE;
+}
+
 static inline QEMU_ALWAYS_INLINE void ec_dispatch_end(XtThread *t,
                                                       CPUState *cs,
                                                       CPUX86State *env)
 {
-    ec_dispatch_flags_out(env);
-    x86_host_fp_exit(env);
-    rcu_read_unlock_reader(t->rcu_reader);
-    cpu_exec_end(cs);
-    t->active = XT_ACT_NONE;
+    ec_dispatch_end_how(t, cs, env, false);
 }
 
 typedef enum EcFallback {
@@ -2874,6 +2895,23 @@ miss:
  * pending.  A destination that is no longer native code declines with no
  * exit, so that the run looks it up as guest code.
  */
+/*
+ * x-ecfast: the host FP state is the guest's, in QEMU's own mode (MXCSR's
+ * default control: guest_fpcr's HOST_FP_CONTROL_QEMU); the live FPCR is
+ * that mode; the live FPSR.
+ */
+static inline QEMU_ALWAYS_INLINE bool ec_fp_default(CPUState *cs,
+                                                    CPUX86State *env)
+{
+    return cs->host_fp_guest && !cs->host_fp_suspended &&
+           !(env->mxcsr & 0xe040);
+}
+
+static inline QEMU_ALWAYS_INLINE bool ec_fpcr_default(void)
+{
+    return host_fp_control_read() == HOST_FP_CONTROL_QEMU;
+}
+
 static TCGEcCallout ec_callout(uintptr_t sp, void *envp)
 {
     CPUX86State *env = envp;
@@ -2910,16 +2948,51 @@ static TCGEcCallout ec_callout(uintptr_t sp, void *envp)
     t->co_flush = qatomic_read(&tb_ctx.tb_flush_count);
     cs->exception_index = -1;
     cs->neg.can_do_io = true;
+    /*
+     * x-ecfast: with the default FP control the guest's FP mode is QEMU's
+     * own, so the host FP state stays held across the call, and the flags
+     * stay lazy: the return takes them from the incoming state.
+     */
+    if (tcg_ecfast && ec_fp_default(cs, env) && xt_ec_segs_loaded(t)) {
+        f->dep_fpsr = host_fp_status_read();
+        f->resume_kind = XT_EC_KEPT_FAST;
+        ec_dispatch_end_how(t, cs, env, true);
+        f->resume_sp = sp;
+        leave_native_prep(t);
+        /* The release's tails are C: FPSR as it was, the guest's. */
+        host_fp_status_write(f->dep_fpsr);
+        /* Neither YMM's upper halves nor MMX: volatile across a call. */
+        return (TCGEcCallout){ target, 2 };
+    }
+    f->resume_kind = XT_EC_KEPT_C;
     ec_dispatch_end(t, cs, env);
     f->resume_sp = sp;
     leave_native_prep(t);
     return (TCGEcCallout){ target, xt_ec_ymm(t) };
 }
 
+/*
+ * A kept frame of x-ecfast's (XT_EC_KEPT_FAST) at an entry that doesn't
+ * resume it fast: the host FP state released, folding FPSR as the caller
+ * gives it (the thread's own, at an entry; the departure's, where the
+ * entry has no FP state of its own), so that C finds it as ec_callout
+ * leaves it.  The flags need nothing: every entry takes them from its
+ * incoming state.
+ */
+static void ec_frame_normalize(XtThread *t, XtEcFrame *f, uint64_t fpsr)
+{
+    if (f->resume_kind == XT_EC_KEPT_FAST) {
+        x86_host_fp_exit_fpsr(t->env, fpsr);
+        f->resume_kind = XT_EC_KEPT_C;
+    }
+}
+
 /* A kept frame no longer resumable: its ring entries are the abandoned. */
 static void ec_discard(XtThread *t, XtEcFrame *f)
 {
+    ec_frame_normalize(t, f, host_fp_status_read());
     f->resume_sp = 0;
+    f->resume_kind = XT_EC_KEPT_C;
     if (tcg_retalign) {
         tcg_retstack_settle(t->cpu);
     }
@@ -2989,6 +3062,12 @@ static __attribute__((noinline)) uintptr_t ec_resume(XtThread *t,
     CPUX86State *env = t->env;
     uintptr_t code = 0;
     TranslationBlock *tb;
+    /*
+     * x-ecfast's kept frame: FPSR is the guest's, held, and what C does
+     * here (cpu_exec_start's tail) mustn't reach it.
+     */
+    bool fast = f->resume_kind == XT_EC_KEPT_FAST;
+    uint64_t fpsr = fast ? host_fp_status_read() : 0;
 
     t->ec_suspended = false;
     t->state = XT_ACQUIRING;
@@ -3000,6 +3079,7 @@ static __attribute__((noinline)) uintptr_t ec_resume(XtThread *t,
     }
     rcu_read_lock_reader(t->rcu_reader);
     if (unlikely(!ec_resume_clear(t, cs))) {
+        ec_frame_normalize(t, f, fpsr);
         rcu_read_unlock_reader(t->rcu_reader);
         cpu_exec_end(cs);
         t->active = XT_ACT_NONE;
@@ -3008,7 +3088,12 @@ static __attribute__((noinline)) uintptr_t ec_resume(XtThread *t,
     }
     f->resume_go = f->resume_sp;
     f->resume_sp = 0;
-    xt_ec_import_engine(t, f->pc, f->nzcv);
+    f->resume_kind = XT_EC_KEPT_C;
+    if (fast) {
+        xt_ec_import_fast(t, f->pc, f->nzcv);
+    } else {
+        xt_ec_import_engine(t, f->pc, f->nzcv);
+    }
     t->state = XT_ENGINE;
     if (tcg_retalign) {
         /* The call's own landing, the return it predicts. */
@@ -3019,7 +3104,12 @@ static __attribute__((noinline)) uintptr_t ec_resume(XtThread *t,
     }
     t->after_suspend = false;
     t->gfault.code = 0;
-    x86_host_fp_enter(env);
+    /* x-ecfast's departure kept the host FP state (ec_enter_kept). */
+    if (!fast) {
+        x86_host_fp_enter(env);
+    } else {
+        host_fp_status_write(fpsr);
+    }
     if (!code) {
         tb = cpu_exec_tb_cached(cs, cpu_exec_tb_state(cs));
         code = tb ? (uintptr_t)tb->tc.ptr : 0;
@@ -3033,9 +3123,48 @@ static __attribute__((noinline)) uintptr_t ec_resume(XtThread *t,
  * goes on (tcg_ec_resume_entry), so that the calls on the way are
  * returned from; else a discard first.
  */
+/*
+ * x-ecfast's kept frame, resumable as it was left: the call's own return
+ * (a return, RSP past the return address), no single step coming in, the
+ * host FP state still the guest's default (native code may have changed
+ * the control), and none of what can change while native code runs: the
+ * remote requests, a flush, single stepping or a breakpoint set, the
+ * one-shot cflags or a pending exception.  The selectors were as an
+ * entry loads them at the departure (ec_callout's x-ecfast branch); what
+ * else ec_dispatch_ready asks of a fresh entry (RF, bp_hit, the reader,
+ * diagnostics, the log) only C paths change, and those enter by
+ * discarding the frame.  ec_resume checks the
+ * requests again under ownership.
+ */
+static inline QEMU_ALWAYS_INLINE bool ec_fast_resume_ready(XtThread *t,
+                                                           const XtEcFrame *f)
+{
+    CPUState *cs = t->cpu;
+
+    return f->entry == XT_EC_ENTRY_RETURN && !(f->nzcv & (1u << 21)) &&
+           t->env->regs[R_ESP] == t->co_rsp + 8 && ec_fpcr_default() &&
+           !qatomic_read(&t->suspend_req) && !qatomic_read(&t->terminating) &&
+           !qatomic_read(&cs->exit_request) &&
+           !qatomic_read(&cs->neg.icount_decr.u16.high) &&
+           cs->cflags_next_tb == -1 && cs->exception_index < 0 &&
+           !cpu_single_stepping(cs) && QTAILQ_EMPTY(&cs->breakpoints) &&
+           qatomic_read(&tb_ctx.tb_flush_count) == t->co_flush;
+}
+
 static __attribute__((noinline)) uintptr_t ec_enter_kept(XtThread *t,
                                                          XtEcFrame *f)
 {
+    /*
+     * x-ecfast's kept frame resumes as it was left (ec_fast_resume_ready);
+     * else it is normalized first, so the resume or the discard finds it
+     * as ec_callout leaves it.
+     */
+    if (f->resume_kind == XT_EC_KEPT_FAST) {
+        if (likely(ec_fast_resume_ready(t, f))) {
+            return ec_resume(t, f);
+        }
+        ec_frame_normalize(t, f, host_fp_status_read());
+    }
     if (ec_resume_ready(t, f)) {
         return ec_resume(t, f);
     }
@@ -3146,7 +3275,14 @@ void xt_ec_begin(void)
     CONTEXT c;
 
     if (unlikely(((XtEcFrame *)area->EmulatorData[1])->resume_sp)) {
-        ec_discard(t, area->EmulatorData[1]);
+        XtEcFrame *f = area->EmulatorData[1];
+
+        /*
+         * The dispatcher's FPSR isn't the guest's: the departure's is (an
+         * MXCSR the context carries is imported after, as an edit).
+         */
+        ec_frame_normalize(t, f, f->dep_fpsr);
+        ec_discard(t, f);
     }
     if (cross_process_work) {
         cross_process_work();
@@ -3527,6 +3663,22 @@ static void ec_half_exit(XtGate *g, uint32_t level, int claimed,
 }
 
 /*
+ * Windows' calls into the module during a native call (the notifications,
+ * the flush notices, termination): with x-ecfast's kept frame
+ * (XT_EC_KEPT_FAST) the guest's host FP state is still held, and the
+ * module's own exception flags mustn't join the guest's, so each gives
+ * FPSR back as it found it.
+ */
+static inline void ec_fpsr_restore(uint64_t *fpsr)
+{
+    host_fp_status_write(*fpsr);
+}
+
+#define EC_FPSR_GUARD()                                                      \
+    uint64_t ec_fpsr_saved __attribute__((cleanup(ec_fpsr_restore))) =      \
+        host_fp_status_read()
+
+/*
  * Windows' calls into the module: each runs inside a level of its own on
  * the thread's admission word (arm64ec-gate.c), entered before anything
  * else and left on its way out, so that a thread inside one is never
@@ -3592,6 +3744,7 @@ static void ec_term_answer(void)
 
 XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
 {
+    EC_FPSR_GUARD();
     XtGate *g = xt_gate_self();
     uint32_t level = xt_adm_enter(g);
     bool popped = false, own_end = false;
@@ -3610,6 +3763,7 @@ XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
 
 XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
 {
+    EC_FPSR_GUARD();
     XtGate *g = xt_gate_self();
 
     xt_adm_enter(g);
@@ -3620,6 +3774,7 @@ XTEXPORT void ProcessTerm(HANDLE h, BOOL after, NTSTATUS status)
 XTEXPORT void NotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type, ULONG prot,
                                 BOOL after, NTSTATUS status)
 {
+    EC_FPSR_GUARD();
     XtGate *g = xt_gate_self();
     uint32_t level;
     int claimed;
@@ -3632,6 +3787,7 @@ XTEXPORT void NotifyMemoryAlloc(void *addr, SIZE_T len, ULONG type, ULONG prot,
 XTEXPORT void NotifyMemoryFree(void *addr, SIZE_T len, ULONG type, BOOL after,
                                NTSTATUS status)
 {
+    EC_FPSR_GUARD();
     XtGate *g = xt_gate_self();
     uint32_t level;
     int claimed;
@@ -3644,6 +3800,7 @@ XTEXPORT void NotifyMemoryFree(void *addr, SIZE_T len, ULONG type, BOOL after,
 XTEXPORT void NotifyMemoryProtect(void *addr, SIZE_T len, ULONG prot,
                                   BOOL after, NTSTATUS status)
 {
+    EC_FPSR_GUARD();
     XtGate *g = xt_gate_self();
     uint32_t level;
     int claimed;
@@ -3656,6 +3813,7 @@ XTEXPORT void NotifyMemoryProtect(void *addr, SIZE_T len, ULONG prot,
 XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
                                          SIZE_T len, ULONG type, ULONG prot)
 {
+    EC_FPSR_GUARD();
     XtGate *g = xt_gate_self();
     NTSTATUS r;
 
@@ -3667,6 +3825,7 @@ XTEXPORT NTSTATUS NotifyMapViewOfSection(void *unk1, void *addr, void *unk2,
 
 XTEXPORT void NotifyUnmapViewOfSection(void *addr, BOOL after, NTSTATUS status)
 {
+    EC_FPSR_GUARD();
     XtGate *g = xt_gate_self();
     uint32_t level;
     int claimed;
@@ -3678,6 +3837,7 @@ XTEXPORT void NotifyUnmapViewOfSection(void *addr, BOOL after, NTSTATUS status)
 
 XTEXPORT void FlushInstructionCacheHeavy(const void *addr, SIZE_T len)
 {
+    EC_FPSR_GUARD();
     XtGate *g = xt_gate_self();
 
     xt_adm_enter(g);
@@ -3687,6 +3847,7 @@ XTEXPORT void FlushInstructionCacheHeavy(const void *addr, SIZE_T len)
 
 XTEXPORT void BTCpu64FlushInstructionCache(const void *addr, SIZE_T len)
 {
+    EC_FPSR_GUARD();
     XtGate *g = xt_gate_self();
 
     xt_adm_enter(g);
@@ -3696,6 +3857,7 @@ XTEXPORT void BTCpu64FlushInstructionCache(const void *addr, SIZE_T len)
 
 XTEXPORT void BTCpu64NotifyMemoryDirty(void *addr, SIZE_T len)
 {
+    EC_FPSR_GUARD();
     XtGate *g = xt_gate_self();
 
     xt_adm_enter(g);
@@ -3706,6 +3868,7 @@ XTEXPORT void BTCpu64NotifyMemoryDirty(void *addr, SIZE_T len)
 XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
                                     BOOL after, NTSTATUS status)
 {
+    EC_FPSR_GUARD();
     XtGate *g = xt_gate_self();
     uint32_t level;
     int claimed;
@@ -3717,6 +3880,7 @@ XTEXPORT void BTCpu64NotifyReadFile(HANDLE h, void *addr, SIZE_T len,
 
 XTEXPORT BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT feature)
 {
+    EC_FPSR_GUARD();
     XtGate *g = xt_gate_self();
     BOOLEAN r;
 
@@ -3728,6 +3892,7 @@ XTEXPORT BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT feature)
 
 XTEXPORT void UpdateProcessorInformation(void *info)
 {
+    EC_FPSR_GUARD();
     XtGate *g = xt_gate_self();
 
     xt_adm_enter(g);

@@ -379,6 +379,24 @@ void xt_ec_import_engine(XtThread *t, uint64_t pc, uint32_t nzcv)
     t->bp_hit = 0;
 }
 
+/*
+ * x-ecfast: a native call's return to the frame its departure kept with
+ * the flags lazy.  The arithmetic flags are volatile across a call: CF,
+ * ZF, SF and OF are the incoming NZCV's, PF and AF 0; every other EFLAGS
+ * bit, DF included, is as the call left it.
+ */
+void xt_ec_import_fast(XtThread *t, uint64_t pc, uint32_t nzcv)
+{
+    CPUX86State *env = t->env;
+
+    env->eip = pc;
+    CC_SRC = ec_eflags(nzcv) & (CC_O | CC_S | CC_Z | CC_C);
+    CC_OP = CC_OP_EFLAGS;
+    env_archcpu(env)->eflags_in_tcg = true;
+    t->bp_skip = false;
+    t->bp_hit = 0;
+}
+
 /* An entry's x64 registers from their ARM64EC places in N, then the rest. */
 void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n, uint64_t pc,
                        uint32_t nzcv)

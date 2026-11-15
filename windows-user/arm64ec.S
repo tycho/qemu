@@ -677,20 +677,23 @@ xt_ec_inj_begin:
     begin_tail
 
 /*
- * void xt_ec_exit_native_env(env, target, ymm): leave the engine for
+ * void xt_ec_exit_native_env(env, target, how): leave the engine for
  * native code at TARGET with the guest state of ENV in its ARM64EC places
  * (xt_ec_pack's, without the frame): the x64 registers, sp the guest's;
  * MM0-7's mantissas from the x87 stack top on, in x30, x6, x7, (x9),
  * x10-x12 and x15, where x9 takes the target and the dispatch may replace
- * lr; with YMM, v16-v31 the upper halves, so the thread's context shows
- * them until native code changes them.  The arguments are taken before
- * the registers they arrive in are loaded.  The engine has given the
- * thread back; no frame of the emulator stack is live.
+ * lr, unless HOW's bit 1 (x-ecfast's call-out: they are volatile across
+ * a call); with HOW's bit 0 (YMM), v16-v31 the upper halves, so the
+ * thread's context shows them until native code changes them.  The
+ * arguments are taken before the registers they arrive in are loaded.
+ * The engine has given the thread back; no frame of the emulator stack
+ * is live.
  */
 .macro exit_loads
     mov     x16, x0
     mov     x9, x1
-    cbz     w2, 1f
+    mov     w13, w2
+    tbz     w13, #0, 1f
     .irp    r, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
     ldr     q\r, [x16, #(E_XMM + 16 + (\r - 16) * 64)]
     .endr
@@ -698,6 +701,7 @@ xt_ec_inj_begin:
     .irp    r, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
     ldr     q\r, [x16, #(E_XMM + \r * 64)]
     .endr
+    tbnz    w13, #1, 2f
     ldr     w0, [x16, #E_FPSTT]
     add     x1, x16, #E_FPREGS
     mm_load 0, 30
@@ -707,6 +711,7 @@ xt_ec_inj_begin:
     mm_load 5, 11
     mm_load 6, 12
     mm_load 7, 15
+2:
     ldp     x8, x0, [x16, #0x00]        /* RAX, RCX */
     ldp     x1, x27, [x16, #0x10]       /* RDX, RBX */
     ldp     x17, x29, [x16, #0x20]      /* RSP, RBP */

@@ -125,7 +125,20 @@ typedef struct XtEcFrame {
      */
     uint64_t resume_sp;
     uint64_t resume_go;         /* the resume's sp, for entry_tail */
+    /*
+     * x-ecfast: what the departure that kept the frame left (read only
+     * while resume_sp is set): XT_EC_KEPT_C, the flags materialized and
+     * the host FP state released (ec_callout's way); XT_EC_KEPT_FAST, the
+     * flags lazy and the host FP state held, with FPSR as it was at the
+     * departure in dep_fpsr.
+     */
+    uint32_t resume_kind;
+    uint32_t resume_pad;
+    uint64_t dep_fpsr;
 } XtEcFrame;
+
+#define XT_EC_KEPT_C        0
+#define XT_EC_KEPT_FAST     1
 
 /*
  * The operation a notification's two halves surround (XtGateRoot.kind).
