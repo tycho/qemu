@@ -565,6 +565,22 @@ static const TCGCacheHost *tb_cache_host(void)
  * mmap_lock held.
  */
 /*
+ * x-partrans: bumped when the engine's own read took a page's guard, so
+ * that a translation that may have read the page meanwhile, with no guard
+ * for the guest to hit, isn't published but done again (tb_gen_stale).
+ * The guard is put back meanwhile (xt_guard_restore), and the window left
+ * is the fault's dispatch, between Windows clearing the guard and the
+ * bump.
+ */
+uint32_t tcg_xlate_epoch;
+static __thread uint32_t tb_gen_epoch;
+
+static bool tb_gen_stale(void)
+{
+    return tcg_partrans && qatomic_read(&tcg_xlate_epoch) != tb_gen_epoch;
+}
+
+/*
  * Why this thread's last install failed (TCG_CACHE_W_*), and its last
  * lookup.
  */
@@ -651,7 +667,8 @@ static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
         }
     }
     if (spans) {
-        phys_p2 = get_page_addr_code(env, page + TARGET_PAGE_SIZE);
+        /* No longjmp out of here: the caller may be in an RCU section. */
+        phys_p2 = get_page_addr_code_probe(env, page + TARGET_PAGE_SIZE);
         if (phys_p2 == -1) {
             tcg_cache_stats.inst_fail_bytes++;
             return NULL;
@@ -743,11 +760,13 @@ static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
         return NULL;
     }
     tb_set_page_addr0(tb, phys_pc);
+    mmap_lock();
     tb_lock_page0(phys_pc);
     if (phys_p2 != -1) {
         tb_set_page_addr1(tb, phys_p2);
         tb_lock_page1(phys_pc, phys_p2);
     }
+    mmap_unlock();
     tcg_cache_part(&tcg_cache_stats.inst_link_ns, &t2);
     /* Placement left each slot reset; this synchronizes the whole TB. */
     tcg_cache_commit(tcg_ctx, &r);
@@ -755,7 +774,15 @@ static TranslationBlock *tb_cache_install(CPUState *cpu, TCGTBCPUState s,
 
     perf_report_code(s.pc, tb, tb->tc.ptr);
     tcg_tb_insert(tb);
+    mmap_lock();
+    if (unlikely(tb_gen_stale())) {
+        mmap_unlock();
+        qatomic_set(&tcg_ctx->code_gen_ptr, r.split ? r.hot : (void *)tb);
+        tcg_tb_remove(tb);
+        return NULL;
+    }
     existing_tb = tb_link_page(tb, true);
+    mmap_unlock();
     assert_no_pages_locked();
     tcg_cache_stats.installs++;
     tcg_cache_part(&tcg_cache_stats.inst_link_ns, &t2);
@@ -1082,6 +1109,12 @@ static void tb_cache_count(CPUState *cpu)
     }
 }
 #else
+/* System mode translates under its page locks (tb_lock_page0). */
+static bool tb_gen_stale(void)
+{
+    return false;
+}
+
 /*
  * System mode installs nothing from files; their readers, built in every
  * mode, copy with a plain one.
@@ -1093,7 +1126,11 @@ int64_t tcg_cache_gcopy(void *dst, const void *src, size_t len)
 }
 #endif
 
-/* Called with mmap_lock held for user mode emulation.  */
+/*
+ * In user mode, called with the translation lock held
+ * (mmap_lock_translation): what it changes that the mmap lock protects,
+ * it changes under mmap_lock.
+ */
 static TranslationBlock *tb_gen_code_in(CPUState *cpu, TCGTBCPUState s)
 {
     CPUArchState *env = cpu_env(cpu);
@@ -1116,7 +1153,7 @@ static TranslationBlock *tb_gen_code_in(CPUState *cpu, TCGTBCPUState s)
     bool gen_counted = false;
 #endif
 
-    assert_memory_lock();
+    assert_translation_lock();
     qemu_thread_jit_write();
     TCG_HOST_FP_SUSPEND_GUARD(cpu);
     translator_region_start();
@@ -1176,7 +1213,6 @@ static TranslationBlock *tb_gen_code_in(CPUState *cpu, TCGTBCPUState s)
          */
         trace_tb_gen_code_buffer_overflow("tcg_tb_alloc");
         queue_tb_flush(cpu);
-        mmap_unlock();
         /* Make the execution loop process the flush as soon as possible.  */
         cpu->exception_index = EXCP_INTERRUPT;
         cpu_loop_exit(cpu);
@@ -1195,7 +1231,9 @@ static TranslationBlock *tb_gen_code_in(CPUState *cpu, TCGTBCPUState s)
     tb_set_page_addr0(tb, phys_pc);
     tb_set_page_addr1(tb, -1);
     if (phys_pc != -1) {
+        mmap_lock();
         tb_lock_page0(phys_pc);
+        mmap_unlock();
     }
 
     tcg_ctx->gen_tb = tb;
@@ -1553,7 +1591,17 @@ static TranslationBlock *tb_gen_code_in(CPUState *cpu, TCGTBCPUState s)
 #ifdef CONFIG_USER_ONLY
     tb->pt_state = TB_PT_ABSENT;
 #endif
+    mmap_lock();
+    if (unlikely(tb_gen_stale())) {
+        mmap_unlock();
+        qatomic_set(&tcg_ctx->code_gen_ptr,
+                    tcg_ctx->lay_on ? tcg_splitwx_to_rw(tb->tc.ptr)
+                                    : (void *)tb);
+        tcg_tb_remove(tb);
+        return NULL;
+    }
     existing_tb = tb_link_page(tb, false);
+    mmap_unlock();
     assert_no_pages_locked();
 
     /* if the TB already exists, discard what we just translated */
@@ -1579,27 +1627,72 @@ static TranslationBlock *tb_gen_code_in(CPUState *cpu, TCGTBCPUState s)
  */
 static __thread TCGContext *tb_gen_ctx;
 
+#ifdef CONFIG_DEBUG_TCG
+/* The RCU reader's depth at the translation's start (tb_gen_end). */
+static __thread unsigned tb_gen_rcu_depth;
+#endif
+
+/*
+ * Give the context back.  Its gen_tb is cleared under the translation's
+ * hold: without x-partrans the context is everyone's.  No RCU read
+ * section the translation entered may be left open: a longjmp out of one
+ * would skip its end.
+ */
 void tb_gen_end(void)
 {
     TCGContext *s = tb_gen_ctx;
 
     if (s) {
-        s->gen_tb = NULL;
+#ifdef CONFIG_DEBUG_TCG
+        tcg_debug_assert(get_ptr_rcu_reader()->depth == tb_gen_rcu_depth);
+#endif
         tb_gen_ctx = NULL;
         tcg_ctx_return(s);
     }
 }
+
+bool tb_gen_active(void)
+{
+    return tb_gen_ctx != NULL;
+}
+
+void tb_gen_abort(void)
+{
+    if (tb_gen_ctx) {
+        tb_gen_ctx->gen_tb = NULL;
+        mmap_lock_reset();
+        tb_gen_end();
+    }
+}
 #endif
 
-/* Called with mmap_lock held for user mode emulation.  */
+/*
+ * In user mode, a translation holds the translation lock
+ * (mmap_lock_translation), with a context of its own.  The context comes
+ * first, so that a thread waiting for one doesn't hold up the lock's
+ * writers.  With x-partrans other translations run meanwhile: one may
+ * have published this TB while this thread waited.
+ */
 TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
 {
 #ifdef CONFIG_USER_ONLY
-    TranslationBlock *tb;
+    TranslationBlock *tb = NULL;
 
     tcg_debug_assert(!tb_gen_ctx);
+#ifdef CONFIG_DEBUG_TCG
+    tb_gen_rcu_depth = get_ptr_rcu_reader()->depth;
+#endif
     tb_gen_ctx = tcg_ctx_borrow();
-    tb = tb_gen_code_in(cpu, s);
+    mmap_lock_translation();
+    if (tcg_partrans) {
+        tb = tb_htable_lookup(cpu, s);
+    }
+    while (!tb) {
+        tb_gen_epoch = qatomic_load_acquire(&tcg_xlate_epoch);
+        tb = tb_gen_code_in(cpu, s);
+    }
+    tcg_ctx->gen_tb = NULL;
+    mmap_unlock_translation();
     tb_gen_end();
     return tb;
 #else

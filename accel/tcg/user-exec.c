@@ -503,6 +503,7 @@ void page_set_flags(vaddr start, vaddr last, int set_flags, int clear_flags)
     assert(start <= last);
     assert(last <= guest_addr_max);
     assert_memory_lock();
+    assert_no_translation();
 
     start &= TARGET_PAGE_MASK;
     last |= ~TARGET_PAGE_MASK;

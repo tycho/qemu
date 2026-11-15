@@ -196,6 +196,7 @@ static inline bool cpu_plugin_mem_cbs_enabled(const CPUState *cpu)
 }
 
 TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s);
+TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s);
 #ifdef CONFIG_USER_ONLY
 /* Ends the translation in progress on this thread, if any (tb_gen_code). */
 void tb_gen_end(void);
@@ -284,8 +285,18 @@ static inline tb_page_addr_t get_page_addr_code(CPUArchState *env,
  */
 #ifdef CONFIG_USER_ONLY
 #define assert_memory_lock() tcg_debug_assert(have_mmap_lock())
+#define assert_translation_lock() \
+    tcg_debug_assert(have_mmap_lock_translation())
+/*
+ * Code is invalidated, and page flags change, with no translation in
+ * flight: never from inside one with x-partrans (tb_gen_code).
+ */
+#define assert_no_translation() \
+    tcg_debug_assert(!tcg_partrans || !tb_gen_active())
 #else
 #define assert_memory_lock()
+#define assert_translation_lock()
+#define assert_no_translation()
 #endif
 
 #if defined(CONFIG_SOFTMMU) && defined(CONFIG_DEBUG_TCG)
