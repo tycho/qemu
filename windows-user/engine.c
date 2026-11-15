@@ -964,6 +964,10 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     if (ac->init_machine(accel, NULL) < 0) {
         refuse_settings("the accelerator's initialization failed");
     }
+    /* Their changes to guest pages and their counts assume one translator. */
+    if (tcg_partrans && (xt_cache_inj || tcg_cache_test_dup)) {
+        refuse_settings("partrans: not with cacheinj or the duplicate test");
+    }
     log_settings(OBJECT(accel));
     if (tcg_cache_mode) {
         xt_cache_init();
