@@ -1534,7 +1534,7 @@ static void ec_reap_all(void)
  *   inside the engine's own work (an outer level), or on an internal
  *   thread, it is quarantined and counted, as it would end holding what
  *   that work holds and the lists' upkeep could wait on it; at its only
- *   level, the reaper's work, then ec_term_self.
+ *   level, the reaper's work, then ec_term_self, and *OWN_END is set.
  * - Another thread is found through its record's own handle
  *   (xt_terminated_thread) at the caller's only level, else among the
  *   process's threads (ec_open_thread), which takes no lock of the
@@ -1543,7 +1543,7 @@ static void ec_reap_all(void)
  *   found holds the reaper.
  */
 static NTSTATUS ec_thread_term(HANDLE thread, LONG code, XtGate *me,
-                               uint32_t level, bool *popped)
+                               uint32_t level, bool *popped, bool *own_end)
 {
     PUBLIC_OBJECT_BASIC_INFORMATION obi;
     bool nested = (level & ~XT_ADM_ATTEMPT) > 1;
@@ -1596,9 +1596,12 @@ self:
     if (nested || qatomic_read(&me->internal) || !xt_adm_alone(me)) {
         xt_gate_quarantine(me);
         ec_unsafe_term_quiet();
-    } else if (state == 2) {
-        ec_reap_all();
-        ec_term_self(me);
+    } else {
+        if (state == 2) {
+            ec_reap_all();
+            ec_term_self(me);
+        }
+        *own_end = true;
     }
     return STATUS_SUCCESS;
 }
@@ -3545,17 +3548,54 @@ XTEXPORT NTSTATUS ThreadInit(void)
     return r;
 }
 
+/*
+ * The end of a thread's own ThreadTerm.  ntdll's NtTerminateThread sets
+ * InSyscallCallback, calls ThreadTerm and then terminates the thread
+ * with the flag still set: its clearing, which answers the doorbell,
+ * comes after the system call, so never for the thread's own end.  A
+ * suspension or context request that arrives in between finds the thread
+ * inconsistent, so Windows holds it and rings the doorbell, and the
+ * request fails once the thread has ended (STATUS_UNSUCCESSFUL).  So,
+ * nothing of the engine's held any more, the thread clears the flag
+ * itself, which makes the rest of its way to the system call consistent,
+ * and answers a rung doorbell as ntdll does where it clears the flag: a
+ * continuation with no context, CONTEXT_ARM64 alone, which returns here.
+ * A context set there takes the thread elsewhere, as it would a native
+ * thread on its way out; its next entry makes it a new record
+ * (enter_engine).
+ */
+static void ec_term_answer(void)
+{
+    XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+    uintptr_t sp = (uintptr_t)__builtin_frame_address(0);
+    ARM64_NT_CONTEXT none = { .ContextFlags = CONTEXT_ARM64 };
+
+    if (!area || area->InSimulation ||
+        (sp >= area->EmulatorStackLimit && sp < area->EmulatorStackBase)) {
+        return;
+    }
+    area->InSyscallCallback = 0;
+    /* The flag's clearing before the doorbell's read, as Windows rings it. */
+    smp_mb();
+    if (area->SuspendDoorbell && (qatomic_read(area->SuspendDoorbell) & 1)) {
+        xt_continue_native(&none);
+    }
+}
+
 XTEXPORT NTSTATUS ThreadTerm(HANDLE thread, LONG code)
 {
     XtGate *g = xt_gate_self();
     uint32_t level = xt_adm_enter(g);
-    bool popped = false;
+    bool popped = false, own_end = false;
     NTSTATUS r;
 
     /* Its level popped already if it waited for another thread outside. */
-    r = ec_thread_term(thread, code, g, level, &popped);
+    r = ec_thread_term(thread, code, g, level, &popped, &own_end);
     if (!popped) {
         xt_adm_exit(g);
+    }
+    if (own_end) {
+        ec_term_answer();
     }
     return r;
 }
