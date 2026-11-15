@@ -127,6 +127,16 @@ xt_check_call:
 #define F_V         (0x30 + 0x110)
 #define F_RESUME    0x3c0
 #define F_RESUME_GO 0x3c8
+#define F_KIND      0x3d0
+#define F_FR_KEY    0x3e0       /* x-ecfast's resume in assembly */
+#define F_FR_LAND   0x3e8
+#define F_FR_RSP    0x3f0
+#define F_FR_NEXT   0x3f8       /* then fr_slot */
+#define F_FR_T      0x408       /* then fr_cs */
+#define F_FR_READER 0x418
+#define F_FR_FLUSH  0x420
+#define F_FR_LO     0x428       /* then fr_hi */
+#define F_DEP_FPSR  0x3d8
 #define C_X(n)      (0x08 + 8 * (n))
 #define C_SP        0x100
 #define C_PC        0x108
@@ -141,6 +151,62 @@ xt_check_call:
 #define E_FPSTT     0x2e0
 #define E_FPREGS    0x2f0
 #define E_XMM       0x3d0
+#define E_EIP       0x100
+#define E_CC_SRC    0x118
+#define E_CC_OP     0x128
+#define E_EFLAGS_IN_TCG 0x3c50  /* X86CPU's, from env */
+#define E_MXCSR     0x3c0
+#define E_DR6       0x34d8
+#define E_RETSP     0x3c38
+#define E_SEGS      0x138       /* ES-GS: selector, then base at 8 */
+#define E_SEG       0x18
+
+/*
+ * What x-ecfast's resume in assembly reads and writes of the thread's
+ * record (XtThread), its CPU (CPUState), its RCU reader and the code
+ * buffer's context (TBContext), as arm64ec.c checks them; XtState's and
+ * XtActive's values.
+ */
+#define T_STATE         0x20
+#define T_ACTIVE        0x24
+#define T_ACTIVATION    0x28
+#define T_SUSPEND_REQ   0x2c
+#define T_TERMINATING   0x30
+#define T_GFAULT_CODE   0x34
+#define T_AFTER_SUSPEND 0x3a
+#define T_BP_SKIP       0x3b
+#define T_EC_SUSPENDED  0x3d
+#define T_BP_HIT        0x40
+#define T_READER        0x10
+#define T_TEB           0x18
+#define T_EC_SEEN       0x3c
+#define T_NATIVE_TARGET 0x48
+#define T_FAULT_BUSY    0xb0
+#define T_CO_RSP        0x6d0
+#define T_CO_FLUSH      0x6d8
+#define CS_HOST_FP      0x208   /* host_fp_guest, then host_fp_suspended */
+#define CS_SSTEP        0xe4
+#define CS_BREAKPOINTS  0x280
+#define CS_CAN_DO_IO    0x4344
+#define R_WAITING       0x04
+#define AREA_RECORD     0x30    /* EmulatorData[0] */
+#define CS_RUNNING      0xc4
+#define CS_EXIT_REQUEST 0xd7
+#define CS_CFLAGS_NEXT  0xdc
+#define CS_INTERRUPT_REQUEST 0xe0
+#define CS_EXCEPTION_INDEX 0x300
+#define CS_ICOUNT_HIGH  0x4342
+#define R_CTR           0x00
+#define R_DEPTH         0x08
+#define TBC_FLUSH_COUNT 0x28
+#define XT_ACQUIRING    1
+#define XT_ENGINE       2
+#define XT_ACT_EXEC     1
+#define FPCR_QEMU       6       /* HOST_FP_CONTROL_QEMU */
+#define XT_EC_FAST_START 1
+#define XT_EC_FAST_CLEAR 2
+#define XT_EC_TAIL_RCU  1
+#define XT_EC_TAIL_EXCL 2
 
 /*
  * The thread's gate (arm64ec.h's XtGate, EmulatorData[3]): its admission
@@ -490,8 +556,12 @@ xt_check_call:
 .Ladm_out\@:
 .endm
 
-/* The entries' common part; with INJ, XTAJIT_INJECT's points 1-3. */
-.macro entry_tail inj
+/*
+ * The entries' common part; with INJ, XTAJIT_INJECT's points 1-3.  With
+ * SLOW, x-ecfast's resume in assembly where it can't finish: the same,
+ * with xt_ec_fast_slow(frame, w6) for xt_ec_enter.
+ */
+.macro entry_tail inj, slow=0
 .if \inj
     inj_point 1, 16, 17
 .endif
@@ -566,7 +636,12 @@ xt_check_call:
 9:
     mov     sp, x0
     mov     x0, x16
+.if \slow
+    mov     w1, w6
+    bl      "#xt_ec_fast_slow"
+.else
     bl      "#xt_ec_enter"
+.endif
     /*
      * Returned: a resume (x-ecinline), by a jump, so that the host's
      * return predictor holds what it held when the TB left:
@@ -606,7 +681,9 @@ RetToEntryThunk:
     lsr     x17, x9, #12
     lsr     x16, x16, x17
     tbnz    x16, #0, xt_ec_bypass_dispatch
-    b       3f
+    /* A return: x-ecfast's resume in assembly, if it can. */
+    tbnz    w15, #1, xt_ec_fast_resume
+    b       xt_ec_entry_tail
 
     .globl ExitToX64
 ExitToX64:
@@ -614,8 +691,415 @@ ExitToX64:
     adm_enter
     str     lr, [sp, #-8]!      /* the x64 return address */
     mov     w15, #1             /* XT_EC_ENTRY_CALL */
-3:
+xt_ec_entry_tail:
     entry_tail 0
+
+/*
+ * x-ecfast's resume (ec_fast_asm_ok, ec_fast_frame): the return of a call
+ * a TB left for native code (x-ecinline) with its frame kept
+ * XT_EC_KEPT_FAST, and nothing for the engine to do, goes back into the
+ * TB's code without C, the host FP state still held from the departure.
+ * After entry_tail's first steps (InSimulation set, NZCV saved), the
+ * checks of the C resume (ec_enter_kept), in registers the x64 state
+ * doesn't use (x6, x7, x10-x14, x16, x17, x23, x24), with the return
+ * address in x9 and the entry's kind in w15 untouched: the frame kept
+ * XT_EC_KEPT_FAST with a key (not 0), the key the return address, RSP
+ * past it, no single step coming in (NZCV's bit 21), FPCR still QEMU's
+ * mode, no test injection.  A failure goes to
+ * entry_tail, with NZCV as it came.  Then ec_resume's acquisition, the
+ * activation counted first (ec_thread): the record's state, cpu_exec_start
+ * (its barrier membarrier's placeholder), the RCU read section; under
+ * ownership ec_resume_clear's checks.  An exclusive section pending, or a
+ * check failing, goes to xt_ec_fast_slow, through entry_tail's capture.
+ * Then the frame consumed and the landing taken (the departure found
+ * them: fr_next, fr_slot), the import (xt_ec_import_fast: EIP, the flags
+ * from NZCV with PF and AF 0, CC_OP_EFLAGS), the record's state; then the
+ * incoming registers moved into the TBs' and tcg_ec_resume_fast_entry
+ * returns to the landing on the TB's frame.
+ */
+xt_ec_fast_resume:
+    ldr     x17, [x18, #TEB_CPU_AREA]
+    mov     w16, #1
+    strb    w16, [x17]
+    mrs     x24, nzcv
+    ldr     x16, [x17, #AREA_FRAME]
+    ldr     x10, [x16, #F_FR_KEY]
+    ldr     x12, [x16, #F_FR_RSP]
+    ldr     x13, [x16, #F_RESUME]
+    ldr     w11, [x16, #F_KIND]
+    mov     x14, sp
+    cmp     x10, x9
+    ccmp    x12, x14, #0, eq
+    ccmp    w11, #1, #0, eq             /* XT_EC_KEPT_FAST */
+    b.ne    .Lfr_decline
+    cbz     x10, .Lfr_decline
+    cbz     x13, .Lfr_decline
+    tbnz    w24, #21, .Lfr_decline
+    mrs     x10, fpcr
+    cmp     x10, #FPCR_QEMU
+    b.ne    .Lfr_decline
+    adrp    x10, xt_inject_point
+    ldr     w10, [x10, :lo12:xt_inject_point]
+    cbnz    w10, .Lfr_decline
+    ldr     x12, [x16, #F_FR_T]         /* the record */
+    ldr     x13, [x16, #(F_FR_T + 8)]   /* the CPU */
+    ldr     x14, [x16, #F_FR_READER]
+    ldr     w10, [x12, #T_ACTIVATION]
+    add     w10, w10, #1
+    str     w10, [x12, #T_ACTIVATION]
+    strb    wzr, [x12, #T_EC_SUSPENDED]
+    mov     w10, #XT_ACQUIRING
+    mov     w11, #XT_ACT_EXEC
+    stp     w10, w11, [x12, #T_STATE]
+    mov     w10, #1
+    strb    w10, [x13, #CS_RUNNING]
+    adrp    x10, pending_cpus
+    ldr     w10, [x10, :lo12:pending_cpus]
+    cbnz    w10, .Lfr_start
+    ldr     w10, [x14, #R_DEPTH]
+    add     w11, w10, #1
+    str     w11, [x14, #R_DEPTH]
+    cbnz    w10, 1f
+    adrp    x10, rcu_gp_ctr
+    ldr     w10, [x10, :lo12:rcu_gp_ctr]
+    str     w10, [x14, #R_CTR]
+1:
+    ldr     w10, [x12, #T_SUSPEND_REQ]
+    ldr     w11, [x12, #T_TERMINATING]
+    orr     w10, w10, w11
+    ldrb    w11, [x13, #CS_EXIT_REQUEST]
+    orr     w10, w10, w11
+    ldr     w11, [x13, #CS_INTERRUPT_REQUEST]
+    orr     w10, w10, w11
+    ldr     w11, [x13, #CS_CFLAGS_NEXT]
+    add     w11, w11, #1                /* -1: none */
+    orr     w10, w10, w11
+    ldr     w11, [x13, #CS_EXCEPTION_INDEX]
+    mvn     w11, w11
+    orr     w10, w10, w11, lsr #31      /* none: below 0 */
+    add     x11, x13, #(CS_ICOUNT_HIGH & ~0xfff)
+    ldrh    w11, [x11, #(CS_ICOUNT_HIGH & 0xfff)]
+    orr     w10, w10, w11
+    adrp    x11, tb_ctx
+    add     x11, x11, :lo12:tb_ctx
+    ldr     w11, [x11, #TBC_FLUSH_COUNT]
+    ldr     w23, [x16, #F_FR_FLUSH]
+    eor     w11, w11, w23
+    orr     w10, w10, w11
+    cbnz    w10, .Lfr_clear
+    /* The frame consumed, its landing taken. */
+    ldr     x10, [x16, #F_RESUME]
+    str     xzr, [x16, #F_RESUME]
+    str     x10, [x16, #F_RESUME_GO]
+    str     wzr, [x16, #F_KIND]
+    str     xzr, [x16, #F_FR_KEY]
+    ldr     x10, [x16, #F_FR_NEXT]
+    ldr     x11, [x16, #(F_FR_NEXT + 8)]
+    str     x10, [x11]
+    /* The import. */
+    ldr     x10, [x16, #F_ENV]
+    str     x9, [x10, #E_EIP]
+    ubfx    w11, w24, #30, #2           /* N, Z: SF, ZF */
+    lsl     w11, w11, #6
+    ubfx    w23, w24, #29, #1           /* C: CF */
+    orr     w11, w11, w23
+    ubfx    w23, w24, #28, #1           /* V: OF */
+    orr     w11, w11, w23, lsl #11
+    str     x11, [x10, #E_CC_SRC]
+    str     wzr, [x10, #E_CC_OP]        /* CC_OP_EFLAGS */
+    add     x11, x10, #(E_EFLAGS_IN_TCG & ~0xfff)
+    mov     w23, #1
+    strb    w23, [x11, #(E_EFLAGS_IN_TCG & 0xfff)]
+    strb    wzr, [x12, #T_BP_SKIP]
+    str     xzr, [x12, #T_BP_HIT]
+    mov     w11, #XT_ENGINE
+    str     w11, [x12, #T_STATE]
+    strb    wzr, [x12, #T_AFTER_SUSPEND]
+    str     wzr, [x12, #T_GFAULT_CODE]
+    /*
+     * The incoming registers into the TBs': each source read before its
+     * register is written, the RAX/R14 pair through x17.
+     */
+    mov     x11, x20                    /* R13 */
+    mov     x10, x22                    /* R15 */
+    mov     x23, x27                    /* RBX */
+    mov     x24, x1                     /* RDX */
+    mov     x12, x3                     /* R9 */
+    mov     x13, x4                     /* R10 */
+    mov     x14, x2                     /* R8 */
+    mov     x15, x5                     /* R11 */
+    mov     x9, x29                     /* RBP */
+    mov     x20, sp                     /* RSP */
+    mov     x22, x26                    /* RDI */
+    mov     x26, x19                    /* R12 */
+    mov     x27, x25                    /* RSI */
+    mov     x25, x0                     /* RCX */
+    mov     x17, x21
+    mov     x21, x8                     /* RAX */
+    mov     x8, x17                     /* R14 */
+    mov     v23.16b, v15.16b            /* XMM0-15 into v8-v23 */
+    mov     v22.16b, v14.16b
+    mov     v21.16b, v13.16b
+    mov     v20.16b, v12.16b
+    mov     v19.16b, v11.16b
+    mov     v18.16b, v10.16b
+    mov     v17.16b, v9.16b
+    mov     v16.16b, v8.16b
+    mov     v15.16b, v7.16b
+    mov     v14.16b, v6.16b
+    mov     v13.16b, v5.16b
+    mov     v12.16b, v4.16b
+    mov     v11.16b, v3.16b
+    mov     v10.16b, v2.16b
+    mov     v9.16b, v1.16b
+    mov     v8.16b, v0.16b
+    ldr     x0, [x16, #F_ENV]
+    ldr     x1, [x16, #F_FR_LAND]
+    ldr     x2, [x16, #F_RESUME_GO]
+    adrp    x17, tcg_ec_resume_fast_entry
+    ldr     x17, [x17, :lo12:tcg_ec_resume_fast_entry]
+    br      x17
+.Lfr_decline:
+    msr     nzcv, x24
+    b       xt_ec_entry_tail
+.Lfr_start:
+    mov     w6, #XT_EC_FAST_START
+    b       .Lfr_slow
+.Lfr_clear:
+    mov     w6, #XT_EC_FAST_CLEAR
+.Lfr_slow:
+    msr     nzcv, x24
+    entry_tail 0, 1
+
+/*
+ * x-ecfast's departure (tcg_ec_callout_fast_fn): a TB's call-out to
+ * native code, with the default FP control, keeps the TB's frame
+ * XT_EC_KEPT_FAST and leaves without C, as ec_callout's x-ecfast branch
+ * does.  Entered from tcg_ec_callout_entry with the TB boundary's state
+ * stored to env and still in the TBs' registers (ec_fast_asm_ok's
+ * placement), env in x19, sp the TB's frame, and x0 the entry's call of
+ * ec_callout, where it goes, having written nothing, if it can't leave:
+ * not ready (xt_ec_fast_asm), a test injection, a target that isn't EC
+ * code (the EC bitmap), any of ec_callout's declines (a kept frame, a
+ * fault continuation, one-shot cflags, a request), the FP state not the
+ * default (held, MXCSR's control default), the segments not as an
+ * entry loads them, single stepping or a breakpoint, or no landing on
+ * the return stack's top (x28, in the ring the C departure found, fr_lo
+ * and fr_hi: 0 before).  Scratch: x0-x7, x16, x17 and x30.  Then
+ * ec_callout's bookkeeping and ec_fast_frame's, the release (the RCU read
+ * section, cpu_exec_end, their barriers membarrier's placeholders) with
+ * any tail owed in C (xt_ec_fast_depart_tail, FPSR kept across it, after
+ * which the registers go from env as xt_ec_exit_native_env's), the frame
+ * kept, xt_publish's end state, DR6's clear; then the registers moved to
+ * their ARM64EC places and xt_ec_exit_dispatch.
+ */
+    .globl xt_ec_fast_depart
+xt_ec_fast_depart:
+    adrp    x16, xt_ec_fast_asm
+    ldrb    w16, [x16, :lo12:xt_ec_fast_asm]
+    adrp    x17, xt_inject_point
+    ldr     w17, [x17, :lo12:xt_inject_point]
+    eor     w16, w16, #1
+    orr     w16, w16, w17
+    cbnz    w16, .Lfd_decline
+    ldr     x1, [x19, #E_EIP]
+    lsr     x17, x1, #47
+    cbnz    x17, .Lfd_decline
+    ldr     x16, [x18, #TEB_PEB]
+    ldr     x16, [x16, #PEB_EC_BITMAP]
+    lsr     x17, x1, #18
+    ldr     x16, [x16, x17, lsl #3]
+    lsr     x17, x1, #12
+    lsr     x16, x16, x17
+    tbz     x16, #0, .Lfd_decline
+    ldr     x2, [x18, #TEB_CPU_AREA]
+    ldr     x3, [x2, #AREA_FRAME]
+    ldr     x4, [x2, #AREA_RECORD]
+    ldr     x5, [x4]                    /* the record's CPU */
+    ldr     x16, [x3, #F_RESUME]
+    ldr     w17, [x4, #T_FAULT_BUSY]
+    orr     x16, x16, x17
+    ldr     w17, [x4, #T_SUSPEND_REQ]
+    orr     x16, x16, x17
+    ldr     w17, [x5, #CS_CFLAGS_NEXT]
+    add     w17, w17, #1                /* -1: none */
+    orr     x16, x16, x17
+    ldrb    w17, [x5, #CS_EXIT_REQUEST]
+    orr     x16, x16, x17
+    add     x17, x5, #(CS_ICOUNT_HIGH & ~0xfff)
+    ldrh    w17, [x17, #(CS_ICOUNT_HIGH & 0xfff)]
+    orr     x16, x16, x17
+    ldrh    w17, [x5, #CS_HOST_FP]
+    eor     w17, w17, #1                /* held, not suspended */
+    orr     x16, x16, x17
+    ldr     w17, [x19, #E_MXCSR]
+    mov     w30, #0xe040                /* RC, FTZ, DAZ */
+    and     w17, w17, w30
+    orr     x16, x16, x17
+    ldr     w17, [x5, #CS_SSTEP]
+    and     w17, w17, #1                /* SSTEP_ENABLE */
+    orr     x16, x16, x17
+    ldr     x17, [x5, #CS_BREAKPOINTS]
+    orr     x16, x16, x17
+    /* The segments as an entry loads them (xt_ec_segs_loaded). */
+    add     x2, x19, #E_SEGS
+    ldr     w17, [x2, #(0 * E_SEG)]     /* ES */
+    ldr     x30, [x2, #(0 * E_SEG + 8)]
+    sub     w17, w17, #0x2b
+    orr     x17, x17, x30
+    orr     x16, x16, x17
+    ldr     w17, [x2, #(1 * E_SEG)]     /* CS */
+    ldr     x30, [x2, #(1 * E_SEG + 8)]
+    sub     w17, w17, #0x33
+    orr     x17, x17, x30
+    orr     x16, x16, x17
+    ldr     w17, [x2, #(2 * E_SEG)]     /* SS */
+    ldr     x30, [x2, #(2 * E_SEG + 8)]
+    sub     w17, w17, #0x2b
+    orr     x17, x17, x30
+    orr     x16, x16, x17
+    ldr     w17, [x2, #(3 * E_SEG)]     /* DS */
+    ldr     x30, [x2, #(3 * E_SEG + 8)]
+    sub     w17, w17, #0x2b
+    orr     x17, x17, x30
+    orr     x16, x16, x17
+    ldr     w17, [x2, #(4 * E_SEG)]     /* FS */
+    ldr     x30, [x2, #(4 * E_SEG + 8)]
+    sub     w17, w17, #0x53
+    orr     x17, x17, x30
+    orr     x16, x16, x17
+    ldr     w17, [x2, #(5 * E_SEG)]     /* GS, its base the TEB */
+    ldr     x30, [x2, #(5 * E_SEG + 8)]
+    ldr     x6, [x4, #T_TEB]
+    sub     w17, w17, #0x2b
+    eor     x30, x30, x6
+    orr     x17, x17, x30
+    orr     x16, x16, x17
+    cbnz    x16, .Lfd_decline
+    ldr     x16, [x3, #F_FR_LO]
+    ldr     x17, [x3, #(F_FR_LO + 8)]
+    cmp     x28, x16
+    ccmp    x28, x17, #2, hs
+    b.hs    .Lfd_decline
+    ldp     x6, x7, [x28]               /* the top's key and landing */
+    cmp     x7, #1
+    b.le    .Lfd_decline
+    /* ec_callout's bookkeeping. */
+    strb    wzr, [x4, #T_EC_SEEN]
+    str     x1, [x4, #T_NATIVE_TARGET]
+    str     x20, [x4, #T_CO_RSP]        /* RSP */
+    adrp    x16, tb_ctx
+    add     x16, x16, :lo12:tb_ctx
+    ldr     w16, [x16, #TBC_FLUSH_COUNT]
+    str     w16, [x4, #T_CO_FLUSH]
+    mov     w17, #-1
+    str     w17, [x5, #CS_EXCEPTION_INDEX]
+    add     x17, x5, #(CS_CAN_DO_IO & ~0xfff)
+    mov     w30, #1
+    strb    w30, [x17, #(CS_CAN_DO_IO & 0xfff)]
+    mrs     x17, fpsr
+    mov     w30, #0x9f                  /* HOST_FPSR_FLAGS */
+    and     x17, x17, x30
+    str     x17, [x3, #F_DEP_FPSR]
+    mov     w17, #1                     /* XT_EC_KEPT_FAST */
+    str     w17, [x3, #F_KIND]
+    /* The return's, for the resume. */
+    str     x6, [x3, #F_FR_KEY]
+    str     x7, [x3, #F_FR_LAND]
+    add     x17, x20, #8
+    str     x17, [x3, #F_FR_RSP]
+    add     x17, x28, #16
+    str     x17, [x3, #F_FR_NEXT]
+    str     w16, [x3, #F_FR_FLUSH]
+    add     x17, x19, #(E_RETSP & ~0xfff)
+    add     x17, x17, #(E_RETSP & 0xfff)
+    str     x17, [x3, #(F_FR_NEXT + 8)] /* fr_slot */
+    ldr     x6, [x4, #T_READER]
+    str     x4, [x3, #F_FR_T]
+    str     x5, [x3, #(F_FR_T + 8)]     /* fr_cs */
+    str     x6, [x3, #F_FR_READER]
+    /* The release: rcu_read_unlock_reader, cpu_exec_end. */
+    mov     w2, #0
+    ldr     w16, [x6, #R_DEPTH]
+    sub     w16, w16, #1
+    str     w16, [x6, #R_DEPTH]
+    cbnz    w16, 1f
+    stlr    wzr, [x6]                   /* ctr */
+    ldrb    w16, [x6, #R_WAITING]
+    cbz     w16, 1f
+    orr     w2, w2, #XT_EC_TAIL_RCU
+1:
+    strb    wzr, [x5, #CS_RUNNING]
+    adrp    x16, pending_cpus
+    ldr     w16, [x16, :lo12:pending_cpus]
+    cbz     w16, 2f
+    orr     w2, w2, #XT_EC_TAIL_EXCL
+2:
+    str     wzr, [x4, #T_ACTIVE]        /* XT_ACT_NONE */
+    mov     x16, sp
+    str     x16, [x3, #F_RESUME]
+    str     wzr, [x4, #T_STATE]         /* XT_WINDOWS */
+    add     x16, x19, #(E_DR6 & ~0xfff)
+    ldr     x17, [x16, #(E_DR6 & 0xfff)]
+    mov     w30, #0x400f                /* DR6_BS | B0-B3 */
+    tst     x17, x30
+    b.eq    3f
+    str     xzr, [x16, #(E_DR6 & 0xfff)]
+3:
+    cbnz    w2, .Lfd_tail
+    /*
+     * The registers into their ARM64EC places: each source read before
+     * its register is written, the RAX/R14 pair through x17.
+     */
+    mov     x16, x1                     /* the target */
+    mov     x0, x25                     /* RCX */
+    mov     x1, x24                     /* RDX */
+    mov     x2, x14                     /* R8 */
+    mov     x3, x12                     /* R9 */
+    mov     x4, x13                     /* R10 */
+    mov     x5, x15                     /* R11 */
+    mov     x25, x27                    /* RSI */
+    mov     x27, x23                    /* RBX */
+    mov     x29, x9                     /* RBP */
+    mov     x19, x26                    /* R12 */
+    mov     x26, x22                    /* RDI */
+    mov     x22, x10                    /* R15 */
+    mov     sp, x20                     /* RSP */
+    mov     x20, x11                    /* R13 */
+    mov     x17, x21
+    mov     x21, x8                     /* R14 */
+    mov     x8, x17                     /* RAX */
+    mov     x9, x16
+    mov     v0.16b, v8.16b              /* XMM0-15 from v8-v23 */
+    mov     v1.16b, v9.16b
+    mov     v2.16b, v10.16b
+    mov     v3.16b, v11.16b
+    mov     v4.16b, v12.16b
+    mov     v5.16b, v13.16b
+    mov     v6.16b, v14.16b
+    mov     v7.16b, v15.16b
+    mov     v8.16b, v16.16b
+    mov     v9.16b, v17.16b
+    mov     v10.16b, v18.16b
+    mov     v11.16b, v19.16b
+    mov     v12.16b, v20.16b
+    mov     v13.16b, v21.16b
+    mov     v14.16b, v22.16b
+    mov     v15.16b, v23.16b
+    b       xt_ec_exit_dispatch
+.Lfd_tail:
+    /* FPSR is still the guest's: kept in x20 (RSP, in env) across C. */
+    mrs     x20, fpsr
+    mov     x0, x4
+    mov     w1, w2
+    bl      "#xt_ec_fast_depart_tail"
+    msr     fpsr, x20
+    mov     x0, x19
+    ldr     x1, [x19, #E_EIP]
+    mov     w2, #2                      /* no YMM, no MMX */
+    b       "#xt_ec_exit_native_env"
+.Lfd_decline:
+    br      x0
 
 /*
  * The entries' copies with XTAJIT_INJECT's test points, reached from

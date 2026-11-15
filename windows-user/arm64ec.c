@@ -43,6 +43,91 @@ QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, inj_armed) != 0x28);
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, ctx) != 0x30);
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, resume_sp) != 0x3c0);
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, resume_go) != 0x3c8);
+/* x-ecfast's resume in assembly (arm64ec.S's fast_resume) */
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, resume_kind) != 0x3d0);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, fr_key) != 0x3e0);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, fr_land) != 0x3e8);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, fr_rsp) != 0x3f0);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, fr_next) != 0x3f8);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, fr_slot) != 0x400);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, fr_t) != 0x408);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, fr_cs) != 0x410);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, fr_reader) != 0x418);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, fr_flush) != 0x420);
+QEMU_BUILD_BUG_ON(XT_EC_KEPT_FAST != 1);
+QEMU_BUILD_BUG_ON(XT_EC_FAST_START != 1 || XT_EC_FAST_CLEAR != 2);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, state) != 0x20);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, active) != 0x24);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, activation) != 0x28);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, suspend_req) != 0x2c);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, terminating) != 0x30);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, gfault.code) != 0x34);
+QEMU_BUILD_BUG_ON(sizeof(((XtThread *)0)->gfault.code) != 4);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, after_suspend) != 0x3a);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, bp_skip) != 0x3b);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, ec_suspended) != 0x3d);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, bp_hit) != 0x40);
+QEMU_BUILD_BUG_ON(sizeof(XtState) != 4 || sizeof(XtActive) != 4);
+QEMU_BUILD_BUG_ON(XT_ACQUIRING != 1 || XT_ENGINE != 2 || XT_ACT_EXEC != 1);
+QEMU_BUILD_BUG_ON(offsetof(CPUState, running) != 0xc4);
+QEMU_BUILD_BUG_ON(offsetof(CPUState, exit_request) != 0xd7);
+QEMU_BUILD_BUG_ON(offsetof(CPUState, cflags_next_tb) != 0xdc);
+QEMU_BUILD_BUG_ON(offsetof(CPUState, interrupt_request) != 0xe0);
+QEMU_BUILD_BUG_ON(offsetof(CPUState, exception_index) != 0x300);
+QEMU_BUILD_BUG_ON(offsetof(CPUState, neg.icount_decr.u16.high) != 0x4342);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, eip) != 0x100);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, cc_src) != 0x118);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, cc_op) != 0x128);
+QEMU_BUILD_BUG_ON(offsetof(X86CPU, eflags_in_tcg) -
+                  offsetof(X86CPU, env) != 0x3c50);
+QEMU_BUILD_BUG_ON(CC_OP_EFLAGS != 0);
+QEMU_BUILD_BUG_ON(CC_C != 0x1 || CC_Z != 0x40 || CC_S != 0x80 ||
+                  CC_O != 0x800);
+QEMU_BUILD_BUG_ON(offsetof(struct rcu_reader_data, ctr) != 0);
+QEMU_BUILD_BUG_ON(sizeof(((struct rcu_reader_data *)0)->ctr) != 4);
+QEMU_BUILD_BUG_ON(sizeof(rcu_gp_ctr) != 4);
+QEMU_BUILD_BUG_ON(offsetof(struct rcu_reader_data, depth) != 8);
+QEMU_BUILD_BUG_ON(offsetof(TBContext, tb_flush_count) != 0x28);
+QEMU_BUILD_BUG_ON(HOST_FP_CONTROL_QEMU != 6);
+/* ... and its departure (xt_ec_fast_depart) */
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, dep_fpsr) != 0x3d8);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, fr_lo) != 0x428);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, fr_hi) != 0x430);
+QEMU_BUILD_BUG_ON(offsetof(XtCpuArea, EmulatorData[0]) != 0x30);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, cpu) != 0);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, rcu_reader) != 0x10);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, ec_seen) != 0x3c);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, native_target) != 0x48);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, fault.busy) != 0xb0);
+QEMU_BUILD_BUG_ON(sizeof(((XtThread *)0)->fault.busy) != 4);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, co_rsp) != 0x6d0);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, co_flush) != 0x6d8);
+QEMU_BUILD_BUG_ON(XT_WINDOWS != 0 || XT_ACT_NONE != 0);
+QEMU_BUILD_BUG_ON(offsetof(CPUState, host_fp_guest) != 0x208);
+QEMU_BUILD_BUG_ON(offsetof(CPUState, host_fp_suspended) != 0x209);
+QEMU_BUILD_BUG_ON(sizeof(((CPUState *)0)->host_fp_guest) != 1 ||
+                  sizeof(((CPUState *)0)->host_fp_suspended) != 1);
+QEMU_BUILD_BUG_ON(offsetof(CPUState, neg.can_do_io) != 0x4344);
+QEMU_BUILD_BUG_ON(sizeof(((CPUState *)0)->neg.can_do_io) != 1);
+QEMU_BUILD_BUG_ON(offsetof(CPUState, singlestep_flags) != 0xe4);
+QEMU_BUILD_BUG_ON(SSTEP_ENABLE != 1);
+QEMU_BUILD_BUG_ON(offsetof(CPUState, breakpoints) != 0x280);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, mxcsr) != 0x3c0);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, dr[6]) != 0x34d8);
+QEMU_BUILD_BUG_ON(sizeof(((CPUX86State *)0)->dr[6]) != 8);
+QEMU_BUILD_BUG_ON((DR6_BS | 0xf) != 0x400f);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, retsp) != 0x3c38);
+QEMU_BUILD_BUG_ON(offsetof(struct rcu_reader_data, waiting) != 4);
+QEMU_BUILD_BUG_ON(sizeof(((struct rcu_reader_data *)0)->waiting) != 1);
+QEMU_BUILD_BUG_ON(HOST_FPSR_FLAGS != 0x9f);
+QEMU_BUILD_BUG_ON(XT_EC_TAIL_RCU != 1 || XT_EC_TAIL_EXCL != 2);
+QEMU_BUILD_BUG_ON(offsetof(XtThread, teb) != 0x18);
+QEMU_BUILD_BUG_ON(offsetof(CPUX86State, segs) != 0x138);
+QEMU_BUILD_BUG_ON(sizeof(SegmentCache) != 0x18);
+QEMU_BUILD_BUG_ON(offsetof(SegmentCache, selector) != 0 ||
+                  offsetof(SegmentCache, base) != 8);
+QEMU_BUILD_BUG_ON(R_ES != 0 || R_CS != 1 || R_SS != 2 || R_DS != 3 ||
+                  R_FS != 4 || R_GS != 5);
 QEMU_BUILD_BUG_ON(offsetof(XtStubInject, ticks) != 0x08);
 QEMU_BUILD_BUG_ON(offsetof(XtStubInject, hits) != 0x10);
 QEMU_BUILD_BUG_ON(offsetof(XtStubInject, rung) != 0x50);
@@ -557,6 +642,15 @@ static unsigned __stdcall rcu_stress_watchdog(void *arg)
 }
 
 static TCGEcCallout ec_callout(uintptr_t sp, void *envp);
+static bool ec_fast_asm_ok(void);
+
+/*
+ * x-ecfast's departure and resume in assembly can run (ec_fast_asm_ok,
+ * at init; arm64ec.S reads it).
+ */
+bool xt_ec_fast_asm;
+/* Their rare ways through C, for exitreport: XT_EC_TAIL_*, XT_EC_FAST_* */
+static unsigned ec_fast_tails[4], ec_fast_slows[3];
 
 static int process_init(void)
 {
@@ -567,11 +661,13 @@ static int process_init(void)
     settings = settings_string();
     xt_log_open();
     tcg_ec_callout_fn = ec_callout;
+    tcg_ec_callout_fast_fn = xt_ec_fast_depart;
     /* The stubs' test points (ProcessInit's xt_ec_stub_inject_init). */
     tcg_ec_leave_fn = xt_stub_inject.point ?
                       (const void *)xt_ec_exit_native_env_inj :
                       (const void *)xt_ec_exit_native_env;
     xt_engine_init(settings, &init_applied, &init_rejected);
+    xt_ec_fast_asm = ec_fast_asm_ok();
     tcg_foreign_pc = ec_foreign_pc;
     tcg_foreign_goto = ec_foreign_goto;
     tcg_foreign_code = ec_foreign_code;
@@ -688,6 +784,9 @@ static XtThread *enter_engine(void)
         ec_register(t);
         /* From here the entries store the registers into the CPU state. */
         qatomic_set(&((XtEcFrame *)area->EmulatorData[1])->env, t->env);
+        /* x-ecfast's departure in assembly: until a C departure, none. */
+        ((XtEcFrame *)area->EmulatorData[1])->fr_lo = NULL;
+        ((XtEcFrame *)area->EmulatorData[1])->fr_hi = NULL;
     }
     return t;
 }
@@ -1413,6 +1512,7 @@ static void ec_term_self(XtGate *g)
     if (f->resume_sp) {
         ec_frame_normalize(t, f, host_fp_status_read());
     }
+    f->fr_lo = f->fr_hi = NULL;
     qatomic_set((XtEcFrame **)&g->frame, NULL);
     /* Before the CPU state goes: no entry of this thread's is storing. */
     qatomic_set(&f->env, NULL);
@@ -1963,6 +2063,22 @@ static void ec_process_term(HANDLE h, BOOL after, NTSTATUS status)
             }
         }
         xt_ec_stub_inject_report();
+        if (xt_exit_report && tcg_ecfast) {
+            char line[160];
+
+            snprintf(line, sizeof(line), "ecfast: assembly %s; departure "
+                     "tails rcu %u exclusive %u both %u; resume in C "
+                     "exclusive %u request %u\n",
+                     xt_ec_fast_asm ? "on" : "off",
+                     qatomic_read(&ec_fast_tails[XT_EC_TAIL_RCU]),
+                     qatomic_read(&ec_fast_tails[XT_EC_TAIL_EXCL]),
+                     qatomic_read(&ec_fast_tails[XT_EC_TAIL_RCU |
+                                                 XT_EC_TAIL_EXCL]),
+                     qatomic_read(&ec_fast_slows[XT_EC_FAST_START]),
+                     qatomic_read(&ec_fast_slows[XT_EC_FAST_CLEAR]));
+            fputs(line, stderr);
+            xt_log_text(line);
+        }
         if (xt_rcu_stress) {
             char line[64];
 
@@ -2912,6 +3028,100 @@ static inline QEMU_ALWAYS_INLINE bool ec_fpcr_default(void)
     return host_fp_control_read() == HOST_FP_CONTROL_QEMU;
 }
 
+/*
+ * x-ecfast's resume in assembly (arm64ec.S's fast_resume) moves the
+ * incoming registers straight into the ones the TBs hold them in, so it
+ * is built for one placement: the general registers in
+ * tcg_target_pin_regs in the x86 front end's pin order, XMM0-15's low
+ * halves in v8-v23, nothing else pinned (it stores EIP and CC_OP to
+ * env), and the return stack's top in x28 (tcg_ec_resume_fast_entry
+ * loads it).  It runs only if the TBs use that placement, and only where
+ * the C resume would have nothing more to do: current_cpu bound
+ * (tcg_cpu_bound), the barriers process-wide (membarrier: none of its
+ * own), the return stack's landings.
+ */
+static bool ec_fast_asm_ok(void)
+{
+    static const int8_t gpr[CPU_NB_REGS] = {
+        [R_EAX] = TCG_REG_X21, [R_ECX] = TCG_REG_X25, [R_EDX] = TCG_REG_X24,
+        [R_EBX] = TCG_REG_X23, [R_ESP] = TCG_REG_X20, [R_EBP] = TCG_REG_X9,
+        [R_ESI] = TCG_REG_X27, [R_EDI] = TCG_REG_X22, [8] = TCG_REG_X14,
+        [9] = TCG_REG_X12, [10] = TCG_REG_X13, [11] = TCG_REG_X15,
+        [12] = TCG_REG_X26, [13] = TCG_REG_X11, [14] = TCG_REG_X8,
+        [15] = TCG_REG_X10,
+    };
+
+#ifndef CONFIG_MEMBARRIER
+    return false;
+#endif
+    if (!tcg_ecfast || !tcg_ecinline || !tcg_retalign || !tcg_cpu_bound ||
+        xt_diag || xt_log_handle() || xt_stub_inject.point ||
+        tcg_retstack_reg != TCG_REG_X28 || !tcg_ec_resume_fast_entry ||
+        tcg_pinned_reg(offsetof(CPUX86State, eip)) >= 0 ||
+        tcg_pinned_reg(offsetof(CPUX86State, cc_op)) >= 0) {
+        return false;
+    }
+    for (int i = 0; i < CPU_NB_REGS; i++) {
+        if (tcg_pinned_reg(offsetof(CPUX86State, regs[i])) != gpr[i] ||
+            tcg_pinned_reg(offsetof(CPUX86State, xmm_regs[i].ZMM_X(0))) !=
+            TCG_REG_V8 + i) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * x-ecfast's departure: what the resume in assembly needs, if it can take
+ * the return (else fr_key 0, and the C resume does): the return stack's
+ * top entry with its landing (the return's key, as the C resume's
+ * tcg_retstack_take_landing takes it), and no single step or breakpoint,
+ * which the C resume handles.
+ */
+static inline QEMU_ALWAYS_INLINE void ec_fast_frame(XtThread *t,
+                                                    CPUState *cs,
+                                                    XtEcFrame *f,
+                                                    uint64_t rsp)
+{
+    uint64_t *lo, *hi;
+
+    f->fr_key = 0;
+    if (!xt_ec_fast_asm || cpu_single_stepping(cs) ||
+        !QTAILQ_EMPTY(&cs->breakpoints)) {
+        return;
+    }
+    f->fr_land = tcg_retstack_peek_landing(cs, &f->fr_key, &f->fr_slot,
+                                           &f->fr_next, &lo, &hi);
+    if (!f->fr_land) {
+        f->fr_key = 0;
+        return;
+    }
+    f->fr_rsp = rsp + 8;
+    f->fr_flush = t->co_flush;
+    f->fr_t = t;
+    f->fr_cs = cs;
+    f->fr_reader = t->rcu_reader;
+    f->fr_lo = lo;
+    f->fr_hi = hi;
+}
+
+/*
+ * x-ecfast's departure in assembly (arm64ec.S's xt_ec_fast_depart), once
+ * ownership's fast parts are given back, where they found a writer
+ * waiting for the RCU reader or an exclusive section pending: the
+ * release's tails, in rcu_read_unlock_reader's then cpu_exec_end's order.
+ */
+void xt_ec_fast_depart_tail(XtThread *t, unsigned tails)
+{
+    qatomic_inc(&ec_fast_tails[tails]);
+    if (tails & XT_EC_TAIL_RCU) {
+        rcu_read_unlock_finish(t->rcu_reader);
+    }
+    if (tails & XT_EC_TAIL_EXCL) {
+        cpu_exec_end_finish(t->cpu);
+    }
+}
+
 static TCGEcCallout ec_callout(uintptr_t sp, void *envp)
 {
     CPUX86State *env = envp;
@@ -2956,6 +3166,7 @@ static TCGEcCallout ec_callout(uintptr_t sp, void *envp)
     if (tcg_ecfast && ec_fp_default(cs, env) && xt_ec_segs_loaded(t)) {
         f->dep_fpsr = host_fp_status_read();
         f->resume_kind = XT_EC_KEPT_FAST;
+        ec_fast_frame(t, cs, f, rsp);
         ec_dispatch_end_how(t, cs, env, true);
         f->resume_sp = sp;
         leave_native_prep(t);
@@ -2965,6 +3176,7 @@ static TCGEcCallout ec_callout(uintptr_t sp, void *envp)
         return (TCGEcCallout){ target, 2 };
     }
     f->resume_kind = XT_EC_KEPT_C;
+    f->fr_key = 0;
     ec_dispatch_end(t, cs, env);
     f->resume_sp = sp;
     leave_native_prep(t);
@@ -2984,6 +3196,7 @@ static void ec_frame_normalize(XtThread *t, XtEcFrame *f, uint64_t fpsr)
     if (f->resume_kind == XT_EC_KEPT_FAST) {
         x86_host_fp_exit_fpsr(t->env, fpsr);
         f->resume_kind = XT_EC_KEPT_C;
+        f->fr_key = 0;
     }
 }
 
@@ -2993,6 +3206,7 @@ static void ec_discard(XtThread *t, XtEcFrame *f)
     ec_frame_normalize(t, f, host_fp_status_read());
     f->resume_sp = 0;
     f->resume_kind = XT_EC_KEPT_C;
+    f->fr_key = 0;
     if (tcg_retalign) {
         tcg_retstack_settle(t->cpu);
     }
@@ -3055,19 +3269,29 @@ void ec_rebase(XtThread *t, XtEcFrame *f)
  * jump cache's TB (a miss: the epilogue, which returns zero to the
  * frame's owner).  It returns that for entry_tail.
  */
+/* The resume's checks failed under ownership: all of it given back. */
+static G_NORETURN void ec_resume_decline(XtThread *t, XtEcFrame *f)
+{
+    rcu_read_unlock_reader(t->rcu_reader);
+    cpu_exec_end(t->cpu);
+    t->active = XT_ACT_NONE;
+    t->state = XT_WINDOWS;
+    ec_rebase(t, f);
+}
+
+static uintptr_t ec_resume_owned(XtThread *t, XtEcFrame *f);
+
 static __attribute__((noinline)) uintptr_t ec_resume(XtThread *t,
                                                      XtEcFrame *f)
 {
     CPUState *cs = t->cpu;
-    CPUX86State *env = t->env;
-    uintptr_t code = 0;
-    TranslationBlock *tb;
     /*
      * x-ecfast's kept frame: FPSR is the guest's, held, and what C does
      * here (cpu_exec_start's tail) mustn't reach it.
      */
     bool fast = f->resume_kind == XT_EC_KEPT_FAST;
     uint64_t fpsr = fast ? host_fp_status_read() : 0;
+    uintptr_t code;
 
     t->ec_suspended = false;
     t->state = XT_ACQUIRING;
@@ -3080,15 +3304,64 @@ static __attribute__((noinline)) uintptr_t ec_resume(XtThread *t,
     rcu_read_lock_reader(t->rcu_reader);
     if (unlikely(!ec_resume_clear(t, cs))) {
         ec_frame_normalize(t, f, fpsr);
-        rcu_read_unlock_reader(t->rcu_reader);
-        cpu_exec_end(cs);
-        t->active = XT_ACT_NONE;
-        t->state = XT_WINDOWS;
-        ec_rebase(t, f);
+        ec_resume_decline(t, f);
     }
+    code = ec_resume_owned(t, f);
+    if (fast) {
+        host_fp_status_write(fpsr);
+    }
+    return code;
+}
+
+/*
+ * x-ecfast's resume in assembly where it can't finish, the entry's state
+ * captured as entry_tail captures it (all but FPSR, the guest's, kept
+ * here), on the emulator stack below the kept frame, ownership taken so
+ * far (the activation counted, the state XT_ACQUIRING, cpu->running
+ * set): with an exclusive section pending at cpu_exec_start
+ * (XT_EC_FAST_START), its tail, then the rest of ec_resume; with a
+ * request or a flush found under ownership (XT_EC_FAST_CLEAR, the RCU
+ * read section taken too), the frame normalized with the guest's FPSR,
+ * ownership given back, and the entry goes on as any other.  It returns
+ * what ec_resume returns, for entry_tail.
+ */
+uintptr_t xt_ec_fast_slow(XtEcFrame *f, int why)
+{
+    /* The guest's, held: what C does here mustn't reach it. */
+    uint64_t fpsr = host_fp_status_read();
+    XtThread *t = f->fr_t;
+    uintptr_t code;
+
+    qatomic_inc(&ec_fast_slows[why]);
+    if (why == XT_EC_FAST_START) {
+        cpu_exec_start_finish(t->cpu);
+        rcu_read_lock_reader(t->rcu_reader);
+        if (likely(ec_resume_clear(t, t->cpu))) {
+            code = ec_resume_owned(t, f);
+            host_fp_status_write(fpsr);
+            return code;
+        }
+    }
+    ec_frame_normalize(t, f, fpsr);
+    ec_resume_decline(t, f);
+}
+
+/*
+ * The resume under ownership: the frame consumed, the import, and the
+ * code for the return address.
+ */
+static uintptr_t ec_resume_owned(XtThread *t, XtEcFrame *f)
+{
+    CPUState *cs = t->cpu;
+    CPUX86State *env = t->env;
+    uintptr_t code = 0;
+    TranslationBlock *tb;
+    bool fast = f->resume_kind == XT_EC_KEPT_FAST;
+
     f->resume_go = f->resume_sp;
     f->resume_sp = 0;
     f->resume_kind = XT_EC_KEPT_C;
+    f->fr_key = 0;
     if (fast) {
         xt_ec_import_fast(t, f->pc, f->nzcv);
     } else {
@@ -3107,8 +3380,6 @@ static __attribute__((noinline)) uintptr_t ec_resume(XtThread *t,
     /* x-ecfast's departure kept the host FP state (ec_enter_kept). */
     if (!fast) {
         x86_host_fp_enter(env);
-    } else {
-        host_fp_status_write(fpsr);
     }
     if (!code) {
         tb = cpu_exec_tb_cached(cs, cpu_exec_tb_state(cs));

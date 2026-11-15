@@ -135,6 +135,29 @@ typedef struct XtEcFrame {
     uint32_t resume_kind;
     uint32_t resume_pad;
     uint64_t dep_fpsr;
+    /*
+     * x-ecfast's resume in assembly (arm64ec.S), from a departure that
+     * kept the frame XT_EC_KEPT_FAST and found it can (else fr_key 0,
+     * which is also what consuming, discarding or normalizing the frame
+     * leaves): the return it takes, by its address (the return stack's
+     * top entry's key) and RSP past it; the entry's landing, and the top
+     * once it is popped, with the env slot that holds the top; the code
+     * buffer's flush count; and the records the resume takes ownership
+     * of.  The departure in assembly (xt_ec_fast_depart) writes them all
+     * but the ring's bounds (fr_lo, fr_hi), which the departure in C that
+     * finds a landing sets for it, and a record's making or end clears.
+     */
+    uint64_t fr_key;
+    uint64_t fr_land;
+    uint64_t fr_rsp;
+    uint64_t *fr_next;
+    uint64_t **fr_slot;
+    struct XtThread *fr_t;
+    CPUState *fr_cs;
+    struct rcu_reader_data *fr_reader;
+    uint32_t fr_flush;
+    uint32_t fr_pad;
+    uint64_t *fr_lo, *fr_hi;
 } XtEcFrame;
 
 #define XT_EC_KEPT_C        0
@@ -158,6 +181,15 @@ typedef struct XtEcFrame {
 
 /* arm64ec.c: the entries' C halves, on the emulator stack */
 uintptr_t xt_ec_enter(XtEcFrame *f);
+/* x-ecfast's resume in assembly, where it can't finish (XT_EC_FAST_*) */
+uintptr_t xt_ec_fast_slow(XtEcFrame *f, int why);
+#define XT_EC_FAST_START    1   /* cpu_exec_start found an exclusive */
+#define XT_EC_FAST_CLEAR    2   /* a request or a flush, under ownership */
+/* x-ecfast's departure in assembly: its C tails (XT_EC_TAIL_*) */
+extern const char xt_ec_fast_depart[];
+void xt_ec_fast_depart_tail(struct XtThread *t, unsigned tails);
+#define XT_EC_TAIL_RCU      1   /* a writer waits for the reader */
+#define XT_EC_TAIL_EXCL     2   /* an exclusive section is pending */
 void xt_ec_begin(void);
 
 /* arm64ec.S: transfers out of the engine; neither returns */
