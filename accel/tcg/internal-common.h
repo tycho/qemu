@@ -196,6 +196,10 @@ static inline bool cpu_plugin_mem_cbs_enabled(const CPUState *cpu)
 }
 
 TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s);
+#ifdef CONFIG_USER_ONLY
+/* Ends the translation in progress on this thread, if any (tb_gen_code). */
+void tb_gen_end(void);
+#endif
 void page_init(void);
 void tb_htable_init(void);
 void tb_reset_jump(TranslationBlock *tb, int n);

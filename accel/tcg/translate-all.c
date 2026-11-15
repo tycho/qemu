@@ -1075,7 +1075,7 @@ int64_t tcg_cache_gcopy(void *dst, const void *src, size_t len)
 #endif
 
 /* Called with mmap_lock held for user mode emulation.  */
-TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+static TranslationBlock *tb_gen_code_in(CPUState *cpu, TCGTBCPUState s)
 {
     CPUArchState *env = cpu_env(cpu);
     TranslationBlock *tb, *existing_tb;
@@ -1550,6 +1550,42 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
         return existing_tb;
     }
     return tb;
+}
+
+#ifdef CONFIG_USER_ONLY
+/*
+ * The translation in progress on this thread: the context it borrowed
+ * (tcg_ctx_borrow), or NULL.  tb_gen_code opens it and ends it, or
+ * cpu_exec_longjmp_cleanup does when the translation leaves by longjmp.
+ */
+static __thread TCGContext *tb_gen_ctx;
+
+void tb_gen_end(void)
+{
+    TCGContext *s = tb_gen_ctx;
+
+    if (s) {
+        s->gen_tb = NULL;
+        tb_gen_ctx = NULL;
+        tcg_ctx_return(s);
+    }
+}
+#endif
+
+/* Called with mmap_lock held for user mode emulation.  */
+TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+{
+#ifdef CONFIG_USER_ONLY
+    TranslationBlock *tb;
+
+    tcg_debug_assert(!tb_gen_ctx);
+    tb_gen_ctx = tcg_ctx_borrow();
+    tb = tb_gen_code_in(cpu, s);
+    tb_gen_end();
+    return tb;
+#else
+    return tb_gen_code_in(cpu, s);
+#endif
 }
 
 /* user-mode: call with mmap_lock held */

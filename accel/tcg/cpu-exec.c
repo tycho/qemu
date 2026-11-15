@@ -1071,6 +1071,8 @@ void cpu_exec_longjmp_cleanup(CPUState *cpu)
 #ifdef CONFIG_USER_ONLY
     clear_helper_retaddr();
     cpu->smc_check_tb = NULL;
+    /* The translation's context first: it may be everyone's. */
+    tb_gen_end();
     if (have_mmap_lock()) {
         mmap_unlock();
     }
