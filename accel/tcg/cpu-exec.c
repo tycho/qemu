@@ -324,6 +324,8 @@ static bool tb_jmp_cache_global(CPUState *cpu, TranslationBlock *tb, vaddr pc)
  * Returns: an existing translation block or NULL.
  */
 bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
+const void *(*tcg_foreign_goto)(CPUState *cpu);
+bool (*tcg_foreign_code)(vaddr pc);
 bool tcg_cpu_bound;
 
 static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
@@ -833,8 +835,13 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
          * where the lookup has just classified it, and cpu_exec_loop
          * leaves after the epilogue without looking it up again.
          */
-        if (unlikely(tcg_foreign_pc)) {
-            tcg_foreign_pc(cpu, s.pc, true);
+        if (unlikely(tcg_foreign_pc) && tcg_foreign_pc(cpu, s.pc, true) &&
+            tcg_foreign_goto) {
+            const void *p = tcg_foreign_goto(cpu);
+
+            if (p) {
+                return p;
+            }
         }
         return tcg_code_gen_epilogue;
     }
