@@ -78,7 +78,7 @@ extern IMAGE_DOS_HEADER __ImageBase;
 
 #ifndef XT_SCAFFOLD
 /* The fork's defaults for the module; XTAJIT_SETTINGS overrides them. */
-#define XT_SCAFFOLD "smc=check,retalign=on,cache=files,ecinline=on"
+#define XT_SCAFFOLD "smc=check,retalign=on,cache=files,ecinline=on,partrans=on"
 #endif
 
 /*
