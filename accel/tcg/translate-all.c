@@ -564,8 +564,11 @@ static const TCGCacheHost *tb_cache_host(void)
  * state may have changed what translation would give.  Called with
  * mmap_lock held.
  */
-/* Why the last install failed (TCG_CACHE_W_*), and the last lookup. */
-static unsigned tb_cache_fail, tb_cache_why;
+/*
+ * Why this thread's last install failed (TCG_CACHE_W_*), and its last
+ * lookup.
+ */
+static __thread unsigned tb_cache_fail, tb_cache_why;
 
 static void tb_cache_test_dup(CPUState *cpu, TCGTBCPUState s,
                               tb_page_addr_t phys_pc, const void *art,
@@ -858,8 +861,8 @@ static void tb_cache_test_dup(CPUState *cpu, TCGTBCPUState s,
                               size_t len, const TCGCacheImage *img,
                               TranslationBlock *first)
 {
-    static unsigned n;
-    static bool in_dup;
+    static __thread unsigned n;
+    static __thread bool in_dup;
     size_t nb_tbs, pending;
     uint64_t dups;
     TranslationBlock *tb;
@@ -925,13 +928,14 @@ static TranslationBlock *tb_cache_lookup(CPUState *cpu, TCGTBCPUState s,
                                          tb_page_addr_t phys_pc,
                                          const TCGCacheImage *img)
 {
-    static void *buf;
-    static size_t buf_size;
+    void **buf = tcg_ctx->cache_buf;
+    size_t *buf_size = tcg_ctx->cache_buf_size;
     const TCGCacheHost *host = tb_cache_host();
     TCGCacheCand c[TCG_CACHE_CANDS];
     int64_t t0 = TCG_CACHE_CLOCK(), t1;
     int n;
 
+    QEMU_BUILD_BUG_ON(TCG_CACHE_CANDS != ARRAY_SIZE(tcg_ctx->cache_buf));
     tcg_cache_stats.lookups++;
     tb_cache_why = TCG_CACHE_W_NONE;
     /* The directory's files (the back end's snapshot). */
@@ -945,11 +949,12 @@ static TranslationBlock *tb_cache_lookup(CPUState *cpu, TCGTBCPUState s,
             qatomic_set(&tcg_cache_file_missed, true);
         }
         if (snap && snap->n) {
-            static void *sbuf;
             TBCacheUse u = { cpu, s, phys_pc, img, NULL };
+            void *sbuf = tcg_ctx->cache_sbuf;
 
             if (!sbuf) {
                 sbuf = g_malloc(sizeof(TCGCacheEnv) + TCG_CACHE_ART_MAX);
+                tcg_ctx->cache_sbuf = sbuf;
             }
             tcg_cache_stats.file_lookups++;
             tcg_cache_snap_select(snap, img->id, s.pc - img->base, s.flags,
@@ -969,11 +974,12 @@ static TranslationBlock *tb_cache_lookup(CPUState *cpu, TCGTBCPUState s,
     }
     /* Testing (XTCG_CACHE_LOAD): a file's artifacts first. */
     if (tcg_cache_have_loaded) {
-        static void *fbuf;
         TBCacheUse u = { cpu, s, phys_pc, img, NULL };
+        void *fbuf = tcg_ctx->cache_fbuf;
 
         if (!fbuf) {
             fbuf = g_malloc(sizeof(TCGCacheEnv) + TCG_CACHE_ART_MAX);
+            tcg_ctx->cache_fbuf = fbuf;
         }
         tcg_cache_stats.file_lookups++;
         tcg_cache_file_select(&tcg_cache_loaded, img->id, s.pc - img->base,
@@ -988,8 +994,29 @@ static TranslationBlock *tb_cache_lookup(CPUState *cpu, TCGTBCPUState s,
             return u.tb;
         }
     }
+    /*
+     * The candidates are copied out under the store's lock, so that none
+     * can be evicted while it's used.
+     */
+    tcg_cache_store_lock();
     n = tcg_cache_store_find(img->id, s.pc - img->base, s.flags, s.cs_base,
                              s.cflags, c);
+    for (int i = 0; i < n; i++) {
+        c[i].fault = 0;
+        if (c[i].base != img->base) {
+            continue;
+        }
+        if (c[i].len > buf_size[i]) {
+            buf_size[i] = ROUND_UP(c[i].len, 4096);
+            g_free(buf[i]);
+            buf[i] = g_malloc(buf_size[i]);
+        }
+        t1 = TCG_CACHE_CLOCK();
+        c[i].fault = host->copy(buf[i], c[i].art, c[i].len);
+        tcg_cache_stats.copies++;
+        tcg_cache_stats.copy_ns += TCG_CACHE_CLOCK() - t1;
+    }
+    tcg_cache_store_unlock();
     if (!n) {
         tcg_cache_stats.look_none++;
         tcg_cache_stats.look_ns += TCG_CACHE_CLOCK() - t0;
@@ -997,21 +1024,12 @@ static TranslationBlock *tb_cache_lookup(CPUState *cpu, TCGTBCPUState s,
     }
     for (int i = 0; i < n; i++) {
         TranslationBlock *tb;
-        int64_t r;
+        int64_t r = c[i].fault;
 
         if (c[i].base != img->base) {
             tcg_cache_stats.miss_base++;
             continue;
         }
-        if (c[i].len > buf_size) {
-            buf_size = ROUND_UP(c[i].len, 4096);
-            g_free(buf);
-            buf = g_malloc(buf_size);
-        }
-        t1 = TCG_CACHE_CLOCK();
-        r = host->copy(buf, c[i].art, c[i].len);
-        tcg_cache_stats.copies++;
-        tcg_cache_stats.copy_ns += TCG_CACHE_CLOCK() - t1;
         if (r) {
             if (tcg_cache_debug) {
                 fprintf(stderr, "xtcg-cache: guarded copy fault %" PRIx64
@@ -1021,7 +1039,7 @@ static TranslationBlock *tb_cache_lookup(CPUState *cpu, TCGTBCPUState s,
             tcg_cache_stats.miss_fault++;
             continue;
         }
-        tb = tb_cache_install_traced(cpu, s, phys_pc, buf, c[i].len, img);
+        tb = tb_cache_install_traced(cpu, s, phys_pc, buf[i], c[i].len, img);
         if (tb) {
             tcg_cache_stats.hits++;
             tcg_cache_stats.hit_ns += TCG_CACHE_CLOCK() - t0;
@@ -1056,8 +1074,9 @@ static void tb_cache_count(CPUState *cpu)
 {
     static unsigned n;
 
-    if (tcg_cache_flush_every && ++n >= tcg_cache_flush_every) {
-        n = 0;
+    if (tcg_cache_flush_every &&
+        qatomic_inc_fetch(&n) >= tcg_cache_flush_every) {
+        qatomic_set(&n, 0);
         tcg_cache_stats.flushes++;
         queue_tb_flush(cpu);
     }
