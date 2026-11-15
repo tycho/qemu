@@ -111,6 +111,9 @@ static void G_NORETURN xt_fault_continue(XtThread *t, XtActive prev)
         uintptr_t stale = tb_smc_inline_fault(f->ctx.Pc, f->addr);
 
         if (stale) {
+            if (f->code == STATUS_GUARD_PAGE_VIOLATION) {
+                qatomic_inc(&tcg_xlate_epoch);
+            }
             if (f->code == STATUS_GUARD_PAGE_VIOLATION &&
                 !xt_guard_restore(f->addr)) {
                 xt_event(t, XT_EV_CHECK, 1, f->addr);
@@ -228,6 +231,10 @@ bool xt_cache_guard_fault(EXCEPTION_RECORD *er, XtNativeContext *ctx)
          er->ExceptionCode == STATUS_IN_PAGE_ERROR) &&
         er->NumberParameters >= 2 && er->ExceptionInformation[0] == 0 &&
         tcg_cache_guard_pc(ctx->Pc)) {
+        if (er->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+            /* Translations in flight may have read the page unguarded. */
+            qatomic_inc(&tcg_xlate_epoch);
+        }
         ctx->X0 = TCG_CACHE_GFAULT |
                   (er->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION ?
                    TCG_CACHE_GFAULT_GUARD : 0) |
@@ -361,7 +368,7 @@ bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx)
         }
         if (helper_retaddr == 0 &&
             !in_code_gen_buffer((void *)(pc - tcg_splitwx_diff))) {
-            if (have_mmap_lock() && tcg_ctx->gen_tb &&
+            if (tb_gen_active() && tcg_ctx->gen_tb &&
                 on_tb_pages(tcg_ctx->gen_tb, addr)) {
                 kind = XT_FK_TRANSLATE;
                 hpc = 0;

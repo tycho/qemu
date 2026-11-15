@@ -493,10 +493,12 @@ void cpu_loop_exit_sigsegv(CPUState *cs, vaddr addr,
     bool native = t && t->gfault.code;
     bool changed;
 
-    /* A fault while translating abandons the translation. */
-    if (have_mmap_lock() && tcg_ctx->gen_tb) {
-        tcg_ctx->gen_tb = NULL;
-    }
+    /*
+     * A fault while translating abandons the translation, first: what
+     * follows may take the mmap lock to change page state, which no
+     * translation may be holding up.
+     */
+    tb_gen_abort();
 #ifdef TARGET_X86_64
     /* A transfer to native code: fetching the first byte of a native page. */
     if (access_type == MMU_INST_FETCH && t && addr == t->env->eip &&
