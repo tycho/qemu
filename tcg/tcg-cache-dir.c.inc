@@ -33,6 +33,23 @@ static QemuThread dir_writer;
 static QemuMutex dir_wlock;
 static QemuCond dir_wcond;
 static bool dir_writer_on;
+static bool dir_abandoned;          /* an end where no publication begins */
+/*
+ * The writer at a process's end (tcg_cache_dir_writer_settled): blocked
+ * on dir_wwork, which a quiesce holds for good, from just after its last
+ * release of dir_wlock until it has dir_wwork; or parked for good once its
+ * loop is over, holding nothing, rather than return into the thread's
+ * teardown.  Its thread id once it runs.
+ */
+enum {
+    DIR_WRITER_NONE,
+    DIR_WRITER_STARTING,
+    DIR_WRITER_ACTIVE,
+    DIR_WRITER_BLOCKED,
+    DIR_WRITER_PARKED,
+};
+static int dir_writer_state;
+static int dir_writer_id;
 static uint64_t dir_seg_counter;
 static int64_t dir_last_refresh;
 /* The exit's segment, written without allocating. */
@@ -937,9 +954,15 @@ static bool dir_over_budget(void)
     return dir_seen_bytes + dir_pub_bytes_since > dir_disk_max;
 }
 
-/* Publication allowed: the last scan complete, and under budget. */
+/*
+ * Publication allowed: the back end not abandoned (checked before a
+ * publication begins), the last scan complete, and under budget.
+ */
 static bool dir_may_publish(void)
 {
+    if (qatomic_read(&dir_abandoned)) {
+        return false;
+    }
     if (!dir_seen_complete) {
         tcg_cache_stats.publish_blind++;
         return false;
@@ -2284,8 +2307,10 @@ static void *dir_writer_main(void *arg)
 {
     bool first = true;
 
+    qatomic_set(&dir_writer_id, qemu_get_thread_id());
+    qatomic_store_release(&dir_writer_state, DIR_WRITER_ACTIVE);
     qemu_mutex_lock(&dir_wlock);
-    while (dir_writer_on) {
+    while (qatomic_read(&dir_writer_on)) {
         int64_t now;
 
         /*
@@ -2297,11 +2322,13 @@ static void *dir_writer_main(void *arg)
             qemu_cond_timedwait(&dir_wcond, &dir_wlock, 100);
         }
         first = false;
-        if (!dir_writer_on) {
+        if (!qatomic_read(&dir_writer_on)) {
             break;
         }
         qemu_mutex_unlock(&dir_wlock);
+        qatomic_store_release(&dir_writer_state, DIR_WRITER_BLOCKED);
         qemu_mutex_lock(&dir_wwork);
+        qatomic_set(&dir_writer_state, DIR_WRITER_ACTIVE);
         dir_drain(false);
         if (dir_hold_ms) {
             tcg_cache_sink_hold(dir_hold_ms);
@@ -2352,6 +2379,11 @@ static void *dir_writer_main(void *arg)
         qemu_mutex_lock(&dir_wlock);
     }
     qemu_mutex_unlock(&dir_wlock);
+    /* Only a process's end stops the writer. */
+    qatomic_store_release(&dir_writer_state, DIR_WRITER_PARKED);
+    for (;;) {
+        g_usleep(G_USEC_PER_SEC);
+    }
     return NULL;
 }
 
@@ -2559,6 +2591,18 @@ void tcg_cache_dir_start(const TCGCacheDirOps *ops, int64_t t0)
     tcg_cache_sink_wake = dir_writer_wake;
     tcg_cache_sink_init();
     dir_writer_on = true;
+    /*
+     * Against an abandonment meanwhile (tcg_cache_dir_abandon): either it
+     * sees the writer starting, its objects ready, and stops it, or this
+     * sees it and starts nothing, captures closed.
+     */
+    qatomic_store_release(&dir_writer_state, DIR_WRITER_STARTING);
+    smp_mb(); /* pairs with tcg_cache_dir_abandon's */
+    if (qatomic_read(&dir_abandoned)) {
+        qatomic_set(&tcg_cache_sink_on, false);
+        qatomic_set(&dir_writer_state, DIR_WRITER_NONE);
+        return;
+    }
     dir_last_refresh = get_clock();
     /* The first maintenance may come at once: a process may be short. */
     dir_last_compact = dir_last_refresh - dir_compact_ns;
@@ -2588,7 +2632,8 @@ void tcg_cache_dir_quiesce(void)
     int64_t t0;
     int was;
 
-    if (!dir_ops || dir_child) {
+    if (qatomic_load_acquire(&dir_writer_state) == DIR_WRITER_NONE ||
+        !dir_ops || dir_child) {
         return;
     }
     if (qatomic_read(&dir_quiet)) {
@@ -2610,7 +2655,7 @@ void tcg_cache_dir_quiesce(void)
         qatomic_set(&tcg_cache_sink_on, false);
     }
     qemu_mutex_lock(&dir_wlock);
-    dir_writer_on = false;
+    qatomic_set(&dir_writer_on, false);
     qemu_cond_signal(&dir_wcond);
     qemu_mutex_unlock(&dir_wlock);
     if (tcg_cache_debug) {
@@ -2631,6 +2676,45 @@ void tcg_cache_dir_quiesce(void)
 }
 
 /*
+ * Whether the writer, if there is one, holds nothing and never will:
+ * parked, or blocked on the work that a complete quiesce holds for good.
+ * Its thread id in @tid, 0 before it runs.  For a process's end, after
+ * a quiesce or an abandonment.
+ */
+bool tcg_cache_dir_writer_settled(int *tid)
+{
+    int state = qatomic_load_acquire(&dir_writer_state);
+
+    *tid = qatomic_read(&dir_writer_id);
+    return state == DIR_WRITER_NONE || state == DIR_WRITER_PARKED ||
+           (state == DIR_WRITER_BLOCKED && qatomic_read(&dir_quiet));
+}
+
+/*
+ * A process's end that can't quiesce, as another thread may hold what a
+ * quiesce needs: captures stop and no publication begins, the exit's
+ * included (one already begun completes, or, its thread killed, leaves
+ * only a temporary).  It holds from any point of the back end's start,
+ * which then starts no writer.  A writer already started is asked without
+ * a lock to stop after its round, then parks
+ * (tcg_cache_dir_writer_settled); its round may wait on what that thread
+ * holds.
+ */
+void tcg_cache_dir_abandon(void)
+{
+    qatomic_set(&dir_abandoned, true);
+    smp_mb(); /* pairs with tcg_cache_dir_start's */
+    qatomic_set(&tcg_cache_sink_on, false);
+    if (qatomic_load_acquire(&dir_writer_state) == DIR_WRITER_NONE ||
+        dir_child) {
+        return;
+    }
+    qatomic_cmpxchg(&dir_shutdown, DIR_RUNNING, DIR_QUIESCED);
+    qatomic_set(&dir_writer_on, false);
+    qemu_cond_signal(&dir_wcond);
+}
+
+/*
  * A clean exit: captures stop here, and what the buffers hold is
  * published from this thread, allocating nothing and waiting for no lock:
  * by the thread that quiesced the back end, or else by the first to end
@@ -2643,7 +2727,16 @@ void tcg_cache_dir_exit(void)
     bool locked = false;
     int n;
 
-    if (!dir_ops || dir_child) {
+    /*
+     * Not before the back end's start has published its locks and the
+     * sink (the writer's state past DIR_WRITER_NONE).
+     */
+    if (qatomic_load_acquire(&dir_writer_state) == DIR_WRITER_NONE ||
+        !dir_ops || dir_child) {
+        return;
+    }
+    if (qatomic_read(&dir_abandoned)) {
+        qatomic_set(&tcg_cache_sink_on, false);
         return;
     }
     if (qatomic_read(&dir_shutdown) == DIR_QUIESCED) {
@@ -2724,6 +2817,7 @@ void tcg_cache_dir_fork_end(bool child)
         qemu_mutex_init(&dir_wwork);
         qemu_cond_init(&dir_wcond);
         dir_writer_on = false;
+        dir_writer_state = DIR_WRITER_NONE;
         dir_child = true;
     } else {
         qemu_mutex_unlock(&dir_wlock);

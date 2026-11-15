@@ -764,6 +764,7 @@ void xt_cache_files_init(CPUState *first);
 
 /* fault.c */
 bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx);
+bool xt_cache_guard_fault(EXCEPTION_RECORD *er, XtNativeContext *ctx);
 uint32_t xt_fault_count(void);
 /* Resume at CTX, all of it (wow64.c, arm64ec.c); returns only on failure. */
 NTSTATUS xt_continue_native(XtNativeContext *ctx);

@@ -50,6 +50,7 @@
 #include "exec/helper-proto-common.h"
 #include "tcg-accel-ops.h"
 #include "tb-jmp-cache.h"
+#include "tcg/tcg-cache.h"
 #include "tb-hash.h"
 #include "tb-context.h"
 #include "tb-internal.h"
@@ -1218,6 +1219,9 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
 
     qemu_log_mask(CPU_LOG_EXEC, "Linking TBs %p index %d -> %p\n",
                   tb->tc.ptr, n, tb_next->tc.ptr);
+    if (unlikely(tcg_cache_trace)) {
+        tcg_cache_trace_event("link", tb, n, tb_next);
+    }
     return;
 
  out_unlock_next:

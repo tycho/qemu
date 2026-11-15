@@ -27,6 +27,10 @@ user_ss.add(files(
   'user-exec.c',
   'user-exec-stub.c',
 ))
+# The translation cache's guarded routines (translate-all.c).
+if cpu == 'aarch64' and host_os in ['linux', 'windows']
+  user_ss.add(files('tcg-cache-guard.S'))
+endif
 
 system_ss.add(files(
   'cputlb.c',
