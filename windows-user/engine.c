@@ -877,6 +877,10 @@ static void set_settings(Object *accel, const char *settings)
                 /* A failure of the process's end is fatal (arm64ec.c). */
                 xt_exit_strict = true;
                 applied++;
+            } else if (!strcmp(kv[i], "termnoanswer")) {
+                /* Testing: ec_term_answer skipped (arm64ec.c). */
+                xt_term_noanswer = true;
+                applied++;
             } else if (!strcmp(kv[i], "lockcheck")) {
                 /* Where the mmap lock is taken (xt_lock_checked). */
                 xt_lock_check = true;
@@ -911,6 +915,12 @@ static void set_settings(Object *accel, const char *settings)
         }
         /* The translation cache's settings with a value (testing). */
 #ifdef TARGET_X86_64
+        if (!strncmp(kv[i], "termhold=", 9)) {
+            /* Testing: a thread's own end held (arm64ec.c). */
+            xt_term_hold_us = atoi(eq + 1);
+            applied++;
+            continue;
+        }
         if (!strncmp(kv[i], "rcuinj=", 7)) {
             /* Testing: registration interrupted (arm64ec.c). */
             xt_rcu_inj_step = atoi(eq + 1);
@@ -1019,6 +1029,8 @@ bool xt_diag;
 bool xt_rcu_stress;
 bool xt_exit_strict, xt_exit_report, xt_lock_check, xt_gate_check;
 int xt_rcu_inj_step;
+int xt_term_hold_us;
+bool xt_term_noanswer;
 
 /*
  * A setting asked for that the module doesn't know or can't do: the

@@ -273,6 +273,13 @@ void xt_lock_checked(void *caller);
 /* Testing (keyword rcuinj=N): registrations interrupted at step N. */
 extern int xt_rcu_inj_step;
 /*
+ * Testing: a thread's own end held US microseconds inside ThreadTerm,
+ * spinning (termhold=US), and left in ntdll's callback, its doorbell
+ * unanswered, as without ec_term_answer (termnoanswer).
+ */
+extern int xt_term_hold_us;
+extern bool xt_term_noanswer;
+/*
  * Whether ordered accesses that cross 16 bytes fault on this host
  * (fault.c): the number of forms tried that faulted or gave wrong bytes,
  * 0 if every one was performed, -1 if the probe couldn't run; what it saw
