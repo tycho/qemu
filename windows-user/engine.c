@@ -55,15 +55,112 @@ NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
 /*
  * The mmap lock: recursive per thread, as in linux-user/mmap.c.  It
  * serializes translation and page flag changes.
+ *
+ * x-partrans: translations run in parallel.  Each holds the translation
+ * lock shared (mmap_lock_translation), and every other mmap_lock holder
+ * takes it exclusively first, so nothing that invalidates code or changes
+ * page state runs while a translation is in flight.  A translation's own
+ * mmap_lock calls take the mutex alone: that still serializes every write
+ * to what the lock protects, and translations' writes only add (a page's
+ * write protection, a TB's link).  Without x-partrans, a translation
+ * holds the mmap lock itself.
  */
 static QemuMutex mmap_mutex;
 static __thread int mmap_lock_count;
+static __thread bool mmap_outer_excl;   /* the outermost took trans_lock */
+
+enum { TRANS_NONE, TRANS_MMAP, TRANS_SHARED };
+static __thread uint8_t trans_hold;     /* mmap_lock_translation's */
+
+/*
+ * The translation lock, favouring writers: once one waits, new readers
+ * wait for it.  trans_state counts readers in its low half, with a bit
+ * for the writer holding it and a count of those waiting; the writer bits
+ * change only under trans_mutex, which the slow paths wait under.  When a
+ * writer leaves, the readers already waiting go before the next writer
+ * (trans_admit, their tickets), so a stream of writers can't hold a
+ * translation back for ever.
+ */
+#define TRANS_READERS   0xffffffffull
+#define TRANS_WRITER    (1ull << 32)
+#define TRANS_WAITER    (1ull << 33)
+
+static uint64_t trans_state;
+static QemuMutex trans_mutex;
+static QemuCond trans_readers_cv, trans_writers_cv;
+static unsigned trans_readers_waiting, trans_admit;  /* under trans_mutex */
+
+static void trans_lock_shared(void)
+{
+    uint64_t s = qatomic_read(&trans_state);
+
+    while (!(s & ~TRANS_READERS)) {
+        uint64_t old = qatomic_cmpxchg(&trans_state, s, s + 1);
+
+        if (old == s) {
+            return;
+        }
+        s = old;
+    }
+    qemu_mutex_lock(&trans_mutex);
+    trans_readers_waiting++;
+    while ((qatomic_read(&trans_state) & TRANS_WRITER) ||
+           ((qatomic_read(&trans_state) & ~TRANS_READERS) && !trans_admit)) {
+        qemu_cond_wait(&trans_readers_cv, &trans_mutex);
+    }
+    trans_readers_waiting--;
+    if (trans_admit) {
+        trans_admit--;
+    }
+    qatomic_inc(&trans_state);
+    qemu_mutex_unlock(&trans_mutex);
+}
+
+static void trans_unlock_shared(void)
+{
+    uint64_t s = qatomic_fetch_dec(&trans_state);
+
+    if ((s & TRANS_READERS) == 1 && (s & ~TRANS_READERS)) {
+        /* The last reader out, with a writer waiting. */
+        qemu_mutex_lock(&trans_mutex);
+        qemu_cond_broadcast(&trans_writers_cv);
+        qemu_mutex_unlock(&trans_mutex);
+    }
+}
+
+static void trans_lock_excl(void)
+{
+    qemu_mutex_lock(&trans_mutex);
+    qatomic_add(&trans_state, TRANS_WAITER);
+    while ((qatomic_read(&trans_state) & (TRANS_WRITER | TRANS_READERS)) ||
+           trans_admit) {
+        qemu_cond_wait(&trans_writers_cv, &trans_mutex);
+    }
+    qatomic_add(&trans_state, TRANS_WRITER - TRANS_WAITER);
+    qemu_mutex_unlock(&trans_mutex);
+}
+
+static void trans_unlock_excl(void)
+{
+    qemu_mutex_lock(&trans_mutex);
+    qatomic_sub(&trans_state, TRANS_WRITER);
+    trans_admit = trans_readers_waiting;
+    if (trans_admit) {
+        qemu_cond_broadcast(&trans_readers_cv);
+    }
+    qemu_cond_broadcast(&trans_writers_cv);
+    qemu_mutex_unlock(&trans_mutex);
+}
 
 void mmap_lock(void)
 {
     if (mmap_lock_count++ == 0) {
         if (unlikely(xt_lock_check)) {
             xt_lock_checked(__builtin_return_address(0));
+        }
+        mmap_outer_excl = tcg_partrans && trans_hold != TRANS_SHARED;
+        if (mmap_outer_excl) {
+            trans_lock_excl();
         }
         qemu_mutex_lock(&mmap_mutex);
     }
@@ -74,12 +171,57 @@ void mmap_unlock(void)
     assert(mmap_lock_count > 0);
     if (--mmap_lock_count == 0) {
         qemu_mutex_unlock(&mmap_mutex);
+        if (mmap_outer_excl) {
+            mmap_outer_excl = false;
+            trans_unlock_excl();
+        }
     }
 }
 
 bool have_mmap_lock(void)
 {
     return mmap_lock_count > 0;
+}
+
+void mmap_lock_translation(void)
+{
+    if (!tcg_partrans || mmap_lock_count) {
+        mmap_lock();
+        trans_hold = TRANS_MMAP;
+        return;
+    }
+    assert(trans_hold == TRANS_NONE);
+    trans_lock_shared();
+    trans_hold = TRANS_SHARED;
+}
+
+void mmap_unlock_translation(void)
+{
+    if (trans_hold == TRANS_MMAP) {
+        trans_hold = TRANS_NONE;
+        mmap_unlock();
+        return;
+    }
+    assert(trans_hold == TRANS_SHARED && !mmap_lock_count);
+    trans_hold = TRANS_NONE;
+    trans_unlock_shared();
+}
+
+bool have_mmap_lock_translation(void)
+{
+    return trans_hold != TRANS_NONE || mmap_lock_count;
+}
+
+/* After a longjmp: everything this thread held (cpu_exec_longjmp_cleanup). */
+void mmap_lock_reset(void)
+{
+    while (mmap_lock_count) {
+        mmap_unlock();
+    }
+    if (trans_hold == TRANS_SHARED) {
+        trans_unlock_shared();
+    }
+    trans_hold = TRANS_NONE;
 }
 
 /* Zeroed memory below 4 GiB (guest-visible to the i386 engine). */
@@ -907,6 +1049,9 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     char reason[96];
 
     qemu_mutex_init(&mmap_mutex);
+    qemu_mutex_init(&trans_mutex);
+    qemu_cond_init(&trans_readers_cv);
+    qemu_cond_init(&trans_writers_cv);
     qemu_mutex_init(&cpu_create_mutex);
 #ifdef TARGET_X86_64
     /* x64 user mode: the lower half of a 48-bit address space. */

@@ -46,6 +46,29 @@ bool have_mmap_lock(void)
     return mmap_lock_count > 0 ? true : false;
 }
 
+/* One translation at a time: a translation holds the mmap lock. */
+void mmap_lock_translation(void)
+{
+    mmap_lock();
+}
+
+void mmap_unlock_translation(void)
+{
+    mmap_unlock();
+}
+
+bool have_mmap_lock_translation(void)
+{
+    return have_mmap_lock();
+}
+
+void mmap_lock_reset(void)
+{
+    while (have_mmap_lock()) {
+        mmap_unlock();
+    }
+}
+
 /* Grab lock to make sure things are in a consistent state after fork().  */
 void mmap_fork_start(void)
 {
