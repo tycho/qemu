@@ -67,11 +67,17 @@ Coroutine *qmp_dispatcher_co;
 bool qmp_dispatcher_co_shutdown;
 
 /*
- * Protects mon_list, monitor_qapi_event_state, coroutine_mon,
- * monitor_destroyed.
+ * Protects mon_list, monitor_qapi_event_state, monitor_destroyed.
  */
 QemuMutex monitor_lock;
 static GHashTable *monitor_qapi_event_state;
+/*
+ * Protects coroutine_mon only, so that monitor_cur() works while
+ * monitor_lock is held: an error report issued while an event is being
+ * written to a monitor (a chardev backend logging, say) looks up the
+ * current monitor.
+ */
+static QemuMutex coroutine_mon_lock;
 static GHashTable *coroutine_mon; /* Maps Coroutine* to Monitor* */
 
 MonitorList mon_list;
@@ -135,9 +141,9 @@ Monitor *monitor_cur(void)
 {
     Monitor *mon;
 
-    qemu_mutex_lock(&monitor_lock);
+    qemu_mutex_lock(&coroutine_mon_lock);
     mon = g_hash_table_lookup(coroutine_mon, qemu_coroutine_self());
-    qemu_mutex_unlock(&monitor_lock);
+    qemu_mutex_unlock(&coroutine_mon_lock);
 
     return mon;
 }
@@ -153,13 +159,13 @@ Monitor *monitor_set_cur(Coroutine *co, Monitor *mon)
 {
     Monitor *old_monitor = monitor_cur();
 
-    qemu_mutex_lock(&monitor_lock);
+    qemu_mutex_lock(&coroutine_mon_lock);
     if (mon) {
         g_hash_table_replace(coroutine_mon, co, mon);
     } else {
         g_hash_table_remove(coroutine_mon, co);
     }
-    qemu_mutex_unlock(&monitor_lock);
+    qemu_mutex_unlock(&coroutine_mon_lock);
 
     return old_monitor;
 }
@@ -635,6 +641,7 @@ static void __attribute__((__constructor__(QEMU_CONSTRUCTOR_EARLY)))
 monitor_init_static(void)
 {
     qemu_mutex_init(&monitor_lock);
+    qemu_mutex_init(&coroutine_mon_lock);
     coroutine_mon = g_hash_table_new(NULL, NULL);
     monitor_qapi_event_state = g_hash_table_new(qapi_event_throttle_hash,
                                                 qapi_event_throttle_equal);

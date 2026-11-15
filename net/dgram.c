@@ -124,20 +124,32 @@ static void net_dgram_send(void *opaque)
 {
     NetDgramState *s = opaque;
     int size;
+    int packets;
 
-    size = recv(s->fd, s->rs.buf, sizeof(s->rs.buf), 0);
-    if (size < 0) {
-        return;
-    }
-    if (size == 0) {
-        /* end of connection */
-        net_dgram_read_poll(s, false);
-        net_dgram_write_poll(s, false);
-        return;
-    }
-    if (qemu_send_packet_async(&s->nc, s->rs.buf, size,
-                               net_dgram_send_completed) == 0) {
-        net_dgram_read_poll(s, false);
+    /*
+     * Read a batch of datagrams per wakeup, as tap does, but no more than
+     * that so that a busy sender cannot hog the BQL.
+     */
+    for (packets = 0; packets < 50; packets++) {
+        size = recv(s->fd, s->rs.buf, sizeof(s->rs.buf), 0);
+        if (size < 0) {
+            return;
+        }
+        if (size == 0) {
+            /* end of connection */
+            net_dgram_read_poll(s, false);
+            net_dgram_write_poll(s, false);
+            return;
+        }
+        size = qemu_send_packet_async(&s->nc, s->rs.buf, size,
+                                      net_dgram_send_completed);
+        if (size == 0) {
+            net_dgram_read_poll(s, false);
+            return;
+        }
+        if (size < 0) {
+            return;
+        }
     }
 }
 

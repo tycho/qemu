@@ -60,7 +60,7 @@ static int qemu_signalfd_compat(const sigset_t *mask)
 
     info = g_malloc(sizeof(*info));
 
-    if (!g_unix_open_pipe(fds, FD_CLOEXEC, NULL)) {
+    if (!g_unix_open_pipe(fds, QEMU_G_UNIX_PIPE_CLOEXEC, NULL)) {
         g_free(info);
         return -1;
     }
