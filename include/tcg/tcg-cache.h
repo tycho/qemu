@@ -338,6 +338,17 @@ int tcg_cache_selftest(uint8_t *p, size_t page);
  */
 extern bool tcg_cache_trace;
 extern void (*tcg_cache_out)(const char *line);
+/*
+ * Testing (cachetrace): the TBs installed from artifacts, with their key,
+ * and a line for each link from one (and its slot), unlink, invalidation,
+ * and for a flush ("flush", @tb NULL).
+ */
+void tcg_cache_trace_installed(const TranslationBlock *tb, uint64_t id,
+                               uint64_t rva);
+void tcg_cache_trace_event(const char *what, const TranslationBlock *tb,
+                           int n, const TranslationBlock *dest);
+/* Testing (XTCG_CACHE_TEST_RELOCFAIL): a relocation form that never fits. */
+extern int tcg_cache_test_reloc_fail;
 
 /*
  * The store: artifacts by image, rva, flags, cs_base and cflags, newest
@@ -755,6 +766,13 @@ void tcg_cache_dir_start(const TCGCacheDirOps *ops, int64_t t0);
  * writer is stopped after its round, and what the sink holds published.
  */
 void tcg_cache_dir_quiesce(void);
+/*
+ * After a quiesce, or for an end that can't have one (abandon: no
+ * publication begins), whether the writer holds nothing and never will;
+ * its thread id in @tid.
+ */
+bool tcg_cache_dir_writer_settled(int *tid);
+void tcg_cache_dir_abandon(void);
 /* A clean exit: captures stop, and what is left is published, at best. */
 void tcg_cache_dir_exit(void);
 void tcg_cache_dir_fork_start(void);

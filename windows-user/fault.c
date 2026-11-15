@@ -215,6 +215,31 @@ static void G_NORETURN zext32_trap(XtNativeContext *ctx, int reg)
 }
 
 /*
+ * A read by one of the translation cache's guarded routines
+ * (tcg-cache.h), wherever it reads: back to its caller with a fault
+ * code.  Only a read access at one of the routines' loads, by its exact
+ * PC; a fault anywhere else in them, a store into the destination
+ * included, is not theirs to contain.
+ */
+bool xt_cache_guard_fault(EXCEPTION_RECORD *er, XtNativeContext *ctx)
+{
+    if ((er->ExceptionCode == STATUS_ACCESS_VIOLATION ||
+         er->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION ||
+         er->ExceptionCode == STATUS_IN_PAGE_ERROR) &&
+        er->NumberParameters >= 2 && er->ExceptionInformation[0] == 0 &&
+        tcg_cache_guard_pc(ctx->Pc)) {
+        ctx->X0 = TCG_CACHE_GFAULT |
+                  (er->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION ?
+                   TCG_CACHE_GFAULT_GUARD : 0) |
+                  (er->ExceptionInformation[1] &
+                   (TCG_CACHE_GFAULT_GUARD - 1));
+        ctx->Pc = ctx->Lr;
+        return true;
+    }
+    return false;
+}
+
+/*
  * Classify a host exception (from BTCpuResetToConsistentState, inside
  * Windows' exception dispatch, or the native harness's vectored handler),
  * and if it is the engine's, redirect CTX to the continuation and return
@@ -249,22 +274,8 @@ bool xt_fault_redirect(EXCEPTION_RECORD *er, XtNativeContext *ctx)
     vaddr addr;
     bool is_write, cross = false;
 
-    /*
-     * A read by one of the translation cache's guarded routines
-     * (tcg-cache.h), wherever it reads: back to its caller with a fault
-     * code.  Before anything else, the thread's own state included.
-     */
-    if ((er->ExceptionCode == STATUS_ACCESS_VIOLATION ||
-         er->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION ||
-         er->ExceptionCode == STATUS_IN_PAGE_ERROR) &&
-        er->NumberParameters >= 2 && er->ExceptionInformation[0] == 0 &&
-        tcg_cache_guard_pc(ctx->Pc)) {
-        ctx->X0 = TCG_CACHE_GFAULT |
-                  (er->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION ?
-                   TCG_CACHE_GFAULT_GUARD : 0) |
-                  (er->ExceptionInformation[1] &
-                   (TCG_CACHE_GFAULT_GUARD - 1));
-        ctx->Pc = ctx->Lr;
+    /* Before anything else, the thread's own state included. */
+    if (xt_cache_guard_fault(er, ctx)) {
         return true;
     }
     if (er->ExceptionCode == STATUS_BREAKPOINT ||

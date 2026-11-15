@@ -14,6 +14,9 @@
 #include "exec/page-protection.h"
 #include "user/page-protection.h"
 #include "xtajit.h"
+#ifdef TARGET_X86_64
+#include "arm64ec.h"
+#endif
 
 NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, PVOID, int, PVOID, SIZE_T,
                                     PSIZE_T);
@@ -214,7 +217,9 @@ static int region_add(uintptr_t start, uintptr_t last, XtImage *img)
  * A page is eligible when its translations are never checked
  * (PAGE_FIXED_CODE: committed image memory that isn't writable, outside
  * this module), it is executable, nothing can write it, and it is in an
- * image the catalogue could identify.
+ * image the catalogue could identify.  In the x64 module, not EC code:
+ * that is native, and a translation never reads it.  Both of a TB's pages
+ * come here, at capture and at install.
  */
 static bool page_image(vaddr page, TCGCacheImage *out)
 {
@@ -227,6 +232,11 @@ static bool page_image(vaddr page, TCGCacheImage *out)
         != want) {
         return false;
     }
+#ifdef TARGET_X86_64
+    if (xt_is_ec_code(page)) {
+        return false;
+    }
+#endif
     i = region_find(page);
     if (i < 0) {
         int64_t t0 = get_clock();

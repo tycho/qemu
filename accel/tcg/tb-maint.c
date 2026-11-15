@@ -1197,6 +1197,9 @@ void tb_flush__exclusive_or_serial(void)
 
     qht_reset_size(&tb_ctx.htable, CODE_GEN_HTABLE_SIZE);
     tb_remove_all();
+    if (unlikely(tcg_cache_trace)) {
+        tcg_cache_trace_event("flush", NULL, -1, NULL);
+    }
 
     tcg_region_reset_all();
     /* XXX: flush processor icache at this point if cache flush is expensive */
@@ -1285,6 +1288,9 @@ void tb_reset_jump(TranslationBlock *tb, int n)
 {
     uintptr_t addr = (uintptr_t)(tb->tc.ptr + tb->jmp[n].reset_offset);
     tb_set_jmp_target(tb, n, addr);
+    if (unlikely(tcg_cache_trace)) {
+        tcg_cache_trace_event("unlink", tb, n, NULL);
+    }
 }
 
 /* remove any jumps to the TB */
@@ -1349,6 +1355,9 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
     qemu_spin_lock(&tb->jmp_lock);
     qatomic_set(&tb->cflags, tb->cflags | CF_INVALID);
     qemu_spin_unlock(&tb->jmp_lock);
+    if (unlikely(tcg_cache_trace)) {
+        tcg_cache_trace_event("inval", tb, -1, NULL);
+    }
     /* Testing: an invalidated TB stays found for unwinding. */
     if (unlikely(tcg_tb_lookup_verify)) {
         g_assert(tcg_tb_lookup((uintptr_t)tb->tc.ptr) == tb);
