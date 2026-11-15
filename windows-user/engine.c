@@ -930,19 +930,6 @@ int xt_engine_init(const char *settings, int *n_applied, int *n_rejected)
     if (rejected) {
         refuse_settings(first_rejected);
     }
-#ifdef TARGET_X86_64
-    /*
-     * The cache's files, not yet in the x64 module: their writer must stop
-     * before Windows ends the process's threads, and at ProcessTerm's
-     * first call the other threads still run in the engine.  Nothing
-     * stops them and the writer safely there yet, and a writer ended
-     * holding the sink's lock would leave a capture at exit waiting for
-     * it forever.  The in-process cache (x-cache=on) has no writer.
-     */
-    if (tcg_cache_mode == TCG_CACHE_ON && tcg_cache_files) {
-        refuse_settings("x-cache=files: not in the x64 module");
-    }
-#endif
     /*
      * Guest registers in host registers across TBs, and globals synced
      * lazily: the engine's fault path stores them from the fault's native
