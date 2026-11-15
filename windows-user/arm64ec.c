@@ -28,6 +28,7 @@
 #include "qemu/timer.h"
 #include "accel/tcg/internal-common.h"
 #include "exec/tb-flush.h"
+#include "accel/tcg/helper-retaddr.h"
 
 /* The layouts arm64ec.S's offsets (F_*, C_*, TEB_CPU_AREA, AREA_*) assume. */
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, entry) != 0x04);
@@ -38,6 +39,8 @@ QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, lr) != 0x18);
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, env) != 0x20);
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, inj_armed) != 0x28);
 QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, ctx) != 0x30);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, resume_sp) != 0x3c0);
+QEMU_BUILD_BUG_ON(offsetof(XtEcFrame, resume_go) != 0x3c8);
 QEMU_BUILD_BUG_ON(offsetof(XtStubInject, ticks) != 0x08);
 QEMU_BUILD_BUG_ON(offsetof(XtStubInject, hits) != 0x10);
 QEMU_BUILD_BUG_ON(offsetof(XtStubInject, rung) != 0x50);
@@ -74,7 +77,7 @@ extern IMAGE_DOS_HEADER __ImageBase;
 
 #ifndef XT_SCAFFOLD
 /* The fork's defaults for the module; XTAJIT_SETTINGS overrides them. */
-#define XT_SCAFFOLD "smc=check,retalign=on,cache=files"
+#define XT_SCAFFOLD "smc=check,retalign=on,cache=files,ecinline=on"
 #endif
 
 /*
@@ -355,6 +358,40 @@ static bool ec_foreign_pc(CPUState *cs, vaddr pc, bool exit)
     return true;
 }
 
+static bool ec_foreign_code(vaddr pc)
+{
+    return xt_is_ec_code(pc);
+}
+
+/*
+ * tcg_foreign_goto (x-ecinline): an indirect exit to native code leaves
+ * through the call-out (ec_callout), unless it returns to a native caller
+ * (a return address past a "blr x16", the call through the dispatch or an
+ * exit thunk), which never comes back to the TB's frame.  The word before
+ * the target is read guarded (tcg_cache_gcopy): EC code needn't be
+ * readable, and a fault here would be the engine's.  Unread, it is taken
+ * for a call.  The answer for the thread's last target is kept: it only
+ * chooses between two correct exits (a call-out whose frame the next
+ * entry discards, or the exit through the epilogue).
+ */
+static const void *ec_foreign_goto(CPUState *cs)
+{
+    XtThread *t = cs->opaque;
+    uint64_t pc = t->native_target;
+    uint32_t insn;
+
+    if (!tcg_ecinline || !tcg_ec_callout_entry) {
+        return NULL;
+    }
+    if (pc != t->fg_pc) {
+        t->fg_pc = pc;
+        t->fg_ret = tcg_cache_gcopy(&insn, (const void *)(uintptr_t)(pc - 4),
+                                    4) == 0 &&
+                    insn == 0xd63f0200;
+    }
+    return t->fg_ret ? NULL : tcg_ec_callout_entry;
+}
+
 /*
  * RCU readers for a thread's life (the x64 module, whose thread-local
  * storage is its own, runtime/emutls.c): a thread registers once, at its
@@ -517,6 +554,8 @@ static unsigned __stdcall rcu_stress_watchdog(void *arg)
     return 0;
 }
 
+static TCGEcCallout ec_callout(uintptr_t sp, void *envp);
+
 static int process_init(void)
 {
     char *settings;
@@ -525,8 +564,15 @@ static int process_init(void)
     xt_crt_process_init();
     settings = settings_string();
     xt_log_open();
+    tcg_ec_callout_fn = ec_callout;
+    /* The stubs' test points (ProcessInit's xt_ec_stub_inject_init). */
+    tcg_ec_leave_fn = xt_stub_inject.point ?
+                      (const void *)xt_ec_exit_native_env_inj :
+                      (const void *)xt_ec_exit_native_env;
     xt_engine_init(settings, &init_applied, &init_rejected);
     tcg_foreign_pc = ec_foreign_pc;
+    tcg_foreign_goto = ec_foreign_goto;
+    tcg_foreign_code = ec_foreign_code;
     /* A thread's reader is registered at its first need (xt_rcu_ensure). */
     rcu_unregister_thread();
     xt_gevent(XT_EV_THREAD_INIT, init_applied, init_rejected);
@@ -2373,8 +2419,7 @@ static void leave(XtThread *t, ARM64_NT_CONTEXT *n, bool context_exit)
  * single-step and breakpoint bits have no place there, and end here as
  * xt_ec_pack ends them.
  */
-static inline QEMU_ALWAYS_INLINE G_NORETURN
-void leave_native(XtThread *t, vaddr target)
+static inline QEMU_ALWAYS_INLINE void leave_native_prep(XtThread *t)
 {
     CPUX86State *env = t->env;
 
@@ -2385,6 +2430,14 @@ void leave_native(XtThread *t, vaddr target)
     if (xt_log_handle()) {
         xt_log_flush(t);
     }
+}
+
+static inline QEMU_ALWAYS_INLINE G_NORETURN
+void leave_native(XtThread *t, vaddr target)
+{
+    CPUX86State *env = t->env;
+
+    leave_native_prep(t);
     if (unlikely(xt_stub_inject.point)) {
         xt_ec_exit_native_env_inj(env, target, xt_ec_ymm(t));
     }
@@ -2782,6 +2835,203 @@ miss:
 }
 
 /*
+ * x-ecinline: a TB that leaves for native code (a direct jump to EC code,
+ * translator_use_foreign_call, or an indirect one, ec_foreign_goto) calls
+ * out from inside the run (tcg_ec_callout_entry, permanent code beside
+ * the epilogue), its state in env.  The call-out ends the activation as
+ * ec_dispatch's exit to native code does, keeps the run's frames on the
+ * emulator stack (the frame's resume_sp, where the next entry's C frames
+ * go, below them), and leaves.  The next entry, if it is the return the
+ * call-out recorded (ec_resume_ready), takes the activation back and goes
+ * on in generated code at the return address, through the resume entry,
+ * whose frame returns to the run's owner (cpu_exec or ec_dispatch) as any
+ * TB does.  It takes nothing of the call's but the frame: the registers
+ * are the entry's, the code the call's own return stack landing or a
+ * fresh lookup, the ownership and the code buffer's generation checked
+ * under ownership.  Any other entry discards the frame (ec_discard):
+ * everything shared was published at the call-out, and the entry runs
+ * from the stack's base.
+ *
+ * The host's return predictor stays in step: the call-out returns to its
+ * stub, which jumps to native code (tcg_ec_leave_fn), and the resume
+ * returns to entry_tail, which jumps to the resume entry, so that the
+ * landing's return is predicted by the call that pushed it.
+ *
+ * The call-out declines (the stub then leaves through the epilogue to the
+ * exit as before) where the boundary has work in hand: a fault
+ * continuation, one-shot cflags, a frame already kept, or a request
+ * pending.  A destination that is no longer native code declines with no
+ * exit, so that the run looks it up as guest code.
+ */
+static TCGEcCallout ec_callout(uintptr_t sp, void *envp)
+{
+    CPUX86State *env = envp;
+    CPUState *cs = env_cpu(env);
+    XtThread *t = cs->opaque;
+    XtEcFrame *f = xt_cpu_area(NtCurrentTeb())->EmulatorData[1];
+    uint64_t target = env->eip;
+    uint64_t rsp = env->regs[R_ESP];
+
+    /*
+     * A direct jump's destination was native code when it was translated;
+     * if it is the guest's now (its allocation freed and reused), its
+     * lookup, as any other TB's exit.
+     */
+    if (unlikely(!xt_is_ec_code(target))) {
+        t->ec_seen = false;
+        cs->exception_index = -1;
+        return (TCGEcCallout){ 0, 0 };
+    }
+    t->native_target = target;
+#ifdef CONFIG_DEBUG_TCG
+    /* Neither is held at a TB boundary. */
+    assert(!have_mmap_lock() && !helper_retaddr);
+#endif
+    if (!tcg_ecinline || f->resume_sp || t->fault.busy ||
+        cs->cflags_next_tb != -1 || qatomic_read(&t->suspend_req) ||
+        qatomic_read(&cs->exit_request) ||
+        qatomic_read(&cs->neg.icount_decr.u16.high)) {
+        cs->exception_index = XT_EXCP_NATIVE;
+        return (TCGEcCallout){ 0, 0 };
+    }
+    t->ec_seen = false;
+    t->co_rsp = rsp;
+    t->co_flush = qatomic_read(&tb_ctx.tb_flush_count);
+    cs->exception_index = -1;
+    cs->neg.can_do_io = true;
+    ec_dispatch_end(t, cs, env);
+    f->resume_sp = sp;
+    leave_native_prep(t);
+    return (TCGEcCallout){ target, xt_ec_ymm(t) };
+}
+
+/* A kept frame no longer resumable: its ring entries are the abandoned. */
+static void ec_discard(XtThread *t, XtEcFrame *f)
+{
+    f->resume_sp = 0;
+    if (tcg_retalign) {
+        tcg_retstack_settle(t->cpu);
+    }
+}
+
+/*
+ * No request pending and the code buffer the call-out's: ec_resume's
+ * check, under ownership (cpu_exec_start may have waited for a flush).
+ */
+static inline QEMU_ALWAYS_INLINE bool ec_resume_clear(XtThread *t,
+                                                      CPUState *cs)
+{
+    return !qatomic_read(&t->suspend_req) && !qatomic_read(&t->terminating) &&
+           !qatomic_read(&cs->exit_request) &&
+           !qatomic_read(&cs->neg.icount_decr.u16.high) &&
+           !cs->interrupt_request && cs->cflags_next_tb == -1 &&
+           cs->exception_index < 0 &&
+           qatomic_read(&tb_ctx.tb_flush_count) == t->co_flush;
+}
+
+/*
+ * The entry looks like the call-out's return (a return, RSP past the
+ * return address the call left on top), with nothing for the entry's
+ * work to do (ec_dispatch_ready).  A false match is a fresh entry that
+ * reuses the frame: the resume takes the entry's registers and its own
+ * lookup, and a landing only if its key is the return address.
+ */
+static inline QEMU_ALWAYS_INLINE bool ec_resume_ready(XtThread *t,
+                                                      const XtEcFrame *f)
+{
+    return f->entry == XT_EC_ENTRY_RETURN &&
+           t->env->regs[R_ESP] == t->co_rsp + 8 && ec_dispatch_ready(t, f);
+}
+
+static G_NORETURN void ec_enter(XtThread *t, XtEcFrame *f);
+
+/* After a discard: the entry again, from the emulator stack's base. */
+static G_NORETURN void ec_enter_based(void)
+{
+    XtCpuArea *area = xt_cpu_area(NtCurrentTeb());
+
+    ec_enter(area->EmulatorData[0], area->EmulatorData[1]);
+    __builtin_unreachable();
+}
+
+static G_NORETURN __attribute__((noinline))
+void ec_rebase(XtThread *t, XtEcFrame *f)
+{
+    ec_discard(t, f);
+    xt_ec_jump_set_stack((uintptr_t)ec_enter_based,
+                         xt_cpu_area(NtCurrentTeb())->EmulatorStackBase);
+}
+
+/*
+ * The resume: ec_dispatch's acquisition, cpu_exec_start then RCU, the
+ * checks under ownership (a failure gives back exactly what was taken,
+ * then the entry goes on as any other, discarding the frame), then the
+ * import into the engine's format and the code for the return address:
+ * the call's landing, if the return stack's top is its push, else the
+ * jump cache's TB (a miss: the epilogue, which returns zero to the
+ * frame's owner).  It returns that for entry_tail.
+ */
+static __attribute__((noinline)) uintptr_t ec_resume(XtThread *t,
+                                                     XtEcFrame *f)
+{
+    CPUState *cs = t->cpu;
+    CPUX86State *env = t->env;
+    uintptr_t code = 0;
+    TranslationBlock *tb;
+
+    t->ec_suspended = false;
+    t->state = XT_ACQUIRING;
+    xt_inject(t, XT_INJ_ACQUIRE);
+    t->active = XT_ACT_EXEC;
+    cpu_exec_start(cs);
+    if (!tcg_cpu_bound) {
+        current_cpu = cs;
+    }
+    rcu_read_lock_reader(t->rcu_reader);
+    if (unlikely(!ec_resume_clear(t, cs))) {
+        rcu_read_unlock_reader(t->rcu_reader);
+        cpu_exec_end(cs);
+        t->active = XT_ACT_NONE;
+        t->state = XT_WINDOWS;
+        ec_rebase(t, f);
+    }
+    f->resume_go = f->resume_sp;
+    f->resume_sp = 0;
+    xt_ec_import_engine(t, f->pc, f->nzcv);
+    t->state = XT_ENGINE;
+    if (tcg_retalign) {
+        /* The call's own landing, the return it predicts. */
+        code = tcg_retstack_take_landing(cs, f->pc);
+        if (code) {
+            code |= 1;
+        }
+    }
+    t->after_suspend = false;
+    t->gfault.code = 0;
+    x86_host_fp_enter(env);
+    if (!code) {
+        tb = cpu_exec_tb_cached(cs, cpu_exec_tb_state(cs));
+        code = tb ? (uintptr_t)tb->tc.ptr : 0;
+    }
+    qemu_thread_jit_execute();
+    return code;
+}
+
+/*
+ * An entry with a kept frame: the resume, which returns where entry_tail
+ * goes on (tcg_ec_resume_entry), so that the calls on the way are
+ * returned from; else a discard first.
+ */
+static __attribute__((noinline)) uintptr_t ec_enter_kept(XtThread *t,
+                                                         XtEcFrame *f)
+{
+    if (ec_resume_ready(t, f)) {
+        return ec_resume(t, f);
+    }
+    ec_rebase(t, f);
+}
+
+/*
  * Testing (cacheselftest): the cache's guarded routines, once, on the
  * first thread to finish an acquisition, in the engine's state.  A
  * thread's first entry is never dispatched (ec_dispatch_ready: its reader
@@ -2809,10 +3059,8 @@ static inline QEMU_ALWAYS_INLINE void ec_cache_selftest(void)
  * places in F; the return address on the stack already.  The record says
  * which, whatever exists by now.
  */
-void xt_ec_enter(XtEcFrame *f)
+static G_NORETURN void ec_enter(XtThread *t, XtEcFrame *f)
 {
-    XtThread *t = ec_thread();
-
     if (ec_dispatch_ready(t, f)) {
         ec_dispatch(t, f);
     }
@@ -2829,6 +3077,16 @@ void xt_ec_enter(XtEcFrame *f)
         ec_retstack_entry(t, f);
     }
     ec_run(t, f);
+}
+
+uintptr_t xt_ec_enter(XtEcFrame *f)
+{
+    XtThread *t = ec_thread();
+
+    if (unlikely(f->resume_sp)) {
+        return ec_enter_kept(t, f);
+    }
+    ec_enter(t, f);
 }
 
 /*
@@ -2876,6 +3134,9 @@ void xt_ec_begin(void)
     uint32_t kept;
     CONTEXT c;
 
+    if (unlikely(((XtEcFrame *)area->EmulatorData[1])->resume_sp)) {
+        ec_discard(t, area->EmulatorData[1]);
+    }
     if (cross_process_work) {
         cross_process_work();
     }

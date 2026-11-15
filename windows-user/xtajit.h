@@ -219,6 +219,15 @@ typedef struct XtThread {
     uint64_t counts[XT_EV__MAX];
     unsigned ring_pos;
     unsigned logged;        /* events written to the log so far */
+    /*
+     * x-ecinline: the native call a TB's frame was left for: the RSP it
+     * was made with, and the code buffer's flush count when it was left.
+     */
+    uint64_t co_rsp;
+    unsigned co_flush;
+    /* ec_foreign_goto's last target, and whether it returns to a caller. */
+    uint64_t fg_pc;
+    bool fg_ret;
     XtEvent ring[XT_RING];
 } XtThread;
 

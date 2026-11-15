@@ -1777,6 +1777,17 @@ bool tcg_retstack_pop_key(CPUState *cpu, uint64_t key)
     return true;
 }
 
+uintptr_t tcg_retstack_take_landing(CPUState *cpu, uint64_t key)
+{
+    uint64_t *lo, *hi, *top = retstack_top(cpu, &lo, &hi);
+
+    if (!tcg_retalign || !top || top < lo || top >= hi || top[0] != key) {
+        return 0;
+    }
+    *(uint64_t **)((char *)cpu_env(cpu) + tcg_retsp_off) = top + 2;
+    return (int64_t)top[1] > 1 ? top[1] : 0;
+}
+
 void tcg_retstack_settle(CPUState *cpu)
 {
     uint64_t *lo, *hi, *p;

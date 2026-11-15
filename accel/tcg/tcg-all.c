@@ -1003,6 +1003,20 @@ static void tcg_set_retalign(Object *obj, bool value, Error **errp)
     tcg_retalign = value;
 }
 
+static bool tcg_get_ecinline(Object *obj, Error **errp)
+{
+    return tcg_ecinline;
+}
+
+static void tcg_set_ecinline(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_ec_callout_fn) {
+        error_setg(errp, "x-ecinline: the x64 Windows module only");
+        return;
+    }
+    tcg_ecinline = value;
+}
+
 static bool tcg_get_sysret(Object *obj, Error **errp)
 {
     return tcg_sysret;
@@ -1588,6 +1602,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-retalign",
         "With x-tblookup, in user mode: keep the return stack in step with "
         "the host's calls where guest code is entered from outside it");
+
+    object_class_property_add_bool(oc, "x-ecinline", tcg_get_ecinline,
+                                   tcg_set_ecinline);
+    object_class_property_set_description(oc, "x-ecinline",
+        "In the x64 Windows module: leave for native code from generated "
+        "code with its frame kept, and resume that frame when the call "
+        "returns before anything else enters the engine");
 
     object_class_property_add_bool(oc, "x-sysret", tcg_get_sysret,
                                    tcg_set_sysret);

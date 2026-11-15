@@ -119,6 +119,12 @@ typedef struct XtEcFrame {
     CPUArchState *env;
     uint32_t inj_armed;         /* XTAJIT_INJECT=sN: suspended before */
     ARM64_NT_CONTEXT ctx;
+    /*
+     * x-ecinline: the sp of a TB's frame left for native code (0: none);
+     * the entries run below it until it is resumed or discarded.
+     */
+    uint64_t resume_sp;
+    uint64_t resume_go;         /* the resume's sp, for entry_tail */
 } XtEcFrame;
 
 /*
@@ -138,7 +144,7 @@ typedef struct XtEcFrame {
 #define XT_EC_ENTRY_RETURN  2
 
 /* arm64ec.c: the entries' C halves, on the emulator stack */
-void xt_ec_enter(XtEcFrame *f);
+uintptr_t xt_ec_enter(XtEcFrame *f);
 void xt_ec_begin(void);
 
 /* arm64ec.S: transfers out of the engine; neither returns */

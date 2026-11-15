@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/sys_membarrier.h"
 #include "qemu/main-loop.h"
 #include "exec/cpu-common.h"
 #include "hw/core/cpu.h"
@@ -208,8 +209,12 @@ void start_exclusive(void)
     /* Make all other cpus stop executing.  */
     qatomic_set(&pending_cpus, 1);
 
-    /* Write pending_cpus before reading other_cpu->running.  */
-    smp_mb();
+    /*
+     * Write pending_cpus before reading other_cpu->running.  Pairs with
+     * smp_mb_placeholder() in cpu_exec_start and cpu_exec_end: the rare
+     * exclusive section pays for the frequent entries and exits.
+     */
+    smp_mb_global();
     running_cpus = 0;
     CPU_FOREACH(other_cpu) {
         if (qatomic_read(&other_cpu->running)) {
@@ -253,8 +258,11 @@ void cpu_exec_start(CPUState *cpu)
 
     qatomic_set(&cpu->running, true);
 
-    /* Write cpu->running before reading pending_cpus.  */
-    smp_mb();
+    /*
+     * Write cpu->running before reading pending_cpus.  Pairs with
+     * smp_mb_global() in start_exclusive.
+     */
+    smp_mb_placeholder();
 
     /* 1. start_exclusive saw cpu->running == true and pending_cpus >= 1.
      * After taking the lock we'll see cpu->has_waiter == true and run---not
@@ -293,8 +301,11 @@ void cpu_exec_end(CPUState *cpu)
 {
     qatomic_set(&cpu->running, false);
 
-    /* Write cpu->running before reading pending_cpus.  */
-    smp_mb();
+    /*
+     * Write cpu->running before reading pending_cpus.  Pairs with
+     * smp_mb_global() in start_exclusive.
+     */
+    smp_mb_placeholder();
 
     /* 1. start_exclusive saw cpu->running == true.  Then it will increment
      * pending_cpus and wait for exclusive_cond.  After taking the lock
