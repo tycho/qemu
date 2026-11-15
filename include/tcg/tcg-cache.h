@@ -755,6 +755,13 @@ void tcg_cache_dir_start(const TCGCacheDirOps *ops, int64_t t0);
  * writer is stopped after its round, and what the sink holds published.
  */
 void tcg_cache_dir_quiesce(void);
+/*
+ * After a quiesce, or for an end that can't have one (abandon: no
+ * publication begins), whether the writer holds nothing and never will;
+ * its thread id in @tid.
+ */
+bool tcg_cache_dir_writer_settled(int *tid);
+void tcg_cache_dir_abandon(void);
 /* A clean exit: captures stop, and what is left is published, at best. */
 void tcg_cache_dir_exit(void);
 void tcg_cache_dir_fork_start(void);
