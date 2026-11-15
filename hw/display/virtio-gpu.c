@@ -1269,8 +1269,23 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
         /* process command */
         vgc->process_cmd(g, cmd);
 
-        /* command suspended */
-        if (!cmd->finished && !(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
+        /*
+         * A deferred command is owned by whoever deferred it, which responds
+         * and frees it once its host-side work lands.  Unlike a suspended
+         * command it must not hold up the queue behind it.
+         */
+        if (cmd->deferred) {
+            QTAILQ_REMOVE(&g->cmdq, cmd, next);
+            continue;
+        }
+
+        /*
+         * A suspended command has not registered its fence (if any) yet
+         * and must be re-processed at the cmdq head after resume, so it
+         * must not be moved to fenceq like a normal in-flight fence.
+         */
+        if (cmd->suspended ||
+            (!cmd->finished && !(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE))) {
             trace_virtio_gpu_cmd_suspended(cmd->cmd_hdr.type);
             break;
         }
@@ -1331,9 +1346,7 @@ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
 
     cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     while (cmd) {
-        cmd->vq = vq;
-        cmd->error = 0;
-        cmd->finished = false;
+        virtio_gpu_ctrl_cmd_init(cmd, vq);
         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     }
@@ -1782,6 +1795,19 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
         error_setg(errp, "old virglrenderer, drm unsupported");
         return;
     #endif
+#endif
+    }
+
+    if (virtio_gpu_neptune_enabled(g->parent_obj.conf)) {
+#ifdef HAVE_VIRGL_RENDERER_NEPTUNE
+        if (!virtio_gpu_blob_enabled(g->parent_obj.conf) ||
+            !virtio_gpu_hostmem_enabled(g->parent_obj.conf)) {
+            error_setg(errp, "neptune requires enabled blob and hostmem options");
+            return;
+        }
+#else
+        error_setg(errp, "virglrenderer does not support neptune");
+        return;
 #endif
     }
 
