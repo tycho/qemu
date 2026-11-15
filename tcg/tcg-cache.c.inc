@@ -55,7 +55,46 @@ static void tcg_cache_out_stderr(const char *line)
 }
 
 void (*tcg_cache_out)(const char *line) = tcg_cache_out_stderr;
-TCGCacheStats tcg_cache_stats;
+TCGCacheStats tcg_cache_stats_shared;
+
+TCGCacheStats *tcg_cache_stats_here(void)
+{
+    TCGContext *s = tcg_ctx;
+
+    return s && s->cache_stats ? s->cache_stats : &tcg_cache_stats_shared;
+}
+
+/* The shared counters and every context's: added, or for peaks the most. */
+void tcg_cache_stats_sum(TCGCacheStats *sum)
+{
+    static const size_t peaks[] = {
+        offsetof(TCGCacheStats, find_slots_max),
+        offsetof(TCGCacheStats, pt_pending_peak),
+        offsetof(TCGCacheStats, pt_pages_peak),
+        offsetof(TCGCacheStats, scan_mem_max),
+    };
+    unsigned n_ctxs = qatomic_read(&tcg_cur_ctxs);
+
+    QEMU_BUILD_BUG_ON(sizeof(TCGCacheStats) % sizeof(uint64_t));
+    *sum = tcg_cache_stats_shared;
+    for (unsigned i = 0; i < n_ctxs; i++) {
+        const TCGContext *s = qatomic_read(&tcg_ctxs[i]);
+        const uint64_t *c = (const uint64_t *)s->cache_stats;
+        uint64_t *t = (uint64_t *)sum;
+
+        if (!c) {
+            continue;
+        }
+        for (size_t k = 0; k < sizeof(*sum) / sizeof(uint64_t); k++) {
+            bool peak = false;
+
+            for (size_t j = 0; j < ARRAY_SIZE(peaks); j++) {
+                peak |= k * sizeof(uint64_t) == peaks[j];
+            }
+            t[k] = peak ? MAX(t[k], c[k]) : t[k] + c[k];
+        }
+    }
+}
 int tcg_cache_test_reloc_fail;
 
 /*
@@ -170,11 +209,15 @@ const char *const tcg_cache_x_names[TCG_CACHE_X_MAX] = {
  * XTCG_CACHE_MAX=n bounds the store at n MiB; XTCG_CACHE_INJPROMOTE
  * promotes an install's first acquire/release site after its check.
  */
+/* The store's lock (tcg_cache_store_lock). */
+static QemuMutex cache_lock;
+
 static void tcg_cache_init(void)
 {
     const char *m = getenv("XTCG_CACHE");
     const char *k = getenv("XTCG_CACHE_SKEW");
 
+    qemu_mutex_init(&cache_lock);
     if (tcg_cache_mode == TCG_CACHE_OFF && m && !strcmp(m, "capture")) {
         tcg_cache_mode = TCG_CACHE_CAPTURE;
     } else if (tcg_cache_mode == TCG_CACHE_OFF && m && !strcmp(m, "stress")) {
@@ -368,10 +411,10 @@ static uintptr_t tcg_cache_anchor(void)
 }
 
 /* The last capture's exclusion (statistics). */
-unsigned tcg_cache_last_reason;
+__thread unsigned tcg_cache_last_reason;
 
 /* The last failed install's relocation (statistics). */
-unsigned tcg_cache_fail_kind, tcg_cache_fail_form;
+__thread unsigned tcg_cache_fail_kind, tcg_cache_fail_form;
 
 #ifdef TCG_TARGET_HAS_CACHE
 
@@ -1398,8 +1441,18 @@ void tcg_cache_commit(TCGContext *s, const TCGCacheRes *r)
 
 /*
  * The store (TCG_CACHE_ON): an open-addressed table of keys, each with its
- * candidates newest first.  The caller holds mmap_lock.
+ * candidates newest first, under cache_lock.
  */
+void tcg_cache_store_lock(void)
+{
+    qemu_mutex_lock(&cache_lock);
+}
+
+void tcg_cache_store_unlock(void)
+{
+    qemu_mutex_unlock(&cache_lock);
+}
+
 typedef struct CacheEnt {
     struct CacheEnt *older;
     uint64_t id, rva, cs_base, base;
@@ -1461,7 +1514,9 @@ const char *tcg_cache_store_put(const TCGCacheImage *img, void *art,
     CacheEnt **slot, *e, **pp;
     int n;
 
+    qemu_mutex_lock(&cache_lock);
     if (cache_bytes + len + sizeof(CacheEnt) > tcg_cache_max) {
+        qemu_mutex_unlock(&cache_lock);
         tcg_cache_stats.store_full++;
         g_free(art);
         return "full";
@@ -1473,6 +1528,7 @@ const char *tcg_cache_store_put(const TCGCacheImage *img, void *art,
     for (e = *slot; e; e = e->older) {
         if (e->base == img->base && e->len == len &&
             !memcmp(e->art, art, len)) {
+            qemu_mutex_unlock(&cache_lock);
             tcg_cache_stats.store_dup++;
             g_free(art);
             return "dup";
@@ -1490,7 +1546,7 @@ const char *tcg_cache_store_put(const TCGCacheImage *img, void *art,
     *slot = e;
     cache_bytes += len + sizeof(CacheEnt);
     tcg_cache_stats.stored++;
-    tcg_cache_stats.store_bytes = cache_bytes;
+    tcg_cache_stats_shared.store_bytes = cache_bytes;
 
     /* The oldest candidate past the limit goes. */
     for (n = 1, pp = &e->older; *pp; pp = &(*pp)->older, n++) {
@@ -1509,6 +1565,7 @@ const char *tcg_cache_store_put(const TCGCacheImage *img, void *art,
             break;
         }
     }
+    qemu_mutex_unlock(&cache_lock);
     return "stored";
 }
 
@@ -1534,11 +1591,13 @@ void tcg_cache_store_foreach(void (*fn)(void *opaque, uint64_t id,
                                         const void *art, size_t len),
                              void *opaque)
 {
+    qemu_mutex_lock(&cache_lock);
     for (size_t i = 0; i < cache_size; i++) {
         for (CacheEnt *e = cache_tab[i]; e; e = e->older) {
             fn(opaque, e->id, e->rva, e->base, e->art, e->len);
         }
     }
+    qemu_mutex_unlock(&cache_lock);
 }
 
 static uint64_t fnv64(uint64_t h, const void *p, size_t n)
@@ -1583,7 +1642,7 @@ void tcg_cache_print_stats(void)
     static const char *const why[] = {
         "none", "helper", "stub", "thunk", "reloc", "key-pc", "key", "other",
     };
-    TCGCacheStats *t = &tcg_cache_stats;
+    TCGCacheStats sum, *t = &sum;
     static const char *const kinds[] = {
         "none", "abs", "helper", "stub", "own-tb", "thunk", "hot", "cold",
         "unsupported",
@@ -1593,6 +1652,7 @@ void tcg_cache_print_stats(void)
         "adrp+add", "adrp+ldr", "raw-adrp", "movw", "pool64", "rel32",
     };
 
+    tcg_cache_stats_sum(&sum);
     fprintf(stderr, "xtcg-cache: tried %" PRIu64 " captured %" PRIu64
             " bytes %" PRIu64 " (hot %" PRIu64 " cold %" PRIu64
             " search %" PRIu64 " guest %" PRIu64 ") capture %.3f ms\n",

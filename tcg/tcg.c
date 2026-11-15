@@ -1896,6 +1896,10 @@ static TCGContext *ctx_clone(void)
     s->plugin_tb = NULL;
 #endif
     s->gen_tb = NULL;
+    s->cache_stats = g_new0(TCGCacheStats, 1);
+    memset(s->cache_buf, 0, sizeof(s->cache_buf));
+    memset(s->cache_buf_size, 0, sizeof(s->cache_buf_size));
+    s->cache_sbuf = s->cache_fbuf = NULL;
     return s;
 }
 
