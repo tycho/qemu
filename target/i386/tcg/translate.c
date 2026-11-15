@@ -2821,6 +2821,21 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
     }
 
     /*
+     * Native code (x-ecinline): left for from the TB, with no return
+     * stack entry for a CALL, whose return comes back through the module
+     * (an import's x64 view jumps straight to its native function).
+     */
+    if (s->jmp_opt && translator_use_foreign_call(&s->base, new_pc)) {
+        s->rs_call = false;
+        if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
+            tcg_gen_movi_tl(cpu_eip, new_eip);
+        }
+        translator_gen_foreign_call(&s->base);
+        s->base.is_jmp = DISAS_NORETURN;
+        return;
+    }
+
+    /*
      * A CALL with the return stack: push the return, then leave through
      * a goto_tb slot that calls, so the host predicts the return to the
      * landing that follows.  Never a branch within the TB: each CALL

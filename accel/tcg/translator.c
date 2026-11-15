@@ -790,6 +790,18 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
     return use_cross_page_goto_tb() || translator_is_same_page(db, dest);
 }
 
+bool translator_use_foreign_call(DisasContextBase *db, vaddr dest)
+{
+    return tcg_ecinline && tcg_ec_callout_entry && tcg_foreign_code &&
+           !(tb_cflags(db->tb) & CF_NO_GOTO_PTR) && tcg_foreign_code(dest);
+}
+
+void translator_gen_foreign_call(DisasContextBase *db)
+{
+    tcg_cache_exclude(tcg_ctx, TCG_CACHE_X_HOSTPTR);
+    tcg_gen_goto_ptr(tcg_constant_ptr(tcg_ec_callout_entry));
+}
+
 bool translator_ptr_guard(DisasContextBase *db, vaddr pc, vaddr addr,
                           MemOp mop, uint64_t *val)
 {

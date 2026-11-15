@@ -632,3 +632,21 @@ XT_IMPORT_SLOT(SetHandleInformation);
 XT_IMPORT_SLOT(LoadLibraryA);
 XT_IMPORT_SLOT(FreeLibrary);
 XT_IMPORT_SLOT(CryptGenRandom);
+
+/*
+ * QEMU's global barrier (util/sys_membarrier.c): every processor running a
+ * thread of the process made to see this one's writes, and to have its own
+ * seen, the other half of a barrier pair whose reader side is a compiler
+ * barrier.  A failure would leave readers unordered, so it ends the process.
+ */
+NTSTATUS NTAPI NtFlushProcessWriteBuffers(void);
+
+void WINAPI FlushProcessWriteBuffers(void)
+{
+    NTSTATUS st = NtFlushProcessWriteBuffers();
+
+    if (st < 0) {
+        NtTerminateProcess(GetCurrentProcess(), st);
+    }
+}
+XT_IMPORT_SLOT(FlushProcessWriteBuffers);

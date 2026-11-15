@@ -446,6 +446,42 @@ void tcg_retstack_reset(CPUState *cpu);
  * and return whether they changed it.
  */
 extern bool tcg_retalign;
+
+/*
+ * tcg_ecinline (x-ecinline, user mode, a front end with native code):
+ * generated code leaving for native code keeps its frame.  The prologue
+ * then has two more entries, which no flush reclaims, and which keep the
+ * host's return predictor in step with the return stack (a call that
+ * doesn't return leaves an entry there that a later return mispredicts):
+ * - tcg_ec_callout_entry, reached by goto_ptr (a direct jump,
+ *   translator_gen_foreign_call, or helper_lookup_tb_ptr's
+ *   tcg_foreign_goto): stores the TB boundary's state to env as the
+ *   epilogue does, then calls tcg_ec_callout_fn(sp, env) on the frame,
+ *   which returns where to go.  A zero target declines: the state is
+ *   loaded again and the TB leaves through the epilogue, its exit to
+ *   native code intact.  Otherwise the stub jumps (not calls) to
+ *   tcg_ec_leave_fn(env, target, arg).
+ * - tcg_ec_resume_entry(env, code, sp), jumped to by the front end: back
+ *   on the frame at SP, with the TB boundary's state loaded from env, then
+ *   to CODE: by a return if its bit 0 is set (a return stack landing,
+ *   tcg_retstack_take_landing, whose host call is owed), else by a jump,
+ *   or out through the epilogue if it is zero.
+ */
+typedef struct TCGEcCallout {
+    uintptr_t target, arg;
+} TCGEcCallout;
+
+extern bool tcg_ecinline;
+extern TCGEcCallout (*tcg_ec_callout_fn)(uintptr_t sp, void *env);
+extern const void *tcg_ec_leave_fn;
+extern const void *tcg_ec_callout_entry;
+extern const void *tcg_ec_resume_entry;
+/*
+ * tcg_retalign: pop the top entry if its key is @key, and return its
+ * landing if a return may take it (pushed in this invocation of generated
+ * code, its host call owed), else 0.
+ */
+uintptr_t tcg_retstack_take_landing(CPUState *cpu, uint64_t key);
 bool tcg_retstack_pop_key(CPUState *cpu, uint64_t key);
 bool tcg_retstack_push_key(CPUState *cpu, uint64_t key);
 /*
@@ -686,6 +722,21 @@ extern bool tcg_zext32_active;
  * through the epilogue to the main loop, which returns.
  */
 extern bool (*tcg_foreign_pc)(CPUState *cpu, vaddr pc, bool exit);
+
+/*
+ * tcg_foreign_goto: after helper_lookup_tb_ptr's tcg_foreign_pc has
+ * prepared an exit, the front end may take the jump instead: a host
+ * address for goto_ptr to jump to (tcg_ec_callout_entry), or NULL for the
+ * exit through the epilogue.
+ */
+extern const void *(*tcg_foreign_goto)(CPUState *cpu);
+
+/*
+ * tcg_foreign_code: whether @pc is code that isn't the guest's, with no
+ * other effect: for the translator, which may then leave a direct jump to
+ * it through tcg_ec_callout_entry (translator_use_foreign_call).
+ */
+extern bool (*tcg_foreign_code)(vaddr pc);
 
 /*
  * tcg_cpu_bound: set by a user-mode front end that sets current_cpu

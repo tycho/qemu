@@ -229,6 +229,17 @@ bool translator_loop_back(DisasContextBase *db, vaddr dest);
  */
 TCGLabel *translator_edge_check(DisasContextBase *db, vaddr dest);
 
+/*
+ * translator_use_foreign_call: with tcg_ecinline, whether a direct jump to
+ * @dest, which the front end may chain (no single-stepping or other
+ * per-insn exit pending), leaves for code that isn't the guest's from the
+ * TB (tcg_foreign_code).  translator_gen_foreign_call() then ends the TB
+ * there, the guest's pc already set to @dest: goto_ptr to
+ * tcg_ec_callout_entry, a host address no translation cache keeps.
+ */
+bool translator_use_foreign_call(DisasContextBase *db, vaddr dest);
+void translator_gen_foreign_call(DisasContextBase *db);
+
 /**
  * translator_ptr_guard
  * @db: Disassembly context
