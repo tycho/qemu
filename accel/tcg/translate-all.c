@@ -1914,6 +1914,22 @@ static uint64_t *retstack_top(CPUState *cpu, uint64_t **lo, uint64_t **hi)
     return *(uint64_t **)((char *)cpu_env(cpu) + tcg_retsp_off);
 }
 
+uintptr_t tcg_retstack_peek_landing(CPUState *cpu, uint64_t *key,
+                                    uint64_t ***slot, uint64_t **next,
+                                    uint64_t **lo, uint64_t **hi)
+{
+    uint64_t *top = retstack_top(cpu, lo, hi);
+
+    if (!tcg_retalign || !top || top < *lo || top >= *hi ||
+        (int64_t)top[1] <= 1) {
+        return 0;
+    }
+    *key = top[0];
+    *slot = (uint64_t **)((char *)cpu_env(cpu) + tcg_retsp_off);
+    *next = top + 2;
+    return top[1];
+}
+
 bool tcg_retstack_pop_key(CPUState *cpu, uint64_t key)
 {
     uint64_t *lo, *hi, *top = retstack_top(cpu, &lo, &hi);

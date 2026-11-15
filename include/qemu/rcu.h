@@ -99,6 +99,17 @@ static inline void rcu_read_lock_reader(struct rcu_reader_data *p_rcu_reader)
     smp_mb_placeholder();
 }
 
+/*
+ * The end of rcu_read_unlock_reader where a writer waits (the reader's
+ * ctr stored 0, the barrier, waiting read true), for callers that do the
+ * rest themselves.
+ */
+static inline void rcu_read_unlock_finish(struct rcu_reader_data *p_rcu_reader)
+{
+    qatomic_set(&p_rcu_reader->waiting, false);
+    qemu_event_set(&rcu_gp_event);
+}
+
 static inline void rcu_read_unlock_reader(struct rcu_reader_data *p_rcu_reader)
 {
     assert(p_rcu_reader->depth != 0);
@@ -116,8 +127,7 @@ static inline void rcu_read_unlock_reader(struct rcu_reader_data *p_rcu_reader)
     /* Write p_rcu_reader->ctr before reading p_rcu_reader->waiting.  */
     smp_mb_placeholder();
     if (unlikely(qatomic_read(&p_rcu_reader->waiting))) {
-        qatomic_set(&p_rcu_reader->waiting, false);
-        qemu_event_set(&rcu_gp_event);
+        rcu_read_unlock_finish(p_rcu_reader);
     }
 }
 

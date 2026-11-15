@@ -6925,7 +6925,7 @@ static void tcg_out_xpage_stub(TCGContext *s)
  */
 static void tcg_out_ec_entries(TCGContext *s)
 {
-    tcg_insn_unit *leave;
+    tcg_insn_unit *leave, *adr, *call;
 
     tcg_ec_callout_entry = tcg_splitwx_to_rx(s->code_ptr);
     tcg_out_bti(s, BTI_J);
@@ -6935,6 +6935,20 @@ static void tcg_out_ec_entries(TCGContext *s)
                    tcg_retsp_off);
     }
     tcg_out_boundary_ldst(s, false);
+    if (tcg_ecfast && tcg_ec_callout_fast_fn) {
+        /* The front end's departure first, with x0 the call below. */
+        adr = s->code_ptr;
+        tcg_out32(s, 0);
+        tcg_out_movi(s, TCG_TYPE_PTR, TCG_REG_TMP0,
+                     (uintptr_t)tcg_ec_callout_fast_fn);
+        tcg_out_insn(s, bcond_reg, BR, TCG_REG_TMP0);
+        call = s->code_ptr;
+        s->code_ptr = adr;
+        tcg_out_insn(s, pcrel, ADR, TCG_REG_X0,
+                     tcg_pcrel_diff(s, tcg_splitwx_to_rx(call)));
+        s->code_ptr = call;
+        tcg_out_bti(s, BTI_J);
+    }
     tcg_out_movr_sp(s, TCG_TYPE_I64, TCG_REG_X0, TCG_REG_SP);
     tcg_out_mov(s, TCG_TYPE_PTR, TCG_REG_X1, TCG_AREG0);
     tcg_out_movi(s, TCG_TYPE_PTR, TCG_REG_TMP0, (uintptr_t)tcg_ec_callout_fn);
@@ -6977,6 +6991,23 @@ static void tcg_out_ec_entries(TCGContext *s)
     tcg_out_insn(s, bcond_reg, BR, TCG_REG_X1);
     tcg_out_insn(s, addsub_imm, SUBI, TCG_TYPE_I64, TCG_REG_LR, TCG_REG_X1, 1);
     tcg_out_insn(s, bcond_reg, RET, TCG_REG_LR);
+
+    /*
+     * (env, landing, sp), the pinned globals already in their registers:
+     * the frame's sp and fp, env, the rest of the state, then the landing.
+     */
+    tcg_ec_resume_fast_entry = tcg_splitwx_to_rx(s->code_ptr);
+    tcg_out_bti(s, BTI_C);
+    tcg_out_movr_sp(s, TCG_TYPE_I64, TCG_REG_SP, TCG_REG_X2);
+    tcg_out_insn(s, addsub_imm, ADDI, TCG_TYPE_I64, TCG_REG_FP, TCG_REG_SP,
+                 FRAME_SIZE - PUSH_SIZE);
+    tcg_out_mov(s, TCG_TYPE_PTR, TCG_AREG0, TCG_REG_X0);
+    if (tcg_retstack_reg >= 0) {
+        tcg_out_ld(s, TCG_TYPE_I64, tcg_retstack_reg, TCG_AREG0,
+                   tcg_retsp_off);
+    }
+    tcg_out_boundary_ldst(s, true);
+    tcg_out_insn(s, bcond_reg, RET, TCG_REG_X1);
 }
 
 static void tcg_target_qemu_prologue(TCGContext *s)

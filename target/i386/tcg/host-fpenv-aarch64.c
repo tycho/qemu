@@ -94,6 +94,20 @@ void x86_host_fp_exit(CPUX86State *env)
     }
 }
 
+void x86_host_fp_exit_fpsr(CPUX86State *env, uint64_t fpsr)
+{
+    CPUState *cs = env_cpu(env);
+
+    if (cs->host_fp_guest) {
+        int flags = flags_from_fpsr(fpsr);
+
+        if (flags & ~get_float_exception_flags(&env->sse_status)) {
+            float_raise(flags, &env->sse_status);
+        }
+        tcg_host_fp_release(cs);
+    }
+}
+
 void x86_host_fp_sync(CPUX86State *env)
 {
     CPUState *cs = env_cpu(env);

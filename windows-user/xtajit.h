@@ -568,6 +568,7 @@ static inline bool xt_ec_segs_loaded(XtThread *t)
 }
 void xt_ec_import_call(XtThread *t, ARM64_NT_CONTEXT *n, uint64_t pc,
                        uint32_t nzcv);
+void xt_ec_import_fast(XtThread *t, uint64_t pc, uint32_t nzcv);
 /* Whether the guest has YMM state: its XCR0 enables the AVX component. */
 static inline bool xt_ec_ymm(XtThread *t)
 {
