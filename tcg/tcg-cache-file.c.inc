@@ -1462,13 +1462,14 @@ static bool file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
                         bool (*use)(const TCGCacheEnv *env, void *opaque),
                         void *opaque, uint64_t *rejects, SelSeen *seen)
 {
+    TCGCacheStats *st = &tcg_cache_stats;
     TCGCacheIdx fe[TCG_CACHE_PROBES];
     int64_t tp = tcg_cache_costs ? get_clock() : 0;
     int fn;
 
     fn = tcg_cache_file_find(f, id, kh, fe, TCG_CACHE_PROBES);
-    tcg_cache_stats.sel_finds++;
-    tcg_cache_part(&tcg_cache_stats.sel_find_ns, &tp);
+    st->sel_finds++;
+    tcg_cache_part(&st->sel_find_ns, &tp);
     if (fn < 0 && rejects) {
         rejects[TCG_CACHE_V_LIMIT]++;
     }
@@ -1479,13 +1480,13 @@ static bool file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
 
         r = tcg_cache_file_get(f, &fe[i], id, rva, flags, cs_base, cflags,
                                buf, bufsz, &env);
-        tcg_cache_stats.sel_gets++;
-        tcg_cache_part(&tcg_cache_stats.sel_get_ns, &tp);
+        st->sel_gets++;
+        tcg_cache_part(&st->sel_get_ns, &tp);
         if (r == TCG_CACHE_V_KEY) {
             continue;
         }
         if (!r) {
-            tcg_cache_stats.sel_get_bytes += env->len;
+            st->sel_get_bytes += env->len;
             for (int k = 0; k < seen->n && !dup; k++) {
                 const TCGCacheEnv *o;
 
@@ -1504,14 +1505,14 @@ static bool file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
                       && o->len == env->len
                       && !memcmp(o + 1, env + 1, env->len - sizeof(*env));
             }
-            tcg_cache_part(&tcg_cache_stats.sel_dup_ns, &tp);
+            tcg_cache_part(&st->sel_dup_ns, &tp);
             if (dup) {
-                tcg_cache_stats.sel_dups++;
+                st->sel_dups++;
                 continue;
             }
             r = tcg_cache_validate_hit(env + 1, env->len - sizeof(*env));
-            tcg_cache_stats.sel_vals++;
-            tcg_cache_part(&tcg_cache_stats.sel_val_ns, &tp);
+            st->sel_vals++;
+            tcg_cache_part(&st->sel_val_ns, &tp);
         }
         if (r) {
             if (rejects) {
@@ -1523,7 +1524,7 @@ static bool file_select(const TCGCacheFile *f, uint64_t id, uint64_t rva,
         seen->e[seen->n] = fe[i];
         seen->content[seen->n] = env->content;
         seen->len[seen->n++] = env->len;
-        tcg_cache_part(&tcg_cache_stats.sel_dup_ns, &tp);
+        tcg_cache_part(&st->sel_dup_ns, &tp);
         if (use(env, opaque)) {
             return true;
         }
