@@ -489,6 +489,13 @@ void tcg_region_reset_all(void)
         TCGContext *s = qatomic_read(&tcg_ctxs[i]);
         tcg_region_initial_alloc__locked(s);
     }
+    /*
+     * User mode with x-partrans before the first translation: tcg_init_ctx
+     * keeps the first region, which the first context takes over.
+     */
+    if (!n_ctxs) {
+        tcg_region_initial_alloc__locked(&tcg_init_ctx);
+    }
     qemu_mutex_unlock(&region.lock);
 
     tcg_region_tree_reset_all();
@@ -496,9 +503,6 @@ void tcg_region_reset_all(void)
 
 static size_t tcg_n_regions(size_t tb_size, unsigned max_threads)
 {
-#ifdef CONFIG_USER_ONLY
-    return 1;
-#else
     size_t n_regions;
 
     /*
@@ -522,7 +526,6 @@ static size_t tcg_n_regions(size_t tb_size, unsigned max_threads)
         return max_threads;
     }
     return MIN(n_regions, max_threads * 8);
-#endif
 }
 
 /*
@@ -802,17 +805,12 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
  *
  * In system-mode the number of TCG threads is bounded by max_threads,
  *
- * In user-mode we use a single region.  Having multiple regions in user-mode
- * is not supported, because the number of vCPU threads (recall that each thread
- * spawned by the guest corresponds to a vCPU thread) is only bounded by the
- * OS, and usually this number is huge (tens of thousands is not uncommon).
- * Thus, given this large bound on the number of vCPU threads and the fact
- * that code_gen_buffer is allocated at compile-time, we cannot guarantee
- * that the availability of at least one region per vCPU thread.
- *
- * However, this user-mode limitation is unlikely to be a significant problem
- * in practice. Multi-threaded guests share most if not all of their translated
- * code, which makes parallel code generation less appealing than in system-mode
+ * In user-mode we use a single region by default.  The number of vCPU
+ * threads (recall that each thread spawned by the guest corresponds to a
+ * vCPU thread) is only bounded by the OS, so regions can't be per thread.
+ * With x-partrans, threads borrow one of max_threads translation contexts
+ * for each translation (tcg_ctx_borrow), and each context has its regions
+ * as a vCPU thread's has in system-mode.
  */
 void tcg_region_init(size_t tb_size, int splitwx, unsigned max_threads)
 {

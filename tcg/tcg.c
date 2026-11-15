@@ -1825,6 +1825,151 @@ void tcg_register_thread(void)
 {
     tcg_ctx = &tcg_init_ctx;
 }
+
+/*
+ * x-partrans: with more than one translation context, threads translate
+ * in parallel, each with a context borrowed for one translation
+ * (tcg_ctx_borrow).  The contexts are copies of tcg_init_ctx made at the
+ * first borrow, each with its own code region; tcg_ctxs[] lists them.
+ * The first takes over tcg_init_ctx's region, after the prologue, and
+ * tcg_init_ctx generates no code after that: outside a borrow, tcg_ctx
+ * points at it for the read-only uses run time makes of it.
+ */
+unsigned tcg_partrans;
+static uint64_t ctx_free;           /* bit i: tcg_ctxs[i] is free */
+static bool ctx_ready;
+static QemuMutex ctx_init_lock;
+static QemuEvent ctx_returned;
+static unsigned ctx_waiters;
+static __thread int ctx_last = -1;
+
+/* A pointer into tcg_init_ctx.temps[], as the same temp of @s. */
+static TCGTemp *ctx_relink(TCGContext *s, TCGTemp *ts)
+{
+    ptrdiff_t t;
+
+    if (!ts) {
+        return NULL;
+    }
+    t = ts - tcg_init_ctx.temps;
+    tcg_debug_assert(t >= 0 && t < tcg_init_ctx.nb_globals);
+    return &s->temps[t];
+}
+
+static TCGContext *ctx_clone(void)
+{
+    TCGContext *s = g_malloc(sizeof(*s));
+    unsigned i;
+
+    *s = tcg_init_ctx;
+    for (i = 0; i < tcg_init_ctx.nb_globals; ++i) {
+        s->temps[i].mem_base = ctx_relink(s, tcg_init_ctx.temps[i].mem_base);
+    }
+    for (i = 0; i < s->nb_pinned; ++i) {
+        s->pinned[i] = ctx_relink(s, tcg_init_ctx.pinned[i]);
+    }
+    for (i = 0; i < s->nb_boundary; ++i) {
+        s->boundary[i] = ctx_relink(s, tcg_init_ctx.boundary[i]);
+    }
+    for (i = 0; i < s->nb_chain_dead; ++i) {
+        s->chain_dead[i] = ctx_relink(s, tcg_init_ctx.chain_dead[i]);
+    }
+    s->alias_base = ctx_relink(s, tcg_init_ctx.alias_base);
+    s->frame_temp = ctx_relink(s, tcg_init_ctx.frame_temp);
+
+    /* Memory a context allocates as it first needs it: its own. */
+    s->pool_first = s->pool_current = s->pool_first_large = NULL;
+    s->pool_cur = s->pool_end = 0;
+    for (i = 0; i < TCG_TYPE_COUNT; ++i) {
+        s->const_table[i] = NULL;
+    }
+    s->smc_buf = s->smc_have = NULL;
+    s->smc_buf_size = 0;
+    s->cap_bytes = NULL;
+    s->cap_span = 0;
+    s->cap_ext = NULL;
+    s->cap_acq = NULL;
+    s->cap_nacq = s->cap_maxacq = 0;
+    s->cap_rec = NULL;
+    s->cap_nrec = s->cap_maxrec = 0;
+#ifdef CONFIG_PLUGIN
+    s->plugin_tb = NULL;
+#endif
+    s->gen_tb = NULL;
+    s->cache_stats = g_new0(TCGCacheStats, 1);
+    memset(s->cache_buf, 0, sizeof(s->cache_buf));
+    memset(s->cache_buf_size, 0, sizeof(s->cache_buf_size));
+    s->cache_sbuf = s->cache_fbuf = NULL;
+    return s;
+}
+
+static void ctx_pool_init(void)
+{
+    qemu_mutex_lock(&ctx_init_lock);
+    if (!qatomic_read(&ctx_ready)) {
+        for (unsigned i = 0; i < tcg_max_ctxs; i++) {
+            TCGContext *s = ctx_clone();
+
+            qatomic_set(&tcg_ctxs[i], s);
+            qatomic_inc(&tcg_cur_ctxs);
+            if (i > 0) {
+                tcg_region_thread_initial_alloc(s);
+            }
+        }
+        qatomic_set(&ctx_free, MAKE_64BIT_MASK(0, tcg_max_ctxs));
+        qatomic_store_release(&ctx_ready, true);
+    }
+    qemu_mutex_unlock(&ctx_init_lock);
+}
+
+TCGContext *tcg_ctx_borrow(void)
+{
+    if (tcg_max_ctxs == 1) {
+        return tcg_ctx = &tcg_init_ctx;
+    }
+    if (unlikely(!qatomic_load_acquire(&ctx_ready))) {
+        ctx_pool_init();
+    }
+    for (;;) {
+        uint64_t m = qatomic_read(&ctx_free);
+
+        while (m) {
+            int i = ctx_last >= 0 && (m & BIT_ULL(ctx_last)) ? ctx_last
+                                                              : ctz64(m);
+            uint64_t old = qatomic_cmpxchg(&ctx_free, m, m & ~BIT_ULL(i));
+
+            if (old == m) {
+                ctx_last = i;
+                return tcg_ctx = qatomic_read(&tcg_ctxs[i]);
+            }
+            m = old;
+        }
+        qatomic_inc(&ctx_waiters);
+        qemu_event_reset(&ctx_returned);
+        /* Pairs with tcg_ctx_return's: a return sees us, or we see it. */
+        smp_mb();
+        if (!qatomic_read(&ctx_free)) {
+            qemu_event_wait(&ctx_returned);
+        }
+        qatomic_dec(&ctx_waiters);
+    }
+}
+
+void tcg_ctx_return(TCGContext *s)
+{
+    tcg_ctx = &tcg_init_ctx;
+    if (s == &tcg_init_ctx) {
+        return;
+    }
+    tcg_debug_assert(!s->gen_tb);
+    qatomic_or(&ctx_free, BIT_ULL(ctx_last));
+    tcg_debug_assert(qatomic_read(&tcg_ctxs[ctx_last]) == s);
+    /* Pairs with tcg_ctx_borrow's: a waiter sees the context, or we it. */
+    smp_mb();
+    if (qatomic_read(&ctx_waiters)) {
+        qemu_event_set(&ctx_returned);
+    }
+}
 #else
 void tcg_register_thread(void)
 {
@@ -2460,9 +2605,18 @@ static void tcg_context_init(unsigned max_threads)
      * In system-mode we will have at most max_threads TCG threads.
      */
 #ifdef CONFIG_USER_ONLY
-    tcg_ctxs = &tcg_ctx;
-    tcg_cur_ctxs = 1;
-    tcg_max_ctxs = 1;
+    if (max_threads > 1) {
+        /* x-partrans: tcg_ctx_borrow fills them in. */
+        assert(max_threads <= 64);
+        tcg_max_ctxs = max_threads;
+        tcg_ctxs = g_new0(TCGContext *, max_threads);
+        qemu_mutex_init(&ctx_init_lock);
+        qemu_event_init(&ctx_returned, false);
+    } else {
+        tcg_ctxs = &tcg_ctx;
+        tcg_cur_ctxs = 1;
+        tcg_max_ctxs = 1;
+    }
 #else
     tcg_max_ctxs = max_threads;
     tcg_ctxs = g_new0(TCGContext *, max_threads);
@@ -2620,6 +2774,10 @@ TranslationBlock *tcg_tb_alloc(TCGContext *s)
     void *next;
 
     QEMU_BUILD_BUG_ON(TCG_TBPACK_ALIGN < __alignof__(TranslationBlock));
+#ifdef CONFIG_USER_ONLY
+    /* x-partrans: the borrowed contexts translate, tcg_init_ctx never. */
+    tcg_debug_assert(tcg_max_ctxs == 1 || s != &tcg_init_ctx);
+#endif
     while (1) {
         tb_layout_chunk(s);
         if (s->lay_on) {

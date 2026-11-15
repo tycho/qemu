@@ -569,6 +569,11 @@ struct TCGContext {
     uint32_t cap_span;
     uint8_t *cap_bytes;
     struct TCGCacheArtExt *cap_ext;
+    /* The cache's counters for this context's translations, or NULL. */
+    struct TCGCacheStats *cache_stats;
+    /* The cache's lookups: where candidates are copied (tb_cache_lookup). */
+    void *cache_buf[4], *cache_sbuf, *cache_fbuf;
+    size_t cache_buf_size[4];
     int cap_next;
     uint64_t *cap_acq;
     int cap_nacq, cap_maxacq;

@@ -244,7 +244,7 @@ static TranslationBlock *tb_htable_lookup_stale(CPUState *cpu,
     return qht_lookup_custom(&tb_ctx.htable, &desc, h, tb_lookup_cmp);
 }
 
-static TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
+TranslationBlock *tb_htable_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     return tb_htable_lookup_stale(cpu, s, NULL);
 }
@@ -1071,9 +1071,8 @@ void cpu_exec_longjmp_cleanup(CPUState *cpu)
 #ifdef CONFIG_USER_ONLY
     clear_helper_retaddr();
     cpu->smc_check_tb = NULL;
-    if (have_mmap_lock()) {
-        mmap_unlock();
-    }
+    tb_gen_abort();
+    mmap_lock_reset();
 #else
     /*
      * For softmmu, a tlb_fill fault during translation will land here,
@@ -1133,9 +1132,7 @@ void cpu_exec_step_atomic(CPUState *cpu)
 
         tb = tb_lookup(cpu, s);
         if (tb == NULL) {
-            mmap_lock();
             tb = tb_gen_code(cpu, s);
-            mmap_unlock();
         }
 
         cpu_exec_enter(cpu);
@@ -1638,9 +1635,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 CPUJumpCache *jc;
                 uint32_t h;
 
-                mmap_lock();
                 tb = tb_gen_code(cpu, s);
-                mmap_unlock();
 
                 /*
                  * We add the TB in the virtual pc hash table

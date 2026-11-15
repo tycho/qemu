@@ -102,7 +102,7 @@ enum {
 
 extern const char *const tcg_cache_x_names[TCG_CACHE_X_MAX];
 /* Why the last capture returned NULL. */
-extern unsigned tcg_cache_last_reason;
+extern __thread unsigned tcg_cache_last_reason;
 
 /* Provenance: what the value at a site is. */
 enum {
@@ -352,13 +352,19 @@ extern int tcg_cache_test_reloc_fail;
 
 /*
  * The store: artifacts by image, rva, flags, cs_base and cflags, newest
- * first.  Under mmap_lock in user mode.
+ * first.  Under its own lock: tcg_cache_store_find's caller holds it while
+ * it uses the candidates' artifacts (tcg_cache_store_lock); the other
+ * functions take it.
  */
 typedef struct TCGCacheCand {
     const void *art;
     size_t len;
     uint64_t base;
+    int64_t fault;          /* for the caller: copying it out faulted */
 } TCGCacheCand;
+
+void tcg_cache_store_lock(void);
+void tcg_cache_store_unlock(void);
 
 #define TCG_CACHE_CANDS 4
 
@@ -880,7 +886,7 @@ enum {
 };
 
 /* Why tcg_cache_place last returned NULL: the relocation's kind and form. */
-extern unsigned tcg_cache_fail_kind, tcg_cache_fail_form;
+extern __thread unsigned tcg_cache_fail_kind, tcg_cache_fail_form;
 
 /* Counters, printed at exit with XTCG_CACHE_STATS. */
 typedef struct TCGCacheStats {
@@ -936,7 +942,15 @@ typedef struct TCGCacheStats {
     uint64_t gen[TCG_CACHE_W_MAX], gen_ns[TCG_CACHE_W_MAX];
 } TCGCacheStats;
 
-extern TCGCacheStats tcg_cache_stats;
+/*
+ * Each translation context counts its own translations' (x-partrans), and
+ * everything else counts in tcg_cache_stats_shared; tcg_cache_stats is
+ * the set the caller counts in, and tcg_cache_stats_sum adds them up.
+ */
+extern TCGCacheStats tcg_cache_stats_shared;
+TCGCacheStats *tcg_cache_stats_here(void);
+void tcg_cache_stats_sum(TCGCacheStats *sum);
+#define tcg_cache_stats (*tcg_cache_stats_here())
 void tcg_cache_print_stats(void);
 
 #endif

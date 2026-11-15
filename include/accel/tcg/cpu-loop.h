@@ -20,6 +20,21 @@ int cpu_exec(CPUState *cpu);
 
 void cpu_exec_step_atomic(CPUState *cpu);
 
+#ifdef CONFIG_USER_ONLY
+/* Whether this thread is translating (tb_gen_code). */
+bool tb_gen_active(void);
+/*
+ * Abandon the translation in progress on this thread, if any: its
+ * context and its hold on the mmap lock (mmap_lock_reset) go.
+ */
+void tb_gen_abort(void);
+/*
+ * Bumped by the port when the engine's own read took a page's guard:
+ * translations in flight then aren't published (x-partrans).
+ */
+extern uint32_t tcg_xlate_epoch;
+#endif
+
 /**
  * cpu_unwind_state_data:
  * @cpu: the cpu context

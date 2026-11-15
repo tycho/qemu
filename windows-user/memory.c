@@ -19,10 +19,13 @@ NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, PVOID, int, PVOID, SIZE_T,
 
 /*
  * Put back the guard on ADDR's page, which a read by the engine itself
- * took (Windows removes it as it raises the fault).  Not atomic: a
- * protection change by another thread or process between the query and
- * the change is overwritten, and another access in between finds no
- * guard.  False if the guard couldn't be put back.
+ * took (Windows removes it as it raises the fault).  Under mmap_lock, as
+ * every protection change the engine makes (a translation's, with
+ * x-partrans, under its mutex alone), so none of those comes between the
+ * query and the change.  Not atomic otherwise: a change by another thread
+ * natively or by another process between the two is overwritten, and
+ * another access in between finds no guard.  False if the guard couldn't
+ * be put back.
  */
 bool xt_guard_restore(vaddr addr)
 {
@@ -30,12 +33,16 @@ bool xt_guard_restore(vaddr addr)
     PVOID base = (PVOID)(uintptr_t)(addr & TARGET_PAGE_MASK);
     SIZE_T size = TARGET_PAGE_SIZE;
     ULONG old;
+    bool ok;
 
-    return NtQueryVirtualMemory(GetCurrentProcess(), base, 0, &mbi,
-                                sizeof(mbi), NULL) >= 0 &&
-           mbi.State == MEM_COMMIT &&
-           NtProtectVirtualMemory(GetCurrentProcess(), &base, &size,
-                                  mbi.Protect | PAGE_GUARD, &old) >= 0;
+    mmap_lock();
+    ok = NtQueryVirtualMemory(GetCurrentProcess(), base, 0, &mbi,
+                              sizeof(mbi), NULL) >= 0 &&
+         mbi.State == MEM_COMMIT &&
+         NtProtectVirtualMemory(GetCurrentProcess(), &base, &size,
+                                mbi.Protect | PAGE_GUARD, &old) >= 0;
+    mmap_unlock();
+    return ok;
 }
 
 /* The first page in the range that QEMU write-protected. */

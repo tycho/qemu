@@ -1507,6 +1507,7 @@ void tb_invalidate_phys_range(CPUState *cpu, tb_page_addr_t start,
     PageForEachNext n;
 
     assert_memory_lock();
+    assert_no_translation();
 
     translator_region_forget(start, last);
     PAGE_FOR_EACH_TB(start, last, unused, tb, n) {
@@ -1552,6 +1553,7 @@ bool tb_invalidate_phys_page_unwind(CPUState *cpu, tb_page_addr_t addr,
     }
 
     assert_memory_lock();
+    assert_no_translation();
     current_tb = tcg_tb_lookup(pc);
 
     last = addr | ~TARGET_PAGE_MASK;

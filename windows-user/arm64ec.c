@@ -19,6 +19,7 @@
 #include "tcg/host-fpenv.h"
 #include "accel/tcg/dispatch.h"
 #include "exec/mmap-lock.h"
+#include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/tb-context.h"
 #include "exec/page-protection.h"
 #include "user/page-protection.h"
@@ -2885,7 +2886,7 @@ static TCGEcCallout ec_callout(uintptr_t sp, void *envp)
     t->native_target = target;
 #ifdef CONFIG_DEBUG_TCG
     /* Neither is held at a TB boundary. */
-    assert(!have_mmap_lock() && !helper_retaddr);
+    assert(!have_mmap_lock() && !tb_gen_active() && !helper_retaddr);
 #endif
     if (!tcg_ecinline || f->resume_sp || t->fault.busy ||
         cs->cflags_next_tb != -1 || qatomic_read(&t->suspend_req) ||
