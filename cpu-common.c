@@ -33,7 +33,7 @@ static QemuCond qemu_work_cond;
 /* >= 1 if a thread is inside start_exclusive/end_exclusive.  Written
  * under qemu_cpu_list_lock, read with atomic operations.
  */
-static int pending_cpus;
+int pending_cpus;
 
 void qemu_init_cpu_list(void)
 {
@@ -278,21 +278,28 @@ void cpu_exec_start(CPUState *cpu)
      * see cpu->running == true, and it will kick the CPU.
      */
     if (unlikely(qatomic_read(&pending_cpus))) {
-        QEMU_LOCK_GUARD(&qemu_cpu_list_lock);
-        if (!cpu->has_waiter) {
-            /* Not counted in pending_cpus, let the exclusive item
-             * run.  Since we have the lock, just set cpu->running to true
-             * while holding it; no need to check pending_cpus again.
-             */
-            qatomic_set(&cpu->running, false);
-            exclusive_idle();
-            /* Now pending_cpus is zero.  */
-            qatomic_set(&cpu->running, true);
-        } else {
-            /* Counted in pending_cpus, go ahead and release the
-             * waiter at cpu_exec_end.
-             */
-        }
+        cpu_exec_start_finish(cpu);
+    }
+}
+
+void cpu_exec_start_finish(CPUState *cpu)
+{
+    QEMU_LOCK_GUARD(&qemu_cpu_list_lock);
+    if (!cpu->has_waiter) {
+        /*
+         * Not counted in pending_cpus, let the exclusive item
+         * run.  Since we have the lock, just set cpu->running to true
+         * while holding it; no need to check pending_cpus again.
+         */
+        qatomic_set(&cpu->running, false);
+        exclusive_idle();
+        /* Now pending_cpus is zero.  */
+        qatomic_set(&cpu->running, true);
+    } else {
+        /*
+         * Counted in pending_cpus, go ahead and release the
+         * waiter at cpu_exec_end.
+         */
     }
 }
 
@@ -323,16 +330,21 @@ void cpu_exec_end(CPUState *cpu)
      * next cpu_exec_start.
      */
     if (unlikely(qatomic_read(&pending_cpus))) {
-        QEMU_LOCK_GUARD(&qemu_cpu_list_lock);
-        if (cpu->has_waiter) {
-            cpu->has_waiter = false;
-            qatomic_set(&pending_cpus, pending_cpus - 1);
-            if (pending_cpus == 1) {
-                qemu_cond_signal(&exclusive_cond);
-            }
-        }
+        cpu_exec_end_finish(cpu);
     }
     trace_cpu_exec_end(cpu->cpu_index);
+}
+
+void cpu_exec_end_finish(CPUState *cpu)
+{
+    QEMU_LOCK_GUARD(&qemu_cpu_list_lock);
+    if (cpu->has_waiter) {
+        cpu->has_waiter = false;
+        qatomic_set(&pending_cpus, pending_cpus - 1);
+        if (pending_cpus == 1) {
+            qemu_cond_signal(&exclusive_cond);
+        }
+    }
 }
 
 void async_safe_run_on_cpu(CPUState *cpu, run_on_cpu_func func,

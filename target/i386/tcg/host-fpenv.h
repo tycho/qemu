@@ -26,6 +26,8 @@ void x86_host_fp_exit(CPUX86State *env);
 void x86_host_fp_fold(CPUX86State *env);
 /* The guest wrote MXCSR: load its mode and flags into the host. */
 void x86_host_fp_sync(CPUX86State *env);
+/* cpu_exec's exit, with FPSR's flags as given rather than the host's. */
+void x86_host_fp_exit_fpsr(CPUX86State *env, uint64_t fpsr);
 #else
 static inline void x86_host_fp_enter(CPUX86State *env) {}
 static inline void x86_host_fp_exit(CPUX86State *env) {}

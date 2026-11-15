@@ -1072,6 +1072,20 @@ static void tcg_set_partrans(Object *obj, const char *value, Error **errp)
 #endif
 }
 
+static bool tcg_get_ecfast(Object *obj, Error **errp)
+{
+    return tcg_ecfast;
+}
+
+static void tcg_set_ecfast(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_ec_callout_fn) {
+        error_setg(errp, "x-ecfast: the x64 Windows module only");
+        return;
+    }
+    tcg_ecfast = value;
+}
+
 static bool tcg_get_sysret(Object *obj, Error **errp)
 {
     return tcg_sysret;
@@ -1664,6 +1678,14 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "In the x64 Windows module: leave for native code from generated "
         "code with its frame kept, and resume that frame when the call "
         "returns before anything else enters the engine");
+
+    object_class_property_add_bool(oc, "x-ecfast", tcg_get_ecfast,
+                                   tcg_set_ecfast);
+    object_class_property_set_description(oc, "x-ecfast",
+        "In the x64 Windows module, with x-ecinline: a native call made "
+        "with the default FP control keeps the flags lazy and the host FP "
+        "state across the call, and its return takes the flags from the "
+        "native code's");
 
     object_class_property_add_str(oc, "x-partrans", tcg_get_partrans,
                                   tcg_set_partrans);
