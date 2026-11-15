@@ -366,6 +366,7 @@ bool tcg_retstack_env;
 intptr_t tcg_retep_off;
 bool tcg_retalign;
 bool tcg_ecinline;
+bool tcg_ecfast;
 TCGEcCallout (*tcg_ec_callout_fn)(uintptr_t sp, void *env);
 const void *tcg_ec_leave_fn;
 const void *tcg_ec_callout_entry;

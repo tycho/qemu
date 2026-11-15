@@ -492,6 +492,12 @@ typedef struct TCGEcCallout {
 } TCGEcCallout;
 
 extern bool tcg_ecinline;
+/*
+ * tcg_ecfast (x-ecfast, with x-ecinline): a call-out made with the
+ * default FP control leaves the flags lazy and the host FP state held,
+ * and its return takes the flags from the incoming state.
+ */
+extern bool tcg_ecfast;
 extern TCGEcCallout (*tcg_ec_callout_fn)(uintptr_t sp, void *env);
 extern const void *tcg_ec_leave_fn;
 extern const void *tcg_ec_callout_entry;
