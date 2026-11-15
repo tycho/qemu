@@ -857,6 +857,7 @@ static void ec_ring_doorbells(void);
  */
 #define EC_FREEZE_MS 30000
 #define EC_PARK_MS 1000
+#define EC_WRITER_MS 2000
 
 enum {
     EC_EXIT_STOP = 1 << 0,          /* a thread not stopped so */
@@ -868,11 +869,18 @@ enum {
     EC_EXIT_FLUSH = 1 << 6,         /* the write-buffer flush failed */
     EC_EXIT_SELF = 1 << 7,          /* the owner's word: not its level alone */
     EC_EXIT_DIED = 1 << 8,          /* a thread died inside, or mid-operation */
+    EC_EXIT_CACHE = 1 << 9,         /* the cache's writer didn't settle */
+    EC_EXIT_WRITER = 1 << 10,       /* nor, after a failure, park */
     EC_EXIT_DONE = 1u << 31,
 };
 
 static uint32_t ec_exit_outcome;
 static uint32_t ec_exit_frozen, ec_exit_passes, ec_exit_refrozen;
+/*
+ * The end's time, and the time elapsed from its start at four points: the
+ * freeze, the parks, the flush and the cache's quiesce done (reported as
+ * the order they run in: freeze, parks, cache, flush).
+ */
 static int64_t ec_exit_ns, ec_exit_phase[4];
 static NTSTATUS ec_exit_first_fail;
 static int ec_exit_first_why;
@@ -1549,7 +1557,10 @@ self:
     return STATUS_SUCCESS;
 }
 
-/* Until EC_PARK_MS: every registered thread parked, or call_rcu's worker. */
+/*
+ * Until EC_PARK_MS: every registered thread parked, or call_rcu's worker,
+ * or the translation cache's writer, which the cache's quiesce stops next.
+ */
 static bool ec_wait_parked(void)
 {
     int64_t deadline = get_clock() + (int64_t)EC_PARK_MS * SCALE_MS;
@@ -1560,13 +1571,15 @@ static bool ec_wait_parked(void)
         for (;;) {
             uint32_t state = qatomic_load_acquire(&r[i].state);
             DWORD tid = qatomic_read(&r[i].tid);
-            int rcu_tid, sampler_tid;
+            int rcu_tid, sampler_tid, writer_tid;
             bool sampler_parked = translator_region_sampler_parked(
                 &sampler_tid);
 
             rcu_worker_resting(&rcu_tid);
+            tcg_cache_dir_writer_settled(&writer_tid);
             if (state == XT_INTERNAL_FREE || state == XT_INTERNAL_PARKED ||
                 (tid && tid == (DWORD)rcu_tid) ||
+                (tid && tid == (DWORD)writer_tid) ||
                 (tid && tid == (DWORD)sampler_tid && sampler_parked)) {
                 break;
             }
@@ -1575,6 +1588,24 @@ static bool ec_wait_parked(void)
             }
             NtYieldExecution();
         }
+    }
+    return true;
+}
+
+/*
+ * Until @ms: the translation cache's writer holding nothing for good
+ * (none, parked, or blocked on the work a quiesce holds).
+ */
+static bool ec_wait_writer(int ms)
+{
+    int64_t deadline = get_clock() + (int64_t)ms * SCALE_MS;
+    int tid;
+
+    while (!tcg_cache_dir_writer_settled(&tid)) {
+        if (get_clock() > deadline) {
+            return false;
+        }
+        NtYieldExecution();
     }
     return true;
 }
@@ -1639,8 +1670,9 @@ static void ec_exit_line(char *line, size_t size)
 {
     int n = snprintf(line, size, "exit: outcome 0x%x, %u threads stopped "
                      "(%u again), %u passes, %u unsafe terminations, "
-                     "%llu.%u ms (freeze %llu.%u, parks %llu.%u, flush "
-                     "%llu.%u), first stop failure 0x%lx why 0x%x; "
+                     "%llu.%u ms (freeze %llu.%u, parks %llu.%u, cache "
+                     "%llu.%u, flush %llu.%u), first stop failure 0x%lx "
+                     "why 0x%x; "
                      "certified idle %u parked %u taken %u new %u ending %u, "
                      "failed %u, still active %u; died inside %u, "
                      "mid-operation %u\n",
@@ -1653,6 +1685,8 @@ static void ec_exit_line(char *line, size_t size)
                      ec_ms_tenth(ec_exit_phase[0]),
                      (unsigned long long)ec_ms_whole(ec_exit_phase[1]),
                      ec_ms_tenth(ec_exit_phase[1]),
+                     (unsigned long long)ec_ms_whole(ec_exit_phase[3]),
+                     ec_ms_tenth(ec_exit_phase[3]),
                      (unsigned long long)ec_ms_whole(ec_exit_phase[2]),
                      ec_ms_tenth(ec_exit_phase[2]),
                      (unsigned long)ec_exit_first_fail, ec_exit_first_why,
@@ -1713,6 +1747,14 @@ static void ec_exit_begin(void)
      * either sees the gate closed, or its level is visible to ec_freeze.
      */
     XT_TP(XT_TP_EXIT_ELECTED, g, 0);
+    /*
+     * The translation cache's diagnostics (cachedebug, for development) go
+     * to the standard error stream, which from here may have a stopped
+     * thread for reader: none starts after this.  One the writer has
+     * already begun can still block it, and the quiesce behind it, if that
+     * reader is stopped.
+     */
+    qatomic_set(&tcg_cache_debug, false);
     if (XT_TP_FAIL(XT_TPF_FLUSH_PROCESS) || ec_flush_write_buffers() < 0) {
         ec_exit_outcome |= EC_EXIT_FLUSH;
     }
@@ -1759,6 +1801,19 @@ static void ec_exit_begin(void)
     if (qatomic_read(&ec_died_owned) || qatomic_read(&ec_died_unfinished)) {
         ec_exit_outcome |= EC_EXIT_DIED;
     }
+    /*
+     * The translation cache's writer finishes its round and stops, holding
+     * nothing, and what the captures hold is published: every lock its
+     * round and the drain wait on is a module thread's, the others
+     * certified out.
+     */
+    if (!ec_exit_outcome) {
+        tcg_cache_dir_quiesce();
+        if (!ec_wait_writer(EC_PARK_MS)) {
+            ec_exit_outcome |= EC_EXIT_CACHE;
+        }
+    }
+    ec_exit_phase[3] = get_clock() - t0;
     if (!ec_exit_outcome && qatomic_load_acquire(&engine_state) == 2) {
         xt_enter();
         for (guint i = 0; i < reads->len; i++) {
@@ -1777,6 +1832,17 @@ static void ec_exit_begin(void)
             ec_exit_outcome |= EC_EXIT_RCU;
         }
     }
+    /*
+     * After a failure no cache publication begins: captures close, and
+     * the writer, asked to stop after its round, gets a bounded wait (a
+     * thread that wasn't stopped may hold what its round needs).
+     */
+    if (ec_exit_outcome) {
+        tcg_cache_dir_abandon();
+        if (!ec_wait_writer(EC_WRITER_MS)) {
+            ec_exit_outcome |= EC_EXIT_WRITER;
+        }
+    }
     ec_exit_ns = get_clock() - t0;
     XT_TP_NOTE(XT_TPN_EXIT, ec_exit_outcome, ec_exit_frozen,
                qatomic_read(&ec_unsafe_terms));
@@ -1789,12 +1855,27 @@ static void ec_exit_begin(void)
     xt_adapter_end(began);
 }
 
+/* @h names this process. */
+static bool ec_is_self(HANDLE h)
+{
+    PROCESS_BASIC_INFORMATION pbi;
+
+    return h == GetCurrentProcess() ||
+           (NtQueryInformationProcess(h, ProcessBasicInformation, &pbi,
+                                      sizeof(pbi), NULL) >= 0 &&
+            (DWORD)(uintptr_t)pbi.UniqueProcessId == GetCurrentProcessId());
+}
+
 /*
  * Windows' calls at the process's end, on the exiting thread: (NULL,
  * before), with the other threads still running; (NULL, after), once it
- * has ended them; then (the process, before).  What writes to the
- * standard streams runs before the first call's freeze (ec_exit_begin),
- * or, for testing (exitreport), at the last, the other threads gone.
+ * has ended them; then (the process, before), this process's last, where
+ * the translation cache publishes what the detach code added (without
+ * allocating or waiting; nothing after a failed end, which abandoned it).
+ * Also the last for a direct termination of the process, which skips the
+ * first two.  What writes to the standard streams runs before the first
+ * call's freeze (ec_exit_begin), or, for testing (exitreport), at the
+ * last, the other threads gone.
  */
 static void ec_process_term(HANDLE h, BOOL after, NTSTATUS status)
 {
@@ -1830,6 +1911,13 @@ static void ec_process_term(HANDLE h, BOOL after, NTSTATUS status)
         if (qatomic_load_acquire(&engine_state) > 0) {
             ec_exit_begin();
         }
+    }
+    if (h && !after && qatomic_load_acquire(&engine_state) == 2 &&
+        ec_is_self(h)) {
+        bool began = xt_adapter_begin();
+
+        tcg_cache_dir_exit();
+        xt_adapter_end(began);
     }
     if (h && !after && xt_exit_report &&
         (qatomic_load_acquire(&ec_exit_outcome) & EC_EXIT_DONE) &&
