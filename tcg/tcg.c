@@ -1336,6 +1336,25 @@ typedef struct TCGOutOpStore {
                   TCGReg base, intptr_t offset);
 } TCGOutOpStore;
 
+typedef struct TCGOutOpNzcvBinary {
+    TCGOutOp base;
+    void (*out_rrr)(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                    TCGReg a2, unsigned flags);
+    void (*out_rri)(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                    tcg_target_long a2, unsigned flags);
+} TCGOutOpNzcvBinary;
+
+typedef struct TCGOutOpNzcvSetcond {
+    TCGOutOp base;
+    void (*out)(TCGContext *s, TCGType type, TCGReg ret, int acond, bool neg);
+} TCGOutOpNzcvSetcond;
+
+typedef struct TCGOutOpNzcvMovcond {
+    TCGOutOp base;
+    void (*out)(TCGContext *s, TCGType type, TCGReg ret, int acond,
+                TCGReg vt, TCGReg vf);
+} TCGOutOpNzcvMovcond;
+
 typedef struct TCGOutOpSubtract {
     TCGOutOp base;
     void (*out_rrr)(TCGContext *s, TCGType type,
@@ -1357,6 +1376,34 @@ static void tcg_out_pinned_clobbered(TCGContext *s, bool store,
 static void tcg_out_boundary_ldst(TCGContext *s, bool load);
 
 #include "tcg-target.c.inc"
+
+#ifndef TCG_TARGET_HAS_NZCV
+static const TCGOutOpNzcvBinary outop_nzcv_add = {
+    .base.static_constraint = C_NotImplemented,
+};
+static const TCGOutOpNzcvBinary outop_nzcv_sub = {
+    .base.static_constraint = C_NotImplemented,
+};
+static const TCGOutOpNzcvBinary outop_nzcv_and = {
+    .base.static_constraint = C_NotImplemented,
+};
+static const TCGOutOpNzcvSetcond outop_nzcv_setcond = {
+    .base.static_constraint = C_NotImplemented,
+};
+static const TCGOutOpNzcvMovcond outop_nzcv_movcond = {
+    .base.static_constraint = C_NotImplemented,
+};
+
+static void tcg_out_nzcv_brcond(TCGContext *s, int acond, TCGLabel *l)
+{
+    g_assert_not_reached();
+}
+
+static bool tcg_target_insn_sets_nzcv(const void *insn)
+{
+    return true;
+}
+#endif
 
 bool tcg_insn_is_acqrel_ldst(uintptr_t pc)
 {
@@ -1812,6 +1859,11 @@ static const TCGOutOp * const all_outop[NB_OPS] = {
     OUTOP(INDEX_op_subb1o, TCGOutOpAddSubCarry, outop_subbio),
     OUTOP(INDEX_op_subbi, TCGOutOpAddSubCarry, outop_subbi),
     OUTOP(INDEX_op_subbio, TCGOutOpAddSubCarry, outop_subbio),
+    OUTOP(INDEX_op_nzcv_add, TCGOutOpNzcvBinary, outop_nzcv_add),
+    OUTOP(INDEX_op_nzcv_sub, TCGOutOpNzcvBinary, outop_nzcv_sub),
+    OUTOP(INDEX_op_nzcv_and, TCGOutOpNzcvBinary, outop_nzcv_and),
+    OUTOP(INDEX_op_nzcv_setcond, TCGOutOpNzcvSetcond, outop_nzcv_setcond),
+    OUTOP(INDEX_op_nzcv_movcond, TCGOutOpNzcvMovcond, outop_nzcv_movcond),
     OUTOP(INDEX_op_subbo, TCGOutOpAddSubCarry, outop_subbo),
     OUTOP(INDEX_op_umax, TCGOutOpBinary, outop_umax),
     OUTOP(INDEX_op_umin, TCGOutOpBinary, outop_umin),
@@ -3451,6 +3503,8 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     }
 
     switch (op) {
+    case INDEX_op_nzcv_brcond:
+        return tcg_nzcv_host();
     case INDEX_op_discard:
     case INDEX_op_set_label:
     case INDEX_op_call:
@@ -4718,6 +4772,9 @@ void tcg_op_remove(TCGContext *s, TCGOp *op)
     case INDEX_op_brcond:
         remove_label_use(op, 3);
         break;
+    case INDEX_op_nzcv_brcond:
+        remove_label_use(op, 1);
+        break;
     case INDEX_op_push_ret:
     case INDEX_op_call_tb:
     case INDEX_op_goto_tb_cold:
@@ -4834,6 +4891,9 @@ static void move_label_uses(TCGLabel *to, TCGLabel *from)
             break;
         case INDEX_op_brcond:
             op->args[3] = label_arg(to);
+            break;
+        case INDEX_op_nzcv_brcond:
+            op->args[1] = label_arg(to);
             break;
         case INDEX_op_push_ret:
         case INDEX_op_call_tb:
@@ -5956,6 +6016,8 @@ static TCGLabel *op_branch_label(const TCGOp *op)
         return arg_label(op->args[0]);
     case INDEX_op_brcond:
         return arg_label(op->args[3]);
+    case INDEX_op_nzcv_brcond:
+        return arg_label(op->args[1]);
     default:
         return NULL;
     }
@@ -6817,6 +6879,123 @@ bool tcg_pin_cc;
 bool tcg_pin_pc;
 bool tcg_edge_sys;
 bool tcg_cc_regs;
+bool tcg_nzcv;
+unsigned tcg_nzcv_retries;
+
+bool tcg_nzcv_host(void)
+{
+#ifdef TCG_TARGET_HAS_NZCV
+    return true;
+#else
+    return false;
+#endif
+}
+
+/*
+ * Whether an op's code may change the host's flags: false only for ops
+ * whose code never does, and user-mode guest accesses without an
+ * alignment check.
+ * The code generator checks the rest (tcg_nzcv_check).
+ */
+bool tcg_op_may_set_nzcv(const TCGOp *op)
+{
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+
+    switch (op->opc) {
+    case INDEX_op_mov:
+    case INDEX_op_add:
+    case INDEX_op_sub:
+    case INDEX_op_neg:
+    case INDEX_op_and:
+    case INDEX_op_or:
+    case INDEX_op_xor:
+    case INDEX_op_andc:
+    case INDEX_op_orc:
+    case INDEX_op_eqv:
+    case INDEX_op_nand:
+    case INDEX_op_nor:
+    case INDEX_op_not:
+    case INDEX_op_shl:
+    case INDEX_op_shr:
+    case INDEX_op_sar:
+    case INDEX_op_rotl:
+    case INDEX_op_rotr:
+    case INDEX_op_mul:
+    case INDEX_op_muluh:
+    case INDEX_op_mulsh:
+    case INDEX_op_lea:
+    case INDEX_op_extract:
+    case INDEX_op_sextract:
+    case INDEX_op_deposit:
+    case INDEX_op_extract2:
+    case INDEX_op_bswap16:
+    case INDEX_op_bswap32:
+    case INDEX_op_bswap64:
+    case INDEX_op_ext_i32_i64:
+    case INDEX_op_extu_i32_i64:
+    case INDEX_op_extrl_i64_i32:
+    case INDEX_op_extrh_i64_i32:
+    case INDEX_op_ld8u:
+    case INDEX_op_ld8s:
+    case INDEX_op_ld16u:
+    case INDEX_op_ld16s:
+    case INDEX_op_ld32u:
+    case INDEX_op_ld32s:
+    case INDEX_op_ld:
+    case INDEX_op_st8:
+    case INDEX_op_st16:
+    case INDEX_op_st32:
+    case INDEX_op_st:
+    case INDEX_op_insn_start:
+    case INDEX_op_discard:
+    case INDEX_op_mb:
+    case INDEX_op_nzcv_setcond:
+    case INDEX_op_nzcv_movcond:
+        return false;
+    case INDEX_op_qemu_ld:
+    case INDEX_op_qemu_st:
+    case INDEX_op_qemu_ld2:
+    case INDEX_op_qemu_st2:
+    case INDEX_op_qemu_ld_x:
+    case INDEX_op_qemu_st_x:
+        /* The softmmu TLB lookup compares. */
+        return tcg_use_softmmu || memop_alignment_bits(get_memop(
+                   op->args[def->nb_oargs + def->nb_iargs])) != 0;
+    default:
+        return true;
+    }
+}
+
+/*
+ * After each op's code (start, end): whether the flags a reader takes are
+ * still those of the last kept flag-setting op.
+ */
+static bool tcg_nzcv_check(TCGContext *s, const TCGOp *op,
+                           const void *start, const void *end)
+{
+    const TCGOpDef *def = &tcg_op_defs[op->opc];
+    const tcg_insn_unit *p = start, *e = end;
+
+    if ((def->flags & TCG_OPF_NZCV_OUT) &&
+        !(op->args[3] & TCG_NZCV_NOFLAGS)) {
+        s->nzcv_valid = true;
+        return true;
+    }
+    if (!s->nzcv_valid && !(def->flags & TCG_OPF_NZCV_IN)) {
+        return true;
+    }
+    if (e < p || (const uint8_t *)e - (const uint8_t *)p > 4096) {
+        s->nzcv_valid = false;      /* code in another part: unknown */
+    } else {
+        for (; p < e; p += 4 / sizeof(tcg_insn_unit)) {
+            if (tcg_target_insn_sets_nzcv(p)) {
+                s->nzcv_valid = false;
+                break;
+            }
+        }
+    }
+    return !(def->flags & TCG_OPF_NZCV_IN) || s->nzcv_valid;
+}
 
 static bool op_lazysync(TCGOpcode opc)
 {
@@ -7014,6 +7193,7 @@ liveness_pass_1(TCGContext *s)
     la_func_end(s, nb_globals, nb_temps);
 
     s->carry_live = false;
+    s->nzcv_live = false;
     QTAILQ_FOREACH_REVERSE_SAFE(op, &s->ops, link, op_prev) {
         int nb_iargs, nb_oargs;
         TCGOpcode opc_new, opc_new2;
@@ -7196,6 +7376,16 @@ liveness_pass_1(TCGContext *s)
             /* Mark the single-word operation live.  */
             goto do_not_remove;
 
+        case INDEX_op_nzcv_add:
+        case INDEX_op_nzcv_sub:
+        case INDEX_op_nzcv_and:
+            /* Nothing reads the flags: the operation alone (no S bit). */
+            if (s->nzcv_live) {
+                goto do_not_remove;
+            }
+            op->args[3] |= TCG_NZCV_NOFLAGS;
+            goto do_default;
+
         case INDEX_op_addco:
             if (s->carry_live) {
                 goto do_not_remove;
@@ -7376,6 +7566,9 @@ liveness_pass_1(TCGContext *s)
             if (def->flags & TCG_OPF_CARRY_OUT) {
                 s->carry_live = false;
             }
+            if (def->flags & TCG_OPF_NZCV_OUT) {
+                s->nzcv_live = false;
+            }
 
             /* Input arguments are live for preceding opcodes.  */
             for (int i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
@@ -7389,6 +7582,9 @@ liveness_pass_1(TCGContext *s)
             }
             if (def->flags & TCG_OPF_CARRY_IN) {
                 s->carry_live = true;
+            }
+            if (def->flags & TCG_OPF_NZCV_IN) {
+                s->nzcv_live = true;
             }
 
             /* Incorporate constraints for this operand.  */
@@ -9604,6 +9800,39 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             tcg_debug_assert(!const_args[4]);
             out->out_rr01r(s, type, new_args[0], new_args[1], new_args[4]);
         }
+        break;
+
+    case INDEX_op_nzcv_add:
+    case INDEX_op_nzcv_sub:
+    case INDEX_op_nzcv_and:
+        {
+            const TCGOutOpNzcvBinary *out =
+                container_of(all_outop[op->opc], TCGOutOpNzcvBinary, base);
+
+            tcg_debug_assert(!const_args[1]);
+            if (const_args[2]) {
+                out->out_rri(s, type, new_args[0], new_args[1],
+                             new_args[2], new_args[3]);
+            } else {
+                out->out_rrr(s, type, new_args[0], new_args[1],
+                             new_args[2], new_args[3]);
+            }
+        }
+        break;
+
+    case INDEX_op_nzcv_brcond:
+        tcg_out_nzcv_brcond(s, new_args[0], arg_label(new_args[1]));
+        break;
+
+    case INDEX_op_nzcv_setcond:
+        outop_nzcv_setcond.out(s, type, new_args[0], new_args[1],
+                               new_args[2]);
+        break;
+
+    case INDEX_op_nzcv_movcond:
+        outop_nzcv_movcond.out(s, type, new_args[0], new_args[3],
+                               const_args[1] ? TCG_REG_ZERO : new_args[1],
+                               const_args[2] ? TCG_REG_ZERO : new_args[2]);
         break;
 
     case INDEX_op_crc32c:
@@ -11880,6 +12109,7 @@ static void tcg_note_cond_link(TCGContext *s, int n)
 int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
 {
     int i, num_insns;
+    const void *nzcv_start;
     TCGOp *op;
     /* tcg_tblayout: the cold part's cursor, saved hot state. */
     tcg_insn_unit *cold_start = NULL, *cold_cur = NULL, *hot = NULL;
@@ -12093,6 +12323,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     num_insns = -1;
     s->gen_cur_insn = -1;
     s->carry_live = false;
+    s->nzcv_valid = false;
     s->xblk_ft = true;          /* the TB's entry falls into its first op */
     QTAILQ_FOREACH(op, &s->ops, link) {
         TCGOpcode opc = op->opc;
@@ -12106,6 +12337,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             tb_layout_switch(s, !s->lay_cold_now, &hot, &cold_cur, &hot_hw);
         }
         ft = tb_layout_falls_through(op);
+        nzcv_start = s->code_ptr;
 
         switch (opc) {
         case INDEX_op_extrl_i64_i32:
@@ -12344,6 +12576,10 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             tcg_reg_alloc_op(s, op);
             break;
         }
+        if (tcg_nzcv && !tcg_nzcv_check(s, op, nzcv_start, s->code_ptr)) {
+            i = -5;
+            goto fail;
+        }
         if (opc == INDEX_op_set_label && !s->lay_cold_now) {
             TCGLabel *l = arg_label(op->args[0]);
 
@@ -12454,6 +12690,11 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     if (s->lay_on && i == -1) {
         /* The chunk's hot or cold part is full: the next chunk. */
         s->lay_hot_end = s->lay_chunk;
+    }
+    if (i == -5) {
+        /* A reader's flags changed: the same TB again without them. */
+        s->nzcv_retry = true;
+        return -5;
     }
     if (hot && i == -2) {
         /*

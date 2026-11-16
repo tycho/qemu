@@ -618,6 +618,13 @@ struct TCGContext {
      * carry-using opcodes like addco+addci.
      */
     bool carry_live;
+    /*
+     * Liveness: a TCG_OPF_NZCV_IN op follows (nzcv_live).  Code generation:
+     * the flags of the last kept TCG_OPF_NZCV_OUT op are still in NZCV
+     * (nzcv_valid); a reader that finds them changed fails the TB, which is
+     * translated again without them (nzcv_retry).
+     */
+    bool nzcv_live, nzcv_valid, nzcv_retry;
     /* tcg_alignfold: a guest access of this TB checks its alignment. */
     bool align_access;
 
@@ -1064,6 +1071,13 @@ enum {
      * are dead.  Unlike TCG_OPF_SIDE_EFFECTS, globals need not be synced.
      */
     TCG_OPF_FP_STATUS    = 0x400,
+    /*
+     * Instruction sets the host's condition flags (NZCV), which a later
+     * TCG_OPF_NZCV_IN op reads; nothing in between may change them.
+     */
+    TCG_OPF_NZCV_OUT     = 0x800,
+    /* Instruction reads the flags of the last TCG_OPF_NZCV_OUT op. */
+    TCG_OPF_NZCV_IN      = 0x1000,
 };
 
 typedef struct TCGOpDef {
@@ -1081,6 +1095,15 @@ extern const size_t tcg_op_defs_max;
  * on which we are currently executing.
  */
 bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags);
+
+/*
+ * INDEX_op_nzcv_* (tcg_nzcv): the add, sub and and's constant.
+ * tcg_op_may_set_nzcv: whether an op's code may change the host flags,
+ * conservatively.
+ */
+#define TCG_NZCV_W32        1
+#define TCG_NZCV_NOFLAGS    2
+bool tcg_op_may_set_nzcv(const TCGOp *op);
 /*
  * tcg_op_deposit_valid:
  * Query if a deposit into (ofs, len) is supported for @type by

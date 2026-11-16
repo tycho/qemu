@@ -1240,6 +1240,7 @@ static TranslationBlock *tb_gen_code_in(CPUState *cpu, TCGTBCPUState s)
 
     tcg_ctx->gen_tb = tb;
     tcg_ctx->guest_mo = cpu->cc->tcg_ops->guest_default_memory_order;
+    tcg_ctx->nzcv_retry = false;
 
  restart_translate:
     /* A retry translates again with all the slots (tcg_tb_trim_slots). */
@@ -1318,6 +1319,13 @@ static TranslationBlock *tb_gen_code_in(CPUState *cpu, TCGTBCPUState s)
              */
             qemu_log_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT,
                           "Restarting code generation with re-locked pages");
+            goto restart_translate;
+
+        case -5:
+            /* tcg_nzcv: a flags reader found them changed (nzcv_retry). */
+            qemu_log_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT,
+                          "Restarting code generation without host flags\n");
+            qatomic_inc(&tcg_nzcv_retries);
             goto restart_translate;
 
         case -4:
