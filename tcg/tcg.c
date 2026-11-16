@@ -5659,16 +5659,32 @@ static void la_func_end(TCGContext *s, int ng, int nt)
 
 /*
  * liveness analysis: at a TB boundary, or a label with the classic
- * contract, the boundary globals are live in their registers.
+ * contract, the boundary globals are live in their registers.  @mem has
+ * bit i set for those that the ops after a conditional branch, on its
+ * fall-through, still need in memory (a helper that reads globals): they
+ * are live in their registers and in memory.
  */
-static void la_boundary_live(TCGContext *s)
+static void la_boundary_live(TCGContext *s, unsigned mem)
 {
     for (int i = 0; i < s->nb_boundary; i++) {
         TCGTemp *ts = s->boundary[i];
 
-        ts->state = 0;
+        ts->state = mem & (1u << i) ? TS_MEM : 0;
         *la_temp_pref(ts) = (TCGRegSet)1 << temp_boundary_reg(ts);
     }
+}
+
+/* The boundary globals the ops after this point need in memory. */
+static unsigned la_boundary_mem(TCGContext *s)
+{
+    unsigned mem = 0;
+
+    for (int i = 0; i < s->nb_boundary; i++) {
+        if (s->boundary[i]->state & TS_MEM) {
+            mem |= 1u << i;
+        }
+    }
+    return mem;
 }
 
 /* liveness analysis: end of basic block: all temps are dead, globals
@@ -6350,7 +6366,7 @@ static bool la_xblk_branch(TCGContext *s, TCGOp *op, int nt, bool cond)
         && s->xblk_pass == 2 && l->nb_loopregs) {
         la_loopback(s, l, nt);
         if (s->boundary_in) {
-            la_boundary_live(s);
+            la_boundary_live(s, 0);
         }
         return true;
     }
@@ -7515,14 +7531,17 @@ liveness_pass_1(TCGContext *s)
                 assert_carry_dead(s);
                 la_func_end(s, nb_globals, nb_temps);
                 if (s->boundary_in) {
-                    la_boundary_live(s);
+                    la_boundary_live(s, 0);
                 }
             } else if (def->flags & TCG_OPF_COND_BRANCH) {
                 assert_carry_dead(s);
                 if (!la_xblk_branch(s, op, nb_temps, true)) {
+                    /* The fall-through's needs, before the branch's own. */
+                    unsigned mem = s->boundary_in ? la_boundary_mem(s) : 0;
+
                     la_bb_sync(s, nb_globals, nb_temps);
                     if (s->boundary_in) {
-                        la_boundary_live(s);
+                        la_boundary_live(s, mem);
                     }
                 }
             } else if (def->flags & TCG_OPF_BB_END) {
@@ -7532,7 +7551,7 @@ liveness_pass_1(TCGContext *s)
                     : !la_xblk_branch(s, op, nb_temps, false)) {
                     la_bb_end(s, nb_globals, nb_temps);
                     if (s->boundary_in) {
-                        la_boundary_live(s);
+                        la_boundary_live(s, 0);
                     }
                 }
             } else if (def->flags & TCG_OPF_SIDE_EFFECTS) {
