@@ -121,6 +121,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-crypto", "on" },
         { "x-alignfold", "on" },
         { "x-region", "on" },
+        { "x-nzcv", "on" },
 #ifdef CONFIG_USER_ONLY
         /* Sampled loops cost more than they give next to units (user only). */
         { "x-superblock", "units-only" },
