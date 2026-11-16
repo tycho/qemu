@@ -160,6 +160,17 @@ typedef struct DisasContext {
 
     CCOp cc_op;  /* current CC operation */
     /*
+     * tcg_nzcv (nzcv_on for this TB): the op of the last 32- or 64-bit
+     * ADD, SUB or AND (nzcv_prod, recorded by gen_nzcv_alu, nzcv_w32 for
+     * 32 bits) and its CC operation, once set (nzcv_pending until then):
+     * nzcv_cc.  A reader, while cc_op is still that one (nzcv_valid) and
+     * no op since may change the host's flags, turns the op into its
+     * flag-setting form and reads them (gen_nzcv_cond).
+     */
+    bool nzcv_on, nzcv_pending, nzcv_valid, nzcv_w32;
+    CCOp nzcv_cc;
+    TCGOp *nzcv_prod;
+    /*
      * With tcg_flags_guess, the CC operation the block was entered with
      * when it was translated, while cc_op is still that dynamic state;
      * else CC_OP_DYNAMIC.
@@ -462,6 +473,9 @@ static void set_cc_op_1(DisasContext *s, CCOp op, bool dirty)
 
 static void set_cc_op(DisasContext *s, CCOp op)
 {
+    s->nzcv_valid = s->nzcv_pending && op != CC_OP_DYNAMIC;
+    s->nzcv_cc = op;
+    s->nzcv_pending = false;
     /*
      * The DYNAMIC setting is translator only, everything else
      * will be spilled later.
@@ -471,7 +485,62 @@ static void set_cc_op(DisasContext *s, CCOp op)
 
 static void assume_cc_op(DisasContext *s, CCOp op)
 {
+    s->nzcv_valid = false;
     set_cc_op_1(s, op, false);
+}
+
+/*
+ * tcg_nzcv: the aarch64 condition code for Jcc condition b on the flags of
+ * the last ADD, SUB or AND recorded (gen_nzcv_alu), its op turned into the
+ * form that sets them, if nothing since may change them; else -1.
+ */
+static int gen_nzcv_cond(DisasContext *s, int b)
+{
+    /* O, B, Z, BE, S, P, L, LE: VS, CS/CC, EQ, LS, MI, -, LT, LE. */
+    static const int8_t cond[3][8] = {
+        { 6, 2, 0, -1, 4, -1, 11, 13 },     /* ADDS: C is CF */
+        { 6, 3, 0, 9, 4, -1, 11, 13 },      /* SUBS: C is !CF */
+        { 6, 2, 0, 0, 4, -1, 11, 13 },      /* ANDS: C and V clear */
+    };
+    int fam, c, n = 0;
+
+    if (!s->nzcv_valid || s->cc_op != s->nzcv_cc) {
+        return -1;
+    }
+    switch (s->cc_op) {
+    case CC_OP_ADDL:
+    case CC_OP_ADDQ:
+        fam = 0;
+        break;
+    case CC_OP_SUBL:
+    case CC_OP_SUBQ:
+        fam = 1;
+        break;
+    case CC_OP_LOGICL:
+    case CC_OP_LOGICQ:
+        fam = 2;
+        break;
+    default:
+        return -1;
+    }
+    c = cond[fam][(b >> 1) & 7];
+    if (c < 0) {
+        return -1;
+    }
+    for (TCGOp *op = tcg_last_op(); op && n < 256;
+         op = QTAILQ_PREV(op, link), n++) {
+        TCGOp *p = s->nzcv_prod;
+
+        if (op != p) {
+            if (tcg_op_may_set_nzcv(op)) {
+                return -1;
+            }
+            continue;
+        }
+        tcg_op_set_nzcv(p, s->nzcv_w32);
+        return c ^ (b & 1);
+    }
+    return -1;
 }
 
 /*
@@ -1498,7 +1567,14 @@ static CCPrepare gen_prepare_cc(DisasContext *s, int b, TCGv reg)
 
 static void gen_neg_setcc(DisasContext *s, int b, TCGv reg)
 {
-    CCPrepare cc = gen_prepare_cc(s, b, reg);
+    int ac = gen_nzcv_cond(s, b);
+    CCPrepare cc;
+
+    if (ac >= 0) {
+        tcg_gen_nzcv_setcond(TCG_TYPE_TL, tcgv_tl_temp(reg), ac, true);
+        return;
+    }
+    cc = gen_prepare_cc(s, b, reg);
 
     if (cc.rhs_type == CC_PREPARE_DIRECT) {
         if (cc.cond == TCG_COND_EQ) {
@@ -1514,7 +1590,14 @@ static void gen_neg_setcc(DisasContext *s, int b, TCGv reg)
 
 static void gen_setcc(DisasContext *s, int b, TCGv reg)
 {
-    CCPrepare cc = gen_prepare_cc(s, b, reg);
+    int ac = gen_nzcv_cond(s, b);
+    CCPrepare cc;
+
+    if (ac >= 0) {
+        tcg_gen_nzcv_setcond(TCG_TYPE_TL, tcgv_tl_temp(reg), ac, false);
+        return;
+    }
+    cc = gen_prepare_cc(s, b, reg);
 
     if (cc.rhs_type == CC_PREPARE_DIRECT) {
         if (cc.cond == TCG_COND_EQ) {
@@ -1537,7 +1620,14 @@ static inline void gen_compute_eflags_c(DisasContext *s, TCGv reg)
    value 'b'. In the fast case, T0 is guaranteed not to be used. */
 static inline void gen_jcc_noeob(DisasContext *s, int b, TCGLabel *l1)
 {
-    CCPrepare cc = gen_prepare_cc(s, b, NULL);
+    int ac = gen_nzcv_cond(s, b);
+    CCPrepare cc;
+
+    if (ac >= 0) {
+        tcg_gen_nzcv_brcond(ac, l1);
+        return;
+    }
+    cc = gen_prepare_cc(s, b, NULL);
 
     tcg_gen_brcond_tl(cc.cond, cc.reg, cc.reg2, l1);
 }
@@ -1548,7 +1638,15 @@ static inline void gen_jcc_noeob(DisasContext *s, int b, TCGLabel *l1)
    cc_op is clean.  */
 static inline void gen_jcc(DisasContext *s, int b, TCGLabel *l1)
 {
-    CCPrepare cc = gen_prepare_cc(s, b, NULL);
+    int ac = gen_nzcv_cond(s, b);
+    CCPrepare cc;
+
+    if (ac >= 0) {
+        gen_update_cc_op(s);
+        tcg_gen_nzcv_brcond(ac, l1);
+        return;
+    }
+    cc = gen_prepare_cc(s, b, NULL);
 
     /*
      * Note that this must be _after_ gen_prepare_cc, because it can change
@@ -2166,7 +2264,15 @@ static void gen_conditional_jump_labels(DisasContext *s, target_long diff,
 
 static void gen_cmovcc(DisasContext *s, int b, TCGv dest, TCGv src)
 {
-    CCPrepare cc = gen_prepare_cc(s, b, NULL);
+    int ac = gen_nzcv_cond(s, b);
+    CCPrepare cc;
+
+    if (ac >= 0) {
+        tcg_gen_nzcv_movcond(TCG_TYPE_TL, tcgv_tl_temp(dest), ac,
+                             tcgv_tl_temp(src), tcgv_tl_temp(dest));
+        return;
+    }
+    cc = gen_prepare_cc(s, b, NULL);
 
     tcg_gen_movcond_tl(cc.cond, dest, cc.reg, cc.reg2, src, dest);
 }
@@ -4782,6 +4888,8 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     g_assert(GUEST(dc) == ((flags & HF_GUEST_MASK) != 0));
 
     dc->cc_op = CC_OP_DYNAMIC;
+    dc->nzcv_on = tcg_nzcv && !tcg_ctx->nzcv_retry;
+    dc->nzcv_pending = dc->nzcv_valid = false;
     dc->cc_op_dirty = false;
     /* The block is translated when it is first entered. */
     dc->cc_op_guess = tcg_flags_guess ? env->cc_op : CC_OP_DYNAMIC;
@@ -4871,6 +4979,7 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 #endif
 
     dc->after_fence = dc->fence_insn;
+    dc->nzcv_pending = false;
     dc->fence_insn = false;
 
     switch (sigsetjmp(dc->jmpbuf, 0)) {
@@ -5001,6 +5110,7 @@ static void i386_tr_block_start(DisasContextBase *dcbase, CPUState *cpu)
     int entry = translator_region_entry(dcbase);
 
     dc->cc_op = entry < 0 ? CC_OP_DYNAMIC : entry;
+    dc->nzcv_valid = false;
     dc->cc_op_dirty = false;
     assert(!dc->ymmh_pending);
     dc->cc_srcT = NULL;

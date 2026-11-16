@@ -227,6 +227,16 @@ bool tcg_pin_system_ok(void);
 extern bool tcg_cc_regs;
 
 /*
+ * tcg_nzcv: front ends may keep a flag result in the host's NZCV for
+ * readers in the same block (INDEX_op_nzcv_*), where the host has them
+ * (tcg_nzcv_host); tcg_nzcv_retries counts TBs translated again without
+ * them (a reader found them changed).
+ */
+extern bool tcg_nzcv;
+extern unsigned tcg_nzcv_retries;
+bool tcg_nzcv_host(void);
+
+/*
  * Front ends keep vector registers in env_alias vector
  * globals (tcg_global_mem_new_vec), so TCG holds them in host registers
  * within a TB.

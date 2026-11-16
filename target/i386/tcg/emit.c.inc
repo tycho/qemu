@@ -3206,6 +3206,42 @@ static void gen_ADCX(DisasContext *s, X86DecodedInsn *decode)
     gen_ADCOX(s, decode, CC_OP_ADCX);
 }
 
+/*
+ * tcg_nzcv: the op of a 32- or 64-bit ADD, SUB or AND that sets the flags,
+ * T0 = T0 op T1, which a reader may turn into its flag-setting form
+ * (gen_nzcv_cond).  An APX NF form sets none: the op is left alone, and
+ * the flags of an earlier one stay usable across it.  A compare with zero
+ * (SUB of an immediate 0, AND of a register with itself) isn't recorded:
+ * its lazy evaluation is a CBZ or TBZ.
+ */
+static void gen_nzcv_alu(DisasContext *s, X86DecodedInsn *decode,
+                         TCGOpcode opc, MemOp ot)
+{
+    TCGOp *op = tcg_last_op();
+    X86DecodedOp *a = &decode->op[1], *b = &decode->op[2];
+
+    if ((s->prefix & PREFIX_EVEX) && EVEX_APX_NF(s)) {
+        return;
+    }
+    s->nzcv_valid = false;
+    if ((opc == INDEX_op_sub && b->unit == X86_OP_IMM &&
+         decode->immediate == 0) ||
+        (opc == INDEX_op_and && a->unit == X86_OP_INT &&
+         b->unit == X86_OP_INT && !a->has_ea && !b->has_ea && a->n == b->n)) {
+        return;
+    }
+    if (!s->nzcv_on || (ot != MO_32 && ot != MO_64) ||
+        tcg_ctx->emit_before_op || !op || op->opc != opc ||
+        arg_temp(op->args[0]) != tcgv_tl_temp(s->T0) ||
+        arg_temp(op->args[1]) != tcgv_tl_temp(s->T0) ||
+        arg_temp(op->args[2]) != tcgv_tl_temp(s->T1)) {
+        return;
+    }
+    s->nzcv_prod = op;
+    s->nzcv_w32 = ot == MO_32;
+    s->nzcv_pending = true;
+}
+
 static void gen_ADD(DisasContext *s, X86DecodedInsn *decode)
 {
     MemOp ot = decode->op[1].ot;
@@ -3215,6 +3251,7 @@ static void gen_ADD(DisasContext *s, X86DecodedInsn *decode)
                                     s->mem_index, ot | MO_LE);
     } else {
         tcg_gen_add_tl(s->T0, s->T0, s->T1);
+        gen_nzcv_alu(s, decode, INDEX_op_add, ot);
     }
     prepare_update2_cc(decode, s, CC_OP_ADDB + ot);
 }
@@ -3233,6 +3270,7 @@ static void gen_AND(DisasContext *s, X86DecodedInsn *decode)
                                     s->mem_index, ot | MO_LE);
     } else {
         tcg_gen_and_tl(s->T0, s->T0, s->T1);
+        gen_nzcv_alu(s, decode, INDEX_op_and, ot);
     }
     prepare_update1_cc(decode, s, CC_OP_LOGICB + ot);
 }
@@ -6995,6 +7033,7 @@ static void gen_SUB(DisasContext *s, X86DecodedInsn *decode)
     } else {
         tcg_gen_mov_tl(s->cc_srcT, s->T0);
         tcg_gen_sub_tl(s->T0, s->T0, s->T1);
+        gen_nzcv_alu(s, decode, INDEX_op_sub, ot);
     }
     prepare_update2_cc(decode, s, CC_OP_SUBB + ot);
 }

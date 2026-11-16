@@ -114,6 +114,20 @@ DEF(subb1o, 1, 2, 0, TCG_OPF_INT | TCG_OPF_CARRY_OUT)
 DEF(subbi, 1, 2, 0, TCG_OPF_INT | TCG_OPF_CARRY_IN)
 DEF(subbio, 1, 2, 0, TCG_OPF_INT | TCG_OPF_CARRY_IN | TCG_OPF_CARRY_OUT)
 
+/*
+ * Host condition flags (tcg_nzcv): add, sub and and that also set NZCV
+ * from the low 32 bits (constant TCG_NZCV_W32) or all of them, the 32-bit
+ * result zero-extended, or don't set them (TCG_NZCV_NOFLAGS: liveness
+ * found no reader); readers of an aarch64 condition code (constant).
+ */
+DEF(nzcv_add, 1, 2, 1, TCG_OPF_INT | TCG_OPF_NZCV_OUT)
+DEF(nzcv_sub, 1, 2, 1, TCG_OPF_INT | TCG_OPF_NZCV_OUT)
+DEF(nzcv_and, 1, 2, 1, TCG_OPF_INT | TCG_OPF_NZCV_OUT)
+DEF(nzcv_brcond, 0, 0, 2, TCG_OPF_BB_END | TCG_OPF_COND_BRANCH |
+                          TCG_OPF_NZCV_IN | TCG_OPF_NOT_PRESENT)
+DEF(nzcv_setcond, 1, 0, 2, TCG_OPF_INT | TCG_OPF_NZCV_IN)
+DEF(nzcv_movcond, 1, 2, 1, TCG_OPF_INT | TCG_OPF_NZCV_IN)
+
 /* size changing ops */
 DEF(ext_i32_i64, 1, 1, 0, 0)
 DEF(extu_i32_i64, 1, 1, 0, 0)

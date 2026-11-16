@@ -910,6 +910,20 @@ static void tcg_set_edgesys(Object *obj, bool value, Error **errp)
     tcg_edge_sys = value;
 }
 
+static bool tcg_get_nzcv(Object *obj, Error **errp)
+{
+    return tcg_nzcv;
+}
+
+static void tcg_set_nzcv(Object *obj, bool value, Error **errp)
+{
+    if (value && !tcg_nzcv_host()) {
+        error_setg(errp, "x-nzcv: the host's flags aren't supported here");
+        return;
+    }
+    tcg_nzcv = value;
+}
+
 static bool tcg_get_ccregs(Object *obj, Error **errp)
 {
     return tcg_cc_regs;
@@ -1624,6 +1638,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-edgesys",
         "With x-region, in system mode: check the exit request on the exits "
         "that may close a cycle instead of at every TB entry");
+
+    object_class_property_add_bool(oc, "x-nzcv", tcg_get_nzcv,
+                                   tcg_set_nzcv);
+    object_class_property_set_description(oc, "x-nzcv",
+        "Keep a flag result in the host's condition flags for the "
+        "instructions in its block that read it (aarch64)");
 
     object_class_property_add_bool(oc, "x-ccregs", tcg_get_ccregs,
                                    tcg_set_ccregs);

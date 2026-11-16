@@ -3369,6 +3369,17 @@ void tcg_optimize(TCGContext *s)
         case INDEX_op_brcond:
             done = fold_brcond(&ctx, op);
             break;
+        case INDEX_op_nzcv_add:
+        case INDEX_op_nzcv_sub:
+        case INDEX_op_nzcv_and:
+            /* Not folded: a reader may follow.  W32 zero-extends. */
+            done = fold_masks_z(&ctx, op, op->args[3] & TCG_NZCV_W32
+                                          ? UINT32_MAX : UINT64_MAX);
+            break;
+        case INDEX_op_nzcv_brcond:
+            finish_bb(&ctx);
+            done = finish_folding(&ctx, op);
+            break;
         case INDEX_op_bswap16:
         case INDEX_op_bswap32:
         case INDEX_op_bswap64:
