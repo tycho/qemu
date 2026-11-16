@@ -2079,6 +2079,15 @@ static void ec_process_term(HANDLE h, BOOL after, NTSTATUS status)
             fputs(line, stderr);
             xt_log_text(line);
         }
+        if (xt_exit_report && tcg_nzcv) {
+            char line[80];
+
+            snprintf(line, sizeof(line), "nzcv: %u TBs translated again "
+                     "without the host's flags\n",
+                     qatomic_read(&tcg_nzcv_retries));
+            fputs(line, stderr);
+            xt_log_text(line);
+        }
         if (xt_rcu_stress) {
             char line[64];
 

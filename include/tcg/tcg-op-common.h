@@ -752,6 +752,13 @@ QEMU_ARG_NONNULL void tcg_gen_add_ptr(TCGv_ptr r, TCGv_ptr a, TCGv_ptr b);
 QEMU_ARG_NONNULL void tcg_gen_addi_ptr(TCGv_ptr r, TCGv_ptr a, intptr_t b);
 QEMU_ARG_NONNULL void tcg_gen_mov_ptr(TCGv_ptr d, TCGv_ptr s);
 QEMU_ARG_NONNULL void tcg_gen_movi_ptr(TCGv_ptr d, intptr_t s);
+/* Host condition flags (tcg_nzcv): see tcg-op.c. */
+void tcg_op_set_nzcv(TCGOp *op, bool w32);
+void tcg_gen_nzcv_brcond(int acond, TCGLabel *l);
+void tcg_gen_nzcv_setcond(TCGType type, TCGTemp *dst, int acond, bool neg);
+void tcg_gen_nzcv_movcond(TCGType type, TCGTemp *dst, int acond,
+                          TCGTemp *vt, TCGTemp *vf);
+
 QEMU_ARG_NONNULL void tcg_gen_brcondi_ptr(TCGCond cond, TCGv_ptr a,
                                           intptr_t b, TCGLabel *label);
 QEMU_ARG_NONNULL void tcg_gen_ext_i32_ptr(TCGv_ptr r, TCGv_i32 a);

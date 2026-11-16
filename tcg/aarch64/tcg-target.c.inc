@@ -4791,6 +4791,166 @@ static const TCGOutOpAddSubCarry outop_subbio = {
     .out_rri = tgen_subbio_rri,
 };
 
+/*
+ * INDEX_op_nzcv_*: ADDS, SUBS and ANDS on W registers (TCG_NZCV_W32: the
+ * flags of the low 32 bits, the result zero-extended) or X registers, or
+ * ADD, SUB and AND (TCG_NZCV_NOFLAGS); readers of an aarch64 condition
+ * code.  A constant that fits no immediate goes through
+ * TMP0.  ADDS of -imm sets the same flags as SUBS of imm (and the
+ * reverse): the carry of a + (2^n - imm) is that of a - imm.
+ */
+static void tgen_nzcv_addsub(TCGContext *s, bool sub, TCGReg a0, TCGReg a1,
+                             tcg_target_long a2, bool is_const, unsigned fl)
+{
+    bool w32 = fl & TCG_NZCV_W32;
+    TCGType ext = w32 ? TCG_TYPE_I32 : TCG_TYPE_I64;
+    uint64_t v = w32 ? (uint32_t)a2 : a2;
+    uint64_t nv = w32 ? (uint32_t)-v : -v;
+    /* The S bit: ADDS, SUBS (immediate and register) are ADD, SUB | it. */
+    AArch64Insn sbit = fl & TCG_NZCV_NOFLAGS ? 0 : 1u << 29;
+
+    if (is_const) {
+        if (is_aimm(v) || is_aimm(nv)) {
+            bool neg = !is_aimm(v);
+
+            tcg_out_insn_addsub_imm(s, ((sub ^ neg) ? Iaddsub_imm_SUBI
+                                                    : Iaddsub_imm_ADDI) | sbit,
+                                    ext, a0, a1, neg ? nv : v);
+            return;
+        }
+        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP0, v);
+        a2 = TCG_REG_TMP0;
+    }
+    tcg_out_insn_addsub_shift(s, (sub ? Iaddsub_shift_SUB
+                                      : Iaddsub_shift_ADD) | sbit, ext,
+                              a0, a1, a2);
+}
+
+static void tgen_nzcv_add(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                          TCGReg a2, unsigned fl)
+{
+    tgen_nzcv_addsub(s, false, a0, a1, a2, false, fl);
+}
+
+static void tgen_nzcv_addi(TCGContext *s, TCGType type, TCGReg a0,
+                           TCGReg a1, tcg_target_long a2, unsigned fl)
+{
+    tgen_nzcv_addsub(s, false, a0, a1, a2, true, fl);
+}
+
+static const TCGOutOpNzcvBinary outop_nzcv_add = {
+    .base.static_constraint = C_O1_I2(r, r, ri),
+    .out_rrr = tgen_nzcv_add,
+    .out_rri = tgen_nzcv_addi,
+};
+
+static void tgen_nzcv_sub(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                          TCGReg a2, unsigned fl)
+{
+    tgen_nzcv_addsub(s, true, a0, a1, a2, false, fl);
+}
+
+static void tgen_nzcv_subi(TCGContext *s, TCGType type, TCGReg a0,
+                           TCGReg a1, tcg_target_long a2, unsigned fl)
+{
+    tgen_nzcv_addsub(s, true, a0, a1, a2, true, fl);
+}
+
+static const TCGOutOpNzcvBinary outop_nzcv_sub = {
+    .base.static_constraint = C_O1_I2(r, r, ri),
+    .out_rrr = tgen_nzcv_sub,
+    .out_rri = tgen_nzcv_subi,
+};
+
+static void tgen_nzcv_and(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                          TCGReg a2, unsigned fl)
+{
+    TCGType ext = fl & TCG_NZCV_W32 ? TCG_TYPE_I32 : TCG_TYPE_I64;
+
+    if (fl & TCG_NZCV_NOFLAGS) {
+        tcg_out_insn(s, logic_shift, AND, ext, a0, a1, a2);
+    } else {
+        tcg_out_insn(s, logic_shift, ANDS, ext, a0, a1, a2);
+    }
+}
+
+static void tgen_nzcv_andi(TCGContext *s, TCGType type, TCGReg a0,
+                           TCGReg a1, tcg_target_long a2, unsigned fl)
+{
+    TCGType ext = fl & TCG_NZCV_W32 ? TCG_TYPE_I32 : TCG_TYPE_I64;
+    /* A W register's immediates as TCG_TYPE_I32 takes them: sign-extended. */
+    uint64_t v = ext == TCG_TYPE_I32 ? (int64_t)(int32_t)a2 : a2;
+
+    if (is_limm(v)) {
+        tcg_out_logicali(s, fl & TCG_NZCV_NOFLAGS ? Ilogic_imm_ANDI
+                                                  : Ilogic_imm_ANDSI,
+                         ext, a0, a1, v);
+        return;
+    }
+    tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP0, v);
+    tgen_nzcv_and(s, type, a0, a1, TCG_REG_TMP0, fl);
+}
+
+static const TCGOutOpNzcvBinary outop_nzcv_and = {
+    .base.static_constraint = C_O1_I2(r, r, ri),
+    .out_rrr = tgen_nzcv_and,
+    .out_rri = tgen_nzcv_andi,
+};
+
+static void tcg_out_nzcv_brcond(TCGContext *s, int acond, TCGLabel *l)
+{
+    tcg_out_reloc(s, s->code_ptr, R_AARCH64_CONDBR19, l, 0);
+    tcg_out32(s, Ibcond_imm_B_C | acond);
+}
+
+/* CSET and CSETM: CSINC and CSINV of the zero register, the inverse. */
+static void tgen_nzcv_setcond(TCGContext *s, TCGType type, TCGReg ret,
+                              int acond, bool neg)
+{
+    tcg_out32(s, (neg ? Icsel_CSINV : Icsel_CSINC) |
+              (type == TCG_TYPE_I64) << 31 | TCG_REG_XZR << 16 |
+              (acond ^ 1) << 12 | TCG_REG_XZR << 5 | ret);
+}
+
+static const TCGOutOpNzcvSetcond outop_nzcv_setcond = {
+    .base.static_constraint = C_O1_I0(r),
+    .out = tgen_nzcv_setcond,
+};
+
+static void tgen_nzcv_movcond(TCGContext *s, TCGType type, TCGReg ret,
+                              int acond, TCGReg vt, TCGReg vf)
+{
+    tcg_out32(s, Icsel_CSEL | (type == TCG_TYPE_I64) << 31 | vf << 16 |
+              acond << 12 | vt << 5 | ret);
+}
+
+static const TCGOutOpNzcvMovcond outop_nzcv_movcond = {
+    .base.static_constraint = C_O1_I2(r, rz, rz),
+    .out = tgen_nzcv_movcond,
+};
+
+/* Whether an insn sets NZCV or calls out (tcg_nzcv_check). */
+static bool tcg_target_insn_sets_nzcv(const void *insn)
+{
+    uint32_t w = *(const uint32_t *)insn;
+    uint32_t sf = (w >> 29) & 1;
+
+    return (((w >> 23) & 0x3f) == 0x22 && sf) ||        /* ADDS/SUBS imm */
+           (((w >> 24) & 0x1f) == 0x0b && sf) ||        /* ADDS/SUBS reg */
+           (((w >> 21) & 0xff) == 0xd0 && sf) ||        /* ADCS/SBCS */
+           (((w >> 23) & 0x3f) == 0x24 && ((w >> 29) & 3) == 3) || /* ANDS */
+           (((w >> 24) & 0x1f) == 0x0a && ((w >> 29) & 3) == 3) ||
+           (((w >> 21) & 0xff) == 0xd2 && sf) ||        /* CCMP/CCMN */
+           (w & 0xff20fc00) == 0x1e202000 ||            /* FCMP */
+           (w & 0xff200c00) == 0x1e200400 ||            /* FCCMP */
+           (w & 0xffffffe0) == 0xd51b4200 ||            /* MSR NZCV */
+           (w & 0xfffff0ff) == 0xd500401f ||            /* CFINV, X/AXFLAG */
+           (w & 0xffe07c10) == 0xba000400 ||            /* RMIF */
+           (w & 0xffffbc1f) == 0x3a00080d ||            /* SETF8/16 */
+           (w & 0xfc000000) == 0x94000000 ||            /* BL */
+           (w & 0xfffffc1f) == 0xd63f0000;              /* BLR */
+}
+
 static void tcg_out_set_borrow(TCGContext *s)
 {
     tcg_out_insn(s, addsub_shift, ADDS, TCG_TYPE_I32,

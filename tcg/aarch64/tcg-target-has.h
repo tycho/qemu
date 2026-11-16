@@ -17,6 +17,8 @@
 
 /* qemu_atomic, with FEAT_LSE (its constraint set says) */
 #define TCG_TARGET_HAS_QEMU_ATOMIC
+/* INDEX_op_nzcv_*: flag results kept in NZCV for readers in the block. */
+#define TCG_TARGET_HAS_NZCV
 
 /* tcg_out_pinned_st_pairs, and the slow paths' shared copy of it */
 #define TCG_TARGET_HAS_PINNED_ST_PAIRS

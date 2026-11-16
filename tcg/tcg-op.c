@@ -527,6 +527,54 @@ void tcg_gen_brcond(TCGType type, TCGCond cond, TCGTemp *src1,
     }
 }
 
+/*
+ * Host condition flags (tcg_nzcv, tcg_nzcv_host): an add, sub or and op
+ * already emitted becomes its form that also sets NZCV, from the low 32
+ * bits (w32: its result then zero-extended) or all of them; readers of
+ * an aarch64 condition code, which must find the flags of the last of
+ * those with no op in between that tcg_op_may_set_nzcv.
+ */
+void tcg_op_set_nzcv(TCGOp *op, bool w32)
+{
+    switch (op->opc) {
+    case INDEX_op_add:
+        op->opc = INDEX_op_nzcv_add;
+        break;
+    case INDEX_op_sub:
+        op->opc = INDEX_op_nzcv_sub;
+        break;
+    case INDEX_op_and:
+        op->opc = INDEX_op_nzcv_and;
+        break;
+    case INDEX_op_nzcv_add:
+    case INDEX_op_nzcv_sub:
+    case INDEX_op_nzcv_and:
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    tcg_debug_assert(op->nargs >= 4);
+    op->args[3] = w32 ? TCG_NZCV_W32 : 0;
+}
+
+void tcg_gen_nzcv_brcond(int acond, TCGLabel *l)
+{
+    TCGOp *op = tcg_gen_op2(INDEX_op_nzcv_brcond, 0, acond, label_arg(l));
+
+    add_as_label_use(l, op);
+}
+
+void tcg_gen_nzcv_setcond(TCGType type, TCGTemp *dst, int acond, bool neg)
+{
+    tcg_gen_op3(INDEX_op_nzcv_setcond, type, temp_arg(dst), acond, neg);
+}
+
+void tcg_gen_nzcv_movcond(TCGType type, TCGTemp *dst, int acond,
+                          TCGTemp *vt, TCGTemp *vf)
+{
+    tcg_gen_op_ttti(INDEX_op_nzcv_movcond, type, dst, vt, vf, acond);
+}
+
 void tcg_gen_brcondi(TCGType type, TCGCond cond, TCGTemp *src1,
                      int64_t src2, TCGLabel *l)
 {
