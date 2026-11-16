@@ -3697,6 +3697,15 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         goto illegal_op;
     }
 
+    /*
+     * A lazy rotate's state (CC_OP_COX) is converted to EFLAGS before the
+     * first op of an insn that may convert it after an op that may fault
+     * (gen_flush_cox): every insn but those cox_keeps admits.
+     */
+    if (s->cc_op == CC_OP_COX && !cox_keeps(decode.e.gen)) {
+        gen_flush_cox(s);
+    }
+
     /* After all of the insn's bytes are fetched: no restart past here. */
     if (decode.cr0_check) {
         /* As in validate_cr0_exceptions: EM first, not for VEX insns. */
@@ -3862,7 +3871,8 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
     } else {
         cc_live = 0;
     }
-    if (decode.cc_op != CC_OP_DYNAMIC && !cc_op_lazy(decode.cc_op)) {
+    if (decode.cc_op != CC_OP_DYNAMIC && !cc_op_lazy(decode.cc_op) &&
+        decode.cc_op != CC_OP_COX) {
         assert(!decode.cc_op_dynamic);
         assert(!!decode.cc_dst == !!(cc_live & USES_CC_DST));
         assert(!!decode.cc_src == !!(cc_live & USES_CC_SRC));

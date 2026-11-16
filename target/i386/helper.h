@@ -7,6 +7,8 @@ DEF_HELPER_FLAGS_3(cc_compute_nz, TCG_CALL_NO_RWG_SE | TCG_CALL_NO_VREG,
                    tl, tl, tl, int)
 DEF_HELPER_FLAGS_5(cc_compute_all2, TCG_CALL_NO_RWG_SE | TCG_CALL_NO_VREG,
                    tl, tl, tl, tl, tl, int)
+DEF_HELPER_FLAGS_5(cc_compute_all_cox, TCG_CALL_NO_RWG_SE | TCG_CALL_NO_VREG,
+                   tl, tl, tl, tl, tl, int)
 DEF_HELPER_FLAGS_5(cc_compute_c2, TCG_CALL_NO_RWG_SE | TCG_CALL_NO_VREG,
                    tl, tl, tl, tl, tl, int)
 

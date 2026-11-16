@@ -3432,7 +3432,8 @@ static void gen_bt_flags(DisasContext *s, X86DecodedInsn *decode, TCGv src,
      * C is the result of the test, Z is unchanged, and the others
      * are all undefined.
      */
-    if (s->cc_op == CC_OP_DYNAMIC || CC_OP_HAS_EFLAGS(s->cc_op)) {
+    if (s->cc_op == CC_OP_DYNAMIC || CC_OP_HAS_EFLAGS(s->cc_op) ||
+        s->cc_op == CC_OP_COX) {
         /* Generate EFLAGS and replace the C bit.  */
         cf = tcg_temp_new();
         tcg_gen_setcond_tl(TCG_COND_TSTNE, cf, src, mask);
@@ -6407,6 +6408,34 @@ static void gen_rot_carry(X86DecodedInsn *decode, TCGv result,
     }
 }
 
+/*
+ * tcg_lazy_rot: a rotate by a nonzero count after a known state for the
+ * other flags leaves that state (CC_OP_COX) instead of computing EFLAGS.
+ * Its CF and OF go to decode->cc_dst and decode->cc_src2, as with
+ * gen_eflags_adcox, and gen_rot_lazy_end packs them into CC_DST2.
+ */
+static bool gen_rot_lazy_begin(DisasContext *s, X86DecodedInsn *decode,
+                               bool can_be_zero)
+{
+    if (!tcg_lazy_rot || can_be_zero ||
+        !(s->cc_op == CC_OP_COX || cc_op_cox_base(s->cc_op))) {
+        gen_eflags_adcox(s, decode, false, can_be_zero);
+        return false;
+    }
+    decode->cc_dst = tcg_temp_new();
+    decode->cc_src2 = tcg_temp_new();
+    return true;
+}
+
+static void gen_rot_lazy_end(X86DecodedInsn *decode)
+{
+    decode->cc_dst2 = tcg_temp_new();
+    tcg_gen_deposit_tl(decode->cc_dst2, decode->cc_dst, decode->cc_src2, 1, 1);
+    decode->cc_dst = NULL;
+    decode->cc_src2 = NULL;
+    decode->cc_op = CC_OP_COX;
+}
+
 static void gen_ROL(DisasContext *s, X86DecodedInsn *decode)
 {
     bool can_be_zero;
@@ -6414,12 +6443,13 @@ static void gen_ROL(DisasContext *s, X86DecodedInsn *decode)
     MemOp ot = gen_shift_count(s, decode, &can_be_zero, &count, decode->op[2].unit);
     TCGv_i32 temp32, count32;
     TCGv old = tcg_temp_new();
+    bool lazy;
 
     if (!count) {
         return;
     }
 
-    gen_eflags_adcox(s, decode, false, can_be_zero);
+    lazy = gen_rot_lazy_begin(s, decode, can_be_zero);
     tcg_gen_mov_tl(old, s->T0);
     temp32 = gen_rot_replicate(ot, s->T0);
     if (temp32) {
@@ -6433,6 +6463,9 @@ static void gen_ROL(DisasContext *s, X86DecodedInsn *decode)
     }
     gen_rot_carry(decode, s->T0, can_be_zero, count, 0);
     gen_rot_overflow(decode, s->T0, old, can_be_zero, count);
+    if (lazy) {
+        gen_rot_lazy_end(decode);
+    }
 }
 
 static void gen_ROR(DisasContext *s, X86DecodedInsn *decode)
@@ -6442,12 +6475,13 @@ static void gen_ROR(DisasContext *s, X86DecodedInsn *decode)
     MemOp ot = gen_shift_count(s, decode, &can_be_zero, &count, decode->op[2].unit);
     TCGv_i32 temp32, count32;
     TCGv old = tcg_temp_new();
+    bool lazy;
 
     if (!count) {
         return;
     }
 
-    gen_eflags_adcox(s, decode, false, can_be_zero);
+    lazy = gen_rot_lazy_begin(s, decode, can_be_zero);
     tcg_gen_mov_tl(old, s->T0);
     temp32 = gen_rot_replicate(ot, s->T0);
     if (temp32) {
@@ -6462,6 +6496,9 @@ static void gen_ROR(DisasContext *s, X86DecodedInsn *decode)
         gen_rot_carry(decode, s->T0, can_be_zero, count, TARGET_LONG_BITS - 1);
     }
     gen_rot_overflow(decode, s->T0, old, can_be_zero, count);
+    if (lazy) {
+        gen_rot_lazy_end(decode);
+    }
 }
 
 static void gen_RORX(DisasContext *s, X86DecodedInsn *decode)
@@ -6532,23 +6569,33 @@ static void gen_shift_dynamic_flags(DisasContext *s, X86DecodedInsn *decode, TCG
     decode->cc_op = CC_OP_DYNAMIC;
     decode->cc_op_dynamic = tcg_temp_new_i32();
 
+    CCOp old = s->cc_op;
+    TCGv old_src = cpu_cc_src;
+
+    /* A lazy rotate's state can't be kept at run time: its EFLAGS. */
+    if (old == CC_OP_COX) {
+        old = CC_OP_EFLAGS;
+        old_src = tcg_temp_new();
+        gen_mov_eflags(s, old_src);
+    }
+
     assert(decode->cc_dst == s->T0);
-    if (cc_op_live(s->cc_op) & USES_CC_DST) {
+    if (cc_op_live(old) & USES_CC_DST) {
         decode->cc_dst = tcg_temp_new();
         tcg_gen_movcond_tl(TCG_COND_EQ, decode->cc_dst, count, tcg_constant_tl(0),
                            cpu_cc_dst, s->T0);
     }
 
-    if (cc_op_live(s->cc_op) & USES_CC_SRC) {
+    if (cc_op_live(old) & USES_CC_SRC) {
         tcg_gen_movcond_tl(TCG_COND_EQ, decode->cc_src, count, tcg_constant_tl(0),
-                           cpu_cc_src, decode->cc_src);
+                           old_src, decode->cc_src);
     }
 
     tcg_gen_trunc_tl_i32(count32, count);
-    if (s->cc_op == CC_OP_DYNAMIC || cc_op_lazy(s->cc_op)) {
+    if (old == CC_OP_DYNAMIC || cc_op_lazy(old)) {
         old_cc_op = cpu_cc_op;
     } else {
-        old_cc_op = tcg_constant_i32(s->cc_op);
+        old_cc_op = tcg_constant_i32(old);
     }
     tcg_gen_movcond_i32(TCG_COND_EQ, decode->cc_op_dynamic, count32, tcg_constant_i32(0),
                         old_cc_op, tcg_constant_i32(cc_op));
@@ -8346,4 +8393,26 @@ static void gen_XSAVEOPT(DisasContext *s, X86DecodedInsn *decode)
 
     tcg_gen_concat_tl_i64(features, cpu_regs[R_EAX], cpu_regs[R_EDX]);
     gen_helper_xsave(tcg_env, s->A0, features);
+}
+
+/*
+ * The insns that may keep a lazy rotate's state (CC_OP_COX) or read it:
+ * none of them converts it to EFLAGS (gen_flush_cox) with an op that may
+ * fault both before and after the conversion.  Readers convert only for
+ * PF, BE, L or LE, and after their own loads (CMOVcc) or with no access
+ * at all (Jcc, SETcc to a register; SETcc to memory reads into a temp).
+ */
+static bool cox_keeps(X86GenFunc gen)
+{
+    return gen == gen_MOV || gen == gen_LEA || gen == gen_PUSH ||
+           gen == gen_POP || gen == gen_XCHG || gen == gen_CBW ||
+           gen == gen_CWD || gen == gen_NOT || gen == gen_NEG ||
+           gen == gen_ADD || gen == gen_ADC || gen == gen_SUB ||
+           gen == gen_SBB || gen == gen_AND || gen == gen_OR ||
+           gen == gen_XOR || gen == gen_CMP || gen == gen_TEST ||
+           gen == gen_INC || gen == gen_DEC || gen == gen_ROL ||
+           gen == gen_ROR || gen == gen_SHL || gen == gen_SHR ||
+           gen == gen_SAR || gen == gen_IMUL || gen == gen_IMUL3 ||
+           gen == gen_MUL || gen == gen_Jcc || gen == gen_SETcc ||
+           gen == gen_CMOVcc;
 }

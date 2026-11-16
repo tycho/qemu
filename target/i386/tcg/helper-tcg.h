@@ -57,6 +57,9 @@ static inline target_long lshift(target_long x, int n)
 
 /* translate.c */
 void tcg_x86_init(void);
+target_ulong x86_cc_compute_all_cox(target_ulong dst, target_ulong src1,
+                                    target_ulong src2, target_ulong dst2,
+                                    int op);
 void x86_translate_code(CPUState *cs, TranslationBlock *tb,
                         int *max_insns, vaddr pc, void *host_pc);
 

@@ -159,6 +159,8 @@ typedef struct DisasContext {
     bool cc_keep;
 
     CCOp cc_op;  /* current CC operation */
+    CCOp cox_base;  /* with cc_op CC_OP_COX, the earlier operation */
+    bool in_insn;   /* within disas_insn (jmpbuf is set) */
     /*
      * tcg_nzcv (nzcv_on for this TB): the op of the last 32- or 64-bit
      * ADD, SUB or AND (nzcv_prod, recorded by gen_nzcv_alu, nzcv_w32 for
@@ -392,6 +394,7 @@ static const uint8_t cc_op_live_[] = {
     [CC_OP_SBB_SELF] = USES_CC_DST,
     [CC_OP_INCLB ... CC_OP_DECLQ] =
         USES_CC_DST | USES_CC_SRC | USES_CC_SRC2 | USES_CC_DST2,
+    [CC_OP_COX] = USES_CC_DST | USES_CC_SRC | USES_CC_SRC2 | USES_CC_DST2,
 };
 
 /* A lazy INC/DEC: CC_OP holds the earlier operation too (cpu.h). */
@@ -416,6 +419,16 @@ static uint8_t cc_op_live(CCOp op)
         result |= USES_CC_DST2;
     }
     return result;
+}
+
+/*
+ * tcg_lazy_rot: the operations a lazy rotate keeps for SF, ZF, AF and PF,
+ * whose ZF and SF come from CC_DST alone.
+ */
+static bool cc_op_cox_base(CCOp op)
+{
+    return (op >= CC_OP_ADDB && op <= CC_OP_LOGICQ) ||
+           (op >= CC_OP_SHLB && op <= CC_OP_SARQ);
 }
 
 /* x-flags=dead: in user mode, and not with RF or single-stepping. */
@@ -468,6 +481,9 @@ static void set_cc_op_1(DisasContext *s, CCOp op, bool dirty)
         tcg_gen_discard_i32(cpu_cc_op);
     }
     s->cc_op_dirty = dirty;
+    if (op == CC_OP_COX) {
+        s->cox_base = s->cc_op;
+    }
     s->cc_op = op;
     s->cc_op_guess = CC_OP_DYNAMIC;
 }
@@ -576,9 +592,52 @@ static void gen_vexzero_flush(DisasContext *s)
     }
 }
 
+/* Whether an op since the current insn's start may fault or call out. */
+static bool insn_may_have_faulted(DisasContext *s)
+{
+    for (TCGOp *op = QTAILQ_NEXT(s->base.insn_start, link); op;
+         op = QTAILQ_NEXT(op, link)) {
+        if (op->opc == INDEX_op_call ||
+            (tcg_op_defs[op->opc].flags & TCG_OPF_SIDE_EFFECTS)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * A lazy rotate's state is never stored: EFLAGS instead, computed from
+ * its operands into CC_SRC.  Within an insn, a fault must restore the
+ * state that the insn's record names.  Before anything that may fault,
+ * the record becomes EFLAGS.  After it, the record keeps the lazy state:
+ * only the insns cox_keeps admits get here, and none of them may fault
+ * after converting.  Every other insn converts before its first op.
+ */
+static void gen_mov_eflags(DisasContext *s, TCGv reg);
+
+static void gen_flush_cox(DisasContext *s)
+{
+    bool first = s->in_insn && !insn_may_have_faulted(s);
+
+    /*
+     * Not set_cc_op: a condition prepared from CC_DST and CC_DST2 may be
+     * evaluated after this, so nothing is discarded.
+     */
+    gen_mov_eflags(s, cpu_cc_src);
+    s->cc_op = CC_OP_EFLAGS;
+    s->cc_op_dirty = true;
+    s->nzcv_valid = false;
+    if (first) {
+        tcg_set_insn_start_param(s->base.insn_start, 1, CC_OP_EFLAGS);
+    }
+}
+
 static void gen_update_cc_op(DisasContext *s)
 {
     gen_vexzero_flush(s);
+    if (s->cc_op == CC_OP_COX) {
+        gen_flush_cox(s);
+    }
     if (s->cc_op_dirty) {
         tcg_gen_movi_i32(cpu_cc_op, s->cc_op);
         s->cc_op_dirty = false;
@@ -1024,6 +1083,16 @@ static void gen_mov_eflags(DisasContext *s, TCGv reg)
         return;
     }
 
+    if (s->cc_op == CC_OP_COX) {
+        live = cc_op_live(s->cox_base);
+        gen_helper_cc_compute_all_cox(reg,
+            live & USES_CC_DST ? cpu_cc_dst : tcg_constant_tl(0),
+            live & USES_CC_SRC ? cpu_cc_src : tcg_constant_tl(0),
+            live & USES_CC_SRC2 ? cpu_cc_src2 : tcg_constant_tl(0),
+            cpu_cc_dst2, tcg_constant_i32(s->cox_base));
+        return;
+    }
+
     dst = cpu_cc_dst;
     src1 = cpu_cc_src;
     src2 = cpu_cc_src2;
@@ -1061,6 +1130,10 @@ static void gen_mov_eflags(DisasContext *s, TCGv reg)
 /* compute all eflags to cc_src */
 static void gen_compute_eflags(DisasContext *s)
 {
+    if (s->cc_op == CC_OP_COX) {
+        gen_flush_cox(s);
+        return;
+    }
     gen_mov_eflags(s, cpu_cc_src);
     set_cc_op(s, CC_OP_EFLAGS);
 }
@@ -1282,6 +1355,10 @@ static CCPrepare gen_prepare_eflags_c(DisasContext *s, TCGv reg)
         return (CCPrepare) { .cond = TCG_COND_TSTNE,
                              .reg = cpu_cc_src, .imm = CC_C };
 
+    case CC_OP_COX:
+        return (CCPrepare) { .cond = TCG_COND_TSTNE,
+                             .reg = cpu_cc_dst2, .imm = 1 };
+
     default:
         /*
          * The need to compute only C from CC_OP_DYNAMIC is important
@@ -1323,6 +1400,8 @@ static CCPrepare gen_prepare_eflags_s(DisasContext *s, TCGv reg)
         return (CCPrepare) { .cond = TCG_COND_NEVER, .reg = cpu_cc_dst };
     case CC_OP_CCMPB ... CC_OP_CCMPQ:
         return gen_prepare_sign_nz(cpu_cc_src2, cc_op_size(s->cc_op));
+    case CC_OP_COX:
+        return gen_prepare_sign_nz(cpu_cc_dst, cc_op_size(s->cox_base));
     default:
         return gen_prepare_sign_nz(cpu_cc_dst, cc_op_size(s->cc_op));
     }
@@ -1336,6 +1415,9 @@ static CCPrepare gen_prepare_eflags_o(DisasContext *s, TCGv reg)
     case CC_OP_ADCOX:
         return (CCPrepare) { .cond = TCG_COND_NE, .reg = cpu_cc_src2,
                              .rhs_type = CC_PREPARE_DIRECT };
+    case CC_OP_COX:
+        return (CCPrepare) { .cond = TCG_COND_TSTNE, .reg = cpu_cc_dst2,
+                             .imm = 2 };
     case CC_OP_SBB_SELF:
     case CC_OP_LOGICB ... CC_OP_LOGICQ:
     case CC_OP_POPCNT:
@@ -1386,6 +1468,8 @@ static CCPrepare gen_prepare_eflags_z(DisasContext *s, TCGv reg)
         return (CCPrepare) { .cond = TCG_COND_EQ, .reg = reg, .imm = 0 };
     case CC_OP_POPCNT:
         return (CCPrepare) { .cond = TCG_COND_EQ, .reg = cpu_cc_dst };
+    case CC_OP_COX:
+        return gen_prepare_val_nz(cpu_cc_dst, cc_op_size(s->cox_base), true);
     default:
         {
             MemOp size = cc_op_size(s->cc_op);
@@ -2883,6 +2967,7 @@ static int region_entry_cc_op(DisasContext *s)
     case CC_OP_DYNAMIC:
     case CC_OP_ADCB ... CC_OP_ADCQ:
     case CC_OP_SBBB ... CC_OP_SBBQ:
+    case CC_OP_COX:
         return -1;
     default:
         return cc_op_lazy(s->cc_op) ? -1 : s->cc_op;
@@ -4798,6 +4883,11 @@ static bool x86_cache_cc_op_ok(uint64_t op)
         || op == CC_OP_SBB_SELF) {
         return true;
     }
+    /* A lazy rotate: its earlier operation in bits 8 to 15. */
+    if ((op & 0xff) == CC_OP_COX && !(op >> 16)) {
+        op >>= 8;
+        return cc_op_cox_base(op) && (op & 3) <= MO_TL;
+    }
     return op >= CC_OP_FIRST_BWLQ && op <= CC_OP_CCMPQ && (op & 3) <= MO_TL;
 }
 
@@ -5093,6 +5183,8 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     g_assert(GUEST(dc) == ((flags & HF_GUEST_MASK) != 0));
 
     dc->cc_op = CC_OP_DYNAMIC;
+    dc->cox_base = CC_OP_DYNAMIC;
+    dc->in_insn = false;
     dc->nzcv_on = tcg_nzcv && !tcg_ctx->nzcv_retry;
     dc->nzcv_pending = dc->nzcv_valid = false;
     dc->cc_op_dirty = false;
@@ -5179,7 +5271,9 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     }
     /* A lazy INC/DEC's CC_OP is already in env, set at run time. */
     tcg_gen_insn_start(pc_arg,
-                       cc_op_lazy(dc->cc_op) ? CC_OP_DYNAMIC : dc->cc_op,
+                       cc_op_lazy(dc->cc_op) ? CC_OP_DYNAMIC :
+                       dc->cc_op == CC_OP_COX ?
+                       CC_OP_COX | dc->cox_base << 8 : dc->cc_op,
                        (uint64_t)dc->ymmh_pending << X86_INSN_YMMH_SHIFT);
 }
 
@@ -5208,12 +5302,16 @@ static void i386_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 
     switch (sigsetjmp(dc->jmpbuf, 0)) {
     case 0:
+        dc->in_insn = true;
         disas_insn(dc, cpu);
+        dc->in_insn = false;
         break;
     case 1:
+        dc->in_insn = false;
         gen_exception_gpf(dc);
         break;
     case 2:
+        dc->in_insn = false;
         /* Restore state that may affect the next instruction. */
         dc->pc = dc->base.pc_next;
         assert(dc->cc_op_dirty == orig_cc_op_dirty);
