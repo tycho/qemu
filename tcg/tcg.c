@@ -2988,6 +2988,7 @@ void tcg_prologue_init(void)
 
 void tcg_func_start(TCGContext *s)
 {
+    memset(s->slot_key, 0, sizeof(s->slot_key));
     /* A captured translation: this translation attempt's front-end state. */
     s->cap_excl = 0;
     s->cap_next = 0;
@@ -3478,6 +3479,7 @@ TCGTemp *tcgv_i32_temp(TCGv_i32 v)
 bool tcg_flags_guess;
 bool tcg_flags_dead;
 bool tcg_lazy_incdec;
+bool tcg_ccentry;
 
 bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
 {
@@ -12295,6 +12297,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         tb->jmp[n].insn_offset = TB_JMP_OFFSET_INVALID;
         tb->jmp[n].cond = 0;
         tb->jmp[n].dead = 0;
+        tb->jmp[n].key = n < ARRAY_SIZE(s->slot_key) ? s->slot_key[n] : 0;
     }
     tb->jmp_call = 0;
     tb->jmp_cold = 0;

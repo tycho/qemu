@@ -2961,7 +2961,13 @@ void ec_dispatch(XtThread *t, XtEcFrame *f)
          * can't.  The next round trip goes on through the link.
          */
         if (last_tb) {
-            tb = cpu_exec_tb_cached(cs, cpu_exec_tb_state(cs));
+            TCGTBCPUState s = cpu_exec_tb_state(cs);
+
+            /* A keyed exit links only to the TB with its key. */
+            tb = cpu_exec_tb_keyed(cs, last_tb, tb_exit, s);
+            if (!tb) {
+                tb = cpu_exec_tb_cached(cs, s);
+            }
             if (tb) {
                 cpu_exec_tb_link(last_tb, tb_exit, tb);
             }

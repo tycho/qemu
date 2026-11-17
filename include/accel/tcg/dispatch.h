@@ -57,6 +57,16 @@ void cpu_exec_tb_link(TranslationBlock *last_tb, int tb_exit,
                       TranslationBlock *tb);
 
 /*
+ * tcg_ccentry: when exit @tb_exit of @last_tb is keyed, the TB at the
+ * state @s with its key (the hash table, not the jump cache), translated
+ * if missing (so a longjmp destination must be ready); NULL for an
+ * unkeyed exit or a destination that isn't guest code.
+ * cpu_exec_tb_link() refuses to link a keyed exit to any other TB.
+ */
+TranslationBlock *cpu_exec_tb_keyed(CPUState *cpu, TranslationBlock *last_tb,
+                                    int tb_exit, TCGTBCPUState s);
+
+/*
  * The loop's handling of a pending exception (cpu->exception_index),
  * before anything else runs: true, with the trap number cpu_exec() would
  * return in *@excp and the exception consumed, if there is one to leave

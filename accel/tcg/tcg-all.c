@@ -135,6 +135,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-ijguard", "on" },
         /* Inactive but for i386 guests with no guest base. */
         { "x-zext32", "on" },
+        { "x-ccentry", "on" },
 #endif
         { "x-sysret", "on" },
         { "x-xpage", "stub" },
@@ -1245,6 +1246,16 @@ static void tcg_set_lazy_incdec(Object *obj, bool value, Error **errp)
     tcg_lazy_incdec = value;
 }
 
+static bool tcg_get_ccentry(Object *obj, Error **errp)
+{
+    return tcg_ccentry;
+}
+
+static void tcg_set_ccentry(Object *obj, bool value, Error **errp)
+{
+    tcg_ccentry = value;
+}
+
 static bool tcg_get_region_entry(Object *obj, Error **errp)
 {
     return tcg_region_entry;
@@ -1801,6 +1812,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-lazyinc",
         "x86: INC and DEC after an unknown flags state keep that state "
         "for CF rather than computing it");
+
+    object_class_property_add_bool(oc, "x-ccentry",
+                                   tcg_get_ccentry, tcg_set_ccentry);
+    object_class_property_set_description(oc, "x-ccentry",
+        "x86 user mode: a direct jump with its flags state known at "
+        "translation links to a TB translated for that state, and stores "
+        "the state only when unlinked");
 
     object_class_property_add_str(oc, "x-superblock",
                                   tcg_get_superblock, tcg_set_superblock);

@@ -501,6 +501,11 @@ struct TCGContext {
     TCGTemp *frame_temp;
 
     TranslationBlock *gen_tb;     /* tb for which code is being generated */
+    /*
+     * tcg_ccentry: each goto_tb slot's entry key (TBJmpSlot.key), set by
+     * the front end, 0 by default.  Indexed by slot (< 8).
+     */
+    uint8_t slot_key[8];
     tcg_insn_unit *code_buf;      /* pointer for start of tb */
     tcg_insn_unit *code_ptr;      /* pointer for running end of tb */
 

@@ -1369,7 +1369,10 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
      * With tcg_region, a TB may branch back to its first insn instead
      * of chaining to itself.  Not with icount (the budget is charged per
      * TB entry), plugins (they count TB executions) or without an exit
-     * check.
+     * check.  A keyed TB (tcg_ccentry) holds one block and is no region's
+     * head; it loops back to its first insn only with its entry state (the
+     * front end's choice), so an exit request there finds the key's state
+     * (the target's synchronize_from_tb).
      */
     db->loop_label = NULL;
     db->region = NULL;
@@ -1391,10 +1394,15 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         }
     }
     is_head = db->region_capable && tcg_superblock && region_cap >= 0
+              && !(tcg_ccentry && tb_entry_key(tb))
               && translator_region_is_head(tb_page_addr0(tb));
 #ifdef CONFIG_USER_ONLY
+    /*
+     * A keyed TB (tcg_ccentry) holds one block: keyed copies of units
+     * would translate their blocks again for each entry state.
+     */
     unit = db->region_capable && region_cap >= 0 && !is_head
-           && tcg_units > 1;
+           && tcg_units > 1 && !(tcg_ccentry && tb_entry_key(tb));
 #endif
     if (is_head) {
         tcg_cache_exclude(tcg_ctx, TCG_CACHE_X_REGION);

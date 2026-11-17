@@ -97,15 +97,24 @@ static TCGTBCPUState x86_get_tb_cpu_state(CPUState *cs)
 static void x86_cpu_synchronize_from_tb(CPUState *cs,
                                         const TranslationBlock *tb)
 {
+    CPUX86State *env = cpu_env(cs);
+
     /* The instruction pointer is always up to date with CF_PCREL. */
     if (!(tb_cflags(tb) & CF_PCREL)) {
-        CPUX86State *env = cpu_env(cs);
-
         if (tb->flags & HF_CS64_MASK) {
             env->eip = tb->pc;
         } else {
-            env->eip = (uint32_t)(tb->pc - tb->cs_base);
+            env->eip = (uint32_t)(tb->pc - (uint32_t)tb->cs_base);
         }
+    }
+    /*
+     * A keyed TB (tcg_ccentry), left before its first insn (an exit
+     * request, a stale SMC check): its entry flags state, which the jump
+     * into it didn't store.  A keyed TB has no internal loop, so nothing
+     * leaves it this way after running insns.
+     */
+    if (tb_entry_key(tb)) {
+        env->cc_op = tb_entry_key(tb) - 1;
     }
 }
 
@@ -125,7 +134,7 @@ static void x86_restore_state_to_opc(CPUState *cs,
          * stay the same across the translation block.  Add the CS base back before
          * replacing the low bits, and subtract it below just like for !CF_PCREL.
          */
-        uint64_t pc = env->eip + tb->cs_base;
+        uint64_t pc = env->eip + (uint32_t)tb->cs_base;
         new_pc = (pc & TARGET_PAGE_MASK) | data[0];
     } else {
         new_pc = data[0];
@@ -133,7 +142,7 @@ static void x86_restore_state_to_opc(CPUState *cs,
     if (tb->flags & HF_CS64_MASK) {
         env->eip = new_pc;
     } else {
-        env->eip = (uint32_t)(new_pc - tb->cs_base);
+        env->eip = (uint32_t)(new_pc - (uint32_t)tb->cs_base);
     }
 
     if (cc_op != CC_OP_DYNAMIC) {

@@ -85,6 +85,7 @@ enum {
     TCG_CACHE_X_TORN,       /* a guest byte read twice, differently */
     TCG_CACHE_X_SPAN,       /* a guest read outside the TB's two pages */
     TCG_CACHE_X_FAKE,       /* bytes not read from guest memory */
+    TCG_CACHE_X_CCENTRY,    /* a keyed TB or slot (tcg_ccentry) */
     TCG_CACHE_X_FRONT_MAX,
     /* Back end */
     TCG_CACHE_X_UNKNOWN_REF = TCG_CACHE_X_FRONT_MAX, /* outward, no meaning */
