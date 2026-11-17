@@ -4654,7 +4654,7 @@ static void gen_JCXZ(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_JMP(DisasContext *s, X86DecodedInsn *decode)
 {
-    gen_update_cc_op(s);
+    gen_update_cc_op_exit(s);
     gen_jmp_rel(s, s->dflag, decode->immediate, 0);
 }
 

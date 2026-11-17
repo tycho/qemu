@@ -654,6 +654,13 @@ extern bool tcg_flags_dead;
 extern bool tcg_lazy_incdec;
 
 /*
+ * x86 user mode: a direct jump whose flags state is known at translation
+ * links only to a TB translated for that state (its key in the TB's
+ * cs_base, tb_entry_key), and stores the state only on its unlinked path.
+ */
+extern bool tcg_ccentry;
+
+/*
  * x86 guests: what a CR3 write flushes from the softmmu TLB (the TCG
  * accelerator property x-cr3-flush).
  */
