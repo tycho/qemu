@@ -134,6 +134,7 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-ijguard", "on" },
         /* Inactive but for i386 guests with no guest base. */
         { "x-zext32", "on" },
+        { "x-ccentry", "on" },
 #endif
         { "x-sysret", "on" },
         { "x-xpage", "stub" },
