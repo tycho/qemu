@@ -232,11 +232,29 @@ struct TranslationBlock {
         uint32_t cond;
         /* 1 + the slot of its tcg_gen_goto_tb_dead(), or 0. */
         uint8_t dead;
+        /*
+         * tcg_ccentry: the entry key (tb_entry_key) a TB must have for
+         * this slot to link to it, or 0: the slot doesn't leave the
+         * target's entry state in the CPU state when linked.
+         */
+        uint8_t key;
         uintptr_t target_addr;  /* target address */
         uintptr_t list_next;
         uintptr_t dest;
     } jmp[];
 };
+
+/*
+ * tcg_ccentry: the target's entry key of @tb (x86: its entry flags state
+ * + 1), kept in cs_base's bits 32-39, which targets that use it leave
+ * free; 0 for an ordinary TB.
+ */
+#define TB_ENTRY_KEY_SHIFT 32
+
+static inline unsigned tb_entry_key(const TranslationBlock *tb)
+{
+    return (tb->cs_base >> TB_ENTRY_KEY_SHIFT) & 0xff;
+}
 
 /* The bytes a TB struct with @nb_slots goto_tb slots takes. */
 static inline size_t tb_struct_size(unsigned nb_slots)
