@@ -329,6 +329,7 @@ STUB_HELPER(write_crN, TCGv_env env, TCGv_i32 reg, TCGv val)
 static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
                         int tb_num);
 static void gen_jmp_rel_csize(DisasContext *s, int diff, int tb_num);
+static void gen_update_cc_op_exit(DisasContext *s);
 static void gen_exception_gpf(DisasContext *s);
 
 /* i386 shift ops */
@@ -1642,7 +1643,7 @@ static inline void gen_jcc(DisasContext *s, int b, TCGLabel *l1)
     CCPrepare cc;
 
     if (ac >= 0) {
-        gen_update_cc_op(s);
+        gen_update_cc_op_exit(s);
         tcg_gen_nzcv_brcond(ac, l1);
         return;
     }
@@ -1651,9 +1652,10 @@ static inline void gen_jcc(DisasContext *s, int b, TCGLabel *l1)
     /*
      * Note that this must be _after_ gen_prepare_cc, because it can change
      * the cc_op to CC_OP_EFLAGS (because it's CC_OP_DYNAMIC or because
-     * it's cheaper to just compute the flags)!
+     * it's cheaper to just compute the flags)!  Both ways are gen_jmp_rel,
+     * which stores cc_op where it must (gen_update_cc_op_exit).
      */
-    gen_update_cc_op(s);
+    gen_update_cc_op_exit(s);
     tcg_gen_brcond_tl(cc.cond, cc.reg, cc.reg2, l1);
 }
 
@@ -2887,16 +2889,68 @@ static int region_entry_cc_op(DisasContext *s)
     }
 }
 
-/* Jump to eip+diff, truncating the result to OT. */
+/*
+ * tcg_ccentry: whether a goto_tb exit with the current flags state may be
+ * keyed: linked only to a TB translated for this state, which the exit then
+ * stores on its unlinked path alone.  User mode; not with plugins (a TB
+ * callback before the first insn would see env's stale state), CF_PCREL,
+ * or x-flags=dead's goto_tb_dead slots.
+ */
+static bool ccentry_keyable(DisasContext *s)
+{
+#ifdef CONFIG_USER_ONLY
+    return tcg_ccentry && s->jmp_opt && !s->base.plugin_enabled &&
+           !(tb_cflags(s->base.tb) & CF_PCREL) && !use_flags_dead(s) &&
+           region_entry_cc_op(s) >= 0;
+#else
+    return false;
+#endif
+}
+
+/*
+ * Before a direct jump's gen_jmp_rel: the state's normalization, and its
+ * store only if the jump can't be keyed; gen_jmp_rel stores it on every
+ * path that needs it.  A unit's or region's branches store it first: a
+ * branch between its blocks is a two-op stub (region_stub_pass), which a
+ * store on the taken side would keep in place.
+ */
+static void gen_update_cc_op_exit(DisasContext *s)
+{
+    if (ccentry_keyable(s) && !s->base.region) {
+        gen_vexzero_flush(s);
+    } else {
+        gen_update_cc_op(s);
+    }
+}
+
+static void gen_jmp_rel_1(DisasContext *s, MemOp ot, target_long diff,
+                          int tb_num);
+
+/*
+ * Jump to eip+diff, truncating the result to OT.  A store of cc_op it
+ * emits is on that jump's path alone: what follows (a Jcc's other way, a
+ * miss path) still has it to store.
+ */
 static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
                         int tb_num)
+{
+    bool dirty = s->cc_op_dirty;
+
+    gen_jmp_rel_1(s, ot, diff, tb_num);
+    s->cc_op_dirty = dirty;
+}
+
+static void gen_jmp_rel_1(DisasContext *s, MemOp ot, target_long diff,
+                          int tb_num)
 {
     bool use_goto_tb = s->jmp_opt;
     target_ulong mask = -1;
     target_ulong new_pc = s->pc + diff;
     target_ulong new_eip = new_pc - s->cs_base;
+    /* gen_update_cc_op_exit left cc_op unstored for a keyed slot. */
+    unsigned key = ccentry_keyable(s) ? region_entry_cc_op(s) + 1 : 0;
 
-    assert(!s->cc_op_dirty);
+    assert(!s->cc_op_dirty || key);
 
     /* In 64-bit mode, operand size is fixed at 64 bits. */
     if (!CODE64(s)) {
@@ -2932,6 +2986,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
      * (an import's x64 view jumps straight to its native function).
      */
     if (s->jmp_opt && translator_use_foreign_call(&s->base, new_pc)) {
+        gen_update_cc_op(s);
         s->rs_call = false;
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
             tcg_gen_movi_tl(cpu_eip, new_eip);
@@ -2954,6 +3009,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
         TCGLabel *reset = gen_new_label();
         TCGLabel *req;
 
+        gen_update_cc_op(s);
         s->rs_call = false;
         tcg_gen_push_ret(rs_push_key(s), land, NULL, rs_tag(s));
         req = translator_edge_check(&s->base, new_pc);
@@ -2992,9 +3048,11 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
              * Within a multi-block region: branch to the destination's
              * block; a backward branch checks the exit request first and
              * leaves the TB through the code below if one is pending.
+             * Region blocks take cc_op from env.
              */
             TCGLabel *exit = backward ? gen_new_label() : NULL;
 
+            gen_update_cc_op(s);
             if (exit) {
                 translator_exit_check(&s->base, exit);
             }
@@ -3007,7 +3065,18 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
         }
     }
 
+    /* A loop back to the TB's start finds cc_op in env (not keyed TBs'). */
+    if (s->base.loop_label && !tb_entry_key(s->base.tb) &&
+        new_pc == s->base.pc_first) {
+        gen_update_cc_op(s);
+    }
+    /*
+     * A keyed TB loops back to its start only with its entry state, which
+     * its first insn assumes; with another, it chains to the TB keyed so.
+     */
     if (use_goto_tb && translator_use_goto_tb(&s->base, new_pc)
+        && (!tb_entry_key(s->base.tb) ||
+            (unsigned)region_entry_cc_op(s) + 1 == tb_entry_key(s->base.tb))
         && translator_loop_back(&s->base, new_pc)) {
         /*
          * A loop within the TB (tcg_region): the exit path takes the pc
@@ -3032,10 +3101,25 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
             tcg_gen_goto_tb_dead(dslot, tb_num);
             dead = true;
         }
+        /*
+         * tcg_ccentry: a keyed slot links only to a TB translated for this
+         * flags state; cc_op is stored on the unlinked path and the exit
+         * request's, which share it.
+         */
+        if (key && tb_num < ARRAY_SIZE(tcg_ctx->slot_key)) {
+            tcg_ctx->slot_key[tb_num] = key;
+            tcg_cache_exclude(tcg_ctx, TCG_CACHE_X_CCENTRY);
+        } else {
+            key = 0;
+            gen_update_cc_op(s);
+        }
         tcg_gen_goto_tb(tb_num);
         if (req && !dead) {
             gen_set_label(req);
             req = NULL;
+        }
+        if (key) {
+            gen_update_cc_op(s);
         }
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
             tcg_gen_movi_tl(cpu_eip, new_eip);
@@ -3055,6 +3139,7 @@ static void gen_jmp_rel(DisasContext *s, MemOp ot, target_long diff,
         }
         s->base.is_jmp = DISAS_NORETURN;
     } else {
+        gen_update_cc_op(s);
         if (!(tb_cflags(s->base.tb) & CF_PCREL)) {
             tcg_gen_movi_tl(cpu_eip, new_eip);
         }
@@ -4866,7 +4951,8 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->fp_entry_mask = 0;
     dc->fence_insn = false;
 
-    dc->cs_base = dc->base.tb->cs_base;
+    /* The base, without a tcg_ccentry key (tb_entry_key). */
+    dc->cs_base = (uint32_t)dc->base.tb->cs_base;
     dc->pc_save = dc->base.pc_next;
     dc->flags = flags;
 #ifndef CONFIG_USER_ONLY
@@ -4916,6 +5002,18 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->A0 = tcg_temp_new();
 
     dc->cc_srcT = NULL;
+
+    /*
+     * A keyed TB (tcg_ccentry) starts with the flags state of the jumps
+     * that link to it, which they didn't store: the operands are in their
+     * globals, cc_op only here (i386_tr_tb_start finishes the state).
+     */
+    if (tb_entry_key(dc->base.tb)) {
+        dc->cc_op = tb_entry_key(dc->base.tb) - 1;
+        dc->cc_op_dirty = true;
+        /* The cache keeps neither TB keys nor slot keys. */
+        tcg_cache_exclude(tcg_ctx, TCG_CACHE_X_CCENTRY);
+    }
 }
 
 static void i386_tr_tb_start(DisasContextBase *db, CPUState *cpu)
@@ -4947,6 +5045,15 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
 
     if (dcbase->plugin_enabled) {
         gen_update_cc_op(dc);
+    }
+    /*
+     * A keyed TB's SUB: its first operand rebuilt, as a region block's,
+     * after the loop label, so on every iteration of a loop back here.
+     */
+    if (dcbase->num_insns == 1 && tb_entry_key(dcbase->tb) &&
+        (cc_op_live(dc->cc_op) & USES_CC_SRCT)) {
+        dc->cc_srcT = tcg_temp_new();
+        tcg_gen_add_tl(dc->cc_srcT, cpu_cc_dst, cpu_cc_src);
     }
     dc->prev_insn_start = dc->base.insn_start;
     dc->prev_insn_end = tcg_last_op();
@@ -5051,7 +5158,7 @@ static void i386_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
          */
         break;
     case DISAS_TOO_MANY:
-        gen_update_cc_op(dc);
+        gen_update_cc_op_exit(dc);
         gen_jmp_rel_csize(dc, 0, 0);
         break;
     case DISAS_EOB_NEXT:
