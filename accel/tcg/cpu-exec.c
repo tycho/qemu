@@ -756,12 +756,16 @@ static void region_sample(CPUState *cpu, TranslationBlock *tb)
     for (int i = 0; i < nv; i++) {
         region_invalidate(v[i].head, v[i].cs_base, v[i].flags, v[i].cflags);
     }
+    /* A keyed TB (tcg_ccentry) is never sampled nor a region's head. */
+    if (tcg_ccentry && tb_entry_key(tb)) {
+        return;
+    }
     is_head = translator_region_try_is_head(tb_page_addr0(tb));
     if (is_head < 0) {
         return;
     }
     head_tb = region_sample_head(tb, is_head);
-    if (!head_tb) {
+    if (!head_tb || (tcg_ccentry && tb_entry_key(head_tb))) {
         return;
     }
     head = tb_page_addr0(head_tb);
@@ -1221,11 +1225,62 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     qemu_spin_unlock(&tb_next->jmp_lock);
 }
 
+/*
+ * tcg_ccentry: the entry key @last_tb's exit @tb_exit requires of the TB
+ * it links to (TBJmpSlot.key), or 0.
+ */
+static inline unsigned tb_slot_key(const TranslationBlock *last_tb,
+                                   int tb_exit)
+{
+    if (tb_exit < 0 || tb_exit == TB_EXIT_REQUESTED ||
+        tb_exit >= last_tb->nb_slots) {
+        return 0;
+    }
+    return last_tb->jmp[tb_exit].key;
+}
+
+/*
+ * tcg_ccentry: after an unlinked exit through a keyed slot, the TB with
+ * that key at @s, from the hash table (the jump cache holds TBs for the
+ * CPU state alone), translated if missing; NULL for an unkeyed exit, or a
+ * destination that isn't guest code (the ordinary lookup classifies and
+ * leaves for it).  The exit's path stored the state the key names, so
+ * running the TB unlinked is right too.
+ */
+static TranslationBlock *tb_keyed(CPUState *cpu, TranslationBlock *last_tb,
+                                  int tb_exit, TCGTBCPUState s)
+{
+    unsigned key;
+    TranslationBlock *tb;
+
+    if (!tcg_ccentry || !last_tb) {
+        return NULL;
+    }
+    key = tb_slot_key(last_tb, tb_exit);
+    if (!key ||
+        (unlikely(tcg_foreign_pc) && tcg_foreign_pc(cpu, s.pc, false))) {
+        return NULL;
+    }
+    s.cs_base |= (uint64_t)key << TB_ENTRY_KEY_SHIFT;
+    tb = tb_htable_lookup(cpu, s);
+    return tb ? tb : tb_gen_code(cpu, s);
+}
+
 /* Link @last_tb's exit *@tb_exit to @tb, and its dead slot's too. */
 static inline QEMU_ALWAYS_INLINE
 void tb_link(TranslationBlock *last_tb, const int *tb_exit,
              TranslationBlock *tb)
 {
+    /* A keyed slot links only to a TB with its key, others to none. */
+    if (unlikely(tcg_ccentry)) {
+        if (tb_slot_key(last_tb, *tb_exit) != tb_entry_key(tb)) {
+            return;
+        }
+        if (tb_entry_key(tb)) {
+            tb_add_jump(last_tb, *tb_exit, tb);
+            return;
+        }
+    }
     tb_add_jump(last_tb, *tb_exit, tb);
     /* Its goto_tb_dead too, if tb writes them first. */
     if (last_tb->jmp[*tb_exit].dead && tb->chain_dead_in) {
@@ -1234,6 +1289,12 @@ void tb_link(TranslationBlock *last_tb, const int *tb_exit,
 }
 
 #ifdef CONFIG_USER_ONLY
+TranslationBlock *cpu_exec_tb_keyed(CPUState *cpu, TranslationBlock *last_tb,
+                                    int tb_exit, TCGTBCPUState s)
+{
+    return tb_keyed(cpu, last_tb, tb_exit, s);
+}
+
 void cpu_exec_tb_link(TranslationBlock *last_tb, int tb_exit,
                       TranslationBlock *tb)
 {
@@ -1625,6 +1686,17 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 break;
             }
 
+            /*
+             * tcg_ccentry: after an unlinked exit through a keyed slot, the
+             * TB with that key, from the hash table only: the jump cache
+             * holds TBs for the CPU state alone.  The exit's path stored
+             * the state the key names, so running it unlinked is right too.
+             */
+            tb = tb_keyed(cpu, last_tb, tb_exit, s);
+            if (tb) {
+                goto have_tb;
+            }
+
             tb = tb_lookup(cpu, s);
             if (tb == NULL && unlikely(tcg_foreign_pc) &&
                 tcg_foreign_pc(cpu, s.pc, true)) {
@@ -1653,6 +1725,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 }
             }
 
+        have_tb:
 #ifndef CONFIG_USER_ONLY
             /*
              * We don't take care of direct jumps when address mapping
