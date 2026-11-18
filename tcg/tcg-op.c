@@ -2075,9 +2075,11 @@ void tcg_gen_boundary_in(void)
 {
     TCGContext *s = tcg_ctx;
 
-    tcg_debug_assert(s->nb_boundary == 2);
-    tcg_gen_op2(INDEX_op_boundary_in, s->boundary[0]->base_type,
-                temp_arg(s->boundary[0]), temp_arg(s->boundary[1]));
+    tcg_debug_assert(s->nb_boundary > 0);
+    for (int i = 0; i < s->nb_boundary; i++) {
+        tcg_gen_op1(INDEX_op_boundary_in, s->boundary[i]->base_type,
+                    temp_arg(s->boundary[i]));
+    }
     s->boundary_in = true;
 }
 

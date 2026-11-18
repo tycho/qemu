@@ -6771,8 +6771,12 @@ static bool xblk_select_loops(TCGContext *s)
             switch (ts->type) {
             case TCG_TYPE_I32:
             case TCG_TYPE_I64:
-                /* With boundary globals, a register left for the moves. */
-                if (nint++ >= (s->boundary_in ? 5 : 10)) {
+                /*
+                 * With boundary globals, one fewer for each, and a
+                 * register left for the moves.
+                 */
+                if (nint++ >= (s->boundary_in ? 8 - s->nb_boundary - 1
+                                              : 10)) {
                     continue;
                 }
                 break;
@@ -7343,18 +7347,16 @@ liveness_pass_1(TCGContext *s)
             la_chain_dead(s, nb_globals);
             break;
         case INDEX_op_boundary_in:
-            /* Defines the boundary globals; never removed. */
-            for (int k = 0; k < 2; k++) {
-                ts = arg_temp(op->args[k]);
-                if (ts->state & TS_DEAD) {
-                    arg_life |= DEAD_ARG << k;
-                }
-                if (ts->state & TS_MEM) {
-                    arg_life |= SYNC_ARG << k;
-                }
-                ts->state = TS_DEAD;
-                la_reset_pref(ts);
+            /* Defines a boundary global; never removed. */
+            ts = arg_temp(op->args[0]);
+            if (ts->state & TS_DEAD) {
+                arg_life |= DEAD_ARG;
             }
+            if (ts->state & TS_MEM) {
+                arg_life |= SYNC_ARG;
+            }
+            ts->state = TS_DEAD;
+            la_reset_pref(ts);
             break;
         case INDEX_op_discard:
             /* mark the temporary as dead */
@@ -8403,23 +8405,31 @@ static void ldst_note_save_regs(TCGContext *s, TCGRegSet clobber)
 }
 
 /*
- * The boundary globals arrive in their registers (INDEX_op_boundary_in):
- * forget where the allocator had them, then install them there.
+ * The boundary globals arrive in their registers: at @op, the first of
+ * the nb_boundary consecutive INDEX_op_boundary_in that import them, one
+ * each (tcg_gen_boundary_in).  Forget where the allocator had them, install
+ * them all there, then apply each op's own sync and death.
  */
 static void tcg_reg_alloc_boundary_in(TCGContext *s, const TCGOp *op)
 {
-    TCGLifeData arg_life = op->life;
+    const TCGOp *ops[ARRAY_SIZE(s->boundary)];
 
-    for (int i = 0; i < 2; i++) {
-        TCGTemp *ts = arg_temp(op->args[i]);
+    for (int i = 0; i < s->nb_boundary; i++) {
+        TCGTemp *ts;
 
+        tcg_debug_assert(op && op->opc == INDEX_op_boundary_in &&
+                         arg_temp(op->args[0]) == s->boundary[i]);
+        ops[i] = op;
+        op = QTAILQ_NEXT(op, link);
+
+        ts = s->boundary[i];
         if (ts->val_type == TEMP_VAL_REG) {
             s->reg_to_temp[ts->reg] = NULL;
         }
         ts->val_type = TEMP_VAL_MEM;
     }
-    for (int i = 0; i < 2; i++) {
-        TCGTemp *ts = arg_temp(op->args[i]);
+    for (int i = 0; i < s->nb_boundary; i++) {
+        TCGTemp *ts = s->boundary[i];
         TCGReg reg = temp_boundary_reg(ts);
 
         if (s->reg_to_temp[reg]) {
@@ -8428,15 +8438,16 @@ static void tcg_reg_alloc_boundary_in(TCGContext *s, const TCGOp *op)
         set_temp_val_reg(s, ts, reg);
         ts->mem_coherent = 0;
     }
-    for (int i = 0; i < 2; i++) {
-        TCGTemp *ts = arg_temp(op->args[i]);
-        unsigned bit = 1u << (ts->boundary - 1);
+    for (int i = 0; i < s->nb_boundary; i++) {
+        TCGLifeData arg_life = ops[i]->life;
+        TCGTemp *ts = s->boundary[i];
+        unsigned bit = 1u << i;
 
         s->boundary_undef &= ~bit;
-        if (NEED_SYNC_ARG(i)) {
+        if (NEED_SYNC_ARG(0)) {
             temp_sync(s, ts, s->reserved_regs, 0, 0);
         }
-        if (IS_DEAD_ARG(i)) {
+        if (IS_DEAD_ARG(0)) {
             temp_dead(s, ts);
             s->boundary_undef |= bit;
         }
@@ -12470,7 +12481,10 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             tcg_reg_alloc_call(s, op);
             break;
         case INDEX_op_boundary_in:
-            tcg_reg_alloc_boundary_in(s, op);
+            /* The first of a group imports them all. */
+            if (arg_temp(op->args[0]) == s->boundary[0]) {
+                tcg_reg_alloc_boundary_in(s, op);
+            }
             break;
         case INDEX_op_exit_tb:
             if (s->chain_dead_used) {
