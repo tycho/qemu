@@ -2075,12 +2075,12 @@ static const TCGReg tcg_target_pin_regs[TCG_TARGET_NB_PIN_REGS] = {
 };
 
 /*
- * Registers for boundary globals (tcg_boundary_global_add): two argument
+ * Registers for boundary globals (tcg_boundary_global_add): argument
  * registers, which the allocator uses between TB boundaries as before.
  */
-#define TCG_TARGET_NB_BOUNDARY_REGS 2
+#define TCG_TARGET_NB_BOUNDARY_REGS 3
 static const TCGReg tcg_target_boundary_regs[TCG_TARGET_NB_BOUNDARY_REGS] = {
-    TCG_REG_X6, TCG_REG_X7,
+    TCG_REG_X6, TCG_REG_X7, TCG_REG_X5,
 };
 
 /*
