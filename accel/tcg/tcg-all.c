@@ -942,6 +942,16 @@ static void tcg_set_ccregs(Object *obj, bool value, Error **errp)
     tcg_cc_regs = value;
 }
 
+static bool tcg_get_ccopreg(Object *obj, Error **errp)
+{
+    return tcg_cc_op_reg;
+}
+
+static void tcg_set_ccopreg(Object *obj, bool value, Error **errp)
+{
+    tcg_cc_op_reg = value;
+}
+
 static bool tcg_get_pinvec(Object *obj, Error **errp)
 {
     return tcg_pin_vec;
@@ -1669,6 +1679,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "With x-pin and x-regcache, keep the guest's condition-code "
         "operands in host registers between TBs, where the host has "
         "registers for them");
+
+    object_class_property_add_bool(oc, "x-ccopreg", tcg_get_ccopreg,
+                                   tcg_set_ccopreg);
+    object_class_property_set_description(oc, "x-ccopreg",
+        "With x-ccregs, keep the guest's condition-code operation in a "
+        "host register between TBs too, where x-pincc doesn't pin it and "
+        "the host has a register for it");
 
     object_class_property_add_bool(oc, "x-region",
                                    tcg_get_region, tcg_set_region);

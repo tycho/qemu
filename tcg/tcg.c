@@ -6901,6 +6901,7 @@ bool tcg_pin_cc;
 bool tcg_pin_pc;
 bool tcg_edge_sys;
 bool tcg_cc_regs;
+bool tcg_cc_op_reg;
 bool tcg_nzcv;
 unsigned tcg_nzcv_retries;
 
