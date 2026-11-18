@@ -3108,7 +3108,6 @@ static void gen_jmp_rel_1(DisasContext *s, MemOp ot, target_long diff,
          */
         if (key && tb_num < ARRAY_SIZE(tcg_ctx->slot_key)) {
             tcg_ctx->slot_key[tb_num] = key;
-            tcg_cache_exclude(tcg_ctx, TCG_CACHE_X_CCENTRY);
         } else {
             key = 0;
             gen_update_cc_op(s);
@@ -5011,8 +5010,6 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     if (tb_entry_key(dc->base.tb)) {
         dc->cc_op = tb_entry_key(dc->base.tb) - 1;
         dc->cc_op_dirty = true;
-        /* The cache keeps neither TB keys nor slot keys. */
-        tcg_cache_exclude(tcg_ctx, TCG_CACHE_X_CCENTRY);
     }
 }
 
