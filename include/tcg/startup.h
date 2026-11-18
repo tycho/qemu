@@ -227,6 +227,13 @@ bool tcg_pin_system_ok(void);
 extern bool tcg_cc_regs;
 
 /*
+ * tcg_cc_op_reg: with tcg_cc_regs, the front end's lazy condition-code
+ * operation becomes a boundary global too, where it isn't pinned and the
+ * backend has a register for it.
+ */
+extern bool tcg_cc_op_reg;
+
+/*
  * tcg_nzcv: front ends may keep a flag result in the host's NZCV for
  * readers in the same block (INDEX_op_nzcv_*), where the host has them
  * (tcg_nzcv_host); tcg_nzcv_retries counts TBs translated again without
