@@ -483,7 +483,7 @@ struct TCGContext {
      * written, which may hold anything.  boundary_check: the allocator is
      * checking a boundary, where they may be dirty in their registers.
      */
-    TCGTemp *boundary[2];
+    TCGTemp *boundary[3];
     int nb_boundary;
     bool boundary_in;
     bool boundary_check;

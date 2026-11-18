@@ -148,8 +148,11 @@ DEF(goto_tb_cold, 0, 0, 2,
 DEF(ret_tb, 0, 1, 1, TCG_OPF_BB_END | TCG_OPF_COND_BRANCH | TCG_OPF_INT)
 /* tcg_retalign: the push on top leaves without its host call. */
 DEF(ret_cancel, 0, 0, 0, TCG_OPF_NOT_PRESENT)
-/* A TB's start, or a return into it: the boundary globals arrive. */
-DEF(boundary_in, 2, 0, 0, TCG_OPF_NOT_PRESENT)
+/*
+ * A TB's start, or a return into it: a boundary global arrives.  One per
+ * global, in TCGContext.boundary's order, back to back (tcg_gen_boundary_in).
+ */
+DEF(boundary_in, 1, 0, 0, TCG_OPF_NOT_PRESENT)
 
 DEF(plugin_cb, 0, 0, 1, TCG_OPF_NOT_PRESENT)
 DEF(plugin_mem_cb, 0, 1, 1, TCG_OPF_NOT_PRESENT)
