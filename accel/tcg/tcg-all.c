@@ -135,7 +135,10 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-ijguard", "on" },
         /* Inactive but for i386 guests with no guest base. */
         { "x-zext32", "on" },
+#ifndef _WIN32
+        /* Keyed TBs are never cached; the Windows modules keep their cache. */
         { "x-ccentry", "on" },
+#endif
 #endif
         { "x-sysret", "on" },
         { "x-xpage", "stub" },
