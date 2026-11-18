@@ -135,7 +135,10 @@ static void xtcg_fork_defaults(Object *obj)
         /* Inactive but for i386 guests with no guest base. */
         { "x-zext32", "on" },
 #ifndef _WIN32
-        /* Keyed TBs are never cached; the Windows modules keep their cache. */
+        /*
+         * Keyed TBs hold one block each: more installs for the Windows
+         * modules' cache than the keys save there.
+         */
         { "x-ccentry", "on" },
 #endif
 #endif
