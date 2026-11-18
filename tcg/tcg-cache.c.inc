@@ -188,7 +188,6 @@ const char *const tcg_cache_x_names[TCG_CACHE_X_MAX] = {
     [TCG_CACHE_X_TORN] = "torn",
     [TCG_CACHE_X_SPAN] = "span",
     [TCG_CACHE_X_FAKE] = "fake",
-    [TCG_CACHE_X_CCENTRY] = "ccentry",
     [TCG_CACHE_X_UNKNOWN_REF] = "unknown-ref",
     [TCG_CACHE_X_RAW_ADRP] = "raw-adrp",
     [TCG_CACHE_X_ORR_PTR] = "orr-ptr",
@@ -967,6 +966,7 @@ void *tcg_cache_capture(TCGContext *s, TranslationBlock *tb,
         }
         slots[i].cond += cond ? 1 : 0;
         slots[i].dead = tb->jmp[i].dead;
+        slots[i].key = tb->jmp[i].key;
     }
 
     cap_buf_size(a, 0);
@@ -1311,8 +1311,7 @@ TranslationBlock *tcg_cache_place(TCGContext *s, const TCGCacheArtView *v,
             }
         }
         tb->jmp[n].dead = sl->dead;
-        /* No cached TB has a keyed slot (TCG_CACHE_X_CCENTRY). */
-        tb->jmp[n].key = 0;
+        tb->jmp[n].key = sl->key;
         tb->jmp[n].target_addr = 0;
         tb->jmp[n].list_next = 0;
         tb->jmp[n].dest = 0;
