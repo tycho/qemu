@@ -669,7 +669,8 @@ static int val_artifact(const void *art, size_t len, bool unwind)
         uint32_t insn;
         bool tramp;
 
-        if (sl->pad[0] || sl->pad[1] || sl->pad[2] || sl->dead > h->nb_slots
+        if (sl->pad[0] || sl->pad[1] || sl->dead > h->nb_slots
+            || (sl->key && (!tcg_ccentry || sl->insn == TB_JMP_OFFSET_INVALID))
             || (sl->dead
                 && v.slot[sl->dead - 1].insn == TB_JMP_OFFSET_INVALID)) {
             return TCG_CACHE_V_SLOT;

@@ -85,7 +85,6 @@ enum {
     TCG_CACHE_X_TORN,       /* a guest byte read twice, differently */
     TCG_CACHE_X_SPAN,       /* a guest read outside the TB's two pages */
     TCG_CACHE_X_FAKE,       /* bytes not read from guest memory */
-    TCG_CACHE_X_CCENTRY,    /* a keyed TB or slot (tcg_ccentry) */
     TCG_CACHE_X_FRONT_MAX,
     /* Back end */
     TCG_CACHE_X_UNKNOWN_REF = TCG_CACHE_X_FRONT_MAX, /* outward, no meaning */
@@ -158,7 +157,7 @@ enum {
  * every multi-byte field is in host order.
  */
 #define TCG_CACHE_MAGIC     0x41435458      /* "XTCA" */
-#define TCG_CACHE_VERSION   1
+#define TCG_CACHE_VERSION   2
 
 /* TCGCacheArt.flags */
 #define TCG_CACHE_ART_SPLIT     1   /* hot and cold parts (tcg_tblayout) */
@@ -204,7 +203,8 @@ typedef struct TCGCacheArtSlot {
     uint32_t insn;          /* a place, or TB_JMP_OFFSET_INVALID */
     uint32_t cond;          /* 0, or 1 + a place */
     uint8_t dead;
-    uint8_t pad[3];
+    uint8_t key;            /* the slot's entry key (TBJmpSlot.key) */
+    uint8_t pad[2];
 } TCGCacheArtSlot;
 
 typedef struct TCGCacheArtRel {
