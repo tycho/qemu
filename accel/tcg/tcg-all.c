@@ -132,6 +132,8 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-tblookup", "on" },
 #ifdef CONFIG_USER_ONLY
         { "x-ijguard", "on" },
+        /* Recovery-only copies described in the writeback lists. */
+        { "x-flagdesc", "on" },
         /* Inactive but for i386 guests with no guest base. */
         { "x-zext32", "on" },
 #ifndef _WIN32
