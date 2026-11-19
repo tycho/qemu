@@ -899,6 +899,30 @@ static bool inline_lookup_checks_breakpoints(void)
 #endif
 }
 
+/*
+ * x-ijlean (tcg_jc_code): the probe's hit path, with @jc the entry and
+ * @epc its key: the entry holds the TB's host code.  It is made only for a
+ * TB valid in this TB's state (tcg_jc_ctx); a cleared entry's key is one
+ * no lookup at the slot has; and a TB's invalidation poisons the entries
+ * naming it (tb_jmp_cache_set).
+ */
+static void gen_inline_lookup_code(TCGv_ptr jc, TCGv_i64 epc, TCGv_i64 key,
+                                   TCGLabel *miss)
+{
+    TCGv_ptr ptr = tcg_temp_ebb_new_ptr();
+
+    tcg_gen_ld_ptr(ptr, jc, offsetof(CPUJumpCache, array[0].code));
+    tcg_gen_brcond_i64(TCG_COND_NE, epc, key, miss);
+    if (inline_lookup_checks_breakpoints()) {
+        tcg_gen_ld_ptr(jc, tcg_env,
+                       offsetof(CPUState, breakpoints.tqh_first) -
+                       sizeof(CPUState));
+        tcg_gen_brcondi_ptr(TCG_COND_NE, jc, 0, miss);
+    }
+    tcg_gen_goto_ptr(ptr);
+    tcg_temp_free_ptr(ptr);
+}
+
 static void gen_inline_lookup(TCGv_i64 pc, uint64_t cs_base, uint32_t flags)
 {
     TCGLabel *miss = gen_new_label();
@@ -939,49 +963,58 @@ static void gen_inline_lookup(TCGv_i64 pc, uint64_t cs_base, uint32_t flags)
     tcg_gen_add_ptr(jc, jc, tb);
     QEMU_BUILD_BUG_ON(sizeof(vaddr) != sizeof(uint64_t));
     tcg_gen_ld_i64(t64, jc, offsetof(CPUJumpCache, array[0].pc));
-    tcg_gen_ld_ptr(tb, jc, offsetof(CPUJumpCache, array[0].tb));
-    if (gkey) {
-        /* Either key; no branch between, as tb must stay live. */
-        tcg_gen_setcond_i64(TCG_COND_EQ, key, t64, key);
-        tcg_gen_setcond_i64(TCG_COND_EQ, gkey, t64, gkey);
-        tcg_gen_or_i64(key, key, gkey);
-        tcg_gen_brcondi_i64(TCG_COND_EQ, key, 0, miss);
-        tcg_temp_free_i64(gkey);
+    if (tcg_jc_code) {
+        /* x-ijlean: user mode, where there is no global salt. */
+        tcg_debug_assert(!gkey);
+        gen_inline_lookup_code(jc, t64, key, miss);
     } else {
-        tcg_gen_brcond_i64(TCG_COND_NE, t64, key, miss);
+        tcg_gen_ld_ptr(tb, jc, offsetof(CPUJumpCache, array[0].tb));
+        if (gkey) {
+            /* Either key; no branch between, as tb must stay live. */
+            tcg_gen_setcond_i64(TCG_COND_EQ, key, t64, key);
+            tcg_gen_setcond_i64(TCG_COND_EQ, gkey, t64, gkey);
+            tcg_gen_or_i64(key, key, gkey);
+            tcg_gen_brcondi_i64(TCG_COND_EQ, key, 0, miss);
+            tcg_temp_free_i64(gkey);
+        } else {
+            tcg_gen_brcond_i64(TCG_COND_NE, t64, key, miss);
+        }
+        tcg_gen_brcondi_ptr(TCG_COND_EQ, tb, 0, miss);
+
+        /* check_for_breakpoints() runs only in the helper. */
+        if (inline_lookup_checks_breakpoints()) {
+            tcg_gen_ld_ptr(jc, tcg_env,
+                           offsetof(CPUState, breakpoints.tqh_first) -
+                           sizeof(CPUState));
+            tcg_gen_brcondi_ptr(TCG_COND_NE, jc, 0, miss);
+        }
+
+        if (tcg_jc_ctx) {
+            /*
+             * The cache holds TBs for this TB's state only (tcg_jc_ctx); still,
+             * an entry may be a TB invalidated since, which must not run.
+             */
+            tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, cflags));
+            tcg_gen_brcondi_i32(TCG_COND_TSTNE, t32, CF_INVALID, miss);
+        } else {
+            tcg_gen_ld_i64(t64, tb, offsetof(TranslationBlock, cs_base));
+            tcg_gen_brcondi_i64(TCG_COND_NE, t64, cs_base, miss);
+            tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, flags));
+            tcg_gen_brcondi_i32(TCG_COND_NE, t32, flags, miss);
+
+            /*
+             * curr_cflags(); a stale TB has CF_INVALID set and never
+             * matches.
+             */
+            tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, cflags));
+            tcg_gen_ld_i32(cf, tcg_env,
+                           offsetof(CPUState, tcg_cflags) - sizeof(CPUState));
+            tcg_gen_brcond_i32(TCG_COND_NE, t32, cf, miss);
+        }
+
+        tcg_gen_ld_ptr(tb, tb, offsetof(TranslationBlock, tc.ptr));
+        tcg_gen_goto_ptr(tb);
     }
-    tcg_gen_brcondi_ptr(TCG_COND_EQ, tb, 0, miss);
-
-    /* check_for_breakpoints() runs only in the helper. */
-    if (inline_lookup_checks_breakpoints()) {
-        tcg_gen_ld_ptr(jc, tcg_env,
-                       offsetof(CPUState, breakpoints.tqh_first) -
-                       sizeof(CPUState));
-        tcg_gen_brcondi_ptr(TCG_COND_NE, jc, 0, miss);
-    }
-
-    if (tcg_jc_ctx) {
-        /*
-         * The cache holds TBs for this TB's state only (tcg_jc_ctx); still,
-         * an entry may be a TB invalidated since, which must not run.
-         */
-        tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, cflags));
-        tcg_gen_brcondi_i32(TCG_COND_TSTNE, t32, CF_INVALID, miss);
-    } else {
-        tcg_gen_ld_i64(t64, tb, offsetof(TranslationBlock, cs_base));
-        tcg_gen_brcondi_i64(TCG_COND_NE, t64, cs_base, miss);
-        tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, flags));
-        tcg_gen_brcondi_i32(TCG_COND_NE, t32, flags, miss);
-
-        /* curr_cflags(); a stale TB has CF_INVALID set and never matches. */
-        tcg_gen_ld_i32(t32, tb, offsetof(TranslationBlock, cflags));
-        tcg_gen_ld_i32(cf, tcg_env,
-                       offsetof(CPUState, tcg_cflags) - sizeof(CPUState));
-        tcg_gen_brcond_i32(TCG_COND_NE, t32, cf, miss);
-    }
-
-    tcg_gen_ld_ptr(tb, tb, offsetof(TranslationBlock, tc.ptr));
-    tcg_gen_goto_ptr(tb);
 
     gen_set_label(miss);
     if (tcg_tblayout) {

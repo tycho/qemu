@@ -53,6 +53,7 @@
 #include "accel/accel-cpu-ops.h"
 #include "accel/tcg/cpu-ops.h"
 #include "internal-common.h"
+#include "tb-jmp-cache.h"
 #include "qapi/visitor.h"
 #include "tcg-accel-ops-mttcg.h"
 #include "qemu/xtcg-stats.h"
@@ -135,6 +136,8 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-ijguard", "on" },
         /* Recovery-only copies described in the writeback lists. */
         { "x-flagdesc", "on" },
+        /* Jump-cache entries that hold their TB's host code. */
+        { "x-ijlean", "on" },
         /* Inactive but for i386 guests with no guest base. */
         { "x-zext32", "on" },
 #ifndef _WIN32
@@ -429,6 +432,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
                     tcg_cr3_flush == TCG_CR3_FLUSH_NONGLOBAL;
 #else
     tcg_jc_ctx = tcg_jcgen && tcg_ijmp_inline;
+    tcg_jc_code = tcg_ijlean && tcg_jc_ctx;
 #endif
 #ifdef CONFIG_USER_ONLY
     if (tcg_partrans) {
@@ -595,6 +599,8 @@ TCGXPage tcg_xpage;
 bool tcg_jcgen;
 bool tcg_jc_ctx;
 bool tcg_jc_global;
+bool tcg_ijlean;
+bool tcg_jc_code;
 
 bool tcg_iolast;
 bool tcg_iolazy;
@@ -884,6 +890,16 @@ static bool tcg_get_flagdesc(Object *obj, Error **errp)
 static void tcg_set_flagdesc(Object *obj, bool value, Error **errp)
 {
     tcg_flagdesc = value;
+}
+
+static bool tcg_get_ijlean(Object *obj, Error **errp)
+{
+    return tcg_ijlean;
+}
+
+static void tcg_set_ijlean(Object *obj, bool value, Error **errp)
+{
+    tcg_ijlean = value;
 }
 
 static bool tcg_get_pin(Object *obj, Error **errp)
@@ -1669,6 +1685,13 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "accesses' recovery reads before it is written again (mostly the "
         "flags' operands); the accesses' writeback records name the "
         "constant or register instead");
+
+    object_class_property_add_bool(oc, "x-ijlean",
+                                   tcg_get_ijlean, tcg_set_ijlean);
+    object_class_property_set_description(oc, "x-ijlean",
+        "In user mode, with the inline jump-cache probe and its TB state per "
+        "salt: each entry holds its TB's host code, so an indirect jump's "
+        "probe compares the key and branches without reading the TB");
 
     object_class_property_add_bool(oc, "x-pin", tcg_get_pin, tcg_set_pin);
     object_class_property_set_description(oc, "x-pin",

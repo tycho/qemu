@@ -1333,7 +1333,18 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
     CPU_FOREACH(cpu) {
         CPUJumpCache *jc = cpu->tb_jmp_cache;
 
-        if (qatomic_read(&jc->array[h].tb) == tb) {
+        if (tb_jmp_cache_tb(jc, h) != tb) {
+            continue;
+        }
+        /*
+         * x-ijlean: the generated probe doesn't check CF_INVALID (set by
+         * now, under jmp_lock; an entry made after sees it).  Only the
+         * key changes: the vCPU owns the rest, and may be refilling the
+         * slot with another TB, which this then merely misses once.
+         */
+        if (tcg_jc_code) {
+            qatomic_set(&jc->array[h].pc, tb_jmp_cache_poison(h));
+        } else {
             qatomic_set(&jc->array[h].tb, NULL);
         }
     }
