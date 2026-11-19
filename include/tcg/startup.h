@@ -180,6 +180,15 @@ extern bool tcg_lazysync;
 extern bool tcg_lazysync_user;
 
 /*
+ * With tcg_lazysync in user mode: a copy into a global from a constant or
+ * a pinned global, whose value only a fault's recovery needs (the global
+ * is written again before anything else reads it), emits no code; the
+ * guest accesses' writeback lists name the constant or the pinned
+ * register instead.
+ */
+extern bool tcg_flagdesc;
+
+/*
  * tcg_pin: a front end pins its most used guest registers (tcg_temp_pin).
  * tcg_pin_user: user mode sets it where the host signal handler can store
  * pinned globals (tcg_pinned_unwind) and no plugin reads guest registers;

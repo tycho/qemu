@@ -347,8 +347,18 @@ typedef struct TCGTemp {
     unsigned int boundary:2;
     /* 1 + its index in TCGContext.chain_dead, or 0 (tcg_chain_dead_add). */
     unsigned int chain_dead:4;
+    /*
+     * tcg_flagdesc: the global's value is not in its location (its slot,
+     * though TEMP_VAL_MEM, or a pinned global's register is stale) but is
+     * pinned scalar @desc_src's value, or @val if @desc_src is NULL, until
+     * the last guest access whose recovery needs it.  The writeback lists
+     * record it; desc_materialize_from() emits it if @desc_src is about to
+     * change.
+     */
+    unsigned int desc:1;
 
     int64_t val;
+    struct TCGTemp *desc_src;
     struct TCGTemp *mem_base;
     intptr_t mem_offset;
     const char *name;
@@ -375,6 +385,13 @@ typedef struct TCGTempSet {
  */
 #define DEAD_ARG  (1 << 4)
 #define SYNC_ARG  (1 << 0)
+/*
+ * tcg_flagdesc: a mov whose output only guest accesses' recovery reads,
+ * from a constant or a pinned global: its value is described in the
+ * writeback lists instead of computed (desc_materialize_from() may still
+ * emit it).  Above any mov's DEAD_ARG and SYNC_ARG bits.
+ */
+#define DESC_MOV  (1u << 31)
 typedef uint32_t TCGLifeData;
 
 struct TCGOp {
@@ -492,6 +509,14 @@ struct TCGContext {
     TCGLdstWriteback *ldst_wb;  /* likewise, tcg_lazysync */
     unsigned ldst_nb_wb;
     struct TCGLazyDead *lazy_dead;  /* tcg_lazysync, from liveness */
+    /*
+     * tcg_flagdesc, in liveness: per global, whether its value is live
+     * only for guest accesses' recovery (a fault, or a slow path that
+     * stores the writeback list), and the pinned globals that may change
+     * between here and those accesses (bits index pinned[]).
+     */
+    uint8_t *la_rec;
+    uint64_t *la_rec_clobbers;
     int nb_lazy_dead;
     TCGLazyMap *lazy_map;       /* tcg_lazysync, user mode: per access */
     int nb_lazy_map;
