@@ -135,6 +135,8 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-ijguard", "on" },
         /* Recovery-only copies described in the writeback lists. */
         { "x-flagdesc", "on" },
+        /* Jump-cache entries that hold their TB's host code. */
+        { "x-ijlean", "on" },
         /* Inactive but for i386 guests with no guest base. */
         { "x-zext32", "on" },
 #ifndef _WIN32
