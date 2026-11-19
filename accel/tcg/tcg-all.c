@@ -133,6 +133,8 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-tblookup", "on" },
 #ifdef CONFIG_USER_ONLY
         { "x-ijguard", "on" },
+        /* Recovery-only copies described in the writeback lists. */
+        { "x-flagdesc", "on" },
         /* Inactive but for i386 guests with no guest base. */
         { "x-zext32", "on" },
 #ifndef _WIN32
@@ -872,6 +874,16 @@ static void tcg_set_regcache(Object *obj, bool value, Error **errp)
     tcg_vecglobal = value;
     tcg_ymmglobal = value;
     tcg_vregs_all = value;
+}
+
+static bool tcg_get_flagdesc(Object *obj, Error **errp)
+{
+    return tcg_flagdesc;
+}
+
+static void tcg_set_flagdesc(Object *obj, bool value, Error **errp)
+{
+    tcg_flagdesc = value;
 }
 
 static bool tcg_get_pin(Object *obj, Error **errp)
@@ -1648,6 +1660,15 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "Keep guest registers in host registers: remove dead stores to CPU "
         "state, keep dirty and vector values in registers across guest "
         "memory accesses, and the x86 vector registers as TCG globals");
+
+    object_class_property_add_bool(oc, "x-flagdesc",
+                                   tcg_get_flagdesc, tcg_set_flagdesc);
+    object_class_property_set_description(oc, "x-flagdesc",
+        "In user mode, with x-regcache and x-pin: defer a scalar copy "
+        "from a constant or a pinned register whose value only guest "
+        "accesses' recovery reads before it is written again (mostly the "
+        "flags' operands); the accesses' writeback records name the "
+        "constant or register instead");
 
     object_class_property_add_bool(oc, "x-pin", tcg_get_pin, tcg_set_pin);
     object_class_property_set_description(oc, "x-pin",

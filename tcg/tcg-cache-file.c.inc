@@ -283,8 +283,14 @@ void tcg_cache_wb_init(void)
     for (int i = 0; i < s->nb_globals; i++) {
         const TCGTemp *ts = &s->temps[i];
 
-        if (ts->kind == TEMP_GLOBAL && ts->mem_base
-            && ts->mem_base->kind == TEMP_FIXED) {
+        /*
+         * A pinned scalar global's slot too: with tcg_flagdesc a
+         * writeback list may describe its value (ldst_record_writeback).
+         */
+        if ((ts->kind == TEMP_GLOBAL
+             || (ts->kind == TEMP_FIXED && ts->pinned
+                 && ts->base_type <= TCG_TYPE_I64))
+            && ts->mem_base && ts->mem_base->kind == TEMP_FIXED) {
             val_wb_table[n++] = (ValWbGlobal) {
                 .ofs = ts->mem_offset,
                 .base = ts->mem_base->reg,

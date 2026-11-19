@@ -3969,6 +3969,7 @@ static void tcg_reg_alloc_start(TCGContext *s)
             g_assert_not_reached();
         }
         ts->val_type = val;
+        ts->desc = 0;
     }
 
     memset(s->reg_to_temp, 0, sizeof(s->reg_to_temp));
@@ -4406,6 +4407,10 @@ void tcg_dump_ops(TCGContext *s, FILE *f, bool have_prefs)
         if (op->life) {
             unsigned life = op->life;
 
+            if (c == INDEX_op_mov && (life & DESC_MOV)) {
+                ne_fprintf(f, "  desc");
+                life &= ~DESC_MOV;
+            }
             if (life & (SYNC_ARG * 3)) {
                 ne_fprintf(f, "  sync:");
                 for (i = 0; i < 2; ++i) {
@@ -5833,14 +5838,81 @@ static void la_global_sync(TCGContext *s, int ng)
     }
 }
 
+/* tcg_flagdesc: the pinned globals @op writes, by index in pinned[]. */
+static uint64_t la_pinned_outputs(TCGContext *s, TCGOp *op, int nb_oargs)
+{
+    uint64_t mask = 0;
+
+    for (int o = 0; o < nb_oargs; o++) {
+        TCGTemp *ts = arg_temp(op->args[o]);
+
+        for (int k = 0; ts->pinned && k < s->nb_pinned; k++) {
+            if (s->pinned[k] == ts) {
+                mask |= 1ull << k;
+            }
+        }
+    }
+    return mask;
+}
+
+/*
+ * tcg_flagdesc: a guest load whose result the next op moves to a pinned
+ * global: pinned_fold_pass may make the load write that global, so it
+ * counts among the load's possible outputs (a description from it would be
+ * lost).  Conservative: the fold has more conditions; a fold it doesn't
+ * foresee reaches desc_materialize_from instead.
+ */
+static uint64_t la_pinned_fold_maybe(TCGContext *s, TCGOp *op)
+{
+    TCGOp *next = QTAILQ_NEXT(op, link);
+
+    if ((op->opc != INDEX_op_qemu_ld && op->opc != INDEX_op_qemu_ld_vec) ||
+        !next || next->opc != INDEX_op_mov ||
+        arg_temp(next->args[1]) != arg_temp(op->args[0])) {
+        return 0;
+    }
+    return la_pinned_outputs(s, next, 1);
+}
+
+/* tcg_flagdesc: @ts's value is not live only for a fault's recovery. */
+static void la_rec_kill(TCGContext *s, TCGTemp *ts)
+{
+    if (s->la_rec && temp_idx(ts) < s->nb_globals) {
+        s->la_rec[temp_idx(ts)] = 0;
+    }
+}
+
+/* tcg_flagdesc: liveness has no recovery-only globals after this op. */
+static void la_rec_clear(TCGContext *s)
+{
+    if (s->la_rec) {
+        memset(s->la_rec, 0, s->nb_globals);
+    }
+}
+
+static void la_ld_dead(TCGContext *s, TCGLazyDead *ld, int ng, int i)
+{
+    if (!ld->dead) {
+        size_t size = BITS_TO_LONGS(ng) * sizeof(unsigned long);
+
+        ld->dead = tcg_malloc(size);
+        memset(ld->dead, 0, size);
+    }
+    set_bit(i, ld->dead);
+}
+
 /*
  * liveness analysis: a guest memory access with tcg_lazysync: its slow path
  * reads every global, but none needs to be in memory before it.  Record
  * the globals whose values die here (other than the op's outputs).
+ * With tcg_flagdesc, those values are live only for the fault's recovery
+ * until something else needs them; a pinned global's dies here too.
  */
 static void la_global_live(TCGContext *s, int ng, TCGOp *op, int nb_oargs)
 {
     TCGLazyDead *ld = &s->lazy_dead[s->nb_lazy_dead++];
+    uint64_t outputs = s->la_rec ? la_pinned_outputs(s, op, nb_oargs)
+                                   | la_pinned_fold_maybe(s, op) : 0;
 
     ld->op = op;
     ld->dead = NULL;
@@ -5852,28 +5924,62 @@ static void la_global_live(TCGContext *s, int ng, TCGOp *op, int nb_oargs)
         if (!(ts->state & TS_DEAD)) {
             continue;
         }
+        for (int o = 0; o < nb_oargs; o++) {
+            output |= arg_temp(op->args[o]) == ts;
+        }
         if (ts->kind == TEMP_FIXED) {
             /* A fault shows a pinned global: it must be current here. */
             if (ts->pinned) {
                 ts->state &= ~TS_DEAD;
+                if (s->la_rec && !output && !ts->state) {
+                    la_ld_dead(s, ld, ng, i);
+                    s->la_rec[i] = 1;
+                    s->la_rec_clobbers[i] = outputs;
+                }
             }
             continue;
         }
-        for (int o = 0; o < nb_oargs; o++) {
-            output |= arg_temp(op->args[o]) == ts;
-        }
         if (!output) {
-            if (!ld->dead) {
-                size_t size = BITS_TO_LONGS(ng) * sizeof(unsigned long);
-
-                ld->dead = tcg_malloc(size);
-                memset(ld->dead, 0, size);
-            }
-            set_bit(i, ld->dead);
+            la_ld_dead(s, ld, ng, i);
         }
         ts->state &= ~TS_DEAD;
         la_reset_pref(ts);
+        if (s->la_rec && !output && !ts->state) {
+            s->la_rec[i] = 1;
+            s->la_rec_clobbers[i] = outputs;
+        }
     }
+}
+
+/*
+ * tcg_flagdesc: whether mov @op (whose output is live only for a fault's
+ * recovery) can leave its value to the writeback lists: from a constant
+ * into a pinned global (other globals hold constants without code), or
+ * from a pinned global that nothing writes before those faults.
+ */
+static bool la_mov_describable(TCGContext *s, TCGOp *op)
+{
+    TCGTemp *g = arg_temp(op->args[0]), *src = arg_temp(op->args[1]);
+    int gi = temp_idx(g);
+
+    if (gi >= s->nb_globals || g->state || !s->la_rec[gi] ||
+        g->base_type > TCG_TYPE_I64 || g->type != src->type ||
+        g->indirect_reg || g->env_alias || g->mem_base->kind != TEMP_FIXED ||
+        (g->kind != TEMP_GLOBAL && !g->pinned)) {
+        return false;
+    }
+    if (src->kind == TEMP_CONST) {
+        return g->pinned;
+    }
+    if (src->kind != TEMP_FIXED || !src->pinned) {
+        return false;
+    }
+    for (int k = 0; k < s->nb_pinned; k++) {
+        if (s->pinned[k] == src) {
+            return !(s->la_rec_clobbers[gi] & (1ull << k));
+        }
+    }
+    return false;
 }
 
 /*
@@ -6894,6 +7000,7 @@ static bool op_is_guest_access(TCGOpcode opc)
  * host supports it (tcg_lazysync_user).
  */
 bool tcg_lazysync_user;
+bool tcg_flagdesc;
 bool tcg_pin;
 bool tcg_pin_user;
 bool tcg_pin_vec;
@@ -7208,6 +7315,14 @@ liveness_pass_1(TCGContext *s)
     }
 
     s->lazy_dead = tcg_malloc(sizeof(TCGLazyDead) * s->nb_ops);
+    s->la_rec = NULL;
+    s->la_rec_clobbers = NULL;
+    if (tcg_flagdesc && !tcg_use_softmmu && tcg_lazysync_user &&
+        s->nb_pinned) {
+        s->la_rec = tcg_malloc(nb_globals);
+        memset(s->la_rec, 0, nb_globals);
+        s->la_rec_clobbers = tcg_malloc(nb_globals * sizeof(uint64_t));
+    }
     s->nb_lazy_dead = 0;
     s->lazy_map = tcg_malloc(sizeof(TCGLazyMap) * s->nb_ops);
     s->nb_lazy_map = 0;
@@ -7229,6 +7344,7 @@ liveness_pass_1(TCGContext *s)
         switch (opc) {
         case INDEX_op_call:
             assert_carry_dead(s);
+            la_rec_clear(s);
             {
                 const TCGHelperInfo *info = tcg_call_info(op);
                 int call_flags = tcg_call_flags(op);
@@ -7345,11 +7461,13 @@ liveness_pass_1(TCGContext *s)
             break;
         case INDEX_op_goto_tb_dead:
             assert_carry_dead(s);
+            la_rec_clear(s);
             la_chain_dead(s, nb_globals);
             break;
         case INDEX_op_boundary_in:
             /* Defines a boundary global; never removed. */
             ts = arg_temp(op->args[0]);
+            la_rec_kill(s, ts);
             if (ts->state & TS_DEAD) {
                 arg_life |= DEAD_ARG;
             }
@@ -7362,6 +7480,7 @@ liveness_pass_1(TCGContext *s)
         case INDEX_op_discard:
             /* mark the temporary as dead */
             ts = arg_temp(op->args[0]);
+            la_rec_kill(s, ts);
             ts->state = TS_DEAD;
             la_reset_pref(ts);
             break;
@@ -7512,8 +7631,22 @@ liveness_pass_1(TCGContext *s)
             nb_iargs = def->nb_iargs;
             nb_oargs = def->nb_oargs;
 
+            if (s->la_rec && opc == INDEX_op_mov &&
+                la_mov_describable(s, op)) {
+                arg_life |= DESC_MOV;
+            }
+            if (s->la_rec) {
+                uint64_t w = la_pinned_outputs(s, op, nb_oargs);
+
+                for (int k = 0; w && k < s->nb_la_globals; k++) {
+                    if (s->la_rec[s->la_globals[k]]) {
+                        s->la_rec_clobbers[s->la_globals[k]] |= w;
+                    }
+                }
+            }
             for (int i = 0; i < nb_oargs; i++) {
                 ts = arg_temp(op->args[i]);
+                la_rec_kill(s, ts);
 
                 /* Remember the preference of the uses that followed.  */
                 if (i < ARRAY_SIZE(op->output_pref)) {
@@ -7532,6 +7665,10 @@ liveness_pass_1(TCGContext *s)
             }
 
             /* If end of basic block, update.  */
+            if (def->flags & (TCG_OPF_BB_EXIT | TCG_OPF_BB_END |
+                              TCG_OPF_COND_BRANCH)) {
+                la_rec_clear(s);
+            }
             if (def->flags & TCG_OPF_BB_EXIT) {
                 assert_carry_dead(s);
                 la_func_end(s, nb_globals, nb_temps);
@@ -7569,6 +7706,7 @@ liveness_pass_1(TCGContext *s)
                      * after it leaves with the boundary globals in place.
                      */
                 } else {
+                    la_rec_clear(s);
                     la_global_sync(s, nb_globals);
                 }
                 if (def->flags & TCG_OPF_CALL_CLOBBER) {
@@ -7597,6 +7735,7 @@ liveness_pass_1(TCGContext *s)
             /* Input arguments are live for preceding opcodes.  */
             for (int i = nb_oargs; i < nb_oargs + nb_iargs; i++) {
                 ts = arg_temp(op->args[i]);
+                la_rec_kill(s, ts);
                 if (ts->state & TS_DEAD) {
                     /* For operands that were dead, initially allow
                        all regs for the type.  */
@@ -7934,6 +8073,7 @@ static void temp_allocate_frame(TCGContext *s, TCGTemp *ts)
 /* Assign @reg to @ts, and update reg_to_temp[]. */
 static void set_temp_val_reg(TCGContext *s, TCGTemp *ts, TCGReg reg)
 {
+    ts->desc = 0;
     if (ts->val_type == TEMP_VAL_REG) {
         TCGReg old = ts->reg;
         tcg_debug_assert(s->reg_to_temp[old] == ts);
@@ -7952,6 +8092,7 @@ static void set_temp_val_reg(TCGContext *s, TCGTemp *ts, TCGReg reg)
 static void set_temp_val_nonreg(TCGContext *s, TCGTemp *ts, TCGTempVal type)
 {
     tcg_debug_assert(type != TEMP_VAL_REG);
+    ts->desc = 0;
     if (ts->val_type == TEMP_VAL_REG) {
         TCGReg reg = ts->reg;
         tcg_debug_assert(s->reg_to_temp[reg] == ts);
@@ -8346,6 +8487,22 @@ static void ldst_record_writeback(TCGContext *s, TCGRegSet allocated_regs)
     for (int k = 0; k < s->nb_la_globals; k++) {
         TCGTemp *ts = &s->temps[s->la_globals[k]];
 
+        if (ts->desc) {
+            /* tcg_flagdesc: a pinned global's register, or a constant. */
+            if (!wb) {
+                wb = tcg_malloc(sizeof(*wb) * s->nb_globals);
+            }
+            wb[n++] = (TCGLdstWriteback){
+                .type = ts->type,
+                .reg = ts->desc_src ? ts->desc_src->reg
+                                    : (TCGReg)TCG_TARGET_NB_REGS,
+                .base = ts->mem_base->reg,
+                .offset = ts->mem_offset,
+                .is_const = !ts->desc_src,
+                .val = ts->val,
+            };
+            continue;
+        }
         if (ts->kind == TEMP_FIXED || ts->mem_coherent
             || ts->val_type == TEMP_VAL_MEM || ts->val_type == TEMP_VAL_DEAD) {
             continue;
@@ -8560,11 +8717,46 @@ static void tcg_reg_alloc_boundary_home(TCGContext *s)
     }
 }
 
+/*
+ * tcg_flagdesc: every value described as pinned register @reg's goes to its
+ * location: a pinned global's own register, another global's slot.  The
+ * access about to be emitted writes @reg.  A pinned global so described
+ * can't be one of the access's inputs (an input is a read, which ends the
+ * recovery-only interval), nor a source of another description.
+ */
+static void desc_materialize_from(TCGContext *s, TCGReg reg)
+{
+    for (int k = 0; k < s->nb_la_globals; k++) {
+        TCGTemp *ts = &s->temps[s->la_globals[k]];
+
+        if (!ts->desc || !ts->desc_src || ts->desc_src->reg != reg) {
+            continue;
+        }
+        if (ts->pinned) {
+            tcg_out_mov(s, ts->type, ts->reg, reg);
+        } else {
+            tcg_out_st(s, ts->type, reg, ts->mem_base->reg, ts->mem_offset);
+        }
+        ts->desc = 0;
+    }
+}
+
+/* tcg_flagdesc: a described value dies at a guest access, within its block. */
+static void assert_no_desc(TCGContext *s)
+{
+#ifdef CONFIG_DEBUG_TCG
+    for (int k = 0; k < s->nb_la_globals; k++) {
+        tcg_debug_assert(!s->temps[s->la_globals[k]].desc);
+    }
+#endif
+}
+
 /* at the end of a basic block, we assume all temporaries are dead and
    all globals are stored at their canonical location. */
 static void tcg_reg_alloc_bb_end(TCGContext *s, TCGRegSet allocated_regs)
 {
     assert_carry_dead(s);
+    assert_no_desc(s);
     for (int i = s->nb_globals; i < s->nb_temps; i++) {
         TCGTemp *ts = &s->temps[i];
 
@@ -8908,6 +9100,7 @@ static void tcg_reg_alloc_cbranch(TCGContext *s, const TCGOp *op,
     TCGLabel *l = s->xblk ? op_branch_label(op) : NULL;
 
     assert_carry_dead(s);
+    assert_no_desc(s);
     if (l && l->xkind == XLBL_INHERIT && l->xbranch == op && l->ft_state) {
         l->snap = xblk_snap(s);
         return;
@@ -8996,6 +9189,24 @@ static void tcg_reg_alloc_mov(TCGContext *s, const TCGOp *op)
 
     /* ENV should not be modified.  */
     tcg_debug_assert(temp_writable(ots));
+
+    if (arg_life & DESC_MOV) {
+        /*
+         * tcg_flagdesc: only a fault reads the value before it is written
+         * again; the writeback lists name the constant or pinned register.
+         */
+        tcg_debug_assert(!NEED_SYNC_ARG(0) && !IS_DEAD_ARG(0));
+        if (!ots->pinned) {
+            set_temp_val_nonreg(s, ots, TEMP_VAL_MEM);
+        }
+        ots->desc = 1;
+        ots->desc_src = ts->kind == TEMP_CONST ? NULL : ts;
+        ots->val = ts->kind == TEMP_CONST ? ts->val : 0;
+        if (IS_DEAD_ARG(1)) {
+            temp_dead(s, ts);
+        }
+        return;
+    }
 
     /* Note that otype != itype for no-op truncation.  */
     otype = ots->type;
@@ -9659,6 +9870,15 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
             for (k = 0; k < nb_oargs; k++) {
                 out |= s->ldst_wb[w].reg == new_args[k];
             }
+            if (out && !s->ldst_wb[w].is_const &&
+                tcg_regset_test_reg(s->reserved_regs, s->ldst_wb[w].reg)) {
+                /*
+                 * tcg_flagdesc: a pinned global the access writes was
+                 * folded into it after liveness: the values it describes
+                 * go to their locations now.
+                 */
+                desc_materialize_from(s, s->ldst_wb[w].reg);
+            }
             if (!out) {
                 s->ldst_wb[n++] = s->ldst_wb[w];
             }
@@ -10130,6 +10350,7 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
     if (lazy && lazy->dead) {
         for (i = find_first_bit(lazy->dead, s->nb_globals); i < s->nb_globals;
              i = find_next_bit(lazy->dead, s->nb_globals, i + 1)) {
+            s->temps[i].desc = 0;
             temp_dead(s, &s->temps[i]);
         }
     }
