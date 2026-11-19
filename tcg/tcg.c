@@ -8198,16 +8198,23 @@ static void temp_sync(TCGContext *s, TCGTemp *ts, TCGRegSet allocated_regs,
 
 /*
  * At goto_tb_dead (@dead false): store the globals other than the
- * chain-dead ones; at the exits after it (@dead true): the chain-dead ones.
+ * chain-dead ones; at the exits after it (@dead true): the chain-dead ones,
+ * and free their registers.  An exit doesn't fall through to the next
+ * label, whose code expects every global in memory alone; a goto_tb's
+ * unlinked path only stores the next pc and exits.
  */
 static void tcg_reg_alloc_chain_store(TCGContext *s, bool dead)
 {
     for (int i = 0; i < s->nb_globals; i++) {
         TCGTemp *ts = &s->temps[i];
 
-        if (ts->kind == TEMP_GLOBAL && !ts->mem_coherent &&
-            !temp_readonly(ts) &&
-            (temp_chain_dead_index(s, ts) >= 0) == dead) {
+        if (ts->kind != TEMP_GLOBAL || temp_readonly(ts) ||
+            (temp_chain_dead_index(s, ts) >= 0) != dead) {
+            continue;
+        }
+        if (dead) {
+            temp_sync(s, ts, s->reserved_regs, 0, -1);
+        } else if (!ts->mem_coherent) {
             temp_sync(s, ts, s->reserved_regs, 0, 0);
         }
     }
