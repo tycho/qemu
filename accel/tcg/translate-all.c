@@ -2080,7 +2080,7 @@ static void tcg_flush_jmp_cache_1(CPUState *cpu, bool clear)
         qatomic_set(&jc->gsalt, TB_JMP_GSALT_BASE);
     }
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
-        qatomic_set(&jc->array[i].tb, NULL);
+        tb_jmp_cache_clear(jc, i);
     }
 }
 
@@ -2125,6 +2125,6 @@ void tcg_flush_jmp_cache_nonglobal(CPUState *cpu)
     qatomic_set(&jc->salt, 0);
     qatomic_set(&jc->gsalt, TB_JMP_GSALT_BASE);
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
-        qatomic_set(&jc->array[i].tb, NULL);
+        tb_jmp_cache_clear(jc, i);
     }
 }

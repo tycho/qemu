@@ -279,7 +279,7 @@ static inline bool tb_jmp_cache_hit(CPUJumpCache *jc, const vaddr *key,
                                     const TCGTBCPUState *s)
 {
     return tb &&
-           tb_jmp_cache_key_match(jc, *key, s->pc) &&
+           tb_jmp_cache_key_match(jc, qatomic_read(key), s->pc) &&
            tb->cs_base == s->cs_base &&
            tb->flags == s->flags &&
            tb_cflags(tb) == s->cflags;
@@ -328,6 +328,41 @@ const void *(*tcg_foreign_goto)(CPUState *cpu);
 bool (*tcg_foreign_code)(vaddr pc);
 bool tcg_cpu_bound;
 
+/* Make entry @h the one for @tb under @key. */
+static void tb_jmp_cache_set(CPUJumpCache *jc, uint32_t h, vaddr key,
+                             TranslationBlock *tb)
+{
+#ifdef CONFIG_USER_ONLY
+    if (tcg_jc_code) {
+        /*
+         * The generated probe enters the code without looking at the TB.
+         * Invalidation can't find a CF_PCREL TB's entry: leave it out.
+         */
+        if (tb_cflags(tb) & CF_PCREL) {
+            tb_jmp_cache_clear(jc, h);
+            return;
+        }
+        /*
+         * Invalidation sets CF_INVALID under jmp_lock, then poisons the
+         * entries naming the TB (tb_jmp_cache_inval_tb): an entry made
+         * under the lock before is found, and none is made after.
+         */
+        qemu_spin_lock(&tb->jmp_lock);
+        if (tb_cflags(tb) & CF_INVALID) {
+            tb_jmp_cache_clear(jc, h);
+        } else {
+            qatomic_set(&jc->tbs[h], tb);
+            qatomic_set(&jc->array[h].code, tb->tc.ptr);
+            qatomic_set(&jc->array[h].pc, key);
+        }
+        qemu_spin_unlock(&tb->jmp_lock);
+        return;
+    }
+#endif
+    jc->array[h].pc = key;
+    qatomic_set(&jc->array[h].tb, tb);
+}
+
 static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 {
     TranslationBlock *tb;
@@ -341,7 +376,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     hash = tb_jmp_cache_hash_func(s.pc);
     jc = cpu->tb_jmp_cache;
 
-    tb = qatomic_read(&jc->array[hash].tb);
+    tb = tb_jmp_cache_tb(jc, hash);
     if (likely(tb_jmp_cache_hit(jc, &jc->array[hash].pc, tb, &s))) {
         goto hit;
     }
@@ -375,7 +410,8 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
      * state and pages, as the hash table's would.
      */
     if (tcg_ijmp_inline && tb && tcg_jcgen &&
-        !((jc->array[hash].pc ^ s.pc) & (jc->salt_step - 1))) {
+        !((qatomic_read(&jc->array[hash].pc) ^ s.pc) &
+          (jc->salt_step - 1))) {
         tb = tb_htable_lookup_stale(cpu, s, tb);
     } else {
         tb = tb_htable_lookup(cpu, s);
@@ -385,8 +421,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
     }
 
     key = tb_jmp_cache_key(jc, s.pc, tb_jmp_cache_global(cpu, tb, s.pc));
-    jc->array[hash].pc = key;
-    qatomic_set(&jc->array[hash].tb, tb);
+    tb_jmp_cache_set(jc, hash, key, tb);
 #ifndef CONFIG_USER_ONLY
     set_bit(tb_jmp_cache_filter_bit(s.pc), jc->filter);
 #endif
@@ -405,7 +440,7 @@ TranslationBlock *cpu_exec_tb_cached(CPUState *cpu, TCGTBCPUState s)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
     uint32_t hash = tb_jmp_cache_hash_func(s.pc);
-    TranslationBlock *tb = qatomic_read(&jc->array[hash].tb);
+    TranslationBlock *tb = tb_jmp_cache_tb(jc, hash);
 
     if (unlikely(jc->region_sample_next)) {
         return NULL;
@@ -927,10 +962,11 @@ const void *HELPER(lookup_tb_ptr_jcp)(CPUArchState *env, uint64_t pc,
     CPUState *cpu = env_cpu(env);
     CPUJumpCache *jc = cpu->tb_jmp_cache;
     uint32_t hash = tb_jmp_cache_hash_func(pc);
-    TranslationBlock *tb = qatomic_read(&jc->array[hash].tb);
+    TranslationBlock *tb = tb_jmp_cache_tb(jc, hash);
 
     if (likely(tb &&
-               tb_jmp_cache_key_match(jc, jc->array[hash].pc, pc) &&
+               tb_jmp_cache_key_match(jc, qatomic_read(&jc->array[hash].pc),
+                                      pc) &&
                QTAILQ_EMPTY(&cpu->breakpoints) &&
                tb->cs_base == cs_base &&
                tb->flags == flags &&
@@ -1716,9 +1752,10 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 h = tb_jmp_cache_hash_func(s.pc);
                 jc = cpu->tb_jmp_cache;
                 if (!tcg_jc_ctx || tb_jmp_cache_ctx_match(jc, s)) {
-                    jc->array[h].pc = tb_jmp_cache_key(jc, s.pc,
-                                        tb_jmp_cache_global(cpu, tb, s.pc));
-                    qatomic_set(&jc->array[h].tb, tb);
+                    tb_jmp_cache_set(jc, h,
+                                     tb_jmp_cache_key(jc, s.pc,
+                                        tb_jmp_cache_global(cpu, tb, s.pc)),
+                                     tb);
 #ifndef CONFIG_USER_ONLY
                     set_bit(tb_jmp_cache_filter_bit(s.pc), jc->filter);
 #endif
@@ -1861,6 +1898,19 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
                                       sizeof(CPUJumpCache));
     memset(cpu->tb_jmp_cache, 0, sizeof(CPUJumpCache));
     cpu->tb_jmp_cache->gsalt = TB_JMP_GSALT_BASE;
+#ifdef CONFIG_USER_ONLY
+    /*
+     * x-ijlean: the TBs beside the entries; an empty entry's key is the
+     * poison, not 0.
+     */
+    if (tcg_jc_code) {
+        cpu->tb_jmp_cache->tbs = g_new0(TranslationBlock *,
+                                        TB_JMP_CACHE_SIZE);
+        for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+            tb_jmp_cache_clear(cpu->tb_jmp_cache, i);
+        }
+    }
+#endif
     if (tcg_retstack_env) {
         /* A ring aligned to its size, which wraps (tcg_out_push_ret). */
         cpu->tb_jmp_cache->retring = qemu_memalign(TCG_RETSTACK_SIZE,
@@ -1907,6 +1957,12 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
         cpu->tb_jmp_cache->salt_step =
             1ull << cpu->cc->tcg_ops->jmp_cache_salt_shift(cpu);
     }
+    /*
+     * x-ijlean's poison keys differ from the slot's in the low bits, which
+     * the salts must leave alone (tb_jmp_cache_poison).
+     */
+    assert(!tcg_jc_code ||
+           cpu->tb_jmp_cache->salt_step >= TB_JMP_CACHE_SIZE);
     tlb_init(cpu);
 #ifndef CONFIG_USER_ONLY
     tcg_iommu_init_notifier_list(cpu);
@@ -1919,6 +1975,9 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
 /* undo the initializations in reverse order */
 static void tb_jmp_cache_free(CPUJumpCache *jc)
 {
+#ifdef CONFIG_USER_ONLY
+    g_free(jc->tbs);
+#endif
     if (tcg_retstack_env) {
         qemu_vfree(jc->retring);
     } else if (jc->retring) {
