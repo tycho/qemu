@@ -110,6 +110,9 @@ extern unsigned tcg_tlb_grow;
  */
 extern bool tcg_jc_global;
 
+/* x-ijlean, as set; tcg_jc_code (tb-jmp-cache.h) is whether it applies. */
+extern bool tcg_ijlean;
+
 /*
  * x-smc=check (user mode): self-modifying code is detected by a CRC32C of
  * each TB's guest bytes at its entry, not by write-protecting its pages.

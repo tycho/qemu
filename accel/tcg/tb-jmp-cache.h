@@ -38,6 +38,12 @@
  * no need for qatomic_rcu_read() and pc is always consistent with a
  * non-NULL value of 'tb'.  Strictly speaking pc is only needed for
  * CF_PCREL, but it's used always for simplicity.
+ *
+ * With tcg_jc_code, entries hold host code and their TBs are in tbs[]:
+ * only the owning vCPU (or a flush, exclusive or on the owner) writes an
+ * entry's code and TB, and every access to pc is atomic, since another
+ * vCPU's invalidation poisons it (tb_jmp_cache_inval_tb).  A non-NULL TB
+ * may then be one invalidated since, beside a pc no lookup matches.
  */
 typedef struct CPUJumpCache {
     struct rcu_head rcu;
@@ -65,7 +71,11 @@ typedef struct CPUJumpCache {
     uint32_t ctx_flags;
     uint32_t ctx_cflags;
     struct {
-        TranslationBlock *tb;
+        /* The TB; with x-ijlean, its host code (the TB is in tbs[]). */
+        union {
+            TranslationBlock *tb;
+            const void *code;
+        };
         vaddr pc;
     } array[TB_JMP_CACHE_SIZE] QEMU_ALIGNED(TB_JMP_CACHE_ALIGN);
     /*
@@ -98,9 +108,59 @@ typedef struct CPUJumpCache {
      * them again.
      */
     unsigned long filter[BITS_TO_LONGS(TB_JMP_CACHE_SIZE)];
+#else
+    /*
+     * tcg_jc_code: each entry's TB, for the C side (the generated probe
+     * reads only the entry), TB_JMP_CACHE_SIZE of them; NULL otherwise.
+     */
+    TranslationBlock **tbs;
 #endif
 } CPUJumpCache;
 
 #define TB_JMP_GSALT_BASE (1ull << 63)
+
+/*
+ * x-ijlean applies (user mode, with tcg_jc_ctx): each entry holds its TB's
+ * host code, the TB itself in tbs[]; the generated probe compares the key
+ * and branches.  Always false in system mode.
+ */
+extern bool tcg_jc_code;
+
+/*
+ * x-ijlean: a cleared entry's key.  In user mode the generated probe's
+ * slot is the pc's low TB_JMP_CACHE_BITS bits, which every key keeps (the
+ * salt is above them), so no key looked up at slot @h has these.
+ */
+static inline vaddr tb_jmp_cache_poison(uint32_t h)
+{
+    return (vaddr)(h ^ 1);
+}
+
+/* The TB of entry @h, or NULL. */
+static inline TranslationBlock *tb_jmp_cache_tb(CPUJumpCache *jc, uint32_t h)
+{
+#ifdef CONFIG_USER_ONLY
+    if (tcg_jc_code) {
+        return qatomic_read(&jc->tbs[h]);
+    }
+#endif
+    return qatomic_read(&jc->array[h].tb);
+}
+
+/*
+ * Clear entry @h: no lookup finds a TB there.  On the owning vCPU, or with
+ * every vCPU stopped: another vCPU's invalidation only poisons the key.
+ */
+static inline void tb_jmp_cache_clear(CPUJumpCache *jc, uint32_t h)
+{
+#ifdef CONFIG_USER_ONLY
+    if (tcg_jc_code) {
+        qatomic_set(&jc->array[h].pc, tb_jmp_cache_poison(h));
+        qatomic_set(&jc->tbs[h], NULL);
+        return;
+    }
+#endif
+    qatomic_set(&jc->array[h].tb, NULL);
+}
 
 #endif /* ACCEL_TCG_TB_JMP_CACHE_H */
