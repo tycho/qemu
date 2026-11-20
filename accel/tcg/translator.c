@@ -138,7 +138,7 @@ TCGLabel *translator_edge_check(DisasContextBase *db, vaddr dest)
     TCGLabel *exit;
     TCGv_i32 count;
 
-    if ((!db->edge_checks && !db->edge_end) ||
+    if ((!db->edge_checks && !db->edge_end) || db->edge_checked ||
         (dest > db->pc_first && !db->edge_end)) {
         return NULL;
     }
@@ -1363,6 +1363,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     db->edge_end = tcg_edge_sys && tcg_region && ops->edge_checks &&
                    (cflags & CF_NOIRQ) && !(cflags & CF_USE_ICOUNT);
 #endif
+    db->edge_checked = false;
 
     ops->init_disas_context(db, cpu);
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
