@@ -931,6 +931,16 @@ static void tcg_set_pinpc(Object *obj, bool value, Error **errp)
     tcg_pin_pc = value;
 }
 
+static bool tcg_get_backedge(Object *obj, Error **errp)
+{
+    return tcg_backedge;
+}
+
+static void tcg_set_backedge(Object *obj, bool value, Error **errp)
+{
+    tcg_backedge = value;
+}
+
 static bool tcg_get_slotplace(Object *obj, Error **errp)
 {
     return tcg_slotplace;
@@ -1715,6 +1725,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-pinpc",
         "With x-pin, in system mode, keep the guest PC in a host register "
         "across TBs, ahead of the guest's general registers");
+    object_class_property_add_bool(oc, "x-backedge", tcg_get_backedge,
+                                   tcg_set_backedge);
+    object_class_property_set_description(oc, "x-backedge",
+        "With x-region's exit checks: a conditional jump back checks the "
+        "exit request before it branches, and then branches back on its "
+        "own condition rather than its inverse followed by a jump");
     object_class_property_add_bool(oc, "x-slotplace", tcg_get_slotplace,
                                    tcg_set_slotplace);
     object_class_property_set_description(oc, "x-slotplace",
