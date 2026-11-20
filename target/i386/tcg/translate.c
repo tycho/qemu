@@ -3206,6 +3206,106 @@ static bool gen_jmp_rel_loops(DisasContext *s, MemOp ot, int diff)
            && translator_use_goto_tb(&s->base, new_pc);
 }
 
+/*
+ * tcg_backedge: a Jcc whose taken side is a backward edge with an exit
+ * check prepares its condition, checks the exit request, and then
+ * branches on its own condition.  Otherwise, within a multi-block region,
+ * the Jcc takes the inverse condition to its fall-through, then checks
+ * and branches back; where the edge leaves the TB, the Jcc branches to
+ * a label that checks before the goto_tb slot.  Here a region's back
+ * edge branches straight to its block, and a TB's to a label whose exit
+ * no longer checks: where that exit gets a slot and nothing precedes it
+ * (tcg_slotplace keeps the boundary globals' moves off it), the branch
+ * can be linked through to the target TB.
+ *
+ * The condition is prepared before the check, so that host flags kept
+ * from the producer (x-nzcv) reach the branch.  A pending request leaves
+ * the TB at the Jcc with the flags as prepared (the same flags, perhaps
+ * as CC_OP_EFLAGS), and the Jcc runs again.
+ *
+ * Not with MPX (gen_bnd_jmp acts before the branch); in a TB's loop to
+ * its own start (an XLBL_LOOP label takes one unconditional branch);
+ * with plugins (the Jcc's callbacks would run twice); where every exit
+ * checks (edge_end); with CF_PCREL, whose eip update would precede the
+ * slot or have to be undone on the fall-through; with sampled regions
+ * (tcg_superblock), whose samples the request's exit, with no TB, would
+ * lose; or where the edge can't use goto_tb, or leaves for native code.
+ * Returns false, emitting nothing, where the Jcc keeps the usual shape.
+ */
+static bool gen_jcc_checked_backedge(DisasContext *s, int b, int diff)
+{
+    target_ulong pc_save = s->pc_save;
+    bool dirty, region, backward;
+    TCGLabel *req, *taken;
+    target_ulong dest;
+    CCPrepare cc = { };
+    CCOp cc_op;
+    int ac;
+
+    if (!tcg_backedge || tcg_superblock || !s->jmp_opt ||
+        !s->base.edge_checks || s->base.edge_end ||
+        s->base.plugin_enabled || (s->flags & HF_MPX_EN_MASK) ||
+        (tb_cflags(s->base.tb) & CF_PCREL) ||
+        !jmp_rel_dest(s, s->dflag, diff, &dest)) {
+        return false;
+    }
+    if (s->base.region && translator_region_backward(&s->base, dest)) {
+        region = true;
+    } else if (dest > s->base.pc_first ||
+               !translator_use_goto_tb(&s->base, dest) ||
+               translator_use_foreign_call(&s->base, dest) ||
+               gen_jmp_rel_loops(s, s->dflag, diff)) {
+        return false;
+    } else {
+        region = false;
+    }
+
+    /* As gen_jcc, with the check between the preparation and the branch. */
+    ac = gen_nzcv_cond(s, b);
+    if (ac < 0) {
+        cc = gen_prepare_cc(s, b, NULL);
+    }
+    gen_update_cc_op_exit(s);
+    /* The request's exit stores cc_op on its own path if it must. */
+    cc_op = s->cc_op;
+    dirty = s->cc_op_dirty;
+
+    if (region) {
+        req = gen_new_label();
+        translator_exit_check(&s->base, req);
+        /* The state the branch enters the block with, as prepared. */
+        taken = translator_region_target(&s->base, dest, &backward,
+                                         region_entry_cc_op(s));
+        assert(taken && backward);
+    } else {
+        req = translator_edge_check(&s->base, dest);
+        assert(req);
+        taken = gen_new_label();
+    }
+    if (ac >= 0) {
+        tcg_gen_nzcv_brcond(ac, taken);
+    } else {
+        tcg_gen_brcond_tl(cc.cond, cc.reg, cc.reg2, taken);
+    }
+    if (region) {
+        gen_jmp_rel_csize(s, 0, 1);
+    } else {
+        s->base.edge_checked = true;
+        gen_conditional_jump_labels(s, diff, NULL, taken);
+        s->base.edge_checked = false;
+    }
+
+    gen_set_label(req);
+    if (dirty) {
+        tcg_gen_movi_i32(cpu_cc_op, cc_op);
+    }
+    s->pc_save = pc_save;
+    gen_update_eip_cur(s);
+    tcg_gen_exit_tb(NULL, 0);
+    s->base.is_jmp = DISAS_NORETURN;
+    return true;
+}
+
 /* Jump to eip+diff, truncating to the current code size. */
 static void gen_jmp_rel_csize(DisasContext *s, int diff, int tb_num)
 {

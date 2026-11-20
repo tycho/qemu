@@ -4626,6 +4626,9 @@ static void gen_Jcc(DisasContext *s, X86DecodedInsn *decode)
 {
     TCGLabel *taken = gen_new_label();
 
+    if (gen_jcc_checked_backedge(s, decode->b & 0xf, decode->immediate)) {
+        return;
+    }
     gen_bnd_jmp(s);
     if (gen_jmp_rel_loops(s, s->dflag, decode->immediate)) {
         /*

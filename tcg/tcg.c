@@ -350,6 +350,7 @@ bool tcg_vecglobal;
 bool tcg_ymmglobal;
 bool tcg_vregs_all;
 bool tcg_region;
+bool tcg_backedge;
 bool tcg_slotplace;
 unsigned tcg_superblock;
 unsigned tcg_units;
