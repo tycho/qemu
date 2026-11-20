@@ -138,6 +138,10 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-flagdesc", "on" },
         /* Jump-cache entries that hold their TB's host code. */
         { "x-ijlean", "on" },
+        /* A conditional jump back checks first, then takes its condition. */
+        { "x-backedge", "on" },
+        /* Boundary globals placed before a branch to a goto_tb slot. */
+        { "x-slotplace", "on" },
         /* Inactive but for i386 guests with no guest base. */
         { "x-zext32", "on" },
 #ifndef _WIN32
@@ -932,6 +936,26 @@ static void tcg_set_pinpc(Object *obj, bool value, Error **errp)
     tcg_pin_pc = value;
 }
 
+static bool tcg_get_backedge(Object *obj, Error **errp)
+{
+    return tcg_backedge;
+}
+
+static void tcg_set_backedge(Object *obj, bool value, Error **errp)
+{
+    tcg_backedge = value;
+}
+
+static bool tcg_get_slotplace(Object *obj, Error **errp)
+{
+    return tcg_slotplace;
+}
+
+static void tcg_set_slotplace(Object *obj, bool value, Error **errp)
+{
+    tcg_slotplace = value;
+}
+
 static bool tcg_get_edgesys(Object *obj, Error **errp)
 {
     return tcg_edge_sys;
@@ -1716,6 +1740,19 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "x-pinpc",
         "With x-pin, in system mode, keep the guest PC in a host register "
         "across TBs, ahead of the guest's general registers");
+    object_class_property_add_bool(oc, "x-backedge", tcg_get_backedge,
+                                   tcg_set_backedge);
+    object_class_property_set_description(oc, "x-backedge",
+        "With x-region's exit checks: a conditional jump back checks the "
+        "exit request before it branches, and then branches back on its "
+        "own condition rather than its inverse followed by a jump");
+    object_class_property_add_bool(oc, "x-slotplace", tcg_get_slotplace,
+                                   tcg_set_slotplace);
+    object_class_property_set_description(oc, "x-slotplace",
+        "With boundary globals: put them in their registers before a "
+        "conditional branch whose label opens with a goto_tb slot, rather "
+        "than at the label, so the branch can be linked straight to the "
+        "slot's TB");
     object_class_property_add_bool(oc, "x-edgesys", tcg_get_edgesys,
                                    tcg_set_edgesys);
     object_class_property_set_description(oc, "x-edgesys",

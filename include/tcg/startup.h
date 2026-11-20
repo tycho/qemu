@@ -288,6 +288,22 @@ void tcg_set_env_scratch(intptr_t ofs, intptr_t size);
 extern bool tcg_region;
 
 /*
+ * With exit checks on backward edges (DisasContextBase.edge_checks): a
+ * conditional jump whose taken side goes back prepares its condition,
+ * checks the exit request, and then branches back on the condition
+ * itself.
+ */
+extern bool tcg_backedge;
+
+/*
+ * With boundary globals: a conditional branch to a label that opens with
+ * a goto_tb slot puts them in their registers before the branch rather
+ * than at the label, so that the slot can be first at its label and the
+ * branch linked straight to the slot's TB.
+ */
+extern bool tcg_slotplace;
+
+/*
  * With tcg_region, the profile samples (one per millisecond) after which a
  * loop's blocks are translated as one multi-block region (0: never).
  * User mode, and only for TBs that aren't PC-relative.

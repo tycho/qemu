@@ -97,6 +97,13 @@ struct DisasContextBase {
      */
     bool edge_end;
     /*
+     * Set by a front end around the exits of one branch whose exit check
+     * it has already emitted, ahead of the branch on every path to them,
+     * with no guest effect in between: translator_edge_check() then emits
+     * no check.
+     */
+    bool edge_checked;
+    /*
      * A multi-block region (translator_region_target), or NULL; whether
      * this TB may become one; the goto_tb slots it has used.
      */
