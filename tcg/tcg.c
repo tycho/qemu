@@ -350,6 +350,8 @@ bool tcg_vecglobal;
 bool tcg_ymmglobal;
 bool tcg_vregs_all;
 bool tcg_region;
+bool tcg_backedge;
+bool tcg_slotplace;
 unsigned tcg_superblock;
 unsigned tcg_units;
 bool tcg_region_entry;
@@ -8666,6 +8668,52 @@ static void tcg_reg_alloc_boundary_place(TCGContext *s)
     }
 }
 
+/* The boundary globals' registers. */
+static TCGRegSet boundary_regs(TCGContext *s)
+{
+    TCGRegSet regs = 0;
+
+    for (int i = 0; i < s->nb_boundary; i++) {
+        tcg_regset_set_reg(regs, temp_boundary_reg(s->boundary[i]));
+    }
+    return regs;
+}
+
+/*
+ * tcg_slotplace: whether a conditional branch to @l puts the boundary
+ * globals in their registers first.  @l is reached by that branch alone,
+ * inherits the allocator's state at it, and opens with a goto_tb slot,
+ * before which the exit would otherwise place them; placed at the
+ * branch instead, they can leave the slot first at its label, where the
+ * branch can be linked straight to the slot's TB (tcg_note_cond_link).
+ * The fall-through continues from the same state, whether it leaves the
+ * TB or not, so placement there may cost moves that the fall-through
+ * didn't need.  Only where such links are made, and not with
+ * goto_tb_dead's chain stores, which belong after the branch.  Stores the
+ * label still owes (xblk_obligations), a slot laid out cold, or a branch
+ * out of the link's range still keep the link from being made.
+ */
+static bool cond_branch_places_boundary(TCGContext *s, TCGLabel *l)
+{
+#ifdef TCG_TARGET_HAS_COND_LINK
+    const TCGOp *next;
+
+    if (!tcg_slotplace || !tcg_goto_tb_cold || !s->boundary_in ||
+        s->chain_dead_used || !s->xblk || l->xkind != XLBL_INHERIT ||
+        !l->xset) {
+        return false;
+    }
+    next = QTAILQ_NEXT(l->xset, link);
+    return next && (next->opc == INDEX_op_goto_tb
+#ifdef TCG_TARGET_HAS_GOTO_TB_COLD
+                    || next->opc == INDEX_op_goto_tb_cold
+#endif
+                    );
+#else
+    return false;
+#endif
+}
+
 /*
  * A boundary global discarded by the front end is defined again by an
  * op's output, or by a helper or a host store that may write its memory.
@@ -9521,6 +9569,14 @@ static void tcg_reg_alloc_op(TCGContext *s, const TCGOp *op)
         if (l && l->xkind == XLBL_REGION) {
             xblk_region_place(s, l);
             i_allocated_regs |= xblk_region_regs(s, l);
+        }
+    }
+    if (def->flags & TCG_OPF_COND_BRANCH) {
+        TCGLabel *l = op_branch_label(op);
+
+        if (l && cond_branch_places_boundary(s, l)) {
+            tcg_reg_alloc_boundary_place(s);
+            i_allocated_regs |= boundary_regs(s);
         }
     }
 
