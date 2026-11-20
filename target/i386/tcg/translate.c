@@ -3152,19 +3152,18 @@ static void gen_jmp_rel_1(DisasContext *s, MemOp ot, target_long diff,
 }
 
 /*
- * Whether gen_jmp_rel(s, ot, diff, ...) would branch back within the TB
- * (tcg_region, or an earlier block of a multi-block region), from the same
- * conditions it uses.
+ * The destination of gen_jmp_rel(s, ot, diff, ...) as a linear pc, like
+ * pc_first (cs_base included: not an eip); false where it isn't known at
+ * translation, which with CF_PCREL is so for a 16-bit jump in 32-bit code
+ * (masked at run time) and for a jump off the page.
  */
-static bool gen_jmp_rel_loops(DisasContext *s, MemOp ot, int diff)
+static bool jmp_rel_dest(DisasContext *s, MemOp ot, int diff,
+                         target_ulong *dest)
 {
     target_ulong mask = -1;
     target_ulong new_pc = s->pc + diff;
     target_ulong new_eip = new_pc - s->cs_base;
 
-    if (!s->jmp_opt || !s->base.loop_label) {
-        return false;
-    }
     if (!CODE64(s)) {
         if (ot == MO_16) {
             mask = 0xffff;
@@ -3182,6 +3181,23 @@ static bool gen_jmp_rel_loops(DisasContext *s, MemOp ot, int diff)
         }
     } else if (!CODE64(s)) {
         new_pc = (uint32_t)(new_eip + s->cs_base);
+    }
+    *dest = new_pc;
+    return true;
+}
+
+/*
+ * Whether gen_jmp_rel(s, ot, diff, ...) would branch back within the TB
+ * (tcg_region, or an earlier block of a multi-block region), from the same
+ * conditions it uses.
+ */
+static bool gen_jmp_rel_loops(DisasContext *s, MemOp ot, int diff)
+{
+    target_ulong new_pc;
+
+    if (!s->jmp_opt || !s->base.loop_label ||
+        !jmp_rel_dest(s, ot, diff, &new_pc)) {
+        return false;
     }
     if (s->base.region) {
         return translator_region_backward(&s->base, new_pc);
