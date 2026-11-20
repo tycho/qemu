@@ -137,6 +137,10 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-flagdesc", "on" },
         /* Jump-cache entries that hold their TB's host code. */
         { "x-ijlean", "on" },
+        /* A conditional jump back checks first, then takes its condition. */
+        { "x-backedge", "on" },
+        /* Boundary globals placed before a branch to a goto_tb slot. */
+        { "x-slotplace", "on" },
         /* Inactive but for i386 guests with no guest base. */
         { "x-zext32", "on" },
 #ifndef _WIN32
