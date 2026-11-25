@@ -350,6 +350,29 @@ target_ulong HELPER(cc_compute_all2)(target_ulong dst, target_ulong src1,
     return HELPER(cc_compute_all)(dst, src1, src2, op);
 }
 
+/*
+ * CC_OP_COX: SF, ZF, AF and PF from the earlier operation OP, CF and OF
+ * from bits 0 and 1 of DST2.
+ */
+target_ulong x86_cc_compute_all_cox(target_ulong dst, target_ulong src1,
+                                    target_ulong src2, target_ulong dst2,
+                                    int op)
+{
+    target_ulong flags = HELPER(cc_compute_all)(dst, src1, src2, op);
+
+    flags &= ~(target_ulong)(CC_C | CC_O);
+    flags |= dst2 & 1 ? CC_C : 0;
+    flags |= dst2 & 2 ? CC_O : 0;
+    return flags;
+}
+
+target_ulong HELPER(cc_compute_all_cox)(target_ulong dst, target_ulong src1,
+                                        target_ulong src2, target_ulong dst2,
+                                        int op)
+{
+    return x86_cc_compute_all_cox(dst, src1, src2, dst2, op);
+}
+
 uint32_t cpu_cc_compute_all(CPUX86State *env)
 {
     return HELPER(cc_compute_all2)(CC_DST, CC_SRC, CC_SRC2, env->cc_dst2,

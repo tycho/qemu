@@ -1663,6 +1663,16 @@ typedef enum {
     CC_OP_DECLW,
     CC_OP_DECLL,
     CC_OP_DECLQ,
+
+    /*
+     * A rotate by a nonzero count with a lazy state for the other flags
+     * (tcg_lazy_rot): CF in bit 0 and OF in bit 1 of CC_DST2, SF, ZF, AF
+     * and PF those of the earlier operation, whose number is in bits 8
+     * and up of CC_OP, with CC_DST, CC_SRC and CC_SRC2 as its operands.
+     * Known at translation only: CC_OP holds it only in the data an insn
+     * records for a fault, whose restore turns it into CC_OP_EFLAGS.
+     */
+    CC_OP_COX,
 } CCOp;
 
 /* See X86DecodedInsn.cc_op, using int8_t. */

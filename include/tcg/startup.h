@@ -693,6 +693,12 @@ extern bool tcg_lazy_incdec;
 extern bool tcg_ccentry;
 
 /*
+ * x86 guests: a rotate by a nonzero count after a known flags state keeps
+ * that state for SF, ZF, AF and PF instead of computing all the flags.
+ */
+extern bool tcg_lazy_rot;
+
+/*
  * x86 guests: what a CR3 write flushes from the softmmu TLB (the TCG
  * accelerator property x-cr3-flush).
  */

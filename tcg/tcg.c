@@ -3482,6 +3482,7 @@ bool tcg_flags_guess;
 bool tcg_flags_dead;
 bool tcg_lazy_incdec;
 bool tcg_ccentry;
+bool tcg_lazy_rot;
 
 bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
 {
