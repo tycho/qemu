@@ -117,6 +117,8 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-pinpc", "on" },
         { "x-ccregs", "on" },
         { "x-lazyinc", "on" },
+        /* Rotates keep a known flags state for the flags they keep. */
+        { "x-lazyrot", "on" },
         { "x-flags", "dead" },
         { "x-repstr", "on" },
         { "x-vexzero", "on" },
@@ -1324,6 +1326,16 @@ static void tcg_set_ccentry(Object *obj, bool value, Error **errp)
     tcg_ccentry = value;
 }
 
+static bool tcg_get_lazy_rot(Object *obj, Error **errp)
+{
+    return tcg_lazy_rot;
+}
+
+static void tcg_set_lazy_rot(Object *obj, bool value, Error **errp)
+{
+    tcg_lazy_rot = value;
+}
+
 static bool tcg_get_region_entry(Object *obj, Error **errp)
 {
     return tcg_region_entry;
@@ -1923,6 +1935,12 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
         "x86 user mode: a direct jump with its flags state known at "
         "translation links to a TB translated for that state, and stores "
         "the state only when unlinked");
+
+    object_class_property_add_bool(oc, "x-lazyrot",
+                                   tcg_get_lazy_rot, tcg_set_lazy_rot);
+    object_class_property_set_description(oc, "x-lazyrot",
+        "x86: ROL and ROR by a nonzero count after a known flags state keep "
+        "that state for SF, ZF, AF and PF rather than computing them");
 
     object_class_property_add_str(oc, "x-superblock",
                                   tcg_get_superblock, tcg_set_superblock);

@@ -145,7 +145,17 @@ static void x86_restore_state_to_opc(CPUState *cs,
         env->eip = (uint32_t)(new_pc - (uint32_t)tb->cs_base);
     }
 
-    if (cc_op != CC_OP_DYNAMIC) {
+    if ((cc_op & 0xff) == CC_OP_COX) {
+        /*
+         * A lazy rotate's state exists at translation only: the guest
+         * state the fault restores has it as EFLAGS.  The operands are
+         * in env already (a guest access keeps them).
+         */
+        env->cc_src = x86_cc_compute_all_cox(env->cc_dst, env->cc_src,
+                                             env->cc_src2, env->cc_dst2,
+                                             cc_op >> 8);
+        env->cc_op = CC_OP_EFLAGS;
+    } else if (cc_op != CC_OP_DYNAMIC) {
         env->cc_op = cc_op;
     }
     for (unsigned i = 0, m = data[2] >> X86_INSN_YMMH_SHIFT; m; ++i, m >>= 1) {
