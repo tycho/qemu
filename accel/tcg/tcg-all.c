@@ -116,6 +116,8 @@ static void xtcg_fork_defaults(Object *obj)
         { "x-pinpc", "on" },
         { "x-ccregs", "on" },
         { "x-lazyinc", "on" },
+        /* Rotates keep a known flags state for the flags they keep. */
+        { "x-lazyrot", "on" },
         { "x-flags", "dead" },
         { "x-repstr", "on" },
         { "x-vexzero", "on" },
